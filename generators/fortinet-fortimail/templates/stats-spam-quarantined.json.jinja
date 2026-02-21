@@ -1,0 +1,152 @@
+{%- set session_seq = shared.get('session_seq', 1000) -%}
+{%- set stats_log_seq = shared.get('stats_log_seq', 4500) -%}
+{#- Session ID -#}
+{%- set pfx = module.rand.string.letters(7) -%}
+{%- set c1 = module.rand.choice("abcdefghijkmnpqrstuvwxyz") -%}
+{%- set c2 = module.rand.choice("bcdefghjkmnpqrstuvwxyz") -%}
+{%- set seq_str = ("000000" ~ (session_seq | string))[-6:] -%}
+{%- set session_id = pfx ~ c1 ~ seq_str ~ "-" ~ pfx ~ c2 ~ seq_str -%}
+{%- set log_id = "02" ~ ("00000000" ~ (stats_log_seq | string))[-8:] -%}
+{#- Sender (could be compromised legitimate server) -#}
+{%- set use_legit_server = module.rand.chance(0.4) -%}
+{%- if use_legit_server -%}
+  {%- set srv_items = [] -%}
+  {%- set srv_weights = [] -%}
+  {%- for srv in samples.mail_servers -%}
+    {%- do srv_items.append(srv) -%}
+    {%- do srv_weights.append(srv.weight) -%}
+  {%- endfor -%}
+  {%- set server = module.rand.weighted_choice(srv_items, srv_weights) -%}
+  {%- set sender_email = module.faker.locale.en_US.user_name() ~ "@" ~ server.domain -%}
+  {%- set client_ip = module.rand.network.ip_v4_public() -%}
+  {%- set client_name = server.hostname -%}
+  {%- set client_cc = server.cc -%}
+{%- else -%}
+  {%- set sender_email = module.faker.locale.en_US.email() -%}
+  {%- set client_ip = module.rand.network.ip_v4_public() -%}
+  {%- set client_name = "[" ~ client_ip ~ "]" -%}
+  {%- set client_cc = module.rand.weighted_choice(["US", "CN", "RU", "BR", "IN", "DE", "NL", "GB"], [20, 15, 12, 10, 10, 8, 8, 7]) -%}
+{%- endif -%}
+{#- Internal recipient -#}
+{%- set recipient = (samples.internal_users | random).username -%}
+{%- set recipient_email = recipient ~ "@" ~ params.domain -%}
+{#- Subject (spam or newsletter-suspicious) -#}
+{%- set subject_cat = module.rand.weighted_choice(["spam", "newsletter", "phishing"], [50, 30, 20]) -%}
+{%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+{#- Classification -#}
+{%- set classifier = module.rand.weighted_choice(["FortiGuard AntiSpam", "Bayesian", "Sender Reputation", "Newsletter Suspicious", "Heuristic"], [35, 25, 20, 12, 8]) -%}
+{%- set disposition = module.rand.weighted_choice(["System Quarantine;Notification", "Modify Subject;Quarantine to Review", "System Quarantine;Notification;Defer Disposition", "Quarantine to Review"], [35, 30, 20, 15]) -%}
+{%- set mailer = "mta" -%}
+{%- set polid = module.rand.weighted_choice(["0:1:1:SYSTEM", "1:1:2:SYSTEM", "3:1:9:SYSTEM"], [40, 30, 30]) -%}
+{#- Metrics -#}
+{%- set message_length = module.rand.number.integer(800, 15000) -%}
+{%- set scan_time = module.rand.number.floating(0.03, 1.0) | round(6) -%}
+{%- set xfer_time = module.rand.number.floating(0.001, 0.04) | round(6) -%}
+{%- set message_id = module.rand.string.hex(12) ~ "@" ~ module.faker.locale.en_US.domain_name() -%}
+{%- set tld = params.domain.split(".")[-1] -%}
+{#- Store for spam-detection correlation -#}
+{%- set spam_pool = shared.get('spam_sessions', []) -%}
+{%- do spam_pool.append({"session_id": session_id, "from": sender_email, "to": recipient_email, "subject": subject, "client_ip": client_ip, "client_name": client_name, "dst_ip": params.device_ip, "classifier": classifier}) -%}
+{%- if spam_pool | length > 50 -%}{%- do spam_pool.pop(0) -%}{%- endif -%}
+{%- do shared.set('spam_sessions', spam_pool) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ params.device_ip }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "email": {
+        "direction": "in",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "subject": "{{ subject }}",
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        },
+        "x_mailer": "{{ mailer }}"
+    },
+    "event": {
+        "code": "{{ log_id }}",
+        "dataset": "fortinet_fortimail.log",
+        "kind": "event",
+        "module": "fortinet_fortimail",
+        "outcome": "success"
+    },
+    "fortinet_fortimail": {
+        "log": {
+            "classifier": "{{ classifier }}",
+            "client": {
+                "cc": "{{ client_cc }}",
+                "ip": "{{ client_ip }}",
+                "name": "{{ client_name }}"
+            },
+            "destination_ip": "{{ params.device_ip }}",
+            "direction": "in",
+            "disposition": "{{ disposition }}",
+            "domain": "{{ params.domain }}",
+            "from": "{{ sender_email }}",
+            "hfrom": "{{ sender_email }}",
+            "id": "{{ log_id }}",
+            "message_id": "{{ message_id }}",
+            "message_length": {{ message_length }},
+            "notif_delay": "0",
+            "policy_id": "{{ polid }}",
+            "priority": "information",
+            "read_status": "",
+            "recv_time": "",
+            "resolved": "OK",
+            "scan_time": {{ scan_time }},
+            "session_id": "{{ session_id }}",
+            "source": {
+                "folder": "",
+                "type": "ext"
+            },
+            "sub_type": "",
+            "subject": "{{ subject }}",
+            "to": "{{ recipient_email }}",
+            "type": "statistics",
+            "virus": "",
+            "xfer_time": {{ xfer_time }}
+        }
+    },
+    "log": {
+        "level": "information",
+        "syslog": {
+            "priority": 190
+        }
+    },
+    "observer": {
+        "product": "FortiMail",
+        "serial_number": "{{ params.device_id }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ client_ip }}", "{{ params.device_ip }}"],
+        "user": ["{{ client_name }}", "{{ sender_email }}", "{{ recipient_email }}"]
+    },
+    "server": {
+        "domain": "{{ params.domain }}",
+        "registered_domain": "{{ params.domain }}",
+        "top_level_domain": "{{ tld }}"
+    },
+    "source": {
+        "ip": "{{ client_ip }}",
+        "user": {
+            "name": "{{ client_name }}"
+        }
+    },
+    "tags": ["fortinet-fortimail", "forwarded"]
+}
+{%- do shared.set('session_seq', session_seq + 1) -%}
+{%- do shared.set('stats_log_seq', stats_log_seq + 1) -%}

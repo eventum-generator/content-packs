@@ -1,0 +1,153 @@
+{%- set conn_id_counter = shared.get('conn_id', 100000) -%}
+{%- set conn_id = conn_id_counter -%}
+{%- do shared.set('conn_id', conn_id_counter + 1) -%}
+{%- set hostname = params.hostname -%}
+
+{#- Direction selection -#}
+{%- set direction = module.rand.weighted_choice(["outbound", "inbound"], [65, 35]) -%}
+
+{#- Pick a TCP service with weight-based selection -#}
+{%- set tcp_services = [] -%}
+{%- set tcp_weights = [] -%}
+{%- for svc in samples.network_services -%}
+  {%- if svc.protocol == "tcp" -%}
+    {%- do tcp_services.append(svc) -%}
+    {%- do tcp_weights.append(svc.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(tcp_services, tcp_weights) -%}
+
+{#- Generate source and destination based on direction -#}
+{%- if direction == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set src_iface = src_host.interface -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port -%}
+  {%- set dst_iface = "outside" -%}
+  {%- set has_nat = module.rand.chance(0.7) -%}
+  {%- if has_nat -%}
+    {%- set mapped_src_ip = params.nat_ip -%}
+    {%- set mapped_src_port = module.rand.number.integer(10000, 60000) -%}
+  {%- else -%}
+    {%- set mapped_src_ip = src_ip -%}
+    {%- set mapped_src_port = src_port -%}
+  {%- endif -%}
+  {%- set mapped_dst_ip = dst_ip -%}
+  {%- set mapped_dst_port = dst_port -%}
+{%- else -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set src_iface = "outside" -%}
+  {%- set dmz_hosts = [] -%}
+  {%- for h in samples.internal_hosts -%}
+    {%- if h.subnet == "dmz" -%}
+      {%- do dmz_hosts.append(h) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set dst_host = dmz_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set dst_iface = "dmz" -%}
+  {%- set mapped_src_ip = src_ip -%}
+  {%- set mapped_src_port = src_port -%}
+  {%- set mapped_dst_ip = dst_ip -%}
+  {%- set mapped_dst_port = dst_port -%}
+{%- endif -%}
+
+{#- Build the original syslog message -#}
+{%- set original_msg = "%ASA-6-302013: Built " ~ direction ~ " TCP connection " ~ conn_id ~ " for " ~ src_iface ~ ":" ~ src_ip ~ "/" ~ src_port ~ " (" ~ mapped_src_ip ~ "/" ~ mapped_src_port ~ ") to " ~ dst_iface ~ ":" ~ dst_ip ~ "/" ~ dst_port ~ " (" ~ mapped_dst_ip ~ "/" ~ mapped_dst_port ~ ")" -%}
+
+{#- Store connection for teardown correlation -#}
+{%- set tcp_sessions = shared.get('tcp_sessions', []) -%}
+{%- do tcp_sessions.append({
+  "conn_id": conn_id,
+  "src_ip": src_ip,
+  "src_port": src_port,
+  "src_iface": src_iface,
+  "dst_ip": dst_ip,
+  "dst_port": dst_port,
+  "dst_iface": dst_iface,
+  "mapped_src_ip": mapped_src_ip,
+  "mapped_src_port": mapped_src_port,
+  "mapped_dst_ip": mapped_dst_ip,
+  "mapped_dst_port": mapped_dst_port,
+  "direction": direction,
+  "iana": service.iana,
+  "transport": service.protocol,
+  "start_time": timestamp.isoformat()
+}) -%}
+{%- if tcp_sessions | length > 200 -%}
+  {%- do tcp_sessions.pop(0) -%}
+{%- endif -%}
+{%- do shared.set('tcp_sessions', tcp_sessions) -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "connection_id": "{{ conn_id }}",
+      "destination_interface": "{{ dst_iface }}",
+      "mapped_destination_ip": "{{ mapped_dst_ip }}",
+      "mapped_destination_port": {{ mapped_dst_port }},
+      "mapped_source_ip": "{{ mapped_src_ip }}",
+      "mapped_source_port": {{ mapped_src_port }},
+      "message_id": "302013",
+      "source_interface": "{{ src_iface }}"
+    }
+  },
+  "destination": {
+    "address": "{{ dst_ip }}",
+    "ip": "{{ dst_ip }}",
+    "port": {{ dst_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "flow-creation",
+    "category": ["network"],
+    "code": "302013",
+    "dataset": "cisco_asa.log",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "outcome": "success",
+    "severity": 6,
+    "type": ["connection", "start"]
+  },
+  "log": {
+    "level": "informational"
+  },
+  "network": {
+    "direction": "{{ direction }}",
+    "iana_number": "{{ service.iana }}",
+    "transport": "tcp"
+  },
+  "observer": {
+    "egress": {
+      "interface": {
+        "name": "{{ dst_iface }}"
+      }
+    },
+    "hostname": "{{ hostname }}",
+    "ingress": {
+      "interface": {
+        "name": "{{ src_iface }}"
+      }
+    },
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"{% if mapped_src_ip != src_ip %}, "{{ mapped_src_ip }}"{% endif %}{% if mapped_dst_ip != dst_ip %}, "{{ mapped_dst_ip }}"{% endif %}]
+  },
+  "source": {
+    "address": "{{ src_ip }}",
+    "ip": "{{ src_ip }}",
+    "port": {{ src_port }}
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

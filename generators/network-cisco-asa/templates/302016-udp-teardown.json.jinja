@@ -1,0 +1,122 @@
+{%- set hostname = params.hostname -%}
+
+{#- Consume from udp_sessions pool for correlation -#}
+{%- set udp_sessions = shared.get('udp_sessions', []) -%}
+{%- if udp_sessions | length > 0 -%}
+  {%- set session = udp_sessions.pop(0) -%}
+  {%- do shared.set('udp_sessions', udp_sessions) -%}
+  {%- set conn_id = session.conn_id -%}
+  {%- set src_ip = session.src_ip -%}
+  {%- set src_port = session.src_port -%}
+  {%- set src_iface = session.src_iface -%}
+  {%- set dst_ip = session.dst_ip -%}
+  {%- set dst_port = session.dst_port -%}
+  {%- set dst_iface = session.dst_iface -%}
+  {%- set iana_num = session.iana -%}
+{%- else -%}
+  {#- Fallback: generate standalone teardown -#}
+  {%- set conn_id = module.rand.number.integer(100000, 999999999) -%}
+  {%- set udp_services = [] -%}
+  {%- set udp_weights = [] -%}
+  {%- for svc in samples.network_services -%}
+    {%- if svc.protocol == "udp" -%}
+      {%- do udp_services.append(svc) -%}
+      {%- do udp_weights.append(svc.weight) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set service = module.rand.weighted_choice(udp_services, udp_weights) -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set src_iface = src_host.interface -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port -%}
+  {%- set dst_iface = "outside" -%}
+  {%- set iana_num = service.iana -%}
+{%- endif -%}
+
+{#- UDP connections are typically short -#}
+{%- set dur_secs = module.rand.weighted_choice(
+  [0, module.rand.number.integer(1, 5), module.rand.number.integer(6, 30), module.rand.number.integer(31, 120)],
+  [30, 40, 20, 10]
+) -%}
+{%- set dur_h = dur_secs // 3600 -%}
+{%- set dur_m = (dur_secs % 3600) // 60 -%}
+{%- set dur_s = dur_secs % 60 -%}
+{%- set duration_str = "%d:%02d:%02d" | format(dur_h, dur_m, dur_s) -%}
+
+{#- Bytes transferred — UDP tends to be smaller -#}
+{%- set bytes_val = module.rand.weighted_choice(
+  [module.rand.number.integer(50, 200), module.rand.number.integer(201, 1000), module.rand.number.integer(1001, 5000), module.rand.number.integer(5001, 20000)],
+  [25, 40, 25, 10]
+) -%}
+
+{#- Build original syslog message -#}
+{%- set original_msg = "%ASA-6-302016: Teardown UDP connection " ~ conn_id ~ " for " ~ src_iface ~ ":" ~ src_ip ~ "/" ~ src_port ~ " to " ~ dst_iface ~ ":" ~ dst_ip ~ "/" ~ dst_port ~ " duration " ~ duration_str ~ " bytes " ~ bytes_val -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "connection_id": "{{ conn_id }}",
+      "destination_interface": "{{ dst_iface }}",
+      "message_id": "302016",
+      "source_interface": "{{ src_iface }}"
+    }
+  },
+  "destination": {
+    "address": "{{ dst_ip }}",
+    "ip": "{{ dst_ip }}",
+    "port": {{ dst_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "flow-expiration",
+    "category": ["network"],
+    "code": "302016",
+    "dataset": "cisco_asa.log",
+    "duration": {{ dur_secs * 1000000000 }},
+    "end": "{{ timestamp.isoformat() }}",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "outcome": "success",
+    "severity": 6,
+    "type": ["connection", "end"]
+  },
+  "log": {
+    "level": "informational"
+  },
+  "network": {
+    "bytes": {{ bytes_val }},
+    "iana_number": "{{ iana_num }}",
+    "transport": "udp"
+  },
+  "observer": {
+    "egress": {
+      "interface": {
+        "name": "{{ dst_iface }}"
+      }
+    },
+    "hostname": "{{ hostname }}",
+    "ingress": {
+      "interface": {
+        "name": "{{ src_iface }}"
+      }
+    },
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+  },
+  "source": {
+    "address": "{{ src_ip }}",
+    "ip": "{{ src_ip }}",
+    "port": {{ src_port }}
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

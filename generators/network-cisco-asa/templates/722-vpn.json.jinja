@@ -1,0 +1,139 @@
+{%- set hostname = params.hostname -%}
+
+{#- VPN event type selection -#}
+{%- set vpn_event = module.rand.weighted_choice(
+  ["722022", "722023", "722051", "722033", "722037"],
+  [30, 25, 20, 15, 10]
+) -%}
+
+{#- Select VPN user -#}
+{%- set user = samples.vpn_users | random -%}
+
+{#- Select VPN group -#}
+{%- set grp_items = [] -%}
+{%- set grp_weights = [] -%}
+{%- for g in samples.vpn_groups -%}
+  {%- do grp_items.append(g) -%}
+  {%- do grp_weights.append(g.weight) -%}
+{%- endfor -%}
+{%- set vpn_group = module.rand.weighted_choice(grp_items, grp_weights) -%}
+
+{#- Client public IP -#}
+{%- set client_ip = module.rand.network.ip_v4_public() -%}
+
+{#- Transport type -#}
+{%- set transport_type = module.rand.weighted_choice(["TCP", "UDP"], [70, 30]) -%}
+
+{#- Compression -#}
+{%- set compression = module.rand.weighted_choice(["without", "with"], [80, 20]) -%}
+
+{#- Assigned internal IP for 722051 -#}
+{%- set assigned_ip = "10.10.10." ~ module.rand.number.integer(10, 250) -%}
+
+{#- Build event based on message ID -#}
+{%- if vpn_event == "722022" -%}
+  {%- set severity = 6 -%}
+  {%- set log_level = "informational" -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type_list = '["connection", "start"]' -%}
+  {%- set original_msg = "%ASA-6-722022: Group <" ~ vpn_group.policy ~ "> User <" ~ user.username ~ "> IP <" ~ client_ip ~ "> " ~ transport_type ~ " SVC connection established " ~ compression ~ " compression" -%}
+  {#- Store VPN session for teardown correlation -#}
+  {%- set vpn_sessions = shared.get('vpn_sessions', []) -%}
+  {%- do vpn_sessions.append({
+    "user": user.username,
+    "client_ip": client_ip,
+    "group_policy": vpn_group.policy,
+    "transport": transport_type,
+    "assigned_ip": assigned_ip,
+    "start_time": timestamp.isoformat()
+  }) -%}
+  {%- if vpn_sessions | length > 50 -%}
+    {%- do vpn_sessions.pop(0) -%}
+  {%- endif -%}
+  {%- do shared.set('vpn_sessions', vpn_sessions) -%}
+{%- elif vpn_event == "722023" -%}
+  {%- set severity = 6 -%}
+  {%- set log_level = "informational" -%}
+  {%- set event_type_list = '["connection", "end"]' -%}
+  {#- Consume from vpn_sessions if available -#}
+  {%- set vpn_sessions = shared.get('vpn_sessions', []) -%}
+  {%- if vpn_sessions | length > 0 -%}
+    {%- set session = vpn_sessions.pop(0) -%}
+    {%- do shared.set('vpn_sessions', vpn_sessions) -%}
+    {%- set user = {"username": session.user} -%}
+    {%- set client_ip = session.client_ip -%}
+    {%- set vpn_group = {"policy": session.group_policy} -%}
+    {%- set transport_type = session.transport -%}
+  {%- endif -%}
+  {%- set outcome = "success" -%}
+  {%- set original_msg = "%ASA-6-722023: Group <" ~ vpn_group.policy ~ "> User <" ~ user.username ~ "> IP <" ~ client_ip ~ "> " ~ transport_type ~ " SVC connection terminated " ~ compression ~ " compression" -%}
+{%- elif vpn_event == "722051" -%}
+  {%- set severity = 6 -%}
+  {%- set log_level = "informational" -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type_list = '["connection", "info"]' -%}
+  {%- set original_msg = "%ASA-6-722051: Group <" ~ vpn_group.policy ~ "> User <" ~ user.username ~ "> IP <" ~ client_ip ~ "> IPv4 Address <" ~ assigned_ip ~ "> IPv6 address <::> assigned to session" -%}
+{%- elif vpn_event == "722033" -%}
+  {%- set severity = 5 -%}
+  {%- set log_level = "notification" -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type_list = '["connection", "start"]' -%}
+  {%- set original_msg = "%ASA-5-722033: Group <" ~ vpn_group.policy ~ "> User <" ~ user.username ~ "> IP <" ~ client_ip ~ "> First " ~ transport_type ~ " SVC connection established for SVC session." -%}
+{%- elif vpn_event == "722037" -%}
+  {%- set severity = 5 -%}
+  {%- set log_level = "notification" -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type_list = '["connection", "end"]' -%}
+  {%- set reason = module.rand.choice(["Connection terminated by user.", "Idle timeout.", "Session terminated by administrator.", "Keepalive failure."]) -%}
+  {%- set original_msg = "%ASA-5-722037: Group <" ~ vpn_group.policy ~ "> User <" ~ user.username ~ "> IP <" ~ client_ip ~ "> SVC closing connection: " ~ reason -%}
+{%- endif -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "group_policy": "{{ vpn_group.policy }}",
+      "message_id": "{{ vpn_event }}"{% if vpn_event == "722051" %},
+      "assigned_ip": "{{ assigned_ip }}"{% endif %}
+    }
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "{% if vpn_event == '722051' %}address-assigned{% elif vpn_event in ['722022', '722033'] %}client-vpn-connected{% else %}client-vpn-disconnected{% endif %}",
+    "category": ["network"],
+    "code": "{{ vpn_event }}",
+    "dataset": "cisco_asa.log",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "outcome": "{{ outcome }}",
+    "severity": {{ severity }},
+    "type": {{ event_type_list }}
+  },
+  "log": {
+    "level": "{{ log_level }}"
+  },
+  "observer": {
+    "hostname": "{{ hostname }}",
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ client_ip }}"{% if vpn_event == "722051" %}, "{{ assigned_ip }}"{% endif %}],
+    "user": ["{{ user.username }}"]
+  },
+  "source": {
+    "address": "{{ client_ip }}",
+    "ip": "{{ client_ip }}",
+    "user": {
+      "group": {
+        "name": "{{ vpn_group.policy }}"
+      },
+      "name": "{{ user.username }}"
+    }
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

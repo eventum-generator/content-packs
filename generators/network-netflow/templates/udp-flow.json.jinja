@@ -1,0 +1,197 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Select UDP service from weighted catalog -#}
+{%- set svc_items = [] -%}
+{%- set svc_weights = [] -%}
+{%- for svc in samples.udp_services -%}
+  {%- do svc_items.append(svc) -%}
+  {%- do svc_weights.append(svc.weight) -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(svc_items, svc_weights) -%}
+{#- Traffic direction -#}
+{%- set direction_type = module.rand.weighted_choice(["outbound", "inbound", "internal"], [55, 20, 25]) -%}
+{#- Generate source and destination based on direction -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- if direction_type == "outbound" -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port if service.port > 0 else module.rand.number.integer(1024, 49151) -%}
+  {%- set src_locality = "internal" -%}
+  {%- set dst_locality = "external" -%}
+  {%- set net_direction = "outbound" -%}
+  {%- set ingress_if = 2 -%}
+  {%- set egress_if = 1 -%}
+  {%- set vlan_id = 10 if src_host.subnet == "workstations" else (20 if src_host.subnet == "servers" else 30) -%}
+{%- elif direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dmz_hosts = samples.internal_hosts | selectattr("subnet", "equalto", "dmz") | list -%}
+  {%- set srv_hosts = samples.internal_hosts | selectattr("subnet", "equalto", "servers") | list -%}
+  {%- set target_host = (dmz_hosts + srv_hosts) | random -%}
+  {%- set dst_ip = target_host.ip -%}
+  {%- set dst_port = service.port if service.port > 0 else module.rand.number.integer(1024, 49151) -%}
+  {%- set src_locality = "external" -%}
+  {%- set dst_locality = "internal" -%}
+  {%- set net_direction = "inbound" -%}
+  {%- set ingress_if = 1 -%}
+  {%- set egress_if = 3 if target_host.subnet == "dmz" else 4 -%}
+  {%- set vlan_id = 30 if target_host.subnet == "dmz" else 20 -%}
+{%- else -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set srv_hosts = samples.internal_hosts | selectattr("role", "equalto", "server") | list -%}
+  {%- set target_host = srv_hosts | random -%}
+  {%- set dst_ip = target_host.ip -%}
+  {%- set dst_port = service.port if service.port > 0 else module.rand.number.integer(1024, 49151) -%}
+  {%- set src_locality = "internal" -%}
+  {%- set dst_locality = "internal" -%}
+  {%- set net_direction = "internal" -%}
+  {%- set ingress_if = 2 -%}
+  {%- set egress_if = 4 -%}
+  {%- set vlan_id = 10 if src_host.subnet == "workstations" else (20 if src_host.subnet == "servers" else 30) -%}
+{%- endif -%}
+{#- Traffic metrics from service profile -#}
+{%- set src_bytes = module.rand.number.integer(service.bytes_min, service.bytes_max) -%}
+{%- set src_packets = module.rand.number.integer(service.packets_min, service.packets_max) -%}
+{%- set resp_ratio = module.rand.number.floating(service.resp_ratio_min, service.resp_ratio_max) -%}
+{%- if resp_ratio > 0 -%}
+  {%- set dst_bytes_raw = (src_bytes * resp_ratio) | int -%}
+  {%- set dst_bytes = dst_bytes_raw if dst_bytes_raw > 0 else 1 -%}
+  {%- set dst_packets_raw = (src_packets * resp_ratio) | int -%}
+  {%- set dst_packets = dst_packets_raw if dst_packets_raw > 0 else 1 -%}
+{%- else -%}
+  {%- set dst_bytes = 0 -%}
+  {%- set dst_packets = 0 -%}
+{%- endif -%}
+{%- set duration_ms = module.rand.number.integer(service.duration_ms_min, service.duration_ms_max) -%}
+{#- Flow timestamps -#}
+{%- set flow_end = timestamp -%}
+{%- set flow_start = timestamp - module.datetime.timedelta(milliseconds=duration_ms) -%}
+{#- BGP AS number for external endpoint -#}
+{%- set as_items = [] -%}
+{%- set as_weights = [] -%}
+{%- for asn in samples.as_numbers -%}
+  {%- do as_items.append(asn) -%}
+  {%- do as_weights.append(asn.weight) -%}
+{%- endfor -%}
+{%- set ext_asn = module.rand.weighted_choice(as_items, as_weights) -%}
+{%- set src_as = ext_asn.number if src_locality == "external" else 0 -%}
+{%- set dst_as = ext_asn.number if dst_locality == "external" else 0 -%}
+{#- TTL and identifiers -#}
+{%- set min_ttl = module.rand.number.integer(48, 64) -%}
+{%- set max_ttl = module.rand.number.integer(min_ttl, 128) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{%- set flow_id = module.rand.string.hex(11) -%}
+{#- Exporter params -#}
+{%- set exporter_ip = params.get("exporter_ip", "10.0.0.1") -%}
+{%- set exporter_port = params.get("exporter_port", 2055) -%}
+{%- set source_id = params.get("source_id", 512) -%}
+{
+    "@timestamp": "{{ flow_end.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.get('agent_id', 'e4f8c1a2-9b3d-4e5f-a6c7-d8e9f0a1b2c3') }}",
+        "name": "{{ params.get('collector_name', 'netflow-collector') }}",
+        "type": "filebeat",
+        "version": "{{ params.get('agent_version', '8.17.0') }}"
+    },
+    "client": {
+        "bytes": {{ src_bytes }},
+        "packets": {{ src_packets }}
+    },
+    "data_stream": {
+        "dataset": "netflow.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "destination": {
+        "bytes": {{ dst_bytes }},
+        "ip": "{{ dst_ip }}",
+        "locality": "{{ dst_locality }}",
+        "packets": {{ dst_packets }},
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "netflow_flow",
+        "category": ["network", "session"],
+        "dataset": "netflow.log",
+        "duration": {{ duration_ms * 1000000 }},
+        "end": "{{ flow_end.isoformat() }}",
+        "kind": "event",
+        "module": "netflow",
+        "start": "{{ flow_start.isoformat() }}",
+        "type": ["connection"]
+    },
+    "flow": {
+        "id": "{{ flow_id }}"{% if src_locality == dst_locality %},
+        "locality": "{{ src_locality }}"{% endif %}
+
+    },
+    "input": {
+        "type": "netflow"
+    },
+    "netflow": {
+        "bgp_destination_as_number": {{ dst_as }},
+        "bgp_source_as_number": {{ src_as }},
+        "biflow_direction": 1,
+        "destination_ipv4_address": "{{ dst_ip }}",
+        "destination_transport_port": {{ dst_port }},
+        "egress_interface": {{ egress_if }},
+        "exporter": {
+            "address": "{{ exporter_ip }}:{{ exporter_port }}",
+            "source_id": {{ source_id }},
+            "timestamp": "{{ flow_end.isoformat() }}",
+            "uptime_millis": 0,
+            "version": 10
+        },
+        "flow_duration_milliseconds": {{ duration_ms }},
+        "flow_end_milliseconds": "{{ flow_end.isoformat() }}",
+        "flow_start_milliseconds": "{{ flow_start.isoformat() }}",
+        "ingress_interface": {{ ingress_if }},
+        "initiator_octets": {{ src_bytes }},
+        "initiator_packets": {{ src_packets }},
+        "ip_class_of_service": 0,
+        "ip_version": 4,
+        "maximum_ttl": {{ max_ttl }},
+        "minimum_ttl": {{ min_ttl }},
+        "protocol_identifier": 17,
+        "responder_octets": {{ dst_bytes }},
+        "responder_packets": {{ dst_packets }},
+        "source_ipv4_address": "{{ src_ip }}",
+        "source_transport_port": {{ src_port }},
+        "tcp_control_bits": 0,
+        "type": "netflow_flow",
+        "vlan_id": {{ vlan_id }}
+    },
+    "network": {
+        "bytes": {{ src_bytes + dst_bytes }},
+        "community_id": "{{ community_id }}",
+        "direction": "{{ net_direction }}",
+        "iana_number": "17",
+        "packets": {{ src_packets + dst_packets }},
+        "transport": "udp",
+        "type": "ipv4"
+    },
+    "observer": {
+        "ip": ["{{ exporter_ip }}"]
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "server": {
+        "bytes": {{ dst_bytes }},
+        "packets": {{ dst_packets }}
+    },
+    "source": {
+        "bytes": {{ src_bytes }},
+        "ip": "{{ src_ip }}",
+        "locality": "{{ src_locality }}",
+        "packets": {{ src_packets }},
+        "port": {{ src_port }}
+    },
+    "tags": ["netflow", "forwarded"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

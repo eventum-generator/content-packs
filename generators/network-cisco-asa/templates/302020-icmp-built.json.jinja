@@ -1,0 +1,109 @@
+{%- set conn_id_counter = shared.get('conn_id', 100000) -%}
+{%- set conn_id = conn_id_counter -%}
+{%- do shared.set('conn_id', conn_id_counter + 1) -%}
+{%- set hostname = params.hostname -%}
+
+{#- Direction selection -#}
+{%- set direction = module.rand.weighted_choice(["outbound", "inbound"], [60, 40]) -%}
+
+{#- ICMP type/code selection -#}
+{%- set icmp_type_code = module.rand.weighted_choice(
+  [{"type": 8, "code": 0}, {"type": 0, "code": 0}, {"type": 3, "code": 3}, {"type": 3, "code": 1}, {"type": 11, "code": 0}],
+  [40, 30, 15, 10, 5]
+) -%}
+
+{#- Generate source and destination based on direction -#}
+{%- if direction == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set local_ip = src_host.ip -%}
+  {%- set foreign_ip = module.rand.network.ip_v4_public() -%}
+  {%- set has_nat = module.rand.chance(0.5) -%}
+  {%- if has_nat -%}
+    {%- set global_ip = params.nat_ip -%}
+  {%- else -%}
+    {%- set global_ip = local_ip -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set foreign_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dmz_hosts = [] -%}
+  {%- for h in samples.internal_hosts -%}
+    {%- if h.subnet == "dmz" -%}
+      {%- do dmz_hosts.append(h) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set dst_host = dmz_hosts | random -%}
+  {%- set local_ip = dst_host.ip -%}
+  {%- set global_ip = local_ip -%}
+{%- endif -%}
+
+{%- set icmp_id = module.rand.number.integer(0, 65535) -%}
+
+{#- Build original syslog message -#}
+{%- set original_msg = "%ASA-6-302020: Built " ~ direction ~ " ICMP connection for faddr " ~ foreign_ip ~ "/" ~ icmp_id ~ " gaddr " ~ global_ip ~ "/" ~ icmp_id ~ " laddr " ~ local_ip ~ "/" ~ icmp_id ~ " type " ~ icmp_type_code.type ~ " code " ~ icmp_type_code.code -%}
+
+{#- Store for teardown correlation -#}
+{%- set icmp_sessions = shared.get('icmp_sessions', []) -%}
+{%- do icmp_sessions.append({
+  "foreign_ip": foreign_ip,
+  "global_ip": global_ip,
+  "local_ip": local_ip,
+  "icmp_id": icmp_id,
+  "icmp_type": icmp_type_code.type,
+  "icmp_code": icmp_type_code.code
+}) -%}
+{%- if icmp_sessions | length > 50 -%}
+  {%- do icmp_sessions.pop(0) -%}
+{%- endif -%}
+{%- do shared.set('icmp_sessions', icmp_sessions) -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "icmp_code": {{ icmp_type_code.code }},
+      "icmp_type": {{ icmp_type_code.type }},
+      "message_id": "302020"
+    }
+  },
+  "destination": {
+    "address": "{{ foreign_ip }}",
+    "ip": "{{ foreign_ip }}"
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "flow-creation",
+    "category": ["network"],
+    "code": "302020",
+    "dataset": "cisco_asa.log",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "outcome": "success",
+    "severity": 6,
+    "type": ["connection", "start"]
+  },
+  "log": {
+    "level": "informational"
+  },
+  "network": {
+    "direction": "{{ direction }}",
+    "iana_number": "1",
+    "transport": "icmp"
+  },
+  "observer": {
+    "hostname": "{{ hostname }}",
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ local_ip }}", "{{ foreign_ip }}"{% if global_ip != local_ip %}, "{{ global_ip }}"{% endif %}]
+  },
+  "source": {
+    "address": "{{ local_ip }}",
+    "ip": "{{ local_ip }}"
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

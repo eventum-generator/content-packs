@@ -1,0 +1,145 @@
+{%- set hostname = params.hostname -%}
+
+{#- Consume from tcp_sessions pool for correlation -#}
+{%- set tcp_sessions = shared.get('tcp_sessions', []) -%}
+{%- if tcp_sessions | length > 0 -%}
+  {%- set session = tcp_sessions.pop(0) -%}
+  {%- do shared.set('tcp_sessions', tcp_sessions) -%}
+  {%- set conn_id = session.conn_id -%}
+  {%- set src_ip = session.src_ip -%}
+  {%- set src_port = session.src_port -%}
+  {%- set src_iface = session.src_iface -%}
+  {%- set dst_ip = session.dst_ip -%}
+  {%- set dst_port = session.dst_port -%}
+  {%- set dst_iface = session.dst_iface -%}
+  {%- set iana_num = session.iana -%}
+{%- else -%}
+  {#- Fallback: generate standalone teardown -#}
+  {%- set conn_id = module.rand.number.integer(100000, 999999999) -%}
+  {%- set tcp_services = [] -%}
+  {%- set tcp_weights = [] -%}
+  {%- for svc in samples.network_services -%}
+    {%- if svc.protocol == "tcp" -%}
+      {%- do tcp_services.append(svc) -%}
+      {%- do tcp_weights.append(svc.weight) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set service = module.rand.weighted_choice(tcp_services, tcp_weights) -%}
+  {%- set direction = module.rand.weighted_choice(["outbound", "inbound"], [65, 35]) -%}
+  {%- if direction == "outbound" -%}
+    {%- set src_host = samples.internal_hosts | random -%}
+    {%- set src_ip = src_host.ip -%}
+    {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+    {%- set src_iface = src_host.interface -%}
+    {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+    {%- set dst_port = service.port -%}
+    {%- set dst_iface = "outside" -%}
+  {%- else -%}
+    {%- set src_ip = module.rand.network.ip_v4_public() -%}
+    {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+    {%- set src_iface = "outside" -%}
+    {%- set dmz_hosts = [] -%}
+    {%- for h in samples.internal_hosts -%}
+      {%- if h.subnet == "dmz" -%}
+        {%- do dmz_hosts.append(h) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set dst_host = dmz_hosts | random -%}
+    {%- set dst_ip = dst_host.ip -%}
+    {%- set dst_port = service.port -%}
+    {%- set dst_iface = "dmz" -%}
+  {%- endif -%}
+  {%- set iana_num = service.iana -%}
+{%- endif -%}
+
+{#- Connection duration -#}
+{%- set dur_secs = module.rand.weighted_choice(
+  [0, module.rand.number.integer(1, 10), module.rand.number.integer(11, 60), module.rand.number.integer(61, 300), module.rand.number.integer(301, 1800), module.rand.number.integer(1801, 7200)],
+  [18, 28, 22, 13, 8, 4]
+) -%}
+{%- set dur_h = dur_secs // 3600 -%}
+{%- set dur_m = (dur_secs % 3600) // 60 -%}
+{%- set dur_s = dur_secs % 60 -%}
+{%- set duration_str = "%d:%02d:%02d" | format(dur_h, dur_m, dur_s) -%}
+
+{#- Bytes transferred -#}
+{%- set bytes_val = module.rand.weighted_choice(
+  [module.rand.number.integer(100, 500), module.rand.number.integer(501, 5000), module.rand.number.integer(5001, 50000), module.rand.number.integer(50001, 500000), module.rand.number.integer(500001, 5000000)],
+  [12, 28, 28, 18, 7]
+) -%}
+
+{#- Teardown reason -#}
+{%- set reason = module.rand.weighted_choice(
+  ["TCP FINs", "TCP Reset-I", "TCP Reset-O", "Idle Timeout", "SYN Timeout"],
+  [50, 15, 10, 20, 5]
+) -%}
+
+{#- Build original syslog message -#}
+{%- set original_msg = "%ASA-6-302014: Teardown TCP connection " ~ conn_id ~ " for " ~ src_iface ~ ":" ~ src_ip ~ "/" ~ src_port ~ " to " ~ dst_iface ~ ":" ~ dst_ip ~ "/" ~ dst_port ~ " duration " ~ duration_str ~ " bytes " ~ bytes_val ~ " " ~ reason -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "connection_id": "{{ conn_id }}",
+      "destination_interface": "{{ dst_iface }}",
+      "message_id": "302014",
+      "source_interface": "{{ src_iface }}"
+    }
+  },
+  "destination": {
+    "address": "{{ dst_ip }}",
+    "ip": "{{ dst_ip }}",
+    "port": {{ dst_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "flow-expiration",
+    "category": ["network"],
+    "code": "302014",
+    "dataset": "cisco_asa.log",
+    "duration": {{ dur_secs * 1000000000 }},
+    "end": "{{ timestamp.isoformat() }}",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "reason": "{{ reason }}",
+    "severity": 6,
+    "type": ["connection", "end"]
+  },
+  "log": {
+    "level": "informational"
+  },
+  "network": {
+    "bytes": {{ bytes_val }},
+    "iana_number": "{{ iana_num }}",
+    "transport": "tcp"
+  },
+  "observer": {
+    "egress": {
+      "interface": {
+        "name": "{{ dst_iface }}"
+      }
+    },
+    "hostname": "{{ hostname }}",
+    "ingress": {
+      "interface": {
+        "name": "{{ src_iface }}"
+      }
+    },
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+  },
+  "source": {
+    "address": "{{ src_ip }}",
+    "ip": "{{ src_ip }}",
+    "port": {{ src_port }}
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

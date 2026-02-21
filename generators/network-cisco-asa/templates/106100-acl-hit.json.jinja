@@ -1,0 +1,148 @@
+{%- set hostname = params.hostname -%}
+
+{#- Select ACL rule with weights -#}
+{%- set rule_items = [] -%}
+{%- set rule_weights = [] -%}
+{%- for r in samples.acl_rules -%}
+  {%- do rule_items.append(r) -%}
+  {%- do rule_weights.append(r.weight) -%}
+{%- endfor -%}
+{%- set rule = module.rand.weighted_choice(rule_items, rule_weights) -%}
+
+{#- Pick a service matching the rule -#}
+{%- set svc_items = [] -%}
+{%- set svc_weights = [] -%}
+{%- for svc in samples.network_services -%}
+  {%- do svc_items.append(svc) -%}
+  {%- do svc_weights.append(svc.weight) -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(svc_items, svc_weights) -%}
+
+{#- Source and destination based on rule zones -#}
+{%- if rule.src_zone == "inside" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_iface = "inside" -%}
+{%- else -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_iface = "outside" -%}
+{%- endif -%}
+{%- set src_port = module.rand.number.integer(1024, 65535) -%}
+
+{%- if rule.dst_zone == "outside" -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_iface = "outside" -%}
+{%- elif rule.dst_zone == "dmz" -%}
+  {%- set dmz_hosts = [] -%}
+  {%- for h in samples.internal_hosts -%}
+    {%- if h.subnet == "dmz" -%}
+      {%- do dmz_hosts.append(h) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set dst_host = dmz_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set dst_iface = "dmz" -%}
+{%- else -%}
+  {%- set srv_hosts = [] -%}
+  {%- for h in samples.internal_hosts -%}
+    {%- if h.role == "server" and h.subnet == "servers" -%}
+      {%- do srv_hosts.append(h) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set dst_host = srv_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set dst_iface = "inside" -%}
+{%- endif -%}
+{%- set dst_port = service.port -%}
+
+{#- Hit count -#}
+{%- set hit_cnt = module.rand.weighted_choice(
+  [1, module.rand.number.integer(2, 10), module.rand.number.integer(11, 100), module.rand.number.integer(101, 500)],
+  [30, 40, 20, 10]
+) -%}
+{%- if hit_cnt == 1 -%}
+  {%- set hit_str = "hit-cnt 1 first hit" -%}
+{%- else -%}
+  {%- set hit_str = "hit-cnt " ~ hit_cnt ~ " 300-second interval" -%}
+{%- endif -%}
+
+{#- Generate ACL hash -#}
+{%- set hash1 = "0x" ~ module.rand.string.hex(8) -%}
+{%- set hash2 = "0x0" -%}
+
+{#- Determine action and ECS outcome -#}
+{%- set action = rule.action -%}
+{%- if action == "permitted" -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type_list = '["connection", "allowed"]' -%}
+{%- else -%}
+  {%- set outcome = "failure" -%}
+  {%- set event_type_list = '["connection", "denied"]' -%}
+{%- endif -%}
+
+{#- Build original syslog message -#}
+{%- set original_msg = "%ASA-6-106100: access-list " ~ rule.name ~ " " ~ action ~ " " ~ service.protocol ~ " " ~ src_iface ~ "/" ~ src_ip ~ "(" ~ src_port ~ ") -> " ~ dst_iface ~ "/" ~ dst_ip ~ "(" ~ dst_port ~ ") " ~ hit_str ~ " [" ~ hash1 ~ ", " ~ hash2 ~ "]" -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "destination_interface": "{{ dst_iface }}",
+      "message_id": "106100",
+      "rule_name": "{{ rule.name }}",
+      "source_interface": "{{ src_iface }}"
+    }
+  },
+  "destination": {
+    "address": "{{ dst_ip }}",
+    "ip": "{{ dst_ip }}",
+    "port": {{ dst_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "firewall-rule",
+    "category": ["network"],
+    "code": "106100",
+    "dataset": "cisco_asa.log",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "outcome": "{{ outcome }}",
+    "severity": 6,
+    "type": {{ event_type_list }}
+  },
+  "log": {
+    "level": "informational"
+  },
+  "network": {
+    "iana_number": "{{ service.iana }}",
+    "transport": "{{ service.protocol }}"
+  },
+  "observer": {
+    "egress": {
+      "interface": {
+        "name": "{{ dst_iface }}"
+      }
+    },
+    "hostname": "{{ hostname }}",
+    "ingress": {
+      "interface": {
+        "name": "{{ src_iface }}"
+      }
+    },
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+  },
+  "source": {
+    "address": "{{ src_ip }}",
+    "ip": "{{ src_ip }}",
+    "port": {{ src_port }}
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

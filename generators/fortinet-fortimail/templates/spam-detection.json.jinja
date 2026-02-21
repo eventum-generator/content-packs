@@ -1,0 +1,106 @@
+{%- set spam_log_seq = shared.get('spam_log_seq', 900) -%}
+{%- set log_id = "0300" ~ ("000000" ~ (spam_log_seq | string))[-6:] -%}
+{#- Try to correlate with a statistics spam event -#}
+{%- set spam_pool = shared.get('spam_sessions', []) -%}
+{%- if spam_pool | length > 0 -%}
+  {%- set info = spam_pool.pop(0) -%}
+  {%- do shared.set('spam_sessions', spam_pool) -%}
+  {%- set session_id = info.session_id -%}
+  {%- set sender_email = info["from"] -%}
+  {%- set recipient_email = info.to -%}
+  {%- set subject = info.subject -%}
+  {%- set client_ip = info.client_ip -%}
+  {%- set client_name = info.client_name -%}
+  {%- set dst_ip = info.dst_ip -%}
+{%- else -%}
+  {#- Standalone (no correlated statistics event) -#}
+  {%- set pfx = module.rand.string.letters(7) -%}
+  {%- set seq = shared.get('session_seq', 1000) -%}
+  {%- set seq_str = ("000000" ~ (seq | string))[-6:] -%}
+  {%- set c1 = module.rand.choice("abcdefghijkmnpqrstuvwxyz") -%}
+  {%- set c2 = module.rand.choice("bcdefghjkmnpqrstuvwxyz") -%}
+  {%- set session_id = pfx ~ c1 ~ seq_str ~ "-" ~ pfx ~ c2 ~ seq_str -%}
+  {%- do shared.set('session_seq', seq + 1) -%}
+  {%- set sender_email = module.faker.locale.en_US.email() -%}
+  {%- set recipient = (samples.internal_users | random).username -%}
+  {%- set recipient_email = recipient ~ "@" ~ params.domain -%}
+  {%- set subject = (samples.subjects | selectattr("category", "equalto", "spam") | list | random).text -%}
+  {%- set client_ip = module.rand.network.ip_v4_public() -%}
+  {%- set client_name = "[" ~ client_ip ~ "]" -%}
+  {%- set dst_ip = params.device_ip -%}
+{%- endif -%}
+{#- Detection reason message -#}
+{%- set detection_msg = module.rand.weighted_choice(["FortiGuard-AntiSpam identified a spam message", "Sender IP is listed in FortiGuard AntiSpam DNSBL", "Detected by BannedWord test", "FortiGuard-WebFilter identified URL(category: Spam URLs, id: 89)", "DMARC SPF Result: Fail", "DMARC: No DKIM signature.", "FortiGuard-AntiSpam identified URL as spam", "Detected by Heuristic scan", "Sender Reputation check failed"], [25, 15, 10, 10, 10, 8, 7, 8, 7]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dst_ip }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "email": {
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "subject": "{{ subject }}",
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        }
+    },
+    "event": {
+        "code": "{{ log_id }}",
+        "dataset": "fortinet_fortimail.log",
+        "kind": "event",
+        "module": "fortinet_fortimail"
+    },
+    "fortinet_fortimail": {
+        "log": {
+            "client": {
+                "ip": "{{ client_ip }}",
+                "name": "{{ client_name }}"
+            },
+            "destination_ip": "{{ dst_ip }}",
+            "from": "{{ sender_email }}",
+            "id": "{{ log_id }}",
+            "message": "{{ detection_msg }}",
+            "priority": "information",
+            "session_id": "{{ session_id }}",
+            "subject": "{{ subject }}",
+            "to": "{{ recipient_email }}",
+            "type": "spam"
+        }
+    },
+    "log": {
+        "level": "information",
+        "syslog": {
+            "priority": 190
+        }
+    },
+    "message": "{{ detection_msg }}",
+    "observer": {
+        "product": "FortiMail",
+        "serial_number": "{{ params.device_id }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ client_ip }}", "{{ dst_ip }}"],
+        "user": ["{{ client_name }}", "{{ sender_email }}", "{{ recipient_email }}"]
+    },
+    "source": {
+        "ip": "{{ client_ip }}",
+        "user": {
+            "name": "{{ client_name }}"
+        }
+    },
+    "tags": ["fortinet-fortimail", "forwarded"]
+}
+{%- do shared.set('spam_log_seq', spam_log_seq + 1) -%}

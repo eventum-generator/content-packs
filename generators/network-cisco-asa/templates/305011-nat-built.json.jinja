@@ -1,0 +1,111 @@
+{%- set hostname = params.hostname -%}
+
+{#- NAT type -#}
+{%- set nat_type = module.rand.weighted_choice(["dynamic", "static"], [85, 15]) -%}
+
+{#- Protocol -#}
+{%- set protocol = module.rand.weighted_choice(["TCP", "UDP"], [75, 25]) -%}
+{%- if protocol == "TCP" -%}
+  {%- set iana_num = "6" -%}
+  {%- set transport = "tcp" -%}
+{%- else -%}
+  {%- set iana_num = "17" -%}
+  {%- set transport = "udp" -%}
+{%- endif -%}
+
+{#- Source: internal host being NATted -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set real_ip = src_host.ip -%}
+{%- set real_port = module.rand.number.integer(1024, 65535) -%}
+{%- set src_iface = src_host.interface -%}
+
+{#- Mapped address (NAT IP) -#}
+{%- set mapped_ip = params.nat_ip -%}
+{%- set mapped_port = module.rand.number.integer(10000, 60000) -%}
+{%- set dst_iface = "outside" -%}
+
+{#- Build original syslog message -#}
+{%- set original_msg = "%ASA-6-305011: Built " ~ nat_type ~ " " ~ protocol ~ " translation from " ~ src_iface ~ ":" ~ real_ip ~ "/" ~ real_port ~ " to " ~ dst_iface ~ ":" ~ mapped_ip ~ "/" ~ mapped_port -%}
+
+{#- Store for NAT teardown correlation -#}
+{%- set nat_sessions = shared.get('nat_sessions', []) -%}
+{%- do nat_sessions.append({
+  "nat_type": nat_type,
+  "protocol": protocol,
+  "transport": transport,
+  "iana": iana_num,
+  "real_ip": real_ip,
+  "real_port": real_port,
+  "src_iface": src_iface,
+  "mapped_ip": mapped_ip,
+  "mapped_port": mapped_port,
+  "dst_iface": dst_iface,
+  "start_time": timestamp.isoformat()
+}) -%}
+{%- if nat_sessions | length > 100 -%}
+  {%- do nat_sessions.pop(0) -%}
+{%- endif -%}
+{%- do shared.set('nat_sessions', nat_sessions) -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "destination_interface": "{{ dst_iface }}",
+      "message_id": "305011",
+      "source_interface": "{{ src_iface }}"
+    }
+  },
+  "destination": {
+    "address": "{{ mapped_ip }}",
+    "ip": "{{ mapped_ip }}",
+    "port": {{ mapped_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "nat-slot",
+    "category": ["network", "configuration"],
+    "code": "305011",
+    "dataset": "cisco_asa.log",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "outcome": "success",
+    "severity": 6,
+    "type": ["creation"]
+  },
+  "log": {
+    "level": "informational"
+  },
+  "network": {
+    "iana_number": "{{ iana_num }}",
+    "transport": "{{ transport }}"
+  },
+  "observer": {
+    "egress": {
+      "interface": {
+        "name": "{{ dst_iface }}"
+      }
+    },
+    "hostname": "{{ hostname }}",
+    "ingress": {
+      "interface": {
+        "name": "{{ src_iface }}"
+      }
+    },
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ real_ip }}", "{{ mapped_ip }}"]
+  },
+  "source": {
+    "address": "{{ real_ip }}",
+    "ip": "{{ real_ip }}",
+    "port": {{ real_port }}
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

@@ -1,0 +1,110 @@
+{%- set hostname = params.hostname -%}
+
+{#- Consume from nat_sessions pool for correlation -#}
+{%- set nat_sessions = shared.get('nat_sessions', []) -%}
+{%- if nat_sessions | length > 0 -%}
+  {%- set session = nat_sessions.pop(0) -%}
+  {%- do shared.set('nat_sessions', nat_sessions) -%}
+  {%- set nat_type = session.nat_type -%}
+  {%- set protocol = session.protocol -%}
+  {%- set transport = session.transport -%}
+  {%- set iana_num = session.iana -%}
+  {%- set real_ip = session.real_ip -%}
+  {%- set real_port = session.real_port -%}
+  {%- set src_iface = session.src_iface -%}
+  {%- set mapped_ip = session.mapped_ip -%}
+  {%- set mapped_port = session.mapped_port -%}
+  {%- set dst_iface = session.dst_iface -%}
+{%- else -%}
+  {#- Fallback: generate standalone NAT teardown -#}
+  {%- set nat_type = module.rand.weighted_choice(["dynamic", "static"], [85, 15]) -%}
+  {%- set protocol = module.rand.weighted_choice(["TCP", "UDP"], [75, 25]) -%}
+  {%- if protocol == "TCP" -%}
+    {%- set iana_num = "6" -%}
+    {%- set transport = "tcp" -%}
+  {%- else -%}
+    {%- set iana_num = "17" -%}
+    {%- set transport = "udp" -%}
+  {%- endif -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set real_ip = src_host.ip -%}
+  {%- set real_port = module.rand.number.integer(1024, 65535) -%}
+  {%- set src_iface = src_host.interface -%}
+  {%- set mapped_ip = params.nat_ip -%}
+  {%- set mapped_port = module.rand.number.integer(10000, 60000) -%}
+  {%- set dst_iface = "outside" -%}
+{%- endif -%}
+
+{#- Duration -#}
+{%- set dur_secs = module.rand.number.integer(0, 3600) -%}
+{%- set dur_h = dur_secs // 3600 -%}
+{%- set dur_m = (dur_secs % 3600) // 60 -%}
+{%- set dur_s = dur_secs % 60 -%}
+{%- set duration_str = "%d:%02d:%02d" | format(dur_h, dur_m, dur_s) -%}
+
+{#- Build original syslog message -#}
+{%- set original_msg = "%ASA-6-305012: Teardown " ~ nat_type ~ " " ~ protocol ~ " translation from " ~ src_iface ~ ":" ~ real_ip ~ "/" ~ real_port ~ " to " ~ dst_iface ~ ":" ~ mapped_ip ~ "/" ~ mapped_port ~ " duration " ~ duration_str -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "destination_interface": "{{ dst_iface }}",
+      "message_id": "305012",
+      "source_interface": "{{ src_iface }}"
+    }
+  },
+  "destination": {
+    "address": "{{ mapped_ip }}",
+    "ip": "{{ mapped_ip }}",
+    "port": {{ mapped_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "nat-slot",
+    "category": ["network", "configuration"],
+    "code": "305012",
+    "dataset": "cisco_asa.log",
+    "duration": {{ dur_secs * 1000000000 }},
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": "{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ original_msg }}",
+    "outcome": "success",
+    "severity": 6,
+    "type": ["deletion"]
+  },
+  "log": {
+    "level": "informational"
+  },
+  "network": {
+    "iana_number": "{{ iana_num }}",
+    "transport": "{{ transport }}"
+  },
+  "observer": {
+    "egress": {
+      "interface": {
+        "name": "{{ dst_iface }}"
+      }
+    },
+    "hostname": "{{ hostname }}",
+    "ingress": {
+      "interface": {
+        "name": "{{ src_iface }}"
+      }
+    },
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ real_ip }}", "{{ mapped_ip }}"]
+  },
+  "source": {
+    "address": "{{ real_ip }}",
+    "ip": "{{ real_ip }}",
+    "port": {{ real_port }}
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}

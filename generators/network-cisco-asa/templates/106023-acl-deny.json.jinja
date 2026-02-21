@@ -1,0 +1,108 @@
+{%- set hostname = params.hostname -%}
+
+{#- Select a deny rule -#}
+{%- set deny_rules = [] -%}
+{%- set deny_weights = [] -%}
+{%- for r in samples.acl_rules -%}
+  {%- if r.action == "denied" -%}
+    {%- do deny_rules.append(r) -%}
+    {%- do deny_weights.append(r.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set rule = module.rand.weighted_choice(deny_rules, deny_weights) -%}
+
+{#- Protocol selection — mostly TCP, some UDP -#}
+{%- set protocol = module.rand.weighted_choice(["tcp", "udp"], [75, 25]) -%}
+{%- if protocol == "tcp" -%}
+  {%- set iana_num = "6" -%}
+{%- else -%}
+  {%- set iana_num = "17" -%}
+{%- endif -%}
+
+{#- Source is always external (denied inbound) -#}
+{%- set src_ip = module.rand.network.ip_v4_public() -%}
+{%- set src_port = module.rand.number.integer(1024, 65535) -%}
+{%- set src_iface = "outside" -%}
+
+{#- Destination is internal -#}
+{%- set dst_host = samples.internal_hosts | random -%}
+{%- set dst_ip = dst_host.ip -%}
+{%- set dst_iface = dst_host.interface -%}
+
+{#- Pick a commonly attacked port -#}
+{%- set dst_port = module.rand.weighted_choice(
+  [22, 23, 25, 80, 443, 445, 1433, 3306, 3389, 5432, 8080, 8443],
+  [10, 5, 5, 10, 15, 10, 5, 3, 15, 3, 5, 5]
+) -%}
+
+{#- Generate ACL hash -#}
+{%- set hash1 = "0x" ~ module.rand.string.hex(8) -%}
+{%- set hash2 = "0x0" -%}
+
+{#- Build original syslog message -#}
+{%- set original_msg = "%ASA-4-106023: Deny " ~ protocol ~ " src " ~ src_iface ~ ":" ~ src_ip ~ "/" ~ src_port ~ " dst " ~ dst_iface ~ ":" ~ dst_ip ~ "/" ~ dst_port ~ " by access-group " ~ rule.name ~ " [" ~ hash1 ~ ", " ~ hash2 ~ "]" -%}
+{%- set full_original = timestamp.strftime('%b %d %Y %H:%M:%S') ~ " " ~ hostname ~ " : " ~ original_msg -%}
+
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "cisco": {
+    "asa": {
+      "destination_interface": "{{ dst_iface }}",
+      "message_id": "106023",
+      "rule_name": "{{ rule.name }}",
+      "source_interface": "{{ src_iface }}"
+    }
+  },
+  "destination": {
+    "address": "{{ dst_ip }}",
+    "ip": "{{ dst_ip }}",
+    "port": {{ dst_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "firewall-rule",
+    "category": ["network"],
+    "code": "106023",
+    "dataset": "cisco_asa.log",
+    "kind": "event",
+    "module": "cisco_asa",
+    "original": {{ full_original | tojson }},
+    "outcome": "failure",
+    "severity": 4,
+    "type": ["connection", "denied"]
+  },
+  "log": {
+    "level": "warning"
+  },
+  "network": {
+    "iana_number": "{{ iana_num }}",
+    "transport": "{{ protocol }}"
+  },
+  "observer": {
+    "egress": {
+      "interface": {
+        "name": "{{ dst_iface }}"
+      }
+    },
+    "hostname": "{{ hostname }}",
+    "ingress": {
+      "interface": {
+        "name": "{{ src_iface }}"
+      }
+    },
+    "product": "asa",
+    "type": "firewall",
+    "vendor": "Cisco"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+  },
+  "source": {
+    "address": "{{ src_ip }}",
+    "ip": "{{ src_ip }}",
+    "port": {{ src_port }}
+  },
+  "tags": ["cisco-asa", "forwarded"]
+}
