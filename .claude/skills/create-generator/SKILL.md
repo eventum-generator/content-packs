@@ -68,6 +68,8 @@ Based on your research, decide:
 - **Correlation strategy** — Does this source have paired events (start/end, request/response)? Use `shared` state pools if so. Not every source needs correlation.
 - **Sample data** — What data needs to vary realistically? Usernames, IPs, URLs, file paths, hostnames? Create CSV for flat lists, JSON for nested structures.
 - **Parameterization** — What environment-specific values should be configurable via `params`? Hostnames, domains, network ranges, index names?
+- **Performance and stability** — create templates that does not have memory leaks or undefined behavior.
+- **Performance and stability** — You can use `module.<any python module>` in templates for complex cases. 
 
 ### Correlation via shared state
 

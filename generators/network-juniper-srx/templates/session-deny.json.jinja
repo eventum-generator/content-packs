@@ -1,0 +1,138 @@
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- RT_FLOW_SESSION_DENY — denied by security policy -#}
+{#- Denied traffic is predominantly inbound -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound", "internal"], [70, 15, 15]) -%}
+{#- Pick a deny policy -#}
+{%- set deny_policies = [] -%}
+{%- set deny_weights = [] -%}
+{%- for pol in samples.security_policies -%}
+  {%- if pol.action == "deny" -%}
+    {%- do deny_policies.append(pol) -%}
+    {%- do deny_weights.append(pol.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set policy = module.rand.weighted_choice(deny_policies, deny_weights) -%}
+{#- Service targeted -#}
+{%- set denied_services = [
+  {"port": 22, "protocol_id": "6", "transport": "tcp", "name": "junos-ssh"},
+  {"port": 23, "protocol_id": "6", "transport": "tcp", "name": "junos-telnet"},
+  {"port": 3389, "protocol_id": "6", "transport": "tcp", "name": "junos-ms-rdp"},
+  {"port": 445, "protocol_id": "6", "transport": "tcp", "name": "junos-smb"},
+  {"port": 53, "protocol_id": "17", "transport": "udp", "name": "junos-dns-udp"},
+  {"port": 80, "protocol_id": "6", "transport": "tcp", "name": "junos-http"},
+  {"port": 443, "protocol_id": "6", "transport": "tcp", "name": "junos-https"},
+  {"port": 1433, "protocol_id": "6", "transport": "tcp", "name": "junos-ms-sql"},
+  {"port": 8080, "protocol_id": "6", "transport": "tcp", "name": "junos-http-alt"}
+] -%}
+{%- set service = module.rand.weighted_choice(denied_services, [20, 10, 15, 10, 10, 10, 10, 5, 10]) -%}
+{#- Generate IPs based on direction -#}
+{%- if direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "untrust" -%}
+  {%- set egress_zone = "trust" -%}
+  {%- set ingress_iface = "ge-0/0/0.0" -%}
+{%- elif direction_type == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "untrust" -%}
+  {%- set ingress_iface = "ge-0/0/1.0" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | selectattr("subnet", "equalto", "workstations") | list | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set srv_host = samples.internal_hosts | selectattr("subnet", "equalto", "servers") | list | random -%}
+  {%- set dst_ip = srv_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "trust" -%}
+  {%- set ingress_iface = "ge-0/0/1.0" -%}
+{%- endif -%}
+{%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "flow_deny",
+        "category": ["network"],
+        "dataset": "juniper_srx.log",
+        "kind": "event",
+        "module": "juniper_srx",
+        "outcome": "success",
+        "severity": 14,
+        "type": ["denied", "connection"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "juniper": {
+        "srx": {
+            "encrypted": "No",
+            "icmp_type": 0,
+            "process": "RT_FLOW",
+            "reason": "Denied by policy",
+            "roles": "N/A",
+            "service_name": "{{ service.name }}",
+            "session_id_32": "{{ session_id }}",
+            "tag": "RT_FLOW_SESSION_DENY",
+            "username": "N/A"
+        }
+    },
+    "log": {
+        "level": "informational"
+    },
+    "network": {
+        "iana_number": "{{ service.protocol_id }}",
+        "transport": "{{ service.transport }}"
+    },
+    "observer": {
+        "egress": {
+            "zone": "{{ egress_zone }}"
+        },
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_iface }}"
+            },
+            "zone": "{{ ingress_zone }}"
+        },
+        "name": "{{ fqdn }}",
+        "product": "SRX",
+        "type": "firewall",
+        "vendor": "Juniper"
+    },
+    "process": {
+        "name": "RT_FLOW"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "name": "{{ policy.name }}"
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "tags": ["juniper-srx", "forwarded"]
+}

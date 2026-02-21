@@ -1,0 +1,165 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- Denied traffic is predominantly inbound -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound", "internal"], [70, 20, 10]) -%}
+{#- Denied traffic targets riskier ports -#}
+{%- set denied_services = [
+  {"port": 23, "proto": 6, "name": "TELNET"},
+  {"port": 445, "proto": 6, "name": "SMB"},
+  {"port": 3389, "proto": 6, "name": "RDP"},
+  {"port": 22, "proto": 6, "name": "SSH"},
+  {"port": 1433, "proto": 6, "name": "MSSQL"},
+  {"port": 3306, "proto": 6, "name": "MySQL"},
+  {"port": 443, "proto": 6, "name": "HTTPS"},
+  {"port": 80, "proto": 6, "name": "HTTP"},
+  {"port": 8080, "proto": 6, "name": "HTTP"},
+  {"port": 161, "proto": 17, "name": "SNMP"},
+  {"port": 135, "proto": 6, "name": "DCE-RPC"},
+  {"port": 139, "proto": 6, "name": "NBSS"}
+] -%}
+{%- set denied_weights = [8, 15, 12, 10, 5, 5, 10, 10, 5, 5, 8, 7] -%}
+{%- set service = module.rand.weighted_choice(denied_services, denied_weights) -%}
+{#- Generate IPs based on direction -#}
+{%- if direction_type == "inbound" -%}
+  {%- set srcip = module.rand.network.ip_v4_public() -%}
+  {%- set srcport = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dstip = dst_host.ip -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port1" -%}
+  {%- set dstintf = "port2" -%}
+  {%- set srcintfrole = "wan" -%}
+  {%- set dstintfrole = "lan" -%}
+  {%- set srccountry = module.rand.weighted_choice(["China", "Russia", "United States", "Brazil", "India", "Iran", "North Korea", "Netherlands", "Romania", "Vietnam"], [20, 18, 12, 8, 8, 6, 5, 5, 5, 5]) -%}
+  {%- set dstcountry = "Reserved" -%}
+{%- elif direction_type == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port1" -%}
+  {%- set srcintfrole = "lan" -%}
+  {%- set dstintfrole = "wan" -%}
+  {%- set srccountry = "Reserved" -%}
+  {%- set dstcountry = module.rand.weighted_choice(["United States", "China", "Russia", "Germany", "Netherlands"], [30, 20, 15, 15, 10]) -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dstip = dst_host.ip -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port2" -%}
+  {%- set srcintfrole = "lan" -%}
+  {%- set dstintfrole = "lan" -%}
+  {%- set srccountry = "Reserved" -%}
+  {%- set dstcountry = "Reserved" -%}
+{%- endif -%}
+{#- Pick a deny policy -#}
+{%- set deny_policies = samples.firewall_policies | selectattr("action", "equalto", "deny") | list -%}
+{%- set pol_items = [] -%}
+{%- set pol_weights = [] -%}
+{%- for pol in deny_policies -%}
+  {%- do pol_items.append(pol) -%}
+  {%- do pol_weights.append(pol.weight) -%}
+{%- endfor -%}
+{%- set policy = module.rand.weighted_choice(pol_items, pol_weights) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": 0,
+        "ip": "{{ dstip }}",
+        "packets": 0,
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "deny",
+        "category": ["network"],
+        "code": "0000000013",
+        "dataset": "fortinet_fortigate.log",
+        "duration": 0,
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "type": ["connection", "end", "denied"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "deny",
+            "dstcountry": "{{ dstcountry }}",
+            "dstintfrole": "{{ dstintfrole }}",
+            "policyid": {{ policy.policyid }},
+            "poluuid": "{{ policy.poluuid }}",
+            "policytype": "policy",
+            "sessionid": {{ sessionid }},
+            "srccountry": "{{ srccountry }}",
+            "srcintfrole": "{{ srcintfrole }}",
+            "subtype": "forward",
+            "trandisp": "noop",
+            "type": "traffic",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "warning"
+    },
+    "message": "deny {{ service.name }}",
+    "network": {
+        "bytes": 0,
+        "direction": "{{ direction_type }}",
+        "iana_number": "{{ service.proto }}",
+        "packets": 0,
+        "protocol": "{{ service.name | lower }}",
+        "transport": "{{ "tcp" if service.proto == 6 else "udp" }}"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ dstintf }}"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "{{ srcintf }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "rule": {
+        "id": "{{ policy.policyid }}",
+        "name": "{{ policy.policyname }}",
+        "ruleset": "policy",
+        "uuid": "{{ policy.poluuid }}"
+    },
+    "source": {
+        "bytes": 0,
+        "ip": "{{ srcip }}",
+        "packets": 0,
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

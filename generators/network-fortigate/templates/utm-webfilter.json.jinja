@@ -1,0 +1,116 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- Web filter events — FortiGuard category-based filtering -#}
+{%- set cat_items = [] -%}
+{%- set cat_weights = [] -%}
+{%- for cat in samples.web_categories -%}
+  {%- do cat_items.append(cat) -%}
+  {%- do cat_weights.append(cat.weight) -%}
+{%- endfor -%}
+{%- set category = module.rand.weighted_choice(cat_items, cat_weights) -%}
+{%- set action = category.action -%}
+{%- set eventtype = "ftgd_blk" if action == "blocked" else ("ftgd_warn" if action == "warning" else "ftgd_allow") -%}
+{#- Generate realistic hostnames based on category -#}
+{%- set domain_prefixes = ["www", "cdn", "api", "app", "portal", "login", "mail", "static", "media"] -%}
+{%- set domain_names = ["example", "contoso", "acme", "globex", "initech", "umbrella", "waystar", "piedpiper", "hooli", "stark"] -%}
+{%- set domain_tlds = [".com", ".net", ".org", ".io", ".co"] -%}
+{%- set target_hostname = module.rand.choice(domain_prefixes) ~ "." ~ module.rand.choice(domain_names) ~ module.rand.choice(domain_tlds) -%}
+{%- set url_paths = ["/", "/index.html", "/login", "/api/v1/data", "/images/logo.png", "/download/file.zip", "/stream/video", "/config", "/admin", "/search?q=test"] -%}
+{%- set url_path = module.rand.choice(url_paths) -%}
+{#- Outbound web traffic from internal users -#}
+{%- set src_host = samples.internal_hosts | selectattr("subnet", "equalto", "workstations") | list | random -%}
+{%- set srcip = src_host.ip -%}
+{%- set srcport = module.rand.number.integer(49152, 65535) -%}
+{%- set dstip = module.rand.network.ip_v4_public() -%}
+{%- set dstport = module.rand.weighted_choice([80, 443], [30, 70]) -%}
+{%- set proto = 6 -%}
+{%- set level = "warning" if action == "blocked" else ("notice" if action == "warning" else "notice") -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ eventtype }}",
+        "category": ["network"],
+        "code": "{{ "0316013056" if action == "blocked" else "0315012544" }}",
+        "dataset": "fortinet_fortigate.log",
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "type": ["{{ "denied" if action == "blocked" else "allowed" }}"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "cat": {{ category.cat }},
+            "catdesc": "{{ category.catdesc }}",
+            "dstintfrole": "wan",
+            "reqtype": "direct",
+            "sessionid": {{ sessionid }},
+            "srcintfrole": "lan",
+            "subtype": "webfilter",
+            "type": "utm",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "{{ level }}"
+    },
+    "message": "URL belongs to a {{ "denied" if action == "blocked" else "monitored" }} category in policy",
+    "network": {
+        "direction": "outbound",
+        "iana_number": "{{ proto }}",
+        "protocol": "{{ "https" if dstport == 443 else "http" }}",
+        "transport": "tcp"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "port1"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "port2"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "rule": {
+        "category": "{{ category.catdesc | replace(' ', '-') }}",
+        "id": "1",
+        "ruleset": "g-webfilter-default"
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"],
+    "url": {
+        "domain": "{{ target_hostname }}",
+        "path": "{{ url_path }}"
+    }
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

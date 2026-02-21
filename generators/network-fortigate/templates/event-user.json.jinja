@@ -1,0 +1,96 @@
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- User authentication events: RADIUS, LDAP, FSSO, local -#}
+{%- set usr_items = [] -%}
+{%- set usr_weights = [] -%}
+{%- for usr in samples.users -%}
+  {%- do usr_items.append(usr) -%}
+  {%- do usr_weights.append(usr.weight) -%}
+{%- endfor -%}
+{%- set user = module.rand.weighted_choice(usr_items, usr_weights) -%}
+{#- Auth event type -#}
+{%- set auth_events = [
+  {"action": "FSSO-logon", "logid": "0102043014", "logdesc": "FSSO logon", "status": "success", "msg_tpl": "FSSO-logon event from server"},
+  {"action": "FSSO-logoff", "logid": "0102043015", "logdesc": "FSSO logoff", "status": "success", "msg_tpl": "FSSO-logoff event from server"},
+  {"action": "auth-logon", "logid": "0102043008", "logdesc": "Authentication success", "status": "success", "msg_tpl": "User USER_NAME succeeded in authentication"},
+  {"action": "auth-logon", "logid": "0102043009", "logdesc": "Authentication failure", "status": "failure", "msg_tpl": "User USER_NAME failed in authentication"},
+  {"action": "auth-logout", "logid": "0102043010", "logdesc": "Authentication logout", "status": "success", "msg_tpl": "User USER_NAME logged out"}
+] -%}
+{%- set auth_weights = [25, 15, 30, 10, 20] -%}
+{%- set evt = module.rand.weighted_choice(auth_events, auth_weights) -%}
+{%- set msg = evt.msg_tpl | replace("USER_NAME", user.user) -%}
+{#- Source IP -#}
+{%- set src_host = samples.internal_hosts | selectattr("subnet", "equalto", "workstations") | list | random -%}
+{%- set srcip = src_host.ip -%}
+{%- set event_outcome = evt.status -%}
+{%- if evt.action == "FSSO-logon" or evt.action == "auth-logon" -%}
+  {%- set event_type = ["start"] -%}
+{%- elif evt.action == "FSSO-logoff" or evt.action == "auth-logout" -%}
+  {%- set event_type = ["end"] -%}
+{%- else -%}
+  {%- set event_type = ["info"] -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ evt.action }}",
+        "category": ["authentication"],
+        "code": "{{ evt.logid }}",
+        "dataset": "fortinet_fortigate.log",
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "{{ event_outcome }}",
+        "type": {{ event_type | tojson }}
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ evt.action }}",
+            "authproto": "{{ user.authproto }}",
+            "logdesc": "{{ evt.logdesc }}",
+            "status": "{{ evt.status }}",
+            "subtype": "user",
+            "type": "event",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "{{ "warning" if evt.status == "failure" else "notice" }}"
+    },
+    "message": "{{ msg }}",
+    "observer": {
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}"],
+        "user": ["{{ user.user }}"]
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "user": {
+            "group": {
+                "name": "{{ user.group }}"
+            },
+            "name": "{{ user.user }}"
+        }
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"],
+    "user": {
+        "name": "{{ user.user }}"
+    }
+}

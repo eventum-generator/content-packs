@@ -1,0 +1,139 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- IPS signature detection events -#}
+{%- set sig_items = [] -%}
+{%- set sig_weights = [] -%}
+{%- for sig in samples.ips_signatures -%}
+  {%- do sig_items.append(sig) -%}
+  {%- do sig_weights.append(sig.weight) -%}
+{%- endfor -%}
+{%- set signature = module.rand.weighted_choice(sig_items, sig_weights) -%}
+{#- Predominantly inbound -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound"], [85, 15]) -%}
+{#- Action: dropped or detected -#}
+{%- set action = module.rand.weighted_choice(["dropped", "detected", "reset"], [55, 30, 15]) -%}
+{#- Service-to-port mapping -#}
+{%- set svc_port_map = {"HTTP": 80, "HTTPS": 443, "SSH": 22, "RDP": 3389, "SMB": 445, "DNS": 53, "FTP": 21, "SMTP": 25} -%}
+{%- set dstport = svc_port_map.get(signature.service, 80) -%}
+{%- set proto = 6 -%}
+{%- if signature.service == "DNS" -%}
+  {%- set proto = 17 -%}
+{%- endif -%}
+{%- if direction_type == "inbound" -%}
+  {%- set srcip = module.rand.network.ip_v4_public() -%}
+  {%- set srcport = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dstip = dst_host.ip -%}
+  {%- set srcintf = "port1" -%}
+  {%- set dstintf = "port2" -%}
+  {%- set srcintfrole = "wan" -%}
+  {%- set dstintfrole = "lan" -%}
+  {%- set direction = "incoming" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port1" -%}
+  {%- set srcintfrole = "lan" -%}
+  {%- set dstintfrole = "wan" -%}
+  {%- set direction = "outgoing" -%}
+{%- endif -%}
+{%- set severity_map = {"critical": 8, "high": 6, "medium": 4, "low": 2} -%}
+{%- set severity_num = severity_map.get(signature.severity, 4) -%}
+{%- set incidentserialno = module.rand.number.integer(100000000, 2147483647) -%}
+{%- set crscore = module.rand.weighted_choice([5, 30, 50], [50, 30, 20]) -%}
+{%- set crlevel = "low" if crscore <= 10 else ("medium" if crscore <= 40 else "critical") -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "signature",
+        "category": ["network", "intrusion_detection"],
+        "code": "0419016384",
+        "dataset": "fortinet_fortigate.log",
+        "kind": "alert",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "reference": "{{ signature.ref }}",
+        "severity": {{ severity_num }},
+        "type": ["info"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "attack": "{{ signature.attack }}",
+            "attackid": {{ signature.attackid }},
+            "craction": 2,
+            "crlevel": "{{ crlevel }}",
+            "crscore": {{ crscore }},
+            "direction": "{{ direction }}",
+            "dstintfrole": "{{ dstintfrole }}",
+            "incidentserialno": "{{ incidentserialno }}",
+            "policyid": 1,
+            "sessionid": {{ sessionid }},
+            "severity": "{{ signature.severity }}",
+            "srcintfrole": "{{ srcintfrole }}",
+            "subtype": "ips",
+            "type": "utm",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "alert"
+    },
+    "message": "{{ signature.attack }}",
+    "network": {
+        "direction": "{{ "inbound" if direction == "incoming" else "outbound" }}",
+        "iana_number": "{{ proto }}",
+        "protocol": "{{ signature.service | lower }}",
+        "transport": "{{ "tcp" if proto == 6 else "udp" }}"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ dstintf }}"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "{{ srcintf }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "rule": {
+        "id": "1",
+        "ruleset": "g-ips-default"
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

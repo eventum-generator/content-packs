@@ -1,0 +1,134 @@
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- VPN events: IPsec tunnel up/down, SSL-VPN -#}
+{%- set vpn_tunnels = ["to-HQ", "to-Branch01", "to-Branch02", "to-DR-Site", "to-Cloud-VPC"] -%}
+{%- set active_tunnels = shared.get('active_vpn_tunnels', []) -%}
+{#- Decide: tunnel-up, tunnel-down, or negotiate -#}
+{%- if active_tunnels | length > 0 and module.rand.chance(0.4) -%}
+  {#- Bring a tunnel down -#}
+  {%- set tunnel = active_tunnels.pop(0) -%}
+  {%- do shared.set('active_vpn_tunnels', active_tunnels) -%}
+  {%- set action = "tunnel-down" -%}
+  {%- set vpntunnel = tunnel.name -%}
+  {%- set remip = tunnel.remip -%}
+  {%- set locip = tunnel.locip -%}
+  {%- set duration = module.rand.number.integer(60, 86400) -%}
+  {%- set sentbyte = module.rand.number.integer(10000, 50000000) -%}
+  {%- set rcvdbyte = module.rand.number.integer(10000, 50000000) -%}
+  {%- set status = "success" -%}
+  {%- set logid = "0101037138" -%}
+  {%- set msg = "IPsec connection status change" -%}
+  {%- set level = "notice" -%}
+{%- elif module.rand.chance(0.7) -%}
+  {#- Bring a tunnel up -#}
+  {%- set vpntunnel = module.rand.choice(vpn_tunnels) -%}
+  {%- set remip = module.rand.network.ip_v4_public() -%}
+  {%- set locip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set action = "tunnel-up" -%}
+  {%- set duration = 0 -%}
+  {%- set sentbyte = 0 -%}
+  {%- set rcvdbyte = 0 -%}
+  {%- set status = "success" -%}
+  {%- set logid = "0101037138" -%}
+  {%- set msg = "IPsec connection status change" -%}
+  {%- set level = "notice" -%}
+  {%- set tunnel_entry = {"name": vpntunnel, "remip": remip, "locip": locip} -%}
+  {%- do active_tunnels.append(tunnel_entry) -%}
+  {%- if active_tunnels | length > 20 -%}{%- do active_tunnels.pop(0) -%}{%- endif -%}
+  {%- do shared.set('active_vpn_tunnels', active_tunnels) -%}
+{%- else -%}
+  {#- Negotiate error -#}
+  {%- set vpntunnel = module.rand.choice(vpn_tunnels) -%}
+  {%- set remip = module.rand.network.ip_v4_public() -%}
+  {%- set locip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set action = "negotiate" -%}
+  {%- set duration = 0 -%}
+  {%- set sentbyte = 0 -%}
+  {%- set rcvdbyte = 0 -%}
+  {%- set status = "negotiate_error" -%}
+  {%- set logid = "0101037128" -%}
+  {%- set msg = "IPsec phase 1 error" -%}
+  {%- set level = "warning" -%}
+{%- endif -%}
+{%- set event_outcome = "failure" if status == "negotiate_error" else "success" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ locip }}",
+        "port": 500
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network"],
+        "code": "{{ logid }}",
+        "dataset": "fortinet_fortigate.log",
+{%- if duration > 0 %}
+        "duration": {{ duration * 1000000000 }},
+{%- endif %}
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "{{ event_outcome }}",
+{%- if status == "negotiate_error" %}
+        "reason": "peer SA proposal not match local policy",
+{%- endif %}
+        "type": ["connection"{% if action == "tunnel-up" %}, "start"{% elif action == "tunnel-down" %}, "end"{% endif %}]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "logdesc": "{{ msg }}",
+{%- if duration > 0 %}
+            "duration": {{ duration }},
+            "rcvdbyte": {{ rcvdbyte }},
+            "sentbyte": {{ sentbyte }},
+{%- endif %}
+            "status": "{{ status }}",
+            "subtype": "vpn",
+            "tunneltype": "ipsec",
+            "type": "event",
+            "vd": "{{ vd }}",
+            "vpntunnel": "{{ vpntunnel }}"
+        }
+    },
+    "log": {
+        "level": "{{ level }}"
+    },
+    "message": "{{ msg }}",
+    "network": {
+        "direction": "inbound",
+        "iana_number": "17",
+        "transport": "udp"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "port1"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ remip }}", "{{ locip }}"]
+    },
+    "source": {
+        "ip": "{{ remip }}",
+        "port": 500
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}

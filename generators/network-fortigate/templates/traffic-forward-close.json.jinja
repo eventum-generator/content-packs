@@ -1,0 +1,200 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- Traffic direction -#}
+{%- set direction_type = module.rand.weighted_choice(["outbound", "inbound", "internal"], [60, 25, 15]) -%}
+{#- Pick a service with weight-based selection -#}
+{%- set svc_items = [] -%}
+{%- set svc_weights = [] -%}
+{%- for svc in samples.network_services -%}
+  {%- do svc_items.append(svc) -%}
+  {%- do svc_weights.append(svc.weight) -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(svc_items, svc_weights) -%}
+{#- Source and destination based on direction -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- if direction_type == "outbound" -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port1" -%}
+  {%- set srcintfrole = "lan" -%}
+  {%- set dstintfrole = "wan" -%}
+  {%- set srccountry = "Reserved" -%}
+  {%- set dstcountry = module.rand.weighted_choice(["United States", "Germany", "Netherlands", "United Kingdom", "France", "Canada", "Japan", "Singapore", "Ireland", "Australia"], [30, 10, 8, 8, 7, 7, 5, 5, 5, 5]) -%}
+  {%- set srcmac = src_host.mac -%}
+  {%- set osname = src_host.os -%}
+{%- elif direction_type == "inbound" -%}
+  {%- set srcip = module.rand.network.ip_v4_public() -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dmz_host = samples.internal_hosts | selectattr("subnet", "equalto", "dmz") | list | random -%}
+  {%- set dstip = dmz_host.ip -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port1" -%}
+  {%- set dstintf = "port3" -%}
+  {%- set srcintfrole = "wan" -%}
+  {%- set dstintfrole = "dmz" -%}
+  {%- set srccountry = module.rand.weighted_choice(["United States", "China", "Russia", "Germany", "Brazil", "India", "Netherlands", "France", "South Korea", "Japan"], [25, 12, 10, 8, 7, 7, 6, 5, 5, 5]) -%}
+  {%- set dstcountry = "Reserved" -%}
+  {%- set srcmac = "" -%}
+  {%- set osname = "" -%}
+{%- else -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set srv_host = samples.internal_hosts | selectattr("role", "equalto", "server") | selectattr("subnet", "equalto", "servers") | list | random -%}
+  {%- set dstip = srv_host.ip -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port2" -%}
+  {%- set srcintfrole = "lan" -%}
+  {%- set dstintfrole = "lan" -%}
+  {%- set srccountry = "Reserved" -%}
+  {%- set dstcountry = "Reserved" -%}
+  {%- set srcmac = src_host.mac -%}
+  {%- set osname = src_host.os -%}
+{%- endif -%}
+{#- Session close action -#}
+{%- set action = module.rand.weighted_choice(["close", "timeout", "client-rst", "server-rst"], [60, 20, 12, 8]) -%}
+{#- Pick a matching allow policy -#}
+{%- set accept_policies = samples.firewall_policies | selectattr("action", "equalto", "accept") | list -%}
+{%- set pol_items = [] -%}
+{%- set pol_weights = [] -%}
+{%- for pol in accept_policies -%}
+  {%- do pol_items.append(pol) -%}
+  {%- do pol_weights.append(pol.weight) -%}
+{%- endfor -%}
+{%- set policy = module.rand.weighted_choice(pol_items, pol_weights) -%}
+{#- Traffic metrics -#}
+{%- set duration = module.rand.number.integer(1, 3600) -%}
+{%- set sentbyte = module.rand.number.integer(200, 500000) -%}
+{%- set rcvdbyte = module.rand.number.integer(200, 2000000) -%}
+{%- set sentpkt = module.rand.number.integer(3, 500) -%}
+{%- set rcvdpkt = module.rand.number.integer(3, 1000) -%}
+{#- NAT for outbound -#}
+{%- set has_nat = direction_type == "outbound" and module.rand.chance(0.8) -%}
+{%- if has_nat -%}
+  {%- set transip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set transport_val = module.rand.number.integer(10000, 60000) -%}
+  {%- set trandisp = "snat" -%}
+{%- else -%}
+  {%- set trandisp = "noop" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": {{ rcvdbyte }},
+        "ip": "{{ dstip }}",
+        "packets": {{ rcvdpkt }},
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network"],
+        "code": "0000000013",
+        "dataset": "fortinet_fortigate.log",
+        "duration": {{ duration * 1000000000 }},
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "start": "{{ timestamp.isoformat() }}",
+        "type": ["connection", "end", "allowed"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "appcat": "{{ service.appcat }}",
+            "apprisk": "{{ service.apprisk }}",
+            "dstintfrole": "{{ dstintfrole }}",
+            "duration": {{ duration }},
+            "policyid": {{ policy.policyid }},
+            "poluuid": "{{ policy.poluuid }}",
+            "policytype": "policy",
+            "rcvdbyte": {{ rcvdbyte }},
+            "rcvdpkt": {{ rcvdpkt }},
+            "sentbyte": {{ sentbyte }},
+            "sentpkt": {{ sentpkt }},
+            "sessionid": {{ sessionid }},
+            "srccountry": "{{ srccountry }}",
+            "dstcountry": "{{ dstcountry }}",
+            "srcintfrole": "{{ srcintfrole }}",
+            "subtype": "forward",
+            "trandisp": "{{ trandisp }}",
+{%- if has_nat %}
+            "transip": "{{ transip }}",
+            "transport": {{ transport_val }},
+{%- endif %}
+            "type": "traffic",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "notice"
+    },
+    "message": "{{ action }} {{ service.name }}",
+    "network": {
+        "application": "{{ service.application }}",
+        "bytes": {{ sentbyte + rcvdbyte }},
+        "direction": "{{ direction_type }}",
+        "iana_number": "{{ service.proto }}",
+        "packets": {{ sentpkt + rcvdpkt }},
+        "protocol": "{{ service.name | lower }}",
+        "transport": "{{ "tcp" if service.proto == 6 else ("udp" if service.proto == 17 else "icmp") }}"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ dstintf }}"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "{{ srcintf }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"{% if has_nat %}, "{{ transip }}"{% endif %}]
+    },
+    "rule": {
+        "id": "{{ policy.policyid }}",
+        "name": "{{ policy.policyname }}",
+        "ruleset": "policy",
+        "uuid": "{{ policy.poluuid }}"
+    },
+    "source": {
+        "bytes": {{ sentbyte }},
+        "ip": "{{ srcip }}",
+{%- if srcmac %}
+        "mac": "{{ srcmac | upper | replace(':', '-') }}",
+{%- endif %}
+{%- if has_nat %}
+        "nat": {
+            "ip": "{{ transip }}",
+            "port": {{ transport_val }}
+        },
+{%- endif %}
+        "packets": {{ sentpkt }},
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

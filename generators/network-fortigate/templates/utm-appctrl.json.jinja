@@ -1,0 +1,133 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- Application control events -#}
+{%- set direction_type = module.rand.weighted_choice(["outbound", "inbound", "internal"], [70, 15, 15]) -%}
+{#- Pick a service -#}
+{%- set svc_items = [] -%}
+{%- set svc_weights = [] -%}
+{%- for svc in samples.network_services -%}
+  {%- do svc_items.append(svc) -%}
+  {%- do svc_weights.append(svc.weight) -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(svc_items, svc_weights) -%}
+{#- Action: most app-ctrl is pass -#}
+{%- set action = module.rand.weighted_choice(["pass", "block"], [85, 15]) -%}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- if direction_type == "outbound" -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port1" -%}
+  {%- set srcintfrole = "lan" -%}
+  {%- set dstintfrole = "wan" -%}
+{%- elif direction_type == "inbound" -%}
+  {%- set srcip = module.rand.network.ip_v4_public() -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dmz_host = samples.internal_hosts | selectattr("subnet", "equalto", "dmz") | list | random -%}
+  {%- set dstip = dmz_host.ip -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port1" -%}
+  {%- set dstintf = "port3" -%}
+  {%- set srcintfrole = "wan" -%}
+  {%- set dstintfrole = "dmz" -%}
+{%- else -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set srv_host = samples.internal_hosts | selectattr("role", "equalto", "server") | selectattr("subnet", "equalto", "servers") | list | random -%}
+  {%- set dstip = srv_host.ip -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port2" -%}
+  {%- set srcintfrole = "lan" -%}
+  {%- set dstintfrole = "lan" -%}
+{%- endif -%}
+{%- set incidentserialno = module.rand.number.integer(1000000000, 2147483647) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "app-ctrl-all",
+        "category": ["network"],
+        "code": "1059028704",
+        "dataset": "fortinet_fortigate.log",
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "start": "{{ timestamp.isoformat() }}",
+        "type": ["{{ "allowed" if action == "pass" else "denied" }}"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "appid": "{{ service.appid }}",
+            "apprisk": "{{ service.apprisk }}",
+            "dstintfrole": "{{ dstintfrole }}",
+            "incidentserialno": "{{ incidentserialno }}",
+            "sessionid": {{ sessionid }},
+            "srcintfrole": "{{ srcintfrole }}",
+            "subtype": "app-ctrl",
+            "type": "utm",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "message": "{{ service.appcat }}: {{ service.application }},",
+    "network": {
+        "application": "{{ service.application }}",
+        "direction": "{{ direction_type }}",
+        "iana_number": "{{ service.proto }}",
+        "protocol": "{{ service.name | lower }}",
+        "transport": "{{ "tcp" if service.proto == 6 else "udp" }}"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ dstintf }}"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "{{ srcintf }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "rule": {
+        "category": "{{ service.appcat | replace('.', '-') }}",
+        "id": "1",
+        "ruleset": "g-appctrl-default"
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

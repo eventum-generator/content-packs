@@ -1,0 +1,223 @@
+{%- set seq_num = shared.get('sequence_number', 100000) -%}
+{%- set hostname = params.hostname -%}
+{#- Try to consume a pending interactive session from the pool -#}
+{%- set pending = shared.get('pending_interactive', []) -%}
+{%- if pending | length > 0 -%}
+  {%- set session = pending.pop(0) -%}
+  {%- do shared.set('pending_interactive', pending) -%}
+  {#- Determine response action based on the block type -#}
+  {%- if session.action == "block-continue" -%}
+    {%- set response_action = "continue" -%}
+  {%- else -%}
+    {%- set response_action = "override" -%}
+  {%- endif -%}
+  {%- set username = session.username -%}
+  {%- set src_ip = session.src_ip -%}
+  {%- set url_domain = session.url_domain -%}
+  {%- set url_path = session.url_path -%}
+  {%- set url_original = session.url_original -%}
+  {%- set url_category = session.category -%}
+  {%- set session_id = session.session_id -%}
+  {%- set app_name = session.application -%}
+  {%- set dst_port = session.dst_port -%}
+  {%- set rule_name = session.rule -%}
+  {%- set user_agent = session.user_agent -%}
+{%- else -%}
+  {#- Fallback: generate a standalone alert event if pool is empty -#}
+  {%- set response_action = "alert" -%}
+  {%- set username = (samples.usernames | random).username -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set alert_cats = [] -%}
+  {%- set alert_weights = [] -%}
+  {%- for cat in samples.url_categories -%}
+    {%- if cat.profile_action == "alert" -%}
+      {%- do alert_cats.append(cat) -%}
+      {%- do alert_weights.append(cat.weight) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set category = module.rand.weighted_choice(alert_cats, alert_weights) -%}
+  {%- set url_entry = category.urls | random -%}
+  {%- set url_domain = url_entry.domain -%}
+  {%- set url_path = url_entry.path -%}
+  {%- set url_original = url_domain ~ url_path -%}
+  {%- set url_category = category.category -%}
+  {%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+  {%- set app_items = [] -%}
+  {%- set app_weights = [] -%}
+  {%- for app in samples.applications -%}
+    {%- do app_items.append(app) -%}
+    {%- do app_weights.append(app.weight) -%}
+  {%- endfor -%}
+  {%- set app_name = module.rand.weighted_choice(app_items, app_weights).name -%}
+  {%- set dst_port = 443 -%}
+  {%- set rule_items = [] -%}
+  {%- set rule_weights = [] -%}
+  {%- for r in samples.security_rules | selectattr("weight", "gt", 5) | list -%}
+    {%- do rule_items.append(r) -%}
+    {%- do rule_weights.append(r.weight) -%}
+  {%- endfor -%}
+  {%- set rule_name = module.rand.weighted_choice(rule_items, rule_weights).name -%}
+  {%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{%- endif -%}
+{#- Shared fields -#}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{%- set nat_src_ip = params.nat_ip -%}
+{%- set nat_src_port = module.rand.number.integer(10000, 60000) -%}
+{%- set dst_country = module.rand.weighted_choice(["United States", "Germany", "United Kingdom", "Netherlands", "Ireland", "Japan", "Canada", "France", "Australia", "Singapore"], [35, 10, 10, 8, 8, 7, 7, 5, 5, 5]) -%}
+{%- if response_action == "alert" -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type = ["allowed"] -%}
+  {%- set url_denied = false -%}
+{%- else -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type = ["allowed"] -%}
+  {%- set url_denied = false -%}
+{%- endif -%}
+{%- set content_type = module.rand.weighted_choice(["text/html", "application/javascript", "application/json", "text/css", "image/png"], [40, 20, 15, 15, 10]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "geo": {
+            "name": "{{ dst_country }}"
+        },
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "url_filtering",
+        "category": ["intrusion_detection", "threat", "network"],
+        "dataset": "panw.panos",
+        "kind": "alert",
+        "module": "panw",
+        "outcome": "{{ outcome }}",
+        "severity": 5,
+        "type": {{ event_type | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "http": {
+        "request": {
+            "method": "get"
+        }
+    },
+    "labels": {
+        "nat_translated": true,
+        "url_filter_denied": {{ url_denied | tojson }}
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 1,
+                "name": "user-level"
+            },
+            "hostname": "{{ hostname }}",
+            "priority": 14,
+            "severity": {
+                "code": 6,
+                "name": "Informational"
+            }
+        }
+    },
+    "network": {
+        "application": "{{ app_name }}",
+        "community_id": "{{ community_id }}",
+        "direction": "inbound",
+        "transport": "tcp",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ params.outbound_interface }}"
+            },
+            "zone": "{{ params.dst_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ params.inbound_interface }}"
+            },
+            "zone": "{{ params.src_zone }}"
+        },
+        "product": "PAN-OS",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Palo Alto Networks"
+    },
+    "panw": {
+        "panos": {
+            "action": "{{ response_action }}",
+            "action_flags": "0x0",
+            "content_version": "{{ params.content_version }}",
+            "flow_id": "{{ session_id }}",
+            "generated_time": "{{ timestamp.isoformat() }}",
+            "http_content_type": "{{ content_type }}",
+            "log_profile": "{{ params.log_profile }}",
+            "received_time": "{{ timestamp.isoformat() }}",
+            "repeat_count": 1,
+            "ruleset": "{{ rule_name }}",
+            "sequence_number": "{{ seq_num }}",
+            "sub_type": "url",
+            "threat": {
+                "id": "9999",
+                "name": "URL-filtering"
+            },
+            "type": "THREAT",
+            "url": {
+                "category": "{{ url_category }}"
+            },
+            "virtual_sys": "{{ params.virtual_sys }}"
+        }
+    },
+    "related": {
+        "hosts": ["{{ hostname }}", "{{ url_domain }}"],
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}", "{{ nat_src_ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "rule": {
+        "name": "{{ rule_name }}"
+    },
+    "source": {
+        "geo": {
+            "name": "{{ params.src_network }}"
+        },
+        "ip": "{{ src_ip }}",
+        "nat": {
+            "ip": "{{ nat_src_ip }}",
+            "port": {{ nat_src_port }}
+        },
+        "port": {{ src_port }},
+        "user": {
+            "domain": "{{ params.domain }}",
+            "name": "{{ username }}"
+        }
+    },
+    "url": {
+        "domain": "{{ url_domain }}",
+        "original": "{{ url_original }}",
+        "path": "{{ url_path }}"
+    },
+    "user": {
+        "domain": "{{ params.domain }}",
+        "name": "{{ username }}"
+    },
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    }
+}
+{%- do shared.set('sequence_number', seq_num + 1) -%}

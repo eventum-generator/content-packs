@@ -1,0 +1,127 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- Antivirus detection events -#}
+{%- set viruses = [
+  {"virus": "EICAR_TEST_FILE", "dtype": "Virus", "file": "eicar.com", "severity": "warning", "weight": 5},
+  {"virus": "W32/Generic.AC.2841!tr", "dtype": "Virus", "file": "update.exe", "severity": "warning", "weight": 8},
+  {"virus": "JS/Phishing.A!tr", "dtype": "Virus", "file": "invoice.html", "severity": "warning", "weight": 10},
+  {"virus": "Riskware/Agent", "dtype": "Virus", "file": "tool.exe", "severity": "warning", "weight": 6},
+  {"virus": "W32/Injector.ESIB!tr", "dtype": "Virus", "file": "setup.exe", "severity": "warning", "weight": 7},
+  {"virus": "PDF/Phishing.F113!tr", "dtype": "Virus", "file": "document.pdf", "severity": "warning", "weight": 8},
+  {"virus": "VBA/Agent.OLZ!tr.dldr", "dtype": "Virus", "file": "report.docm", "severity": "warning", "weight": 6},
+  {"virus": "MSIL/GenKryptik.GHZP!tr", "dtype": "Virus", "file": "loader.dll", "severity": "warning", "weight": 4},
+  {"virus": "JS/Miner.AQ!tr", "dtype": "Virus", "file": "script.js", "severity": "warning", "weight": 5},
+  {"virus": "Linux/Mirai.A!tr", "dtype": "Virus", "file": "bins.sh", "severity": "critical", "weight": 3}
+] -%}
+{%- set vir_items = [] -%}
+{%- set vir_weights = [] -%}
+{%- for v in viruses -%}
+  {%- do vir_items.append(v) -%}
+  {%- do vir_weights.append(v.weight) -%}
+{%- endfor -%}
+{%- set detection = module.rand.weighted_choice(vir_items, vir_weights) -%}
+{#- Direction: mostly inbound downloads, some outbound C2 -#}
+{%- set direction = module.rand.weighted_choice(["incoming", "outgoing"], [80, 20]) -%}
+{%- set service_type = module.rand.weighted_choice(["HTTP", "HTTPS", "SMTP", "FTP"], [40, 30, 20, 10]) -%}
+{%- set svc_port_map = {"HTTP": 80, "HTTPS": 443, "SMTP": 25, "FTP": 21} -%}
+{%- set dstport = svc_port_map.get(service_type, 80) -%}
+{%- if direction == "incoming" -%}
+  {%- set srcip = module.rand.network.ip_v4_public() -%}
+  {%- set srcport = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dstip = dst_host.ip -%}
+  {%- set srcintf = "port1" -%}
+  {%- set dstintf = "port2" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "port1" -%}
+{%- endif -%}
+{%- set action = module.rand.weighted_choice(["blocked", "monitored"], [85, 15]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "infected",
+        "category": ["network", "malware"],
+        "code": "0211008192",
+        "dataset": "fortinet_fortigate.log",
+        "kind": "alert",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "type": ["info"]
+    },
+    "file": {
+        "name": "{{ detection.file }}"
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "direction": "{{ direction }}",
+            "dstintfrole": "{{ "lan" if direction == "incoming" else "wan" }}",
+            "dtype": "{{ detection.dtype }}",
+            "policyid": 1,
+            "sessionid": {{ sessionid }},
+            "srcintfrole": "{{ "wan" if direction == "incoming" else "lan" }}",
+            "subtype": "virus",
+            "type": "utm",
+            "vd": "{{ vd }}",
+            "virus": "{{ detection.virus }}"
+        }
+    },
+    "log": {
+        "level": "{{ detection.severity }}"
+    },
+    "message": "File is infected.",
+    "network": {
+        "direction": "{{ "inbound" if direction == "incoming" else "outbound" }}",
+        "iana_number": "6",
+        "protocol": "{{ service_type | lower }}",
+        "transport": "tcp"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ dstintf }}"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "{{ srcintf }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

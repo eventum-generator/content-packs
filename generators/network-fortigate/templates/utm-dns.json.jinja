@@ -1,0 +1,108 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- DNS filter/logging events -#}
+{%- set dns_event = module.rand.weighted_choice(["dns-response", "dns-query"], [60, 40]) -%}
+{%- set dns_action = module.rand.weighted_choice(["pass", "block"], [90, 10]) -%}
+{#- Generate DNS query name -#}
+{%- set subdomains = ["www", "mail", "api", "cdn", "app", "login", "portal", "static", "dev", "test", "vpn", "ftp", "ns1", "mx"] -%}
+{%- set domains = ["example.com", "contoso.com", "microsoft.com", "google.com", "cloudflare.com", "amazon.com", "github.com", "office365.com", "okta.com", "zoom.us", "slack.com", "aws.amazon.com"] -%}
+{%- set qname = module.rand.choice(subdomains) ~ "." ~ module.rand.choice(domains) -%}
+{%- set qtypes = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "SOA", "PTR"] -%}
+{%- set qtype_weights = [50, 10, 10, 8, 7, 5, 3, 7] -%}
+{%- set qtype = module.rand.weighted_choice(qtypes, qtype_weights) -%}
+{%- set xid = module.rand.number.integer(1000, 65535) -%}
+{#- Source: internal host doing DNS lookup -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set srcip = src_host.ip -%}
+{%- set srcport = module.rand.number.integer(49152, 65535) -%}
+{%- set dstip = "10.1.2.70" -%}
+{%- set dstport = 53 -%}
+{%- set resolved_ip = module.rand.network.ip_v4_public() -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "dns": {
+        "id": "{{ xid }}",
+        "question": {
+            "class": "IN",
+            "name": "{{ qname }}",
+            "type": "{{ qtype }}"
+        }{% if dns_event == "dns-response" and qtype == "A" %},
+        "resolved_ip": ["{{ resolved_ip }}"]
+{%- endif %}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ dns_event }}",
+        "category": ["network"],
+        "code": "{{ "1501054802" if dns_event == "dns-response" else "1501054600" }}",
+        "dataset": "fortinet_fortigate.log",
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "type": ["info", "{{ "allowed" if dns_action == "pass" else "denied" }}"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ dns_action }}",
+            "dstintfrole": "lan",
+            "sessionid": {{ sessionid }},
+            "srcintfrole": "lan",
+            "subtype": "dns",
+            "type": "utm",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "message": "DNS {{ dns_event }} {{ qname }}",
+    "network": {
+        "direction": "outbound",
+        "iana_number": "17",
+        "protocol": "dns",
+        "transport": "udp"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "port2"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "port2"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "hosts": ["{{ qname }}"],
+        "ip": ["{{ srcip }}", "{{ dstip }}"{% if dns_event == "dns-response" and qtype == "A" %}, "{{ resolved_ip }}"{% endif %}]
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

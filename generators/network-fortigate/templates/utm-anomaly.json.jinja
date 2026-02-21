@@ -1,0 +1,106 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- DoS/anomaly detection events -#}
+{%- set anomalies = [
+  {"attack": "icmp_flood", "attackid": 16777316, "proto": 1, "service": "PING", "logid": "0720018433", "threshold": 50},
+  {"attack": "tcp_syn_flood", "attackid": 16777217, "proto": 6, "service": "tcp", "logid": "0720018432", "threshold": 2000},
+  {"attack": "udp_flood", "attackid": 16777218, "proto": 17, "service": "udp", "logid": "0720018432", "threshold": 2000},
+  {"attack": "tcp_port_scan", "attackid": 16777220, "proto": 6, "service": "tcp", "logid": "0720018432", "threshold": 1000},
+  {"attack": "udp_scan", "attackid": 16777221, "proto": 17, "service": "udp", "logid": "0720018434", "threshold": 1000},
+  {"attack": "ip_src_session", "attackid": 16777222, "proto": 6, "service": "tcp", "logid": "0720018432", "threshold": 5000}
+] -%}
+{%- set anomaly_weights = [15, 25, 15, 20, 10, 15] -%}
+{%- set anomaly = module.rand.weighted_choice(anomalies, anomaly_weights) -%}
+{#- Anomalies are predominantly inbound -#}
+{%- set srcip = module.rand.network.ip_v4_public() -%}
+{%- set dst_host = samples.internal_hosts | random -%}
+{%- set dstip = dst_host.ip -%}
+{%- set srcport = module.rand.number.integer(1, 65535) -%}
+{%- set dstport = module.rand.number.integer(1, 65535) -%}
+{%- set action = module.rand.weighted_choice(["clear_session", "pass"], [80, 20]) -%}
+{%- set count = module.rand.number.integer(anomaly.threshold + 1, anomaly.threshold * 3) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "anomaly",
+        "category": ["network", "intrusion_detection"],
+        "code": "{{ anomaly.logid }}",
+        "dataset": "fortinet_fortigate.log",
+        "kind": "alert",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "type": ["denied"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "attack": "{{ anomaly.attack }}",
+            "attackid": {{ anomaly.attackid }},
+            "count": {{ count }},
+            "crlevel": "critical",
+            "crscore": 50,
+            "dstintfrole": "lan",
+            "policyid": 1,
+            "policytype": "DoS-policy",
+            "sessionid": 0,
+            "severity": "critical",
+            "srcintfrole": "wan",
+            "subtype": "anomaly",
+            "type": "utm",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "alert"
+    },
+    "message": "anomaly: {{ anomaly.attack }}, {{ count }} > threshold {{ anomaly.threshold }}",
+    "network": {
+        "direction": "inbound",
+        "iana_number": "{{ anomaly.proto }}",
+        "protocol": "{{ anomaly.service | lower }}",
+        "transport": "{{ "tcp" if anomaly.proto == 6 else ("udp" if anomaly.proto == 17 else "icmp") }}"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "port2"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "port1"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

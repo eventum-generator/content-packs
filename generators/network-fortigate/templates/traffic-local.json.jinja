@@ -1,0 +1,133 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set devid = params.serial_number -%}
+{%- set vd = params.get('vdom', 'root') -%}
+{#- Local traffic: to/from the FortiGate itself -#}
+{%- set local_services = [
+  {"port": 443, "proto": 6, "name": "HTTPS", "desc": "FortiGuard web filter rating", "direction": "outbound"},
+  {"port": 443, "proto": 6, "name": "HTTPS", "desc": "FortiGuard update", "direction": "outbound"},
+  {"port": 53, "proto": 17, "name": "DNS", "desc": "DNS query", "direction": "outbound"},
+  {"port": 123, "proto": 17, "name": "NTP", "desc": "NTP sync", "direction": "outbound"},
+  {"port": 514, "proto": 17, "name": "SYSLOG", "desc": "Syslog to collector", "direction": "outbound"},
+  {"port": 443, "proto": 6, "name": "HTTPS", "desc": "Management session", "direction": "inbound"},
+  {"port": 22, "proto": 6, "name": "SSH", "desc": "SSH management", "direction": "inbound"},
+  {"port": 161, "proto": 17, "name": "SNMP", "desc": "SNMP polling", "direction": "inbound"},
+  {"port": 500, "proto": 17, "name": "IKE", "desc": "IPsec negotiation", "direction": "inbound"},
+  {"port": 8443, "proto": 6, "name": "HTTPS", "desc": "SSLVPN portal", "direction": "inbound"}
+] -%}
+{%- set local_weights = [15, 12, 15, 10, 8, 10, 8, 5, 5, 5] -%}
+{%- set service = module.rand.weighted_choice(local_services, local_weights) -%}
+{%- if service.direction == "outbound" -%}
+  {%- set srcip = "10.1.2.1" -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "root" -%}
+  {%- set dstintf = "port1" -%}
+{%- else -%}
+  {%- set mgmt_host = samples.internal_hosts | selectattr("subnet", "equalto", "servers") | list | random -%}
+  {%- set srcip = mgmt_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = "10.1.2.1" -%}
+  {%- set dstport = service.port -%}
+  {%- set srcintf = "port2" -%}
+  {%- set dstintf = "root" -%}
+{%- endif -%}
+{%- set action = module.rand.weighted_choice(["close", "timeout"], [75, 25]) -%}
+{%- set duration = module.rand.number.integer(1, 300) -%}
+{%- set sentbyte = module.rand.number.integer(100, 50000) -%}
+{%- set rcvdbyte = module.rand.number.integer(100, 100000) -%}
+{%- set sentpkt = module.rand.number.integer(2, 100) -%}
+{%- set rcvdpkt = module.rand.number.integer(2, 200) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": {{ rcvdbyte }},
+        "ip": "{{ dstip }}",
+        "packets": {{ rcvdpkt }},
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network"],
+        "code": "0001000014",
+        "dataset": "fortinet_fortigate.log",
+        "duration": {{ duration * 1000000000 }},
+        "kind": "event",
+        "module": "fortinet_fortigate",
+        "outcome": "success",
+        "type": ["connection", "end", "allowed"]
+    },
+    "fortinet": {
+        "firewall": {
+            "action": "{{ action }}",
+            "dstintfrole": "undefined",
+            "duration": {{ duration }},
+            "policyid": 0,
+            "policytype": "local-in-policy",
+            "rcvdbyte": {{ rcvdbyte }},
+            "rcvdpkt": {{ rcvdpkt }},
+            "sentbyte": {{ sentbyte }},
+            "sentpkt": {{ sentpkt }},
+            "sessionid": {{ sessionid }},
+            "srccountry": "Reserved",
+            "dstcountry": "Reserved",
+            "srcintfrole": "undefined",
+            "subtype": "local",
+            "trandisp": "noop",
+            "type": "traffic",
+            "vd": "{{ vd }}"
+        }
+    },
+    "log": {
+        "level": "notice"
+    },
+    "message": "{{ action }} {{ service.desc }}",
+    "network": {
+        "bytes": {{ sentbyte + rcvdbyte }},
+        "direction": "{{ service.direction }}",
+        "iana_number": "{{ service.proto }}",
+        "packets": {{ sentpkt + rcvdpkt }},
+        "protocol": "{{ service.name | lower }}",
+        "transport": "{{ "tcp" if service.proto == 6 else "udp" }}"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ dstintf }}"
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": "{{ srcintf }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "Fortigate",
+        "serial_number": "{{ devid }}",
+        "type": "firewall",
+        "vendor": "Fortinet"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "source": {
+        "bytes": {{ sentbyte }},
+        "ip": "{{ srcip }}",
+        "packets": {{ sentpkt }},
+        "port": {{ srcport }}
+    },
+    "tags": ["fortinet-fortigate", "fortinet-firewall", "forwarded"]
+}
+{%- do shared.set('sessionid', sessionid + 1) -%}

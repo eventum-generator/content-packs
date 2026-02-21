@@ -1,0 +1,196 @@
+{%- set seq_num = shared.get('sequence_number', 100000) -%}
+{%- set hostname = params.hostname -%}
+{#- Pick URL category from alert-action categories -#}
+{%- set alert_cats = [] -%}
+{%- set alert_weights = [] -%}
+{%- for cat in samples.url_categories -%}
+  {%- if cat.profile_action == "alert" -%}
+    {%- do alert_cats.append(cat) -%}
+    {%- do alert_weights.append(cat.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set category = module.rand.weighted_choice(alert_cats, alert_weights) -%}
+{%- set url_entry = category.urls | random -%}
+{%- set url_domain = url_entry.domain -%}
+{%- set url_path = url_entry.path -%}
+{%- set url_original = url_domain ~ url_path -%}
+{#- Source host and user -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set src_ip = src_host.ip -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set username = (samples.usernames | random).username -%}
+{#- Application with weighted selection -#}
+{%- set app_items = [] -%}
+{%- set app_weights = [] -%}
+{%- for app in samples.applications -%}
+  {%- do app_items.append(app) -%}
+  {%- do app_weights.append(app.weight) -%}
+{%- endfor -%}
+{%- set application = module.rand.weighted_choice(app_items, app_weights) -%}
+{%- set dst_port = application.port -%}
+{#- Security rule -#}
+{%- set allow_rules = samples.security_rules | selectattr("weight", "gt", 5) | list -%}
+{%- set rule_items = [] -%}
+{%- set rule_weights = [] -%}
+{%- for r in allow_rules -%}
+  {%- do rule_items.append(r) -%}
+  {%- do rule_weights.append(r.weight) -%}
+{%- endfor -%}
+{%- set rule = module.rand.weighted_choice(rule_items, rule_weights) -%}
+{#- HTTP details -#}
+{%- set http_method = module.rand.weighted_choice(["get", "post", "put", "delete", "head", "options"], [80, 12, 3, 1, 2, 2]) -%}
+{%- set content_type = module.rand.weighted_choice(["text/html", "application/javascript", "application/json", "text/css", "image/png", "image/jpeg", "application/xml", ""], [35, 15, 15, 10, 8, 7, 5, 5]) -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Session and flow -#}
+{%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{#- NAT: outbound through firewall -#}
+{%- set nat_src_ip = params.nat_ip -%}
+{%- set nat_src_port = module.rand.number.integer(10000, 60000) -%}
+{#- Destination country -#}
+{%- set dst_country = module.rand.weighted_choice(["United States", "Germany", "United Kingdom", "Netherlands", "Ireland", "Japan", "Canada", "France", "Australia", "Singapore"], [35, 10, 10, 8, 8, 7, 7, 5, 5, 5]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "geo": {
+            "name": "{{ dst_country }}"
+        },
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "url_filtering",
+        "category": ["intrusion_detection", "threat", "network"],
+        "dataset": "panw.panos",
+        "kind": "alert",
+        "module": "panw",
+        "outcome": "success",
+        "severity": 5,
+        "type": ["allowed"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "http": {
+        "request": {
+            "method": "{{ http_method }}"
+        }
+    },
+    "labels": {
+        "nat_translated": true,
+        "url_filter_denied": false
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 1,
+                "name": "user-level"
+            },
+            "hostname": "{{ hostname }}",
+            "priority": 14,
+            "severity": {
+                "code": 6,
+                "name": "Informational"
+            }
+        }
+    },
+    "network": {
+        "application": "{{ application.name }}",
+        "community_id": "{{ community_id }}",
+        "direction": "inbound",
+        "transport": "tcp",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ params.outbound_interface }}"
+            },
+            "zone": "{{ params.dst_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ params.inbound_interface }}"
+            },
+            "zone": "{{ params.src_zone }}"
+        },
+        "product": "PAN-OS",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Palo Alto Networks"
+    },
+    "panw": {
+        "panos": {
+            "action": "alert",
+            "action_flags": "0x0",
+            "content_version": "{{ params.content_version }}",
+            "flow_id": "{{ session_id }}",
+            "generated_time": "{{ timestamp.isoformat() }}",
+            "http_content_type": "{{ content_type }}",
+            "log_profile": "{{ params.log_profile }}",
+            "received_time": "{{ timestamp.isoformat() }}",
+            "repeat_count": 1,
+            "ruleset": "{{ rule.name }}",
+            "sequence_number": "{{ seq_num }}",
+            "sub_type": "url",
+            "threat": {
+                "id": "9999",
+                "name": "URL-filtering"
+            },
+            "type": "THREAT",
+            "url": {
+                "category": "{{ category.category }}"
+            },
+            "virtual_sys": "{{ params.virtual_sys }}"
+        }
+    },
+    "related": {
+        "hosts": ["{{ hostname }}", "{{ url_domain }}"],
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}", "{{ nat_src_ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "rule": {
+        "name": "{{ rule.name }}"
+    },
+    "source": {
+        "geo": {
+            "name": "{{ params.src_network }}"
+        },
+        "ip": "{{ src_ip }}",
+        "nat": {
+            "ip": "{{ nat_src_ip }}",
+            "port": {{ nat_src_port }}
+        },
+        "port": {{ src_port }},
+        "user": {
+            "domain": "{{ params.domain }}",
+            "name": "{{ username }}"
+        }
+    },
+    "url": {
+        "domain": "{{ url_domain }}",
+        "original": "{{ url_original }}",
+        "path": "{{ url_path }}"
+    },
+    "user": {
+        "domain": "{{ params.domain }}",
+        "name": "{{ username }}"
+    },
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    }
+}
+{%- do shared.set('sequence_number', seq_num + 1) -%}
