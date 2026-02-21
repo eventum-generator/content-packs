@@ -1,0 +1,102 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set user = (samples.usernames | random).username -%}
+{%- set client_ip = module.rand.network.ip_v4_public() -%}
+{#- VPN profile -#}
+{%- set group_policy = module.rand.weighted_choice(
+  ["GP_AnyConnect", "GP_FullAccess", "GP_RestrictedAccess", "GP_Contractors"],
+  [40, 25, 20, 15]
+) -%}
+{#- Tunnel protocol — TCP (TLS) or UDP (DTLS) -#}
+{%- set protocol = module.rand.weighted_choice(["TCP", "UDP"], [55, 45]) -%}
+{#- Compression -#}
+{%- set compression = module.rand.chance(0.15) -%}
+{%- set compression_str = "with" if compression else "without" -%}
+{%- set syslog_msg = "%ASA-6-722022: Group <" ~ group_policy ~ "> User <" ~ user ~ "> IP <" ~ client_ip ~ "> " ~ protocol ~ " SVC connection established " ~ compression_str ~ " compression" -%}
+{%- set pri = 166 -%}
+{#- Push to tunnels pool for correlation with tunnel termination -#}
+{%- set tunnels = shared.get('tunnels', []) -%}
+{%- do tunnels.append({
+  "user": user,
+  "client_ip": client_ip,
+  "group_policy": group_policy,
+  "protocol": protocol,
+  "compression": compression
+}) -%}
+{%- if tunnels | length > 100 -%}{%- do tunnels.pop(0) -%}{%- endif -%}
+{%- do shared.set('tunnels', tunnels) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "cisco": {
+        "asa": {
+            "message_id": "722022"
+        }
+    },
+    "data_stream": {
+        "dataset": "cisco_asa.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "client-vpn-connected",
+        "category": ["network"],
+        "code": "722022",
+        "dataset": "cisco_asa.log",
+        "kind": "event",
+        "module": "cisco_asa",
+        "original": "<{{ pri }}>{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ syslog_msg }}",
+        "outcome": "success",
+        "severity": 6,
+        "type": ["connection", "start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 20
+            },
+            "priority": {{ pri }},
+            "severity": {
+                "code": 6
+            }
+        }
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "asa",
+        "type": "firewall",
+        "vendor": "Cisco"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ client_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "user": {
+            "group": {
+                "name": "{{ group_policy }}"
+            },
+            "name": "{{ user }}"
+        }
+    },
+    "tags": ["cisco-asa", "forwarded"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

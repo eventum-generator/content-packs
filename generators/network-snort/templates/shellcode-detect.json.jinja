@@ -1,0 +1,117 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.sensor_hostname -%}
+{#- Inline shellcode-detect signatures (JSON samples don't support attribute access) -#}
+{%- set sigs = [
+  {"sid": 1000100, "gid": 1, "rev": 1, "msg": "SHELLCODE-DETECT x86 NOOP sled detected", "priority": 1, "protocol": "tcp", "service": ""},
+  {"sid": 1000101, "gid": 1, "rev": 2, "msg": "SHELLCODE-DETECT reverse shell connection attempt", "priority": 1, "protocol": "tcp", "service": ""}
+] -%}
+{%- set sig = sigs | random -%}
+{#- Shellcode is inbound — attacker sending exploit payload -#}
+{%- set src_ip = module.rand.network.ip_v4_public() -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_host = samples.internal_hosts | random -%}
+{%- set dst_ip = dst_host[0] -%}
+{#- Shellcode targets vulnerable services -#}
+{%- set dst_port = module.rand.weighted_choice([80, 443, 445, 22, 3389, 8080, 21], [20, 20, 15, 15, 10, 10, 10]) -%}
+{#- Shellcode is almost always blocked in IPS mode -#}
+{%- set action = module.rand.weighted_choice(["drop", "would_drop", "allow"], [50, 35, 15]) -%}
+{%- if action == "allow" -%}
+  {%- set event_type = ["allowed"] -%}
+  {%- set outcome = "success" -%}
+{%- else -%}
+  {%- set event_type = ["denied"] -%}
+  {%- set outcome = "failure" -%}
+{%- endif -%}
+{#- Shellcode packets are often established connections with data -#}
+{%- set tcp_flags = module.rand.weighted_choice(["***AP***", "****P***", "***A****"], [50, 30, 20]) -%}
+{%- set tcp_seq = module.rand.number.integer(100000, 4294967295) -%}
+{%- set tcp_ack = module.rand.number.integer(100000, 4294967295) -%}
+{%- set tcp_win = module.rand.weighted_choice([65535, 32768, 16384], [40, 30, 30]) -%}
+{%- set ttl = module.rand.weighted_choice([64, 128, 48, 52, 60], [25, 25, 20, 15, 15]) -%}
+{%- set ip_id = module.rand.number.integer(1, 65535) -%}
+{%- set pkt_len = module.rand.number.integer(200, 1500) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network", "intrusion_detection"],
+        "dataset": "snort.log",
+        "kind": "alert",
+        "module": "snort",
+        "outcome": "{{ outcome }}",
+        "severity": {{ sig.priority }},
+        "type": {{ event_type | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "alert"
+    },
+    "network": {
+        "community_id": "{{ community_id }}",
+        "direction": "inbound",
+        "iana_number": "6",
+        "transport": "tcp",
+        "type": "ipv4"
+    },
+    "observer": {
+        "ingress": {
+            "interface": {
+                "name": "{{ params.sensor_interface }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "ids",
+        "type": "ids",
+        "vendor": "snort"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "category": "Executable Code was Detected",
+        "description": "{{ sig.msg }}",
+        "id": "{{ sig.sid }}",
+        "version": "{{ sig.rev }}"
+    },
+    "snort": {
+        "gid": {{ sig.gid }},
+        "ip": {
+            "id": {{ ip_id }},
+            "length": {{ pkt_len }},
+            "tos": 0,
+            "ttl": {{ ttl }}
+        },
+        "tcp": {
+            "ack": {{ tcp_ack }},
+            "flags": "{{ tcp_flags }}",
+            "length": 20,
+            "seq": {{ tcp_seq }},
+            "window": {{ tcp_win }}
+        }
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "tags": ["forwarded", "snort.log"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

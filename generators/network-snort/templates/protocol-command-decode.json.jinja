@@ -1,0 +1,133 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.sensor_hostname -%}
+{#- Inline protocol-command-decode signatures (JSON samples don't support attribute access) -#}
+{%- set sigs = [
+  {"sid": 1000060, "gid": 1, "rev": 1, "msg": "PROTOCOL-DNS DNS zone transfer attempt", "priority": 3, "protocol": "tcp", "service": "dns"},
+  {"sid": 1000061, "gid": 1, "rev": 2, "msg": "PROTOCOL-FTP FTP bounce attack attempt", "priority": 3, "protocol": "tcp", "service": "ftp"},
+  {"sid": 1000062, "gid": 1, "rev": 1, "msg": "PROTOCOL-SMTP suspicious RCPT TO command overflow", "priority": 3, "protocol": "tcp", "service": "smtp"},
+  {"sid": 1000063, "gid": 1, "rev": 1, "msg": "PROTOCOL-SNMP SNMP AgentX/tcp request", "priority": 3, "protocol": "tcp", "service": "snmp"},
+  {"sid": 1000064, "gid": 1, "rev": 2, "msg": "PROTOCOL-RPC portmap listing request", "priority": 3, "protocol": "udp", "service": "rpc"}
+] -%}
+{%- set sig = sigs | random -%}
+{#- Protocol decode events can be any direction -#}
+{%- set direction = module.rand.weighted_choice(["inbound", "outbound", "internal"], [50, 30, 20]) -%}
+{%- if direction == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+{%- elif direction == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+{%- endif -%}
+{#- Service-specific ports -#}
+{%- set service_ports = {"dns": 53, "ftp": 21, "smtp": 25, "snmp": 161, "rpc": 111} -%}
+{%- set dst_port = service_ports.get(sig.service, module.rand.number.integer(1, 1024)) -%}
+{%- set transport = sig.protocol -%}
+{%- set iana_number = "6" if transport == "tcp" else "17" -%}
+{#- Protocol decode is informational — almost never blocked -#}
+{%- set action = "allow" -%}
+{%- set event_type = ["allowed"] -%}
+{%- set outcome = "success" -%}
+{%- set ttl = module.rand.weighted_choice([64, 128, 63, 127], [35, 35, 15, 15]) -%}
+{%- set ip_id = module.rand.number.integer(1, 65535) -%}
+{%- set pkt_len = module.rand.number.integer(60, 600) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network", "intrusion_detection"],
+        "dataset": "snort.log",
+        "kind": "alert",
+        "module": "snort",
+        "outcome": "{{ outcome }}",
+        "severity": {{ sig.priority }},
+        "type": {{ event_type | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "alert"
+    },
+    "network": {
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction }}",
+        "iana_number": "{{ iana_number }}",
+{% if sig.service %}
+        "protocol": "{{ sig.service }}",
+{% endif %}
+        "transport": "{{ transport }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "ingress": {
+            "interface": {
+                "name": "{{ params.sensor_interface }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "ids",
+        "type": "ids",
+        "vendor": "snort"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "category": "Generic Protocol Command Decode",
+        "description": "{{ sig.msg }}",
+        "id": "{{ sig.sid }}",
+        "version": "{{ sig.rev }}"
+    },
+    "snort": {
+        "gid": {{ sig.gid }},
+        "ip": {
+            "id": {{ ip_id }},
+            "length": {{ pkt_len }},
+            "tos": 0,
+            "ttl": {{ ttl }}
+        }{% if transport == "tcp" %},
+        "tcp": {
+            "ack": {{ module.rand.number.integer(100000, 4294967295) }},
+            "flags": "{{ module.rand.weighted_choice(["***AP***", "***A****", "****P***"], [50, 30, 20]) }}",
+            "length": 20,
+            "seq": {{ module.rand.number.integer(100000, 4294967295) }},
+            "window": {{ module.rand.weighted_choice([65535, 29200, 32768], [35, 35, 30]) }}
+        }{% else %},
+        "udp": {
+            "length": {{ pkt_len }}
+        }{% endif %}
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "tags": ["forwarded", "snort.log"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

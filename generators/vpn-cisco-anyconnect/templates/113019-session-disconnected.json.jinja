@@ -1,0 +1,128 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- Consume from vpn_sessions pool for correlation -#}
+{%- set vpn_sessions = shared.get('vpn_sessions', []) -%}
+{%- if vpn_sessions | length > 0 -%}
+  {%- set session = vpn_sessions.pop(0) -%}
+  {%- do shared.set('vpn_sessions', vpn_sessions) -%}
+  {%- set user = session.user -%}
+  {%- set client_ip = session.client_ip -%}
+  {%- set group_policy = session.group_policy -%}
+{%- else -%}
+  {#- Fallback: generate standalone disconnect -#}
+  {%- set user = (samples.usernames | random).username -%}
+  {%- set client_ip = module.rand.network.ip_v4_public() -%}
+  {%- set group_policy = module.rand.weighted_choice(
+    ["GP_AnyConnect", "GP_FullAccess", "GP_RestrictedAccess", "GP_Contractors"],
+    [40, 25, 20, 15]
+  ) -%}
+{%- endif -%}
+{#- Session type -#}
+{%- set session_type = module.rand.weighted_choice(["SSL", "IKEv2", "L2TP/IPsec"], [85, 10, 5]) -%}
+{#- Disconnect reason -#}
+{%- set reason = module.rand.weighted_choice(
+  ["User Requested", "Idle Timeout", "Max Time Exceeded", "Lost Service", "Connection Preempted", "DPD Failure", "Administrator Reset", "Simultaneous Logins Exceeded", "Firewall Restart"],
+  [45, 25, 8, 7, 5, 4, 3, 2, 1]
+) -%}
+{#- Session duration (seconds) — weighted toward workday lengths -#}
+{%- set duration_type = module.rand.weighted_choice(["short", "medium", "long", "workday", "extended"], [10, 20, 25, 35, 10]) -%}
+{%- if duration_type == "short" -%}
+  {%- set duration_secs = module.rand.number.integer(30, 300) -%}
+{%- elif duration_type == "medium" -%}
+  {%- set duration_secs = module.rand.number.integer(300, 3600) -%}
+{%- elif duration_type == "long" -%}
+  {%- set duration_secs = module.rand.number.integer(3600, 14400) -%}
+{%- elif duration_type == "workday" -%}
+  {%- set duration_secs = module.rand.number.integer(14400, 32400) -%}
+{%- else -%}
+  {%- set duration_secs = module.rand.number.integer(32400, 57600) -%}
+{%- endif -%}
+{%- set dur_hours = duration_secs // 3600 -%}
+{%- set dur_minutes = (duration_secs % 3600) // 60 -%}
+{%- set dur_seconds = duration_secs % 60 -%}
+{%- set duration_str = "%dh:%02dm:%02ds" | format(dur_hours, dur_minutes, dur_seconds) -%}
+{#- Traffic statistics -#}
+{%- set bytes_xmt = module.rand.number.integer(50000, 500000000) -%}
+{%- set bytes_rcv = module.rand.number.integer(100000, 2000000000) -%}
+{%- set syslog_msg = "%ASA-4-113019: Group = " ~ group_policy ~ ", Username = " ~ user ~ ", IP = " ~ client_ip ~ ", Session disconnected. Session Type: " ~ session_type ~ ", Duration: " ~ duration_str ~ ", Bytes xmt: " ~ bytes_xmt ~ ", Bytes rcv: " ~ bytes_rcv ~ ", Reason: " ~ reason -%}
+{%- set pri = 164 -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "cisco": {
+        "asa": {
+            "message_id": "113019",
+            "session_type": "{{ session_type }}"
+        }
+    },
+    "data_stream": {
+        "dataset": "cisco_asa.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "client-vpn-disconnected",
+        "category": ["network"],
+        "code": "113019",
+        "dataset": "cisco_asa.log",
+        "duration": {{ duration_secs * 1000000000 }},
+        "end": "{{ timestamp.isoformat() }}",
+        "kind": "event",
+        "module": "cisco_asa",
+        "original": "<{{ pri }}>{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ syslog_msg }}",
+        "reason": "{{ reason }}",
+        "severity": 4,
+        "type": ["connection", "end"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "warning",
+        "syslog": {
+            "facility": {
+                "code": 20
+            },
+            "priority": {{ pri }},
+            "severity": {
+                "code": 4
+            }
+        }
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "asa",
+        "type": "firewall",
+        "vendor": "Cisco"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ client_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "bytes": {{ bytes_xmt }},
+        "user": {
+            "group": {
+                "name": "{{ group_policy }}"
+            },
+            "name": "{{ user }}"
+        }
+    },
+    "destination": {
+        "bytes": {{ bytes_rcv }}
+    },
+    "tags": ["cisco-asa", "forwarded"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

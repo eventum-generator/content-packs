@@ -1,0 +1,124 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.sensor_hostname -%}
+{#- Inline icmp-event signatures (JSON samples don't support attribute access) -#}
+{%- set sigs = [
+  {"sid": 1000090, "gid": 1, "rev": 1, "msg": "PROTOCOL-ICMP Echo Reply", "priority": 3, "protocol": "icmp", "service": ""},
+  {"sid": 1000091, "gid": 1, "rev": 1, "msg": "PROTOCOL-ICMP Echo Request", "priority": 3, "protocol": "icmp", "service": ""},
+  {"sid": 1000092, "gid": 1, "rev": 2, "msg": "PROTOCOL-ICMP Time Exceeded in Transit", "priority": 3, "protocol": "icmp", "service": ""},
+  {"sid": 1000093, "gid": 1, "rev": 1, "msg": "PROTOCOL-ICMP Destination Unreachable - Host Unreachable", "priority": 3, "protocol": "icmp", "service": ""}
+] -%}
+{%- set sig = sigs | random -%}
+{#- ICMP direction varies -#}
+{%- set direction = module.rand.weighted_choice(["inbound", "outbound", "internal"], [45, 35, 20]) -%}
+{%- if direction == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+{%- elif direction == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+{%- endif -%}
+{#- ICMP type distribution -#}
+{%- set icmp_types = [
+  {"type": 8, "code": 0, "name": "Echo Request"},
+  {"type": 0, "code": 0, "name": "Echo Reply"},
+  {"type": 3, "code": 0, "name": "Destination Network Unreachable"},
+  {"type": 3, "code": 1, "name": "Destination Host Unreachable"},
+  {"type": 3, "code": 3, "name": "Destination Port Unreachable"},
+  {"type": 11, "code": 0, "name": "Time Exceeded in Transit"},
+  {"type": 5, "code": 0, "name": "Redirect for Network"}
+] -%}
+{%- set icmp = module.rand.weighted_choice(icmp_types, [30, 25, 10, 10, 10, 10, 5]) -%}
+{#- ICMP alerts are almost never blocked -#}
+{%- set action = "allow" -%}
+{%- set event_type = ["allowed"] -%}
+{%- set outcome = "success" -%}
+{%- set ttl = module.rand.weighted_choice([64, 128, 255, 1, 2, 63], [25, 25, 15, 10, 10, 15]) -%}
+{%- set ip_id = module.rand.number.integer(0, 65535) -%}
+{%- set pkt_len = module.rand.number.integer(28, 128) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network", "intrusion_detection"],
+        "dataset": "snort.log",
+        "kind": "alert",
+        "module": "snort",
+        "outcome": "{{ outcome }}",
+        "severity": {{ sig.priority }},
+        "type": {{ event_type | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "alert"
+    },
+    "network": {
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction }}",
+        "iana_number": "1",
+        "transport": "icmp",
+        "type": "ipv4"
+    },
+    "observer": {
+        "ingress": {
+            "interface": {
+                "name": "{{ params.sensor_interface }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "ids",
+        "type": "ids",
+        "vendor": "snort"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "category": "Generic ICMP Event",
+        "description": "{{ sig.msg }}",
+        "id": "{{ sig.sid }}",
+        "version": "{{ sig.rev }}"
+    },
+    "snort": {
+        "gid": {{ sig.gid }},
+        "icmp": {
+            "code": {{ icmp.code }},
+            "type": {{ icmp.type }}
+        },
+        "ip": {
+            "id": {{ ip_id }},
+            "length": {{ pkt_len }},
+            "tos": 0,
+            "ttl": {{ ttl }}
+        }
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}"
+    },
+    "tags": ["forwarded", "snort.log"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

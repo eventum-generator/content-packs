@@ -1,0 +1,152 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.sensor_hostname -%}
+{#- Inline network-scan signatures (JSON samples don't support attribute access) -#}
+{%- set sigs = [
+  {"sid": 469, "gid": 1, "rev": 3, "msg": "PROTOCOL-ICMP PING NMAP", "priority": 3, "protocol": "icmp", "service": ""},
+  {"sid": 1000040, "gid": 1, "rev": 1, "msg": "PROTOCOL-ICMP large ICMP packet - possible exfiltration", "priority": 3, "protocol": "icmp", "service": ""},
+  {"sid": 1000041, "gid": 1, "rev": 2, "msg": "PROTOCOL-ICMP destination unreachable - port unreachable", "priority": 3, "protocol": "icmp", "service": ""},
+  {"sid": 1000042, "gid": 1, "rev": 1, "msg": "INDICATOR-SCAN TCP SYN to multiple ports from single source", "priority": 3, "protocol": "tcp", "service": ""}
+] -%}
+{%- set sig = sigs | random -%}
+{#- Reuse scan source from shared state for multi-stage scanning -#}
+{%- set scan_sources = shared.get('scan_sources', []) -%}
+{%- if scan_sources | length > 0 and module.rand.chance(0.4) -%}
+  {%- set src_ip = scan_sources | random -%}
+{%- else -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- do scan_sources.append(src_ip) -%}
+  {%- if scan_sources | length > 50 -%}{%- do scan_sources.pop(0) -%}{%- endif -%}
+  {%- do shared.set('scan_sources', scan_sources) -%}
+{%- endif -%}
+{%- set dst_host = samples.internal_hosts | random -%}
+{%- set dst_ip = dst_host[0] -%}
+{#- Protocol varies for scans — includes ICMP -#}
+{%- if sig.protocol == "icmp" -%}
+  {%- set transport = "icmp" -%}
+  {%- set iana_number = "1" -%}
+  {%- set src_port = 0 -%}
+  {%- set dst_port = 0 -%}
+  {%- set icmp_type = module.rand.weighted_choice([8, 0, 3, 11], [50, 20, 20, 10]) -%}
+  {%- set icmp_code = 0 if icmp_type in [8, 0, 11] else module.rand.number.integer(0, 3) -%}
+{%- else -%}
+  {%- set transport = "tcp" -%}
+  {%- set iana_number = "6" -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {#- Scan targets common ports -#}
+  {%- set dst_port = module.rand.weighted_choice([22, 80, 443, 445, 3389, 8080, 21, 23, 25, 3306, 5432, 6379, 27017], [12, 15, 15, 10, 8, 5, 5, 5, 5, 5, 5, 5, 5]) -%}
+{%- endif -%}
+{#- Scan alerts are mostly just logged -#}
+{%- set action = module.rand.weighted_choice(["allow", "would_drop"], [75, 25]) -%}
+{%- if action == "allow" -%}
+  {%- set event_type = ["allowed"] -%}
+  {%- set outcome = "success" -%}
+{%- else -%}
+  {%- set event_type = ["denied"] -%}
+  {%- set outcome = "failure" -%}
+{%- endif -%}
+{%- set ttl = module.rand.weighted_choice([64, 128, 48, 52, 255], [25, 25, 20, 15, 15]) -%}
+{%- set ip_id = module.rand.number.integer(0, 65535) -%}
+{%- set pkt_len = module.rand.number.integer(40, 128) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+{% if transport != "icmp" %}
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+{% else %}
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}"
+    },
+{% endif %}
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network", "intrusion_detection"],
+        "dataset": "snort.log",
+        "kind": "alert",
+        "module": "snort",
+        "outcome": "{{ outcome }}",
+        "severity": {{ sig.priority }},
+        "type": {{ event_type | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "alert"
+    },
+    "network": {
+        "community_id": "{{ community_id }}",
+        "direction": "inbound",
+        "iana_number": "{{ iana_number }}",
+        "transport": "{{ transport }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "ingress": {
+            "interface": {
+                "name": "{{ params.sensor_interface }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "ids",
+        "type": "ids",
+        "vendor": "snort"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "category": "Detection of a Network Scan",
+        "description": "{{ sig.msg }}",
+        "id": "{{ sig.sid }}",
+        "version": "{{ sig.rev }}"
+    },
+    "snort": {
+        "gid": {{ sig.gid }},
+        "ip": {
+            "id": {{ ip_id }},
+            "length": {{ pkt_len }},
+            "tos": 0,
+            "ttl": {{ ttl }}
+        }{% if transport == "tcp" %},
+        "tcp": {
+            "ack": 0,
+            "flags": "{{ module.rand.weighted_choice(["**S*****", "***A****", "**SF****", "********"], [50, 20, 15, 15]) }}",
+            "length": 20,
+            "seq": {{ module.rand.number.integer(100000, 4294967295) }},
+            "window": {{ module.rand.weighted_choice([1024, 2048, 3072, 0], [30, 30, 20, 20]) }}
+        }{% else %},
+        "icmp": {
+            "code": {{ icmp_code }},
+            "type": {{ icmp_type }}
+        }{% endif %}
+    },
+{% if transport != "icmp" %}
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+{% else %}
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}"
+    },
+{% endif %}
+    "tags": ["forwarded", "snort.log"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

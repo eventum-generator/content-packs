@@ -1,0 +1,128 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.sensor_hostname -%}
+{#- Inline bad-unknown signatures (JSON samples don't support attribute access) -#}
+{%- set sigs = [
+  {"sid": 1000080, "gid": 1, "rev": 2, "msg": "INDICATOR-COMPROMISE suspicious outbound connection to known bad IP", "priority": 2, "protocol": "tcp", "service": "http"},
+  {"sid": 1000081, "gid": 1, "rev": 1, "msg": "INDICATOR-COMPROMISE self-signed SSL certificate detected", "priority": 2, "protocol": "tcp", "service": "https"},
+  {"sid": 1000082, "gid": 1, "rev": 1, "msg": "INDICATOR-COMPROMISE HTTP response with suspicious content-type", "priority": 2, "protocol": "tcp", "service": "http"},
+  {"sid": 1000083, "gid": 1, "rev": 2, "msg": "INDICATOR-COMPROMISE outbound connection to newly registered domain", "priority": 2, "protocol": "tcp", "service": "http"}
+] -%}
+{%- set sig = sigs | random -%}
+{#- Bad-unknown traffic is a mix — slightly more outbound (compromised hosts) -#}
+{%- set direction = module.rand.weighted_choice(["outbound", "inbound"], [55, 45]) -%}
+{%- if direction == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- else -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+{%- endif -%}
+{%- set dst_port = module.rand.weighted_choice([80, 443, 8080, 8443], [30, 40, 15, 15]) -%}
+{#- Bad-unknown sometimes blocked -#}
+{%- set action = module.rand.weighted_choice(["allow", "would_drop"], [55, 45]) -%}
+{%- if action == "allow" -%}
+  {%- set event_type = ["allowed"] -%}
+  {%- set outcome = "success" -%}
+{%- else -%}
+  {%- set event_type = ["denied"] -%}
+  {%- set outcome = "failure" -%}
+{%- endif -%}
+{%- set tcp_flags = module.rand.weighted_choice(["***AP***", "***A****", "****P***", "**S*****"], [40, 25, 20, 15]) -%}
+{%- set tcp_seq = module.rand.number.integer(100000, 4294967295) -%}
+{%- set tcp_ack = module.rand.number.integer(100000, 4294967295) -%}
+{%- set tcp_win = module.rand.weighted_choice([65535, 29200, 32768, 16384], [30, 30, 20, 20]) -%}
+{%- set ttl = module.rand.weighted_choice([64, 128, 48, 52, 60], [25, 25, 20, 15, 15]) -%}
+{%- set ip_id = module.rand.number.integer(1, 65535) -%}
+{%- set pkt_len = module.rand.number.integer(60, 1200) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network", "intrusion_detection"],
+        "dataset": "snort.log",
+        "kind": "alert",
+        "module": "snort",
+        "outcome": "{{ outcome }}",
+        "severity": {{ sig.priority }},
+        "type": {{ event_type | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "alert"
+    },
+    "network": {
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction }}",
+        "iana_number": "6",
+{% if sig.service %}
+        "protocol": "{{ sig.service }}",
+{% endif %}
+        "transport": "tcp",
+        "type": "ipv4"
+    },
+    "observer": {
+        "ingress": {
+            "interface": {
+                "name": "{{ params.sensor_interface }}"
+            }
+        },
+        "name": "{{ hostname }}",
+        "product": "ids",
+        "type": "ids",
+        "vendor": "snort"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "category": "Potentially Bad Traffic",
+        "description": "{{ sig.msg }}",
+        "id": "{{ sig.sid }}",
+        "version": "{{ sig.rev }}"
+    },
+    "snort": {
+        "gid": {{ sig.gid }},
+        "ip": {
+            "id": {{ ip_id }},
+            "length": {{ pkt_len }},
+            "tos": 0,
+            "ttl": {{ ttl }}
+        },
+        "tcp": {
+            "ack": {{ tcp_ack }},
+            "flags": "{{ tcp_flags }}",
+            "length": 20,
+            "seq": {{ tcp_seq }},
+            "window": {{ tcp_win }}
+        }
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "tags": ["forwarded", "snort.log"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

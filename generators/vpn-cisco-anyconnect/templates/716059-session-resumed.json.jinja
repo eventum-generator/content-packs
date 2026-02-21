@@ -1,0 +1,100 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- Consume from lost_sessions pool for correlation -#}
+{%- set lost_sessions = shared.get('lost_sessions', []) -%}
+{%- if lost_sessions | length > 0 -%}
+  {%- set session = lost_sessions.pop(0) -%}
+  {%- do shared.set('lost_sessions', lost_sessions) -%}
+  {%- set user = session.user -%}
+  {%- set original_ip = session.client_ip -%}
+  {%- set group_policy = session.group_policy -%}
+{%- else -%}
+  {#- Fallback: generate standalone resume -#}
+  {%- set user = (samples.usernames | random).username -%}
+  {%- set original_ip = module.rand.network.ip_v4_public() -%}
+  {%- set group_policy = module.rand.weighted_choice(
+    ["GP_AnyConnect", "GP_FullAccess", "GP_RestrictedAccess", "GP_Contractors"],
+    [40, 25, 20, 15]
+  ) -%}
+{%- endif -%}
+{#- New IP (may differ if user roamed to different network) -#}
+{%- set new_ip = module.rand.weighted_choice(
+  [original_ip, module.rand.network.ip_v4_public()],
+  [60, 40]
+) -%}
+{%- set syslog_msg = "%ASA-6-716059: Group <" ~ group_policy ~ "> User <" ~ user ~ "> IP <" ~ new_ip ~ "> AnyConnect session resumed connection from IP <" ~ new_ip ~ ">." -%}
+{%- set pri = 166 -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "cisco": {
+        "asa": {
+            "message_id": "716059"
+        }
+    },
+    "data_stream": {
+        "dataset": "cisco_asa.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "client-vpn-resumed",
+        "category": ["network"],
+        "code": "716059",
+        "dataset": "cisco_asa.log",
+        "kind": "event",
+        "module": "cisco_asa",
+        "original": "<{{ pri }}>{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ syslog_msg }}",
+        "severity": 6,
+        "type": ["connection", "start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 20
+            },
+            "priority": {{ pri }},
+            "severity": {
+                "code": 6
+            }
+        }
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "asa",
+        "type": "firewall",
+        "vendor": "Cisco"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ new_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "address": "{{ new_ip }}",
+        "ip": "{{ new_ip }}",
+        "user": {
+            "group": {
+                "name": "{{ group_policy }}"
+            },
+            "name": "{{ user }}"
+        }
+    },
+    "tags": ["cisco-asa", "forwarded"]
+}
+{%- do shared.set('record_id', record_id + 1) -%}

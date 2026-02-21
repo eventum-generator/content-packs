@@ -112,4 +112,4 @@ After completing the generator, reflect on the development experience and append
 - **Developer experience** — Were errors hard to debug? Was iteration slow?
 - **Other** — any other additions from you.
 
-Only add **new** proposals not already in the file. Each proposal should include: the problem encountered, a concrete example from this generator, and a suggested improvement.
+Only add **new** proposals not already in the file. Each proposal should include: the problem encountered, a concrete example from this generator, and a suggested improvement. Mark with prefix and emoji whether it is a bug or new feature or something other. 

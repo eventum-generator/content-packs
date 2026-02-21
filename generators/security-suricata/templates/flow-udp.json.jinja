@@ -1,0 +1,123 @@
+{%- set flows = shared.get('flows', []) -%}
+{%- set udp_flows = [] -%}
+{%- for f in flows -%}
+{%- if f.proto == "UDP" -%}{%- do udp_flows.append(f) -%}{%- endif -%}
+{%- endfor -%}
+{%- if udp_flows | length > 0 -%}
+{%- set flow = udp_flows[0] -%}
+{%- do flows.remove(flow) -%}
+{%- do shared.set('flows', flows) -%}
+{%- set fid = flow.flow_id -%}
+{%- set src_ip = flow.src_ip -%}
+{%- set src_port = flow.src_port -%}
+{%- set dst_ip = flow.dst_ip -%}
+{%- set dst_port = flow.dst_port -%}
+{%- set app_proto = flow.app_proto -%}
+{%- set community_id = flow.community_id -%}
+{%- set bytes_ts = flow.bytes_ts -%}
+{%- set bytes_tc = flow.bytes_tc -%}
+{%- set pkts_ts = flow.pkts_ts -%}
+{%- set pkts_tc = flow.pkts_tc -%}
+{%- set flow_start = flow.start -%}
+{%- else -%}
+{%- set fid = shared.get('flow_id_counter', 100000000000000) -%}
+{%- do shared.set('flow_id_counter', fid + module.rand.number.integer(1, 500)) -%}
+{%- set src_ip = params.internal_subnet ~ "." ~ module.rand.number.integer(2, 254) -%}
+{%- set src_port = module.rand.number.integer(32768, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set dst_port_options = [53, 123, 443, 5353, 1194] -%}
+{%- set dst_port = module.rand.choice(dst_port_options) -%}
+{%- set app_proto_weights = {"dns": 60, "failed": 30, "quic": 10} -%}
+{%- set app_proto = module.rand.weighted_choice(app_proto_weights | list, app_proto_weights.values() | list) -%}
+{%- set cid_input = (src_ip ~ ":" ~ (src_port | string) ~ "<>" ~ dst_ip ~ ":" ~ (dst_port | string) ~ "/udp").encode() -%}
+{%- set community_id = "1:" ~ module.base64.b64encode(module.hashlib.sha1(cid_input).digest()).decode() -%}
+{%- set bytes_ts = module.rand.number.integer(60, 5000) -%}
+{%- set bytes_tc = module.rand.number.integer(60, 10000) -%}
+{%- set pkts_ts = module.rand.number.integer(1, 20) -%}
+{%- set pkts_tc = module.rand.number.integer(1, 20) -%}
+{%- set flow_start = (timestamp - module.datetime.timedelta(seconds=module.rand.number.integer(0, 60))).strftime('%Y-%m-%dT%H:%M:%S.%f') ~ "+0000" -%}
+{%- endif -%}
+{%- set state_weights = {"new": 60, "established": 30, "bypassed": 10} -%}
+{%- set flow_state = module.rand.weighted_choice(state_weights | list, state_weights.values() | list) -%}
+{%- set flow_reason = module.rand.weighted_choice(["timeout", "shutdown", "forced"], [70, 20, 10]) -%}
+{%- set flow_end = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ "+0000" -%}
+{%- set age = module.rand.number.integer(0, 60) -%}
+{%- set total_bytes = bytes_ts + bytes_tc -%}
+{%- set total_pkts = pkts_ts + pkts_tc -%}
+{%- if flow_state == "new" -%}
+{%- set event_type_list = ["connection", "start"] -%}
+{%- else -%}
+{%- set event_type_list = ["connection", "end"] -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') }}Z",
+    "agent": {
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "bytes": {{ bytes_tc }},
+        "ip": "{{ dst_ip }}",
+        "packets": {{ pkts_tc }},
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "category": ["network"],
+        "dataset": "suricata.eve",
+        "duration": {{ age * 1000000000 }},
+        "end": "{{ flow_end }}",
+        "kind": "event",
+        "module": "suricata",
+        "start": "{{ flow_start }}",
+        "type": {{ event_type_list | tojson }}
+    },
+    "host": {
+        "hostname": "{{ params.hostname }}",
+        "name": "{{ params.hostname }}"
+    },
+    "network": {
+        "bytes": {{ total_bytes }},
+        "community_id": "{{ community_id }}",
+        "packets": {{ total_pkts }},
+{% if app_proto != "failed" %}
+        "protocol": "{{ app_proto }}",
+{% endif %}
+        "transport": "udp"
+    },
+    "observer": {
+        "hostname": "{{ params.hostname }}",
+        "product": "Suricata",
+        "type": "ids",
+        "vendor": "OISF"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "bytes": {{ bytes_ts }},
+        "ip": "{{ src_ip }}",
+        "packets": {{ pkts_ts }},
+        "port": {{ src_port }}
+    },
+    "suricata": {
+        "eve": {
+            "event_type": "flow",
+            "flow": {
+                "age": {{ age }},
+                "alerted": false,
+                "reason": "{{ flow_reason }}",
+                "state": "{{ flow_state }}"
+            },
+            "flow_id": "{{ fid }}",
+            "in_iface": "{{ params.interface }}"
+        }
+    },
+    "tags": ["suricata"]
+}

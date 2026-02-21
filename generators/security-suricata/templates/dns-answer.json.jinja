@@ -1,0 +1,144 @@
+{%- set dns_queries = shared.get('dns_queries', []) -%}
+{%- if dns_queries | length > 0 -%}
+{%- set query = dns_queries.pop(0) -%}
+{%- do shared.set('dns_queries', dns_queries) -%}
+{%- set fid = query.flow_id -%}
+{%- set src_ip = query.dst_ip -%}
+{%- set src_port = query.dst_port -%}
+{%- set dst_ip = query.src_ip -%}
+{%- set dst_port = query.src_port -%}
+{%- set community_id = query.community_id -%}
+{%- set dns_id = query.dns_id -%}
+{%- set domain = query.rrname -%}
+{%- set rrtype = query.rrtype -%}
+{%- else -%}
+{%- set fid = shared.get('flow_id_counter', 100000000000000) -%}
+{%- do shared.set('flow_id_counter', fid + module.rand.number.integer(1, 500)) -%}
+{%- set src_ip = params.dns_server_ip -%}
+{%- set src_port = 53 -%}
+{%- set dst_ip = params.internal_subnet ~ "." ~ module.rand.number.integer(2, 254) -%}
+{%- set dst_port = module.rand.number.integer(32768, 65535) -%}
+{%- set cid_input = (dst_ip ~ ":" ~ (dst_port | string) ~ "<>" ~ src_ip ~ ":" ~ (src_port | string) ~ "/udp").encode() -%}
+{%- set community_id = "1:" ~ module.base64.b64encode(module.hashlib.sha1(cid_input).digest()).decode() -%}
+{%- set dns_id = module.rand.number.integer(1, 65535) -%}
+{%- set domain = (samples.domains | random).domain -%}
+{%- set rrtype = "A" -%}
+{%- endif -%}
+{%- set rcode_weights = {"NOERROR": 90, "NXDOMAIN": 8, "SERVFAIL": 2} -%}
+{%- set rcode = module.rand.weighted_choice(rcode_weights | list, rcode_weights.values() | list) -%}
+{%- set ttl = module.rand.number.integer(30, 86400) -%}
+{%- if rrtype == "A" -%}
+{%- set rdata = module.rand.network.ip_v4_public() -%}
+{%- elif rrtype == "AAAA" -%}
+{%- set rdata = "2001:db8:" ~ module.rand.string.hex(4) ~ ":" ~ module.rand.string.hex(4) ~ "::1" -%}
+{%- elif rrtype == "CNAME" -%}
+{%- set rdata = "cdn." ~ domain -%}
+{%- elif rrtype == "MX" -%}
+{%- set rdata = "mail." ~ domain -%}
+{%- elif rrtype == "TXT" -%}
+{%- set rdata = "v=spf1 include:_spf." ~ domain ~ " ~all" -%}
+{%- elif rrtype == "SOA" -%}
+{%- set rdata = "ns1." ~ domain ~ " admin." ~ domain -%}
+{%- else -%}
+{%- set rdata = "ns1." ~ domain -%}
+{%- endif -%}
+{%- set resolved_ips = [] -%}
+{%- if rrtype in ["A", "AAAA"] and rcode == "NOERROR" -%}
+{%- do resolved_ips.append(rdata) -%}
+{%- endif -%}
+{%- set header_flags = ["RD", "RA"] -%}
+{%- if rcode == "NOERROR" and module.rand.chance(0.1) -%}
+{%- do header_flags.insert(0, "AA") -%}
+{%- endif -%}
+{%- set related_ips = [src_ip, dst_ip] -%}
+{%- for ip in resolved_ips -%}
+{%- if ip not in related_ips -%}
+{%- do related_ips.append(ip) -%}
+{%- endif -%}
+{%- endfor -%}
+{
+    "@timestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') }}Z",
+    "agent": {
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "dns": {
+{% if rcode == "NOERROR" %}
+        "answers": [
+            {
+                "data": "{{ rdata }}",
+                "name": "{{ domain }}",
+                "ttl": {{ ttl }},
+                "type": "{{ rrtype }}"
+            }
+        ],
+{% endif %}
+        "header_flags": {{ header_flags | tojson }},
+        "id": "{{ dns_id }}",
+        "question": {
+            "name": "{{ domain }}",
+            "type": "{{ rrtype }}"
+        },
+{% if resolved_ips | length > 0 %}
+        "resolved_ip": {{ resolved_ips | tojson }},
+{% endif %}
+        "response_code": "{{ rcode }}",
+        "type": "answer"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "category": ["network"],
+        "dataset": "suricata.eve",
+        "kind": "event",
+        "module": "suricata",
+        "type": ["protocol"]
+    },
+    "host": {
+        "hostname": "{{ params.hostname }}",
+        "name": "{{ params.hostname }}"
+    },
+    "network": {
+        "community_id": "{{ community_id }}",
+        "protocol": "dns",
+        "transport": "udp"
+    },
+    "observer": {
+        "hostname": "{{ params.hostname }}",
+        "product": "Suricata",
+        "type": "ids",
+        "vendor": "OISF"
+    },
+    "related": {
+        "ip": {{ related_ips | tojson }}
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "suricata": {
+        "eve": {
+            "dns": {
+                "id": {{ dns_id }},
+                "rcode": "{{ rcode }}",
+                "rrname": "{{ domain }}",
+                "rrtype": "{{ rrtype }}",
+                "type": "answer",
+                "version": 2
+            },
+            "event_type": "dns",
+            "flow_id": "{{ fid }}",
+            "in_iface": "{{ params.interface }}"
+        }
+    },
+    "tags": ["suricata"]
+}

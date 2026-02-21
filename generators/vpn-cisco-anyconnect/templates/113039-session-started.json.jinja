@@ -1,0 +1,120 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set user = (samples.usernames | random).username -%}
+{%- set client_ip = module.rand.network.ip_v4_public() -%}
+{%- set client_port = module.rand.number.integer(49152, 65535) -%}
+{#- VPN profile selection -#}
+{%- set tunnel_group = module.rand.weighted_choice(
+  ["CorpVPN", "EMPLOYEE_VPN", "CONTRACTOR_VPN", "DefaultWEBVPNGroup"],
+  [50, 30, 15, 5]
+) -%}
+{%- set group_policy = module.rand.weighted_choice(
+  ["GP_AnyConnect", "GP_FullAccess", "GP_RestrictedAccess", "GP_Contractors", "DfltGrpPolicy"],
+  [40, 25, 15, 15, 5]
+) -%}
+{#- Client platform (weighted selection) -#}
+{%- set platform_weights = samples.client_platforms | map(attribute='weight') | list -%}
+{%- set platform = module.rand.weighted_choice(samples.client_platforms, platform_weights) -%}
+{%- set client_name = "Cisco Secure Client" if platform.version.startswith("5") else "Cisco AnyConnect" -%}
+{#- Assigned VPN IP from pool -#}
+{%- set assigned_ip = params.vpn_pool_network ~ "." ~ module.rand.number.integer(10, 254) -%}
+{%- set syslog_msg = "%ASA-6-113039: Group <" ~ group_policy ~ "> User <" ~ user ~ "> IP <" ~ client_ip ~ "> AnyConnect parent session started." -%}
+{%- set pri = 166 -%}
+{#- Push to vpn_sessions pool for correlation with disconnect events -#}
+{%- set vpn_sessions = shared.get('vpn_sessions', []) -%}
+{%- do vpn_sessions.append({
+  "user": user,
+  "client_ip": client_ip,
+  "client_port": client_port,
+  "assigned_ip": assigned_ip,
+  "group_policy": group_policy,
+  "tunnel_group": tunnel_group,
+  "session_start": timestamp.isoformat()
+}) -%}
+{%- if vpn_sessions | length > 100 -%}{%- do vpn_sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('vpn_sessions', vpn_sessions) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "cisco": {
+        "asa": {
+            "message_id": "113039"
+        }
+    },
+    "data_stream": {
+        "dataset": "cisco_asa.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "client-vpn-connected",
+        "category": ["network", "session"],
+        "code": "113039",
+        "dataset": "cisco_asa.log",
+        "kind": "event",
+        "module": "cisco_asa",
+        "original": "<{{ pri }}>{{ timestamp.strftime('%b %d %Y %H:%M:%S') }} {{ hostname }} : {{ syslog_msg }}",
+        "outcome": "success",
+        "severity": 6,
+        "type": ["connection", "start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 20
+            },
+            "priority": {{ pri }},
+            "severity": {
+                "code": 6
+            }
+        }
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "asa",
+        "type": "firewall",
+        "vendor": "Cisco"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ client_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "user": {
+            "group": {
+                "name": "{{ group_policy }}"
+            },
+            "name": "{{ user }}"
+        }
+    },
+    "tags": ["cisco-asa", "forwarded"],
+    "user_agent": {
+        "name": "{{ client_name }}",
+        "original": "{{ client_name }}/{{ platform.version }} ({{ platform.os }} {{ platform.os_version }})",
+        "version": "{{ platform.version }}",
+        "os": {
+            "full": "{{ platform.os }} {{ platform.os_version }}",
+            "name": "{{ platform.os }}",
+            "version": "{{ platform.os_version }}"
+        }
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}
