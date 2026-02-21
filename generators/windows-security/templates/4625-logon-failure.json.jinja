@@ -1,0 +1,146 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set domain_sid = params.domain_sid -%}
+{#- Target user — sometimes a real user, sometimes a non-existent one -#}
+{%- set user_exists = module.rand.weighted_choice([true, false], [60, 40]) -%}
+{%- if user_exists -%}
+  {%- set target_user = (samples.usernames | random).username -%}
+{%- else -%}
+  {%- set target_user = module.rand.choice(["admin", "root", "test", "user", "guest", "backup", "support", "oracle", "postgres", "sa"]) -%}
+{%- endif -%}
+{#- Logon type — network attacks dominate -#}
+{%- set logon_type = module.rand.weighted_choice(["3", "10", "2", "8"], [60, 20, 15, 5]) -%}
+{#- Status / SubStatus pairs with realistic distribution -#}
+{%- set failure_idx = module.rand.weighted_choice([0, 1, 2, 3, 4, 5, 6], [50, 25, 8, 5, 5, 4, 3]) -%}
+{%- set failure_data = [
+  {"status": "0xc000006d", "substatus": "0xc000006a", "reason": "%%2313", "status_text": "This is either due to a bad username or authentication information", "substatus_text": "User logon with misspelled or bad password", "reason_text": "Unknown user name or bad password."},
+  {"status": "0xc000006d", "substatus": "0xc0000064", "reason": "%%2313", "status_text": "This is either due to a bad username or authentication information", "substatus_text": "User logon with misspelled or bad user name", "reason_text": "Unknown user name or bad password."},
+  {"status": "0xc0000234", "substatus": "0xc0000234", "reason": "%%2307", "status_text": "User logon with account locked", "substatus_text": "User logon with account locked", "reason_text": "Account locked out."},
+  {"status": "0xc000006e", "substatus": "0xc0000072", "reason": "%%2310", "status_text": "Unknown user name or bad password", "substatus_text": "User logon to account disabled by administrator", "reason_text": "Account currently disabled."},
+  {"status": "0xc0000193", "substatus": "0xc0000193", "reason": "%%2305", "status_text": "User logon with expired account", "substatus_text": "User logon with expired account", "reason_text": "The specified user account has expired."},
+  {"status": "0xc000015b", "substatus": "0xc000015b", "reason": "%%2308", "status_text": "The user has not been granted the requested logon type at this machine", "substatus_text": "The user has not been granted the requested logon type at this machine", "reason_text": "The user has not been granted the requested logon type at this machine."},
+  {"status": "0xc000006f", "substatus": "0xc000006f", "reason": "%%2311", "status_text": "User logon outside authorized hours", "substatus_text": "User logon outside authorized hours", "reason_text": "Account logon time restriction violation."}
+] -%}
+{%- set failure = failure_data[failure_idx] -%}
+{#- Auth package -#}
+{%- if logon_type == "3" -%}
+  {%- set logon_process = "NtLmSsp " -%}
+  {%- set auth_package = "NTLM" -%}
+{%- elif logon_type == "10" -%}
+  {%- set logon_process = "User32 " -%}
+  {%- set auth_package = "Negotiate" -%}
+{%- else -%}
+  {%- set logon_process = "User32 " -%}
+  {%- set auth_package = "Negotiate" -%}
+{%- endif -%}
+{#- Source IP — failures almost always have a source -#}
+{%- set src_ip = module.rand.weighted_choice(
+  [module.rand.network.ip_v4_public(), module.rand.network.ip_v4_private_c()],
+  [70, 30]
+) -%}
+{%- set src_port = module.rand.number.integer(1024, 65535) -%}
+{%- set workstation = module.rand.choice(["ATTACKER-PC", "UNKNOWN", "PENTEST01"]) ~ "-" ~ module.rand.string.hex(2) | upper -%}
+{%- set logon_type_map = {"2": "Interactive", "3": "Network", "8": "NetworkCleartext", "10": "RemoteInteractive"} -%}
+{%- set logon_type_name = logon_type_map[logon_type] -%}
+{%- set subject_user = hostname ~ "$" -%}
+{%- set process_id = module.rand.number.integer(4, 65535) -%}
+{%- set thread_id = module.rand.number.integer(1, 8191) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "{{ params.agent_version }}"
+    },
+    "event": {
+        "action": "logon-failed",
+        "category": ["authentication"],
+        "code": "4625",
+        "kind": "event",
+        "module": "security",
+        "outcome": "failure",
+        "provider": "Microsoft-Windows-Security-Auditing",
+        "type": ["start"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "source": {
+        "domain": "{{ workstation }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ target_user }}", "{{ subject_user }}"]
+    },
+    "user": {
+        "domain": "{{ domain }}",
+        "id": "S-1-0-0",
+        "name": "{{ target_user }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "computer_name": "{{ fqdn }}",
+        "event_data": {
+            "AuthenticationPackageName": "{{ auth_package }}",
+            "FailureReason": "{{ failure.reason }}",
+            "IpAddress": "{{ src_ip }}",
+            "IpPort": "{{ src_port }}",
+            "KeyLength": "0",
+            "LmPackageName": "-",
+            "LogonProcessName": "{{ logon_process }}",
+            "LogonType": "{{ logon_type }}",
+            "Status": "{{ failure.status }}",
+            "SubStatus": "{{ failure.substatus }}",
+            "SubjectDomainName": "{{ domain }}",
+            "SubjectLogonId": "0x3e7",
+            "SubjectUserName": "{{ subject_user }}",
+            "SubjectUserSid": "S-1-5-18",
+            "TargetDomainName": "{{ domain }}",
+            "TargetUserName": "{{ target_user }}",
+            "TargetUserSid": "S-1-0-0",
+            "TransmittedServices": "-",
+            "WorkstationName": "{{ workstation }}"
+        },
+        "event_id": "4625",
+        "keywords": ["Audit Failure"],
+        "level": "information",
+        "logon": {
+            "failure": {
+                "reason": "{{ failure.reason_text }}",
+                "status": "{{ failure.status_text }}",
+                "sub_status": "{{ failure.substatus_text }}"
+            },
+            "type": "{{ logon_type_name }}"
+        },
+        "opcode": "Info",
+        "outcome": "failure",
+        "process": {
+            "pid": {{ process_id }},
+            "thread": {
+                "id": {{ thread_id }}
+            }
+        },
+        "provider_guid": "{54849625-5478-4994-A5BA-3E3B0328C30D}",
+        "provider_name": "Microsoft-Windows-Security-Auditing",
+        "record_id": "{{ record_id }}",
+        "task": "Logon",
+        "time_created": "{{ timestamp.isoformat() }}"
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

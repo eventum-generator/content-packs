@@ -1,0 +1,185 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set domain_sid = params.domain_sid -%}
+{#- User type selection -#}
+{%- set user_type = module.rand.weighted_choice(["regular", "admin", "service", "computer"], [70, 10, 15, 5]) -%}
+{%- if user_type == "admin" -%}
+  {%- set target_user = "Administrator" -%}
+  {%- set target_rid = 500 -%}
+{%- elif user_type == "service" -%}
+  {%- set target_user = module.rand.choice(["svc_backup", "svc_sql", "svc_iis", "svc_exchange", "svc_scom"]) -%}
+  {%- set target_rid = module.rand.number.integer(2000, 2100) -%}
+{%- elif user_type == "computer" -%}
+  {%- set target_user = (samples.workstations | random).name ~ "$" -%}
+  {%- set target_rid = module.rand.number.integer(1000, 1099) -%}
+{%- else -%}
+  {%- set target_user = (samples.usernames | random).username -%}
+  {%- set target_rid = module.rand.number.integer(1100, 9999) -%}
+{%- endif -%}
+{%- set target_sid = domain_sid ~ "-" ~ target_rid -%}
+{#- Logon type selection with realistic weights -#}
+{%- set logon_type = module.rand.weighted_choice(["3", "5", "10", "2", "7", "4", "8", "9", "11"], [55, 20, 8, 5, 3, 2, 2, 2, 3]) -%}
+{#- Authentication package based on logon type -#}
+{%- if logon_type == "3" -%}
+  {%- set auth_type = module.rand.weighted_choice(["ntlm", "kerberos"], [40, 60]) -%}
+  {%- if auth_type == "ntlm" -%}
+    {%- set logon_process = "NtLmSsp " -%}
+    {%- set auth_package = "NTLM" -%}
+    {%- set lm_package = "NTLM V2" -%}
+    {%- set key_length = "128" -%}
+  {%- else -%}
+    {%- set logon_process = "Kerberos" -%}
+    {%- set auth_package = "Kerberos" -%}
+    {%- set lm_package = "-" -%}
+    {%- set key_length = "0" -%}
+  {%- endif -%}
+{%- elif logon_type == "5" -%}
+  {%- set logon_process = "Advapi  " -%}
+  {%- set auth_package = "Negotiate" -%}
+  {%- set lm_package = "-" -%}
+  {%- set key_length = "0" -%}
+{%- elif logon_type == "10" -%}
+  {%- set logon_process = "User32 " -%}
+  {%- set auth_package = "Negotiate" -%}
+  {%- set lm_package = "-" -%}
+  {%- set key_length = "0" -%}
+{%- elif logon_type in ["2", "7"] -%}
+  {%- set logon_process = "User32 " -%}
+  {%- set auth_package = "Negotiate" -%}
+  {%- set lm_package = "-" -%}
+  {%- set key_length = "0" -%}
+{%- elif logon_type == "9" -%}
+  {%- set logon_process = "seclogo" -%}
+  {%- set auth_package = "Negotiate" -%}
+  {%- set lm_package = "-" -%}
+  {%- set key_length = "0" -%}
+{%- else -%}
+  {%- set logon_process = "Advapi  " -%}
+  {%- set auth_package = "Negotiate" -%}
+  {%- set lm_package = "-" -%}
+  {%- set key_length = "0" -%}
+{%- endif -%}
+{#- Source IP — network logons have a remote IP -#}
+{%- if logon_type in ["3", "8", "10"] -%}
+  {%- set src_ip = module.rand.network.ip_v4_private_c() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set workstation = (samples.workstations | random).name -%}
+{%- else -%}
+  {%- set src_ip = "-" -%}
+  {%- set src_port = "-" -%}
+  {%- set workstation = "-" -%}
+{%- endif -%}
+{#- Logon type name mapping -#}
+{%- set logon_type_map = {"2": "Interactive", "3": "Network", "4": "Batch", "5": "Service", "7": "Unlock", "8": "NetworkCleartext", "9": "NewCredentials", "10": "RemoteInteractive", "11": "CachedInteractive"} -%}
+{%- set logon_type_name = logon_type_map[logon_type] -%}
+{#- Subject is SYSTEM for most logon events -#}
+{%- set subject_user = hostname ~ "$" -%}
+{%- set subject_sid = "S-1-5-18" -%}
+{%- set logon_id = "0x" ~ module.rand.string.hex(5) -%}
+{%- set process_id = module.rand.number.integer(4, 65535) -%}
+{%- set thread_id = module.rand.number.integer(1, 8191) -%}
+{#- Store session for correlation with 4634/4672 -#}
+{%- set sessions = shared.get('sessions', []) -%}
+{%- do sessions.append({"logon_id": logon_id, "user": target_user, "domain": domain, "sid": target_sid, "logon_type": logon_type, "logon_type_name": logon_type_name, "is_admin": user_type == "admin"}) -%}
+{%- if sessions | length > 100 -%}{%- do sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('sessions', sessions) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "{{ params.agent_version }}"
+    },
+    "event": {
+        "action": "logged-in",
+        "category": ["authentication"],
+        "code": "4624",
+        "kind": "event",
+        "module": "security",
+        "outcome": "success",
+        "provider": "Microsoft-Windows-Security-Auditing",
+        "type": ["start"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+{% if src_ip != "-" %}
+    "source": {
+        "domain": "{{ workstation }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+{% endif %}
+    "related": {
+{% if src_ip != "-" %}
+        "ip": ["{{ src_ip }}"],
+{% endif %}
+        "user": ["{{ target_user }}", "{{ subject_user }}"]
+    },
+    "user": {
+        "domain": "{{ domain }}",
+        "id": "{{ target_sid }}",
+        "name": "{{ target_user }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "computer_name": "{{ fqdn }}",
+        "event_data": {
+            "AuthenticationPackageName": "{{ auth_package }}",
+            "ImpersonationLevel": "%%1833",
+            "IpAddress": "{{ src_ip }}",
+            "IpPort": "{{ src_port }}",
+            "KeyLength": "{{ key_length }}",
+            "LmPackageName": "{{ lm_package }}",
+            "LogonGuid": "{{{ module.rand.crypto.uuid4() }}}",
+            "LogonProcessName": "{{ logon_process }}",
+            "LogonType": "{{ logon_type }}",
+            "SubjectDomainName": "{{ domain }}",
+            "SubjectLogonId": "0x3e7",
+            "SubjectUserName": "{{ subject_user }}",
+            "SubjectUserSid": "{{ subject_sid }}",
+            "TargetDomainName": "{{ domain }}",
+            "TargetLogonId": "{{ logon_id }}",
+            "TargetUserName": "{{ target_user }}",
+            "TargetUserSid": "{{ target_sid }}",
+            "TransmittedServices": "-",
+            "VirtualAccount": "%%1843",
+            "ElevatedToken": "%%1843"
+        },
+        "event_id": "4624",
+        "keywords": ["Audit Success"],
+        "level": "information",
+        "logon": {
+            "id": "{{ logon_id }}",
+            "type": "{{ logon_type_name }}"
+        },
+        "opcode": "Info",
+        "outcome": "success",
+        "process": {
+            "pid": {{ process_id }},
+            "thread": {
+                "id": {{ thread_id }}
+            }
+        },
+        "provider_guid": "{54849625-5478-4994-A5BA-3E3B0328C30D}",
+        "provider_name": "Microsoft-Windows-Security-Auditing",
+        "record_id": "{{ record_id }}",
+        "task": "Logon",
+        "time_created": "{{ timestamp.isoformat() }}"
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

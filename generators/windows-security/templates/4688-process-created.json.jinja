@@ -1,0 +1,130 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set domain_sid = params.domain_sid -%}
+{#- Subject user -#}
+{%- set user_type = module.rand.weighted_choice(["system", "regular", "admin", "service"], [40, 35, 10, 15]) -%}
+{%- if user_type == "system" -%}
+  {%- set subject_user = hostname ~ "$" -%}
+  {%- set subject_domain = domain -%}
+  {%- set subject_sid = "S-1-5-18" -%}
+  {%- set subject_logon_id = "0x3e7" -%}
+{%- elif user_type == "admin" -%}
+  {%- set subject_user = "Administrator" -%}
+  {%- set subject_domain = domain -%}
+  {%- set subject_sid = domain_sid ~ "-500" -%}
+  {%- set subject_logon_id = "0x" ~ module.rand.string.hex(5) -%}
+{%- elif user_type == "service" -%}
+  {%- set subject_user = module.rand.choice(["svc_backup", "svc_sql", "svc_iis", "svc_exchange"]) -%}
+  {%- set subject_domain = domain -%}
+  {%- set subject_sid = domain_sid ~ "-" ~ module.rand.number.integer(2000, 2100) -%}
+  {%- set subject_logon_id = "0x" ~ module.rand.string.hex(5) -%}
+{%- else -%}
+  {%- set subject_user = (samples.usernames | random).username -%}
+  {%- set subject_domain = domain -%}
+  {%- set subject_sid = domain_sid ~ "-" ~ module.rand.number.integer(1100, 9999) -%}
+  {%- set subject_logon_id = "0x" ~ module.rand.string.hex(5) -%}
+{%- endif -%}
+{#- Pick a process from sample data -#}
+{%- set proc = samples.processes | random -%}
+{%- set new_process_id = "0x" ~ module.rand.string.hex(3) -%}
+{%- set parent_process_id = "0x" ~ module.rand.string.hex(3) -%}
+{#- Store process in pool for 4689 correlation -#}
+{%- set proc_pool = shared.get('processes', []) -%}
+{%- do proc_pool.append({"pid": new_process_id, "name": proc.name, "path": proc.path, "user": subject_user, "domain": subject_domain, "sid": subject_sid, "logon_id": subject_logon_id}) -%}
+{%- if proc_pool | length > 50 -%}{%- do proc_pool.pop(0) -%}{%- endif -%}
+{%- do shared.set('processes', proc_pool) -%}
+{%- set process_id = module.rand.number.integer(4, 65535) -%}
+{%- set thread_id = module.rand.number.integer(1, 8191) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "{{ params.agent_version }}"
+    },
+    "event": {
+        "action": "created-process",
+        "category": ["process"],
+        "code": "4688",
+        "kind": "event",
+        "module": "security",
+        "outcome": "success",
+        "provider": "Microsoft-Windows-Security-Auditing",
+        "type": ["start"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "process": {
+        "args": {{ proc.command_line.split() | tojson }},
+        "command_line": "{{ proc.command_line }}",
+        "executable": "{{ proc.path }}",
+        "name": "{{ proc.name }}",
+        "parent": {
+            "executable": "{{ proc.parent_path }}",
+            "name": "{{ proc.parent_name }}",
+            "pid": {{ parent_process_id }}
+        },
+        "pid": {{ new_process_id }}
+    },
+    "related": {
+        "user": ["{{ subject_user }}"]
+    },
+    "user": {
+        "domain": "{{ subject_domain }}",
+        "id": "{{ subject_sid }}",
+        "name": "{{ subject_user }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "computer_name": "{{ fqdn }}",
+        "event_data": {
+            "CommandLine": "{{ proc.command_line }}",
+            "MandatoryLabel": "{{ proc.label }}",
+            "NewProcessId": "{{ new_process_id }}",
+            "NewProcessName": "{{ proc.path }}",
+            "ParentProcessName": "{{ proc.parent_path }}",
+            "ProcessId": "{{ parent_process_id }}",
+            "SubjectDomainName": "{{ subject_domain }}",
+            "SubjectLogonId": "{{ subject_logon_id }}",
+            "SubjectUserName": "{{ subject_user }}",
+            "SubjectUserSid": "{{ subject_sid }}",
+            "TargetDomainName": "-",
+            "TargetLogonId": "0x0",
+            "TargetUserName": "-",
+            "TargetUserSid": "S-1-0-0",
+            "TokenElevationType": "{{ proc.token }}"
+        },
+        "event_id": "4688",
+        "keywords": ["Audit Success"],
+        "level": "information",
+        "opcode": "Info",
+        "outcome": "success",
+        "process": {
+            "pid": {{ process_id }},
+            "thread": {
+                "id": {{ thread_id }}
+            }
+        },
+        "provider_guid": "{54849625-5478-4994-A5BA-3E3B0328C30D}",
+        "provider_name": "Microsoft-Windows-Security-Auditing",
+        "record_id": "{{ record_id }}",
+        "task": "Process Creation",
+        "time_created": "{{ timestamp.isoformat() }}"
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}
