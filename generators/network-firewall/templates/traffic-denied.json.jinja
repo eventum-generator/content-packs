@@ -1,0 +1,139 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- Denied traffic is predominantly inbound -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound", "internal"], [70, 20, 10]) -%}
+{#- Pick a service — denied traffic targets riskier ports more often -#}
+{%- set denied_services = [
+  {"port": 23, "protocol": "tcp", "name": "telnet", "application": "telnet"},
+  {"port": 445, "protocol": "tcp", "name": "smb", "application": "ms-ds-smb"},
+  {"port": 3389, "protocol": "tcp", "name": "rdp", "application": "ms-rdp"},
+  {"port": 22, "protocol": "tcp", "name": "ssh", "application": "ssh"},
+  {"port": 1433, "protocol": "tcp", "name": "mssql", "application": "mssql-db"},
+  {"port": 3306, "protocol": "tcp", "name": "mysql", "application": "mysql"},
+  {"port": 443, "protocol": "tcp", "name": "https", "application": "ssl"},
+  {"port": 80, "protocol": "tcp", "name": "http", "application": "web-browsing"},
+  {"port": 8080, "protocol": "tcp", "name": "http-alt", "application": "web-browsing"},
+  {"port": 161, "protocol": "udp", "name": "snmp", "application": "snmp"},
+  {"port": 135, "protocol": "tcp", "name": "msrpc", "application": "msrpc"},
+  {"port": 139, "protocol": "tcp", "name": "netbios-ssn", "application": "netbios-ssn"}
+] -%}
+{%- set denied_weights = [8, 15, 12, 10, 5, 5, 10, 10, 5, 5, 8, 7] -%}
+{%- set service = module.rand.weighted_choice(denied_services, denied_weights) -%}
+{#- Generate IPs based on direction -#}
+{%- if direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "untrust" -%}
+  {%- set egress_zone = "trust" -%}
+  {%- set ingress_iface = "eth0" -%}
+  {%- set egress_iface = "eth1" -%}
+{%- elif direction_type == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "untrust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth0" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "trust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth1" -%}
+{%- endif -%}
+{#- Pick a deny rule -#}
+{%- set deny_rules = samples.firewall_rules | selectattr("action", "equalto", "deny") | list -%}
+{%- set rule = deny_rules | random -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": 0,
+        "ip": "{{ dst_ip }}",
+        "packets": 0,
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "deny",
+        "category": ["network"],
+        "dataset": "firewall.traffic",
+        "duration": 0,
+        "kind": "event",
+        "module": "firewall",
+        "outcome": "failure",
+        "severity": 3,
+        "type": ["connection", "denied"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "warning"
+    },
+    "network": {
+        "application": "{{ service.application }}",
+        "bytes": 0,
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction_type }}",
+        "packets": 1,
+        "transport": "{{ service.protocol }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ egress_iface }}"
+            },
+            "zone": "{{ egress_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_iface }}"
+            },
+            "zone": "{{ ingress_zone }}"
+        },
+        "name": "{{ fqdn }}",
+        "product": "Network Firewall",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Generic"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "id": "{{ rule.id }}",
+        "name": "{{ rule.name }}",
+        "ruleset": "{{ rule.ruleset }}"
+    },
+    "source": {
+        "bytes": {{ module.rand.number.integer(40, 120) }},
+        "ip": "{{ src_ip }}",
+        "packets": 1,
+        "port": {{ src_port }}
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

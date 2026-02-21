@@ -1,0 +1,164 @@
+{%- set hostname = params.hostname -%}
+{%- set server_name = params.server_name -%}
+{#- URL category distribution: assets 40%, pages 30%, api 18%, wellknown 12% -#}
+{%- set url_category = module.rand.weighted_choice(
+  ["asset", "page", "api", "wellknown"],
+  [40, 30, 18, 12]
+) -%}
+{%- set category_urls = [] -%}
+{%- for u in samples.urls if u.category == url_category -%}
+  {%- do category_urls.append(u) -%}
+{%- endfor -%}
+{%- set url_entry = category_urls | random -%}
+{%- set url_path = url_entry.path -%}
+{#- Method: mostly GET; POST only for pages/api that support it -#}
+{%- if url_entry.methods | length > 1 and url_category in ["page", "api"] -%}
+  {%- set method = module.rand.weighted_choice(url_entry.methods, [80] + [20 // (url_entry.methods | length - 1)] * (url_entry.methods | length - 1)) -%}
+{%- else -%}
+  {%- set method = url_entry.methods[0] -%}
+{%- endif -%}
+{#- Success status code distribution -#}
+{%- if method == "HEAD" -%}
+  {%- set status_code = 200 -%}
+{%- elif method == "OPTIONS" -%}
+  {%- set status_code = 204 -%}
+{%- elif method == "POST" and url_category == "api" -%}
+  {%- set status_code = module.rand.weighted_choice([200, 201, 204], [50, 40, 10]) -%}
+{%- elif url_category == "asset" -%}
+  {%- set status_code = module.rand.weighted_choice([200, 304], [70, 30]) -%}
+{%- else -%}
+  {%- set status_code = module.rand.weighted_choice([200, 301, 302, 304, 206], [82, 4, 3, 9, 2]) -%}
+{%- endif -%}
+{#- Response body bytes -#}
+{%- if status_code == 304 or method == "HEAD" -%}
+  {%- set body_bytes = 0 -%}
+{%- elif status_code in [301, 302] -%}
+  {%- set body_bytes = 162 -%}
+{%- elif status_code == 204 -%}
+  {%- set body_bytes = 0 -%}
+{%- else -%}
+  {%- set body_bytes = module.rand.number.integer(url_entry.size_min, url_entry.size_max) -%}
+{%- endif -%}
+{#- HTTP version -#}
+{%- set http_version = module.rand.weighted_choice(["1.1", "2.0", "1.0"], [55, 43, 2]) -%}
+{#- User agent selection with type weighting -#}
+{%- set ua_type = module.rand.weighted_choice(
+  ["browser", "mobile", "bot", "tool", "monitor"],
+  [55, 20, 10, 8, 7]
+) -%}
+{%- set type_uas = [] -%}
+{%- for ua in samples.user_agents if ua.type == ua_type -%}
+  {%- do type_uas.append(ua) -%}
+{%- endfor -%}
+{%- set ua = type_uas | random -%}
+{#- Source IP — vary by user agent type -#}
+{%- if ua.type == "monitor" -%}
+  {%- set src_ip = module.rand.weighted_choice(["10.0.1.10", "10.0.1.11", "10.0.1.12"], [40, 30, 30]) -%}
+{%- elif ua.type == "bot" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+{%- else -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+{%- endif -%}
+{#- Referer -#}
+{%- if ua.type in ["bot", "monitor", "tool"] -%}
+  {%- set referer = "-" -%}
+{%- elif url_category == "asset" -%}
+  {%- set referer = "https://" ~ server_name ~ "/" -%}
+{%- elif url_category == "api" -%}
+  {%- set referer = "https://" ~ server_name ~ "/dashboard" -%}
+{%- else -%}
+  {%- set ref_entry = samples.referers | random -%}
+  {%- set referer = ref_entry.referer | replace("${server_name}", server_name) -%}
+{%- endif -%}
+{#- Remote user (very rarely set) -#}
+{%- set remote_user = "-" -%}
+{#- URL with possible query string -#}
+{%- if url_category == "api" and "search" in url_path -%}
+  {%- set full_url = url_path ~ "?q=" ~ module.rand.choice(["widget", "pricing", "docs", "help", "api"]) -%}
+{%- elif url_category == "page" and url_path == "/search" -%}
+  {%- set full_url = url_path ~ "?q=" ~ module.rand.choice(["getting+started", "installation", "features", "pricing", "help"]) -%}
+{%- else -%}
+  {%- set full_url = url_path -%}
+{%- endif -%}
+{#- Determine event.outcome -#}
+{%- if status_code < 400 -%}
+  {%- set outcome = "success" -%}
+{%- else -%}
+  {%- set outcome = "failure" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "data_stream": {
+        "dataset": "nginx.access",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "category": ["web"],
+        "dataset": "nginx.access",
+        "kind": "event",
+        "module": "nginx",
+        "outcome": "{{ outcome }}",
+        "type": ["access"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}"
+    },
+    "http": {
+        "request": {
+            "method": "{{ method }}"{% if referer != "-" %},
+            "referrer": "{{ referer }}"
+{%- endif %}
+        },
+        "response": {
+            "body": {
+                "bytes": {{ body_bytes }}
+            },
+            "status_code": {{ status_code }}
+        },
+        "version": "{{ http_version }}"
+    },
+    "nginx": {
+        "access": {
+            "remote_ip_list": ["{{ src_ip }}"]
+        }
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}"
+    },
+    "url": {
+        "original": "{{ full_url }}",
+        "path": "{{ url_path }}"{% if "?" in full_url %},
+        "query": "{{ full_url.split('?')[1] }}"
+{%- endif %}
+    },
+    "user_agent": {
+        "device": {
+            "name": "{{ ua.device_name }}"
+        },
+        "name": "{{ ua.ua_name }}",
+        "original": "{{ ua.ua_string }}",
+        "version": "{{ ua.ua_version }}"{% if ua.os_name and ua.os_name != "Other" %},
+        "os": {
+            "name": "{{ ua.os_name }}"{% if ua.os_version %},
+            "version": "{{ ua.os_version }}"
+{%- endif %}
+        }
+{%- endif %}
+    }
+}

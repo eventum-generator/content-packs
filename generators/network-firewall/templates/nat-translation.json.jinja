@@ -1,0 +1,130 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- NAT translation events for source and destination NAT -#}
+{%- set nat_type = module.rand.weighted_choice(["source", "destination"], [80, 20]) -%}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set svc_items = [] -%}
+{%- set svc_weights = [] -%}
+{%- for svc in samples.network_services -%}
+  {%- if svc.protocol == "tcp" -%}
+    {%- do svc_items.append(svc) -%}
+    {%- do svc_weights.append(svc.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(svc_items, svc_weights) -%}
+{%- if nat_type == "source" -%}
+  {#- SNAT: internal client → external server, translated source IP -#}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port -%}
+  {%- set nat_src_ip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set nat_src_port = module.rand.number.integer(10000, 60000) -%}
+  {%- set nat_dst_ip = dst_ip -%}
+  {%- set nat_dst_port = dst_port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "untrust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth0" -%}
+  {%- set direction_type = "outbound" -%}
+{%- else -%}
+  {#- DNAT: external client → public VIP, translated to internal DMZ server -#}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set dst_port = service.port -%}
+  {%- set dmz_host = samples.internal_hosts | selectattr("subnet", "equalto", "dmz") | list | random -%}
+  {%- set nat_src_ip = src_ip -%}
+  {%- set nat_src_port = src_port -%}
+  {%- set nat_dst_ip = dmz_host.ip -%}
+  {%- set nat_dst_port = dst_port -%}
+  {%- set ingress_zone = "untrust" -%}
+  {%- set egress_zone = "dmz" -%}
+  {%- set ingress_iface = "eth0" -%}
+  {%- set egress_iface = "eth2" -%}
+  {%- set direction_type = "inbound" -%}
+{%- endif -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "nat",
+        "category": ["network"],
+        "dataset": "firewall.traffic",
+        "kind": "event",
+        "module": "firewall",
+        "outcome": "success",
+        "severity": 0,
+        "type": ["connection", "info"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational"
+    },
+    "nat": {
+        "type": "{{ nat_type }}",
+{%- if nat_type == "source" %}
+        "source": {
+            "ip": "{{ nat_src_ip }}",
+            "port": {{ nat_src_port }}
+        }
+{%- else %}
+        "destination": {
+            "ip": "{{ nat_dst_ip }}",
+            "port": {{ nat_dst_port }}
+        }
+{%- endif %}
+    },
+    "network": {
+        "application": "{{ service.application }}",
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction_type }}",
+        "transport": "{{ service.protocol }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ egress_iface }}"
+            },
+            "zone": "{{ egress_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_iface }}"
+            },
+            "zone": "{{ ingress_zone }}"
+        },
+        "name": "{{ fqdn }}",
+        "product": "Network Firewall",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Generic"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}", "{{ nat_src_ip }}", "{{ nat_dst_ip }}"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

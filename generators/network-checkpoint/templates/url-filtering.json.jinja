@@ -1,0 +1,127 @@
+{%- set seq = shared.get('sequencenum', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set origin = params.gateway_ip -%}
+{#- url_categories.json: 0=category, 1=action, 2=risk, 3=domains, 4=weight -#}
+{%- set cat_items = [] -%}
+{%- set cat_weights = [] -%}
+{%- for c in samples.url_categories -%}
+  {%- do cat_items.append(c) -%}
+  {%- do cat_weights.append(c[4]) -%}
+{%- endfor -%}
+{%- set cat = module.rand.weighted_choice(cat_items, cat_weights) -%}
+{%- set target_domain = cat[3] | random -%}
+{%- set url_path = module.rand.weighted_choice(
+  ["/", "/index.html", "/login", "/search?q=test", "/api/v1/data", "/images/logo.png", "/news/article"],
+  [30, 10, 15, 15, 10, 10, 10]
+) -%}
+{%- set resource = "https://" ~ target_domain ~ url_path -%}
+{%- set action = cat[1] -%}
+{%- if action == "Accept" -%}
+  {%- set rule_action = "Accept" -%}
+  {%- set event_type_val = ["allowed", "connection"] -%}
+{%- else -%}
+  {%- set rule_action = "Block" -%}
+  {%- set event_type_val = ["connection", "denied"] -%}
+{%- endif -%}
+{#- internal_hosts.csv: 0=ip, 1=hostname, 2=mac, 3=subnet, 4=role -#}
+{%- set ws_hosts = [] -%}
+{%- for h in samples.internal_hosts if h[3] == "workstations" -%}
+  {%- do ws_hosts.append(h) -%}
+{%- endfor -%}
+{%- set src_host = ws_hosts | random -%}
+{%- set src_ip = src_host[0] -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set s_port = module.rand.number.integer(1024, 65535) -%}
+{%- set d_port = module.rand.weighted_choice([443, 80], [80, 20]) -%}
+{%- set ts_hex = "%x" | format(timestamp.timestamp() | int) -%}
+{%- set loguid = "{0x%s,0x%s,0x%s,0x%s}" | format(ts_hex, module.rand.string.hex(1), module.rand.string.hex(8), "c" ~ module.rand.string.hex(7)) -%}
+{#- users.csv: 0=username, 1=full_name, 2=domain, 3=department, 4=role -#}
+{%- set has_user = module.rand.chance(0.4) -%}
+{%- if has_user -%}
+  {%- set user = samples.users | random -%}
+{%- endif -%}
+{%- do shared.set('sequencenum', seq + 1) -%}
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "agent": {
+    "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+    "id": "{{ params.agent_id }}",
+    "name": "{{ hostname }}.{{ domain }}",
+    "type": "filebeat",
+    "version": "{{ params.agent_version }}"
+  },
+  "checkpoint": {
+    "app_risk": {{ cat[2] }},
+    "flags": "417028",
+    "ifdir": "outbound",
+    "ifname": "eth0",
+    "logid": "0",
+    "loguid": "{{ loguid }}",
+    "matched_category": "{{ cat[0] }}",
+    "origin": "{{ origin }}",
+    "origin_sic_name": "cn=cp_mgmt,o={{ hostname }}.{{ domain }}",
+    "parent_rule": "0",
+    "rule_action": "{{ rule_action }}",
+    "sequencenum": {{ seq }},
+    "version": "5",
+    "layer_name": "URL Filtering",
+    "layer_uuid": "e2f3a4b5-c6d7-8901-bcde-f12345678901"
+  },
+  "destination": {
+    "ip": "{{ dst_ip }}",
+    "port": {{ d_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "{{ action }}",
+    "category": ["network"],
+    "dataset": "checkpoint.firewall",
+    "kind": "event",
+    "module": "checkpoint",
+    "outcome": "success",
+    "risk_score": {{ cat[2] }},
+    "sequence": {{ seq }},
+    "type": {{ event_type_val | tojson }}
+  },
+  "host": {
+    "hostname": "{{ hostname }}"
+  },
+  "network": {
+    "application": "{{ 'https' if d_port == 443 else 'http' }}",
+    "direction": "outbound",
+    "iana_number": "6",
+    "name": "URL Filtering",
+    "transport": "tcp"
+  },
+  "observer": {
+    "egress": { "zone": "External" },
+    "ingress": { "zone": "Internal" },
+    "name": "{{ origin }}",
+    "product": "URL Filtering",
+    "type": "firewall",
+    "vendor": "Checkpoint"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]{% if has_user %},
+    "user": ["{{ user[0] }}"]{% endif %}
+  },
+  "rule": {
+    "category": "{{ cat[0] }}"
+  },
+  "source": {
+    "ip": "{{ src_ip }}",
+    "port": {{ s_port }}{% if has_user %},
+    "user": {
+      "name": "{{ user[0] }}",
+      "group": { "name": "{{ user[3] }}" }
+    }{% endif %}
+  },
+  "url": {
+    "domain": "{{ target_domain }}",
+    "original": "{{ resource }}"
+  },
+  "tags": ["checkpoint", "forwarded"]
+}

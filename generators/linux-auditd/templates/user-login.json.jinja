@@ -1,0 +1,136 @@
+{%- set seq = shared.get('sequence', 1000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Try to consume from auth session pool for correlation -#}
+{%- set auth_sessions = shared.get('auth_sessions', []) -%}
+{%- if auth_sessions | length > 0 -%}
+  {%- set session = auth_sessions.pop(0) -%}
+  {%- do shared.set('auth_sessions', auth_sessions) -%}
+  {%- set acct_user = session.user -%}
+  {%- set acct_uid = session.uid -%}
+  {%- set exe = session.exe -%}
+  {%- set terminal = session.terminal -%}
+  {%- set src_ip = session.src_ip -%}
+  {%- set pid = session.pid -%}
+  {%- set ses = session.ses -%}
+  {%- set outcome = "success" -%}
+  {%- set result = "success" -%}
+{%- else -%}
+  {#- Fallback: generate standalone values -#}
+  {%- set u = samples.usernames | random -%}
+  {%- set acct_user = u.username -%}
+  {%- set acct_uid = u.uid | string -%}
+  {%- set outcome = module.rand.weighted_choice(["success", "failure"], [80, 20]) -%}
+  {%- set result = "success" if outcome == "success" else "fail" -%}
+  {%- set login_method = module.rand.weighted_choice(["sshd", "login"], [80, 20]) -%}
+  {%- if login_method == "sshd" -%}
+    {%- set exe = "/usr/sbin/sshd" -%}
+    {%- set terminal = "sshd" -%}
+    {%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_public()], [60, 40]) -%}
+  {%- else -%}
+    {%- set exe = "/bin/login" -%}
+    {%- set terminal = "tty" ~ module.rand.number.integer(1, 6) -%}
+    {%- set src_ip = "?" -%}
+  {%- endif -%}
+  {%- set pid = module.rand.number.integer(1000, 65535) -%}
+  {%- set ses = module.rand.number.integer(1, 9999) | string -%}
+{%- endif -%}
+{#- For failed logins, may use invalid user -#}
+{%- if outcome == "failure" -%}
+  {%- set acct_user = module.rand.weighted_choice([acct_user, "admin", "test", "guest", "oracle", "ftpuser"], [50, 15, 10, 10, 10, 5]) -%}
+  {%- set result = "fail" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "auditbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "auditd": {
+        "data": {
+            "acct": "{{ acct_user }}",
+{% if src_ip != "?" %}
+            "addr": "{{ src_ip }}",
+{% endif %}
+            "hostname": "{{ '?' if src_ip == '?' else '?' }}",
+            "op": "login",
+            "terminal": "{{ terminal }}"
+        },
+        "message_type": "user_login",
+        "result": "{{ result }}",
+        "session": "{{ ses }}",
+        "summary": {
+            "actor": {
+                "primary": "{{ acct_user }}",
+                "secondary": "{{ acct_user }}"
+            },
+            "how": "{{ exe }}",
+            "object": {
+                "primary": "{{ terminal }}",
+{% if src_ip != "?" %}
+                "secondary": "{{ src_ip }}",
+{% endif %}
+                "type": "user-session"
+            }
+        }
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "logged-in",
+        "category": ["authentication"],
+        "kind": "event",
+        "module": "auditd",
+        "outcome": "{{ outcome }}",
+        "sequence": {{ seq }},
+        "type": ["start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ params.os_kernel }}",
+            "name": "{{ params.os_name }}",
+            "platform": "{{ params.os_platform }}",
+            "type": "linux",
+            "version": "{{ params.os_version }}"
+        }
+    },
+{% if src_ip != "?" %}
+    "network": {
+        "direction": "inbound"
+    },
+{% endif %}
+    "process": {
+        "executable": "{{ exe }}",
+        "pid": {{ pid }}
+    },
+{% if src_ip != "?" %}
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+{% endif %}
+    "related": {
+{% if src_ip != "?" %}
+        "ip": ["{{ src_ip }}"],
+{% endif %}
+        "user": ["{{ acct_user }}"]
+    },
+    "service": {
+        "type": "auditd"
+    },
+    "user": {
+        "audit": {
+            "id": "{{ acct_uid }}",
+            "name": "{{ acct_user }}"
+        },
+        "id": "0",
+        "name": "root"
+    }
+}
+{%- do shared.set('sequence', seq + 1) -%}

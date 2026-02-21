@@ -1,0 +1,126 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- Dropped traffic hits the default-deny rule — mostly inbound noise -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound"], [85, 15]) -%}
+{#- Dropped traffic often targets unusual ports (scans, worms, botnets) -#}
+{%- set drop_port_type = module.rand.weighted_choice(["known", "random_high", "random_low"], [30, 40, 30]) -%}
+{%- if drop_port_type == "known" -%}
+  {%- set dst_port = module.rand.weighted_choice([445, 3389, 22, 23, 135, 139, 1433, 5900, 8080, 161], [15, 12, 10, 8, 10, 8, 7, 5, 15, 10]) -%}
+{%- elif drop_port_type == "random_high" -%}
+  {%- set dst_port = module.rand.number.integer(1024, 49151) -%}
+{%- else -%}
+  {%- set dst_port = module.rand.number.integer(1, 1023) -%}
+{%- endif -%}
+{%- set protocol = module.rand.weighted_choice(["tcp", "udp", "icmp"], [65, 25, 10]) -%}
+{#- Generate IPs -#}
+{%- if direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set ingress_zone = "untrust" -%}
+  {%- set egress_zone = "trust" -%}
+  {%- set ingress_iface = "eth0" -%}
+  {%- set egress_iface = "eth1" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "untrust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth0" -%}
+{%- endif -%}
+{%- if protocol == "icmp" -%}
+  {%- set src_port = 0 -%}
+  {%- set dst_port = 0 -%}
+  {%- set icmp_type = module.rand.weighted_choice([8, 0, 3, 11, 13], [50, 20, 15, 10, 5]) -%}
+  {%- set icmp_code = 0 -%}
+{%- endif -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": 0,
+        "ip": "{{ dst_ip }}",
+        "packets": 0,
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "drop",
+        "category": ["network"],
+        "dataset": "firewall.traffic",
+        "duration": 0,
+        "kind": "event",
+        "module": "firewall",
+        "outcome": "failure",
+        "severity": 3,
+        "type": ["connection", "denied"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "warning"
+    },
+    "network": {
+        "bytes": {{ module.rand.number.integer(40, 120) }},
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction_type }}",
+        "packets": 1,
+{%- if protocol == "icmp" %}
+        "transport": "icmp",
+        "type": "ipv4"
+{%- else %}
+        "transport": "{{ protocol }}",
+        "type": "ipv4"
+{%- endif %}
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ egress_iface }}"
+            },
+            "zone": "{{ egress_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_iface }}"
+            },
+            "zone": "{{ ingress_zone }}"
+        },
+        "name": "{{ fqdn }}",
+        "product": "Network Firewall",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Generic"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "id": "9999",
+        "name": "Default-Deny",
+        "ruleset": "default"
+    },
+    "source": {
+        "bytes": {{ module.rand.number.integer(40, 120) }},
+        "ip": "{{ src_ip }}",
+        "packets": 1,
+        "port": {{ src_port }}
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

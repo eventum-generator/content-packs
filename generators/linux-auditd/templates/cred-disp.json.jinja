@@ -1,0 +1,111 @@
+{%- set seq = shared.get('sequence', 1000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Try to consume from cred session pool for correlation -#}
+{%- set cred_sessions = shared.get('cred_sessions', []) -%}
+{%- if cred_sessions | length > 0 -%}
+  {%- set session = cred_sessions.pop(0) -%}
+  {%- do shared.set('cred_sessions', cred_sessions) -%}
+  {%- set acct_user = session.user -%}
+  {%- set acct_uid = session.uid -%}
+  {%- set exe = session.exe -%}
+  {%- set terminal = session.terminal -%}
+  {%- set pid = session.pid -%}
+  {%- set ses = session.ses -%}
+{%- else -%}
+  {#- Fallback: generate standalone values -#}
+  {%- set u = samples.usernames | random -%}
+  {%- set acct_user = u.username -%}
+  {%- set acct_uid = u.uid | string -%}
+  {%- set exe_choice = module.rand.weighted_choice(["sshd", "sudo", "cron", "su"], [40, 30, 20, 10]) -%}
+  {%- set exe_map = {"sshd": "/usr/sbin/sshd", "sudo": "/usr/bin/sudo", "cron": "/usr/sbin/cron", "su": "/usr/bin/su"} -%}
+  {%- set exe = exe_map[exe_choice] -%}
+  {%- if exe_choice == "sshd" -%}
+    {%- set terminal = "ssh" -%}
+  {%- elif exe_choice == "cron" -%}
+    {%- set terminal = "cron" -%}
+  {%- else -%}
+    {%- set terminal = "pts/" ~ module.rand.number.integer(0, 9) -%}
+  {%- endif -%}
+  {%- set pid = module.rand.number.integer(1000, 65535) -%}
+  {%- set ses = module.rand.number.integer(1, 9999) | string -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "auditbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "auditd": {
+        "data": {
+            "acct": "{{ acct_user }}",
+            "grantors": "pam_unix",
+            "op": "PAM:setcred",
+            "terminal": "{{ terminal }}"
+        },
+        "message_type": "cred_disp",
+        "result": "success",
+        "session": "{{ ses }}",
+        "summary": {
+            "actor": {
+                "primary": "{{ acct_user }}",
+                "secondary": "root"
+            },
+            "how": "{{ exe }}",
+            "object": {
+                "primary": "{{ terminal }}",
+                "type": "user-session"
+            }
+        }
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "disposed-credentials",
+        "category": ["authentication"],
+        "kind": "event",
+        "module": "auditd",
+        "outcome": "success",
+        "sequence": {{ seq }},
+        "type": ["info"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ params.os_kernel }}",
+            "name": "{{ params.os_name }}",
+            "platform": "{{ params.os_platform }}",
+            "type": "linux",
+            "version": "{{ params.os_version }}"
+        }
+    },
+    "process": {
+        "executable": "{{ exe }}",
+        "pid": {{ pid }}
+    },
+    "related": {
+        "user": ["{{ acct_user }}"]
+    },
+    "service": {
+        "type": "auditd"
+    },
+    "user": {
+        "audit": {
+            "id": "{{ acct_uid }}",
+            "name": "{{ acct_user }}"
+        },
+        "id": "0",
+        "name": "root",
+        "target": {
+            "id": "{{ acct_uid }}",
+            "name": "{{ acct_user }}"
+        }
+    }
+}
+{%- do shared.set('sequence', seq + 1) -%}

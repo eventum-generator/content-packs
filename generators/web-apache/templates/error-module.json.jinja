@@ -1,0 +1,122 @@
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set tid = module.rand.number.integer(140000000000000, 140999999999999) -%}
+{#- Try to consume from server error pool for correlation with access-server-error -#}
+{%- set server_error_pool = shared.get('server_error_pool', []) -%}
+{%- if server_error_pool | length > 0 -%}
+  {%- set entry = server_error_pool.pop(0) -%}
+  {%- do shared.set('server_error_pool', server_error_pool) -%}
+  {%- set client_ip = entry.client_ip -%}
+  {%- set err_module = entry.module -%}
+  {%- set has_client = true -%}
+{%- else -%}
+  {%- set client_ip = module.rand.network.ip_v4_public() -%}
+  {%- set err_module = module.rand.weighted_choice(
+      ["proxy_http", "cgid", "proxy_fcgi", "core", "ssl", "rewrite", "authz_core"],
+      [25, 15, 20, 15, 10, 10, 5]
+  ) -%}
+  {%- set has_client = module.rand.chance(0.6) -%}
+{%- endif -%}
+{#- Error messages per module -#}
+{%- if err_module == "proxy_http" -%}
+  {%- set messages = [
+      "AH01114: HTTP: failed to make connection to backend: localhost",
+      "AH01102: error reading status line from remote server localhost:8080",
+      "AH01110: error connecting to 127.0.0.1:8080"
+  ] -%}
+{%- elif err_module == "cgid" -%}
+  {%- set messages = [
+      "AH01241: error spawning CGI child process",
+      "AH01257: End of script output before headers",
+      "AH01259: script timed out before returning headers"
+  ] -%}
+{%- elif err_module == "proxy_fcgi" -%}
+  {%- set messages = [
+      "AH01071: Got error 'Primary script unknown'",
+      "AH01067: Failed to read FastCGI header",
+      "AH01068: Got bogus version from FastCGI backend"
+  ] -%}
+{%- elif err_module == "ssl" -%}
+  {%- set messages = [
+      "AH02032: Hostname " ~ domain ~ " provided via SNI, but no hostname found in SSL certificate",
+      "AH01964: Connection to child 0 established (server " ~ domain ~ ":443)",
+      "AH02008: SSL library error 1 in handshake (server " ~ domain ~ ":443)"
+  ] -%}
+{%- elif err_module == "rewrite" -%}
+  {%- set messages = [
+      "AH00670: Options FollowSymLinks and SymLinksIfOwnerMatch are both off, so RewriteRule directive is ignored",
+      "AH01620: Could not open RewriteMap file",
+      "AH01616: Regex pattern match failed"
+  ] -%}
+{%- elif err_module == "authz_core" -%}
+  {%- set messages = [
+      "AH01630: client denied by server configuration",
+      "AH01631: user is not allowed access"
+  ] -%}
+{%- else -%}
+  {%- set messages = [
+      "AH00126: Invalid URI in request",
+      "AH00135: Invalid method in request",
+      "AH00565: request failed: error reading the headers"
+  ] -%}
+{%- endif -%}
+{%- set error_message = messages | random -%}
+{#- Log level — errors and warnings -#}
+{%- set log_level = module.rand.weighted_choice(["error", "warn", "crit"], [70, 25, 5]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "apache": {
+        "error": {
+            "module": "{{ err_module }}"
+        }
+    },
+    "data_stream": {
+        "dataset": "apache.error",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "category": ["web"],
+        "dataset": "apache.error",
+        "kind": "event",
+        "module": "apache",
+        "type": ["error"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "{{ params.os_family }}",
+            "name": "{{ params.os_name }}",
+            "type": "linux"
+        }
+    },
+    "log": {
+        "level": "{{ log_level }}"
+    },
+    "message": "{{ error_message }}",
+    "process": {
+        "pid": {{ pid }},
+        "thread": {
+            "id": {{ tid }}
+        }
+    },
+{% if has_client %}
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}"
+    },
+{% endif %}
+    "tags": ["apache-error"]
+}

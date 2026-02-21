@@ -1,0 +1,154 @@
+{%- set seq = shared.get('sequence', 1000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Pick user context -#}
+{%- set user_type = module.rand.weighted_choice(["root", "regular", "service"], [30, 50, 20]) -%}
+{%- if user_type == "root" -%}
+  {%- set actor_user = "root" -%}
+  {%- set actor_uid = "0" -%}
+  {%- set actor_gid = "0" -%}
+  {%- set actor_group = "root" -%}
+  {%- set auid_user = (samples.usernames | random).username -%}
+  {%- set auid_uid = module.rand.number.integer(1000, 1200) | string -%}
+{%- elif user_type == "service" -%}
+  {%- set svc_accounts = ["www-data", "nobody", "postgres", "redis", "nginx", "daemon"] -%}
+  {%- set svc_uids = ["33", "65534", "114", "115", "101", "1"] -%}
+  {%- set svc_idx = module.rand.number.integer(0, 5) -%}
+  {%- set actor_user = svc_accounts[svc_idx] -%}
+  {%- set actor_uid = svc_uids[svc_idx] -%}
+  {%- set actor_gid = actor_uid -%}
+  {%- set actor_group = actor_user -%}
+  {%- set auid_user = "unset" -%}
+  {%- set auid_uid = "4294967295" -%}
+{%- else -%}
+  {%- set u = samples.usernames | random -%}
+  {%- set actor_user = u.username -%}
+  {%- set actor_uid = u.uid | string -%}
+  {%- set actor_gid = u.gid | string -%}
+  {%- set actor_group = actor_user -%}
+  {%- set auid_user = actor_user -%}
+  {%- set auid_uid = actor_uid -%}
+{%- endif -%}
+{#- Pick a process -#}
+{%- set proc = samples.processes | random -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set ppid = module.rand.number.integer(1, 65535) -%}
+{%- set ses = module.rand.number.integer(1, 9999) | string -%}
+{%- if auid_user == "unset" -%}{%- set ses = "unset" -%}{%- endif -%}
+{%- set tty_type = module.rand.weighted_choice(["pts", "tty", "none"], [60, 10, 30]) -%}
+{%- if tty_type == "pts" -%}
+  {%- set tty = "pts" ~ module.rand.number.integer(0, 9) -%}
+{%- elif tty_type == "tty" -%}
+  {%- set tty = "tty" ~ module.rand.number.integer(1, 6) -%}
+{%- else -%}
+  {%- set tty = "(none)" -%}
+{%- endif -%}
+{#- Build raw messages for event.original -#}
+{%- set epoch = timestamp.timestamp() | round(3) -%}
+{%- set exit_code = module.rand.weighted_choice([0, 1, 2, 126, 127], [90, 4, 3, 1, 2]) -%}
+{%- set success = "yes" if exit_code == 0 else "no" -%}
+{%- set outcome = "success" if exit_code == 0 else "failure" -%}
+{%- set cwd = module.rand.choice(["/root", "/home/" ~ actor_user, "/tmp", "/opt/app", "/var/log", "/etc"]) -%}
+{%- if user_type == "root" -%}{%- set cwd = module.rand.choice(["/root", "/tmp", "/etc", "/var/log"]) -%}{%- endif -%}
+{%- set selinux_context = module.rand.weighted_choice(["unconfined", "system_u:system_r:sshd_t:s0-s0:c0.c1023", "system_u:system_r:init_t:s0"], [70, 20, 10]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "auditbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "auditd": {
+        "data": {
+            "a0": "{{ module.rand.string.hex(7) }}",
+            "a1": "{{ module.rand.string.hex(7) }}",
+            "a2": "{{ module.rand.string.hex(7) }}",
+            "a3": "{{ module.rand.string.hex(7) }}",
+            "arch": "x86_64",
+            "argc": "{{ proc.args | length }}",
+            "exit": "{{ exit_code }}",
+            "success": "{{ success }}",
+            "syscall": "execve",
+            "tty": "{{ tty }}"
+        },
+        "message_type": "syscall",
+        "result": "{{ outcome }}",
+        "session": "{{ ses }}",
+        "summary": {
+            "actor": {
+                "primary": "{{ auid_user }}",
+                "secondary": "{{ actor_user }}"
+            },
+            "how": "{{ proc.exe }}",
+            "object": {
+                "primary": "{{ proc.exe }}",
+                "type": "process"
+            }
+        }
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "executed",
+        "category": ["process"],
+        "kind": "event",
+        "module": "auditd",
+        "outcome": "{{ outcome }}",
+        "sequence": {{ seq }},
+        "type": ["start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ params.os_kernel }}",
+            "name": "{{ params.os_name }}",
+            "platform": "{{ params.os_platform }}",
+            "type": "linux",
+            "version": "{{ params.os_version }}"
+        }
+    },
+    "process": {
+        "args": {{ proc.args | tojson }},
+        "executable": "{{ proc.exe }}",
+        "name": "{{ proc.name }}",
+        "parent": {
+            "executable": "{{ proc.parent_exe }}",
+            "name": "{{ proc.parent_name }}",
+            "pid": {{ ppid }}
+        },
+        "pid": {{ pid }},
+        "working_directory": "{{ cwd }}"
+    },
+    "related": {
+        "user": [{% if auid_user != "unset" and auid_user != actor_user %}"{{ auid_user }}", {% endif %}"{{ actor_user }}"]
+    },
+    "service": {
+        "type": "auditd"
+    },
+    "user": {
+        "audit": {
+            "id": "{{ auid_uid }}",
+            "name": "{{ auid_user }}"
+        },
+        "effective": {
+            "group": {
+                "id": "{{ actor_gid }}",
+                "name": "{{ actor_group }}"
+            },
+            "id": "{{ actor_uid }}",
+            "name": "{{ actor_user }}"
+        },
+        "group": {
+            "id": "{{ actor_gid }}",
+            "name": "{{ actor_group }}"
+        },
+        "id": "{{ actor_uid }}",
+        "name": "{{ actor_user }}"
+    }
+}
+{%- do shared.set('sequence', seq + 1) -%}

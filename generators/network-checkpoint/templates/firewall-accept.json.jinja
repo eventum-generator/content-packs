@@ -1,0 +1,195 @@
+{%- set seq = shared.get('sequencenum', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set origin = params.gateway_ip -%}
+{#- Direction: outbound 60%, inbound 25%, internal 15% -#}
+{%- set direction_type = module.rand.weighted_choice(
+  ["outbound", "inbound", "internal"],
+  [60, 25, 15]
+) -%}
+{#- Select service with weights -#}
+{#- network_services.json: 0=port, 1=proto, 2=name, 3=transport, 4=weight -#}
+{%- set svc_items = [] -%}
+{%- set svc_weights = [] -%}
+{%- for svc in samples.network_services -%}
+  {%- do svc_items.append(svc) -%}
+  {%- do svc_weights.append(svc[4]) -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(svc_items, svc_weights) -%}
+{%- set svc_port = service[0] -%}
+{%- set svc_proto = service[1] -%}
+{%- set svc_name = service[2] -%}
+{%- set svc_transport = service[3] -%}
+{#- Select matching accept rule -#}
+{#- firewall_rules.json: 0=rule_num, 1=rule_name, 2=rule_uid, 3=layer_name, 4=layer_uuid, 5=action, 6=src_zone, 7=dst_zone, 8=service, 9=weight -#}
+{%- set accept_rules = [] -%}
+{%- set accept_weights = [] -%}
+{%- for r in samples.firewall_rules if r[5] == "Accept" -%}
+  {%- do accept_rules.append(r) -%}
+  {%- do accept_weights.append(r[9]) -%}
+{%- endfor -%}
+{%- set rule = module.rand.weighted_choice(accept_rules, accept_weights) -%}
+{#- internal_hosts.csv: 0=ip, 1=hostname, 2=mac, 3=subnet, 4=role -#}
+{%- if direction_type == "outbound" -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set inzone = "Internal" -%}
+  {%- set outzone = "External" -%}
+  {%- set ifname_in = "eth0" -%}
+  {%- set ifname_out = "eth1" -%}
+{%- elif direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dmz_hosts = [] -%}
+  {%- for h in samples.internal_hosts if h[3] == "dmz" -%}
+    {%- do dmz_hosts.append(h) -%}
+  {%- endfor -%}
+  {%- set dst_host = dmz_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+  {%- set inzone = "External" -%}
+  {%- set outzone = "DMZ" -%}
+  {%- set ifname_in = "eth1" -%}
+  {%- set ifname_out = "eth2" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set srv_hosts = [] -%}
+  {%- for h in samples.internal_hosts if h[3] == "servers" -%}
+    {%- do srv_hosts.append(h) -%}
+  {%- endfor -%}
+  {%- set dst_host = srv_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+  {%- set inzone = "Internal" -%}
+  {%- set outzone = "Internal" -%}
+  {%- set ifname_in = "eth0" -%}
+  {%- set ifname_out = "eth0" -%}
+{%- endif -%}
+{%- set s_port = module.rand.number.integer(1024, 65535) -%}
+{%- set has_nat = direction_type == "outbound" and module.rand.chance(0.7) -%}
+{%- if has_nat -%}
+  {%- set nat_src_ip = params.nat_ip -%}
+  {%- set nat_src_port = module.rand.number.integer(10000, 60000) -%}
+{%- endif -%}
+{%- set ts_hex = "%x" | format(timestamp.timestamp() | int) -%}
+{%- set loguid = "{0x%s,0x%s,0x%s,0x%s}" | format(ts_hex, module.rand.string.hex(1), module.rand.string.hex(8), "c" ~ module.rand.string.hex(7)) -%}
+{%- set duration = module.rand.number.integer(1, 300) -%}
+{%- set src_bytes = module.rand.number.integer(200, 500000) -%}
+{%- set dst_bytes = module.rand.number.integer(200, 2000000) -%}
+{%- set src_packets = module.rand.number.integer(1, 1000) -%}
+{%- set dst_packets = module.rand.number.integer(1, 2000) -%}
+{%- set sessions = shared.get('active_sessions', []) -%}
+{%- if direction_type == "outbound" -%}
+  {%- set session_entry = {
+    "src_ip": src_ip,
+    "dst_ip": dst_ip,
+    "s_port": s_port,
+    "d_port": svc_port,
+    "proto": svc_proto,
+    "service_name": svc_name,
+    "inzone": inzone,
+    "outzone": outzone,
+    "timestamp": timestamp.isoformat()
+  } -%}
+  {%- do sessions.append(session_entry) -%}
+  {%- if sessions | length > 100 -%}
+    {%- do sessions.pop(0) -%}
+  {%- endif -%}
+  {%- do shared.set('active_sessions', sessions) -%}
+{%- endif -%}
+{%- do shared.set('sequencenum', seq + 1) -%}
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "agent": {
+    "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+    "id": "{{ params.agent_id }}",
+    "name": "{{ hostname }}.{{ domain }}",
+    "type": "filebeat",
+    "version": "{{ params.agent_version }}"
+  },
+  "checkpoint": {
+    "flags": "417028",
+    "ifdir": "{{ 'inbound' if direction_type == 'inbound' else 'outbound' }}",
+    "ifname": "{{ ifname_in }}",
+    "logid": "0",
+    "loguid": "{{ loguid }}",
+    "match_id": "{{ rule[0] }}",
+    "origin": "{{ origin }}",
+    "origin_sic_name": "cn=cp_mgmt,o={{ hostname }}.{{ domain }}",
+    "parent_rule": "0",
+    "rule": "{{ rule[0] }}",
+    "rule_action": "Accept",
+    "rule_uid": "{{ rule[2] }}",
+    "sequencenum": {{ seq }},
+    "version": "5",
+    "layer_name": "{{ rule[3] }}",
+    "layer_uuid": "{{ rule[4] }}"{% if has_nat %},
+    "xlatesrc": "{{ nat_src_ip }}",
+    "xlatedst": "0.0.0.0",
+    "xlatesport": {{ nat_src_port }},
+    "xlatedport": 0,
+    "nat_rulenum": 1{% endif %}
+  },
+  "destination": {
+    "ip": "{{ dst_ip }}",
+    "port": {{ svc_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "Accept",
+    "category": ["network"],
+    "dataset": "checkpoint.firewall",
+    "duration": {{ duration * 1000000000 }},
+    "kind": "event",
+    "module": "checkpoint",
+    "outcome": "success",
+    "sequence": {{ seq }},
+    "type": ["allowed", "connection"]
+  },
+  "host": {
+    "hostname": "{{ hostname }}"
+  },
+  "network": {
+    "application": "{{ svc_name }}",
+    "bytes": {{ src_bytes + dst_bytes }},
+    "direction": "{{ direction_type }}",
+    "iana_number": "{{ svc_proto }}",
+    "name": "{{ rule[3] }}",
+    "packets": {{ src_packets + dst_packets }},
+    "transport": "{{ svc_transport }}"
+  },
+  "observer": {
+    "egress": {
+      "interface": { "name": "{{ ifname_out }}" },
+      "zone": "{{ outzone }}"
+    },
+    "ingress": {
+      "interface": { "name": "{{ ifname_in }}" },
+      "zone": "{{ inzone }}"
+    },
+    "name": "{{ origin }}",
+    "product": "VPN-1 & FireWall-1",
+    "type": "firewall",
+    "vendor": "Checkpoint"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"{% if has_nat %}, "{{ nat_src_ip }}"{% endif %}]
+  },
+  "rule": {
+    "id": "{{ rule[0] }}",
+    "name": "{{ rule[1] }}",
+    "uuid": "{{ rule[2] }}"
+  },
+  "source": {
+    "bytes": {{ src_bytes }},
+    "ip": "{{ src_ip }}",
+    "packets": {{ src_packets }},
+    "port": {{ s_port }}{% if has_nat %},
+    "nat": {
+      "ip": "{{ nat_src_ip }}",
+      "port": {{ nat_src_port }}
+    }{% endif %}
+  },
+  "tags": ["checkpoint", "forwarded"]
+}

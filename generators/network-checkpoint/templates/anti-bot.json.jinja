@@ -1,0 +1,105 @@
+{%- set seq = shared.get('sequencenum', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set origin = params.gateway_ip -%}
+{#- malware_signatures.json: 0=name, 1=family, 2=type, 3=action_desc, 4=severity, 5=confidence, 6=blade, 7=weight -#}
+{%- set bot_sigs = [] -%}
+{%- set bot_weights = [] -%}
+{%- for s in samples.malware_signatures if s[6] == "anti_bot" -%}
+  {%- do bot_sigs.append(s) -%}
+  {%- do bot_weights.append(s[7]) -%}
+{%- endfor -%}
+{%- set sig = module.rand.weighted_choice(bot_sigs, bot_weights) -%}
+{%- set action = module.rand.weighted_choice(["Prevent", "Detect", "Redirect"], [60, 30, 10]) -%}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set src_ip = src_host[0] -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set s_port = module.rand.number.integer(1024, 65535) -%}
+{%- set d_port = module.rand.weighted_choice([443, 80, 8080, 53], [40, 30, 15, 15]) -%}
+{%- set proto = 6 if d_port != 53 else 17 -%}
+{%- set transport = "tcp" if proto == 6 else "udp" -%}
+{%- set c2_domains = ["c2-panel.example.net", "botnet-ctrl.example.org", "mal-update.example.com", "data-exfil.example.net"] -%}
+{%- set resource = "https://" ~ (c2_domains | random) ~ "/" ~ module.rand.string.hex(8) -%}
+{%- set severity_map = {"Critical": 4, "High": 3, "Medium": 2, "Low": 1} -%}
+{%- set severity_num = severity_map.get(sig[4], 2) -%}
+{%- set ts_hex = "%x" | format(timestamp.timestamp() | int) -%}
+{%- set loguid = "{0x%s,0x%s,0x%s,0x%s}" | format(ts_hex, module.rand.string.hex(1), module.rand.string.hex(8), "c" ~ module.rand.string.hex(7)) -%}
+{%- do shared.set('sequencenum', seq + 1) -%}
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "agent": {
+    "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+    "id": "{{ params.agent_id }}",
+    "name": "{{ hostname }}.{{ domain }}",
+    "type": "filebeat",
+    "version": "{{ params.agent_version }}"
+  },
+  "checkpoint": {
+    "confidence_level": "{{ sig[5] }}",
+    "flags": "147456",
+    "ifdir": "outbound",
+    "ifname": "eth0",
+    "logid": "0",
+    "loguid": "{{ loguid }}",
+    "malware_action": "{{ sig[3] }}",
+    "malware_family": "{{ sig[1] }}",
+    "origin": "{{ origin }}",
+    "origin_sic_name": "cn=cp_mgmt,o={{ hostname }}.{{ domain }}",
+    "protection_name": "{{ sig[0] }}",
+    "protection_type": "Anti-Bot",
+    "rule_action": "{{ action }}",
+    "sequencenum": {{ seq }},
+    "severity": "{{ sig[4] }}",
+    "version": "5"
+  },
+  "destination": {
+    "ip": "{{ dst_ip }}",
+    "port": {{ d_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "{{ action }}",
+    "category": ["network", "malware"],
+    "dataset": "checkpoint.firewall",
+    "kind": "alert",
+    "module": "checkpoint",
+    "outcome": "success",
+    "sequence": {{ seq }},
+    "severity": {{ severity_num }},
+    "type": ["connection"{% if action == "Prevent" %}, "denied"{% endif %}]
+  },
+  "host": {
+    "hostname": "{{ hostname }}"
+  },
+  "network": {
+    "application": "{{ 'dns' if d_port == 53 else 'https' if d_port == 443 else 'http' }}",
+    "direction": "outbound",
+    "iana_number": "{{ proto }}",
+    "transport": "{{ transport }}"
+  },
+  "observer": {
+    "egress": { "zone": "External" },
+    "ingress": { "zone": "Internal" },
+    "name": "{{ origin }}",
+    "product": "Anti Malware",
+    "type": "firewall",
+    "vendor": "Checkpoint"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+  },
+  "rule": {
+    "description": "{{ sig[3] }}",
+    "name": "{{ sig[0] }}"
+  },
+  "source": {
+    "ip": "{{ src_ip }}",
+    "port": {{ s_port }}
+  },
+  "url": {
+    "original": "{{ resource }}"
+  },
+  "tags": ["checkpoint", "forwarded"]
+}

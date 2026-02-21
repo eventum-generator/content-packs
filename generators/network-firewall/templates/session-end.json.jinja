@@ -1,0 +1,147 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- Consume from active_sessions pool for correlation -#}
+{%- set active_sessions = shared.get('active_sessions', []) -%}
+{%- if active_sessions | length > 0 -%}
+  {%- set session = active_sessions.pop(0) -%}
+  {%- do shared.set('active_sessions', active_sessions) -%}
+  {%- set src_ip = session.src_ip -%}
+  {%- set src_port = session.src_port -%}
+  {%- set dst_ip = session.dst_ip -%}
+  {%- set dst_port = session.dst_port -%}
+  {%- set protocol = session.protocol -%}
+  {%- set application = session.application -%}
+  {%- set rule_id = session.rule_id -%}
+  {%- set rule_name = session.rule_name -%}
+  {%- set rule_ruleset = session.rule_ruleset -%}
+  {%- set ingress_zone = session.ingress_zone -%}
+  {%- set egress_zone = session.egress_zone -%}
+  {%- set ingress_iface = session.ingress_iface -%}
+  {%- set egress_iface = session.egress_iface -%}
+  {%- set direction_type = session.direction -%}
+  {%- set community_id = session.community_id -%}
+  {%- set session_id = session.session_id -%}
+  {%- set has_nat = session.get("nat_src_ip") is not none -%}
+  {%- if has_nat -%}
+    {%- set nat_src_ip = session.nat_src_ip -%}
+    {%- set nat_src_port = session.nat_src_port -%}
+  {%- endif -%}
+{%- else -%}
+  {#- Fallback: generate standalone session-end -#}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = module.rand.weighted_choice([443, 80, 53, 22, 8443], [40, 20, 15, 10, 15]) -%}
+  {%- set protocol = "tcp" -%}
+  {%- set application = "ssl" -%}
+  {%- set rule_id = "1001" -%}
+  {%- set rule_name = "Allow-HTTPS-Out" -%}
+  {%- set rule_ruleset = "outbound" -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "untrust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth0" -%}
+  {%- set direction_type = "outbound" -%}
+  {%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+  {%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+  {%- set has_nat = false -%}
+{%- endif -%}
+{#- End reason -#}
+{%- set end_reason = module.rand.weighted_choice(["tcp-fin", "tcp-rst-from-client", "tcp-rst-from-server", "aged-out", "policy-deny"], [50, 15, 10, 20, 5]) -%}
+{#- Session metrics -#}
+{%- set duration_ms = module.rand.number.integer(100, 600000) -%}
+{%- set src_bytes = module.rand.number.integer(500, 1000000) -%}
+{%- set dst_bytes = module.rand.number.integer(500, 5000000) -%}
+{%- set src_packets = module.rand.number.integer(5, 2000) -%}
+{%- set dst_packets = module.rand.number.integer(5, 5000) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": {{ dst_bytes }},
+        "ip": "{{ dst_ip }}",
+        "packets": {{ dst_packets }},
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "session-end",
+        "category": ["network"],
+        "dataset": "firewall.session",
+        "duration": {{ duration_ms * 1000000 }},
+        "kind": "event",
+        "module": "firewall",
+        "outcome": "success",
+        "reason": "{{ end_reason }}",
+        "severity": 0,
+        "type": ["connection", "end"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational"
+    },
+    "network": {
+        "application": "{{ application }}",
+        "bytes": {{ src_bytes + dst_bytes }},
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction_type }}",
+        "packets": {{ src_packets + dst_packets }},
+        "transport": "{{ protocol }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ egress_iface }}"
+            },
+            "zone": "{{ egress_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_iface }}"
+            },
+            "zone": "{{ ingress_zone }}"
+        },
+        "name": "{{ fqdn }}",
+        "product": "Network Firewall",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Generic"
+    },
+{%- if has_nat %}
+    "nat": {
+        "source": {
+            "ip": "{{ nat_src_ip }}",
+            "port": {{ nat_src_port }}
+        }
+    },
+{%- endif %}
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"{% if has_nat %}, "{{ nat_src_ip }}"{% endif %}]
+    },
+    "rule": {
+        "id": "{{ rule_id }}",
+        "name": "{{ rule_name }}",
+        "ruleset": "{{ rule_ruleset }}"
+    },
+    "source": {
+        "bytes": {{ src_bytes }},
+        "ip": "{{ src_ip }}",
+        "packets": {{ src_packets }},
+        "port": {{ src_port }}
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

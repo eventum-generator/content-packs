@@ -1,0 +1,147 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Pick an active process (non-consuming) or fallback -#}
+{%- set proc_pool = shared.get('proc_pool', []) -%}
+{%- if proc_pool | length > 0 -%}
+  {%- set active_proc = proc_pool | random -%}
+  {%- set process_guid = active_proc.guid -%}
+  {%- set process_id = active_proc.pid -%}
+  {%- set process_image = active_proc.image -%}
+  {%- set process_name = active_proc.name -%}
+  {%- set user_name = active_proc.user_name -%}
+  {%- set user_domain = active_proc.user_domain -%}
+{%- else -%}
+  {%- set proc = samples.processes | random -%}
+  {%- set process_guid = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
+  {%- set process_id = module.rand.number.integer(100, 65535) -%}
+  {%- set process_image = proc.path -%}
+  {%- set process_name = proc.name -%}
+  {%- set user_name = (samples.usernames | random).username -%}
+  {%- set user_domain = domain -%}
+{%- endif -%}
+{#- DNS query data -#}
+{%- set dns = samples.dns_domains | random -%}
+{%- set query_success = module.rand.weighted_choice(["success", "nxdomain"], [95, 5]) -%}
+{%- if query_success == "success" and dns.ip -%}
+  {%- set query_status = "0" -%}
+  {%- set dns_status = "SUCCESS" -%}
+  {%- if dns.cname -%}
+    {%- set query_results = "type: 5 " ~ dns.cname ~ ";" ~ dns.ip ~ ";" -%}
+  {%- else -%}
+    {%- set query_results = dns.ip ~ ";" -%}
+  {%- endif -%}
+  {%- set resolved_ip = dns.ip -%}
+{%- else -%}
+  {%- set query_status = "9003" -%}
+  {%- set dns_status = "DNS_ERROR_RCODE_NAME_ERROR" -%}
+  {%- set query_results = "-" -%}
+  {%- set resolved_ip = "" -%}
+{%- endif -%}
+{%- set sysmon_pid = module.rand.number.integer(1000, 5000) -%}
+{%- set sysmon_tid = module.rand.number.integer(1000, 8000) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "dns": {
+        "question": {
+            "name": "{{ dns.domain }}",
+            "registered_domain": "{{ dns.registered_domain }}",
+            "subdomain": "{{ dns.subdomain }}",
+            "top_level_domain": "{{ dns.tld }}"
+        }{% if resolved_ip %},
+        "resolved_ip": ["{{ resolved_ip }}"]{% endif %}{% if dns.cname and query_success == "success" %},
+        "answers": [
+            {"type": "CNAME", "data": "{{ dns.cname }}"},
+            {"type": "A", "data": "{{ dns.ip }}"}
+        ]{% elif resolved_ip %},
+        "answers": [
+            {"type": "A", "data": "{{ resolved_ip }}"}
+        ]{% endif %}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "DNSEvent (DNS query)",
+        "category": ["network"],
+        "code": "22",
+        "created": "{{ timestamp.isoformat() }}",
+        "kind": "event",
+        "module": "sysmon",
+        "provider": "Microsoft-Windows-Sysmon",
+        "type": ["connection", "protocol", "info"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "network": {
+        "protocol": "dns"
+    },
+    "process": {
+        "entity_id": "{{ process_guid }}",
+        "executable": "{{ process_image }}",
+        "name": "{{ process_name }}",
+        "pid": {{ process_id }}
+    },
+    "related": {
+{% if dns.cname and query_success == "success" %}
+        "hosts": ["{{ dns.cname }}", "{{ dns.domain }}"],
+{% else %}
+        "hosts": ["{{ dns.domain }}"],
+{% endif %}
+{% if resolved_ip %}
+        "ip": ["{{ resolved_ip }}"],
+{% endif %}
+        "user": ["{{ user_name }}"]
+    },
+    "sysmon": {
+        "dns": {
+            "status": "{{ dns_status }}"
+        }
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "id": "S-1-5-18",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Microsoft-Windows-Sysmon/Operational",
+        "computer_name": "{{ fqdn }}",
+        "event_data": {
+            "QueryName": "{{ dns.domain }}",
+            "QueryResults": "{{ query_results }}",
+            "QueryStatus": "{{ query_status }}"
+        },
+        "event_id": "22",
+        "opcode": "Info",
+        "process": {
+            "pid": {{ sysmon_pid }},
+            "thread": {
+                "id": {{ sysmon_tid }}
+            }
+        },
+        "provider_guid": "{5770385f-c22a-43e0-bf4c-06f5698ffbd9}",
+        "provider_name": "Microsoft-Windows-Sysmon",
+        "record_id": "{{ record_id }}",
+        "user": {
+            "identifier": "S-1-5-18"
+        },
+        "version": 5
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

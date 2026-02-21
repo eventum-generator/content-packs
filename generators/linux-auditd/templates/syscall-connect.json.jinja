@@ -1,0 +1,165 @@
+{%- set seq = shared.get('sequence', 1000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Pick user context -#}
+{%- set user_type = module.rand.weighted_choice(["root", "regular", "service"], [20, 30, 50]) -%}
+{%- if user_type == "root" -%}
+  {%- set actor_user = "root" -%}
+  {%- set actor_uid = "0" -%}
+  {%- set actor_gid = "0" -%}
+  {%- set actor_group = "root" -%}
+  {%- set auid_user = "root" -%}
+  {%- set auid_uid = "0" -%}
+{%- elif user_type == "service" -%}
+  {%- set svc_accounts = ["www-data", "nobody", "postgres", "nginx"] -%}
+  {%- set svc_uids = ["33", "65534", "114", "101"] -%}
+  {%- set svc_idx = module.rand.number.integer(0, 3) -%}
+  {%- set actor_user = svc_accounts[svc_idx] -%}
+  {%- set actor_uid = svc_uids[svc_idx] -%}
+  {%- set actor_gid = actor_uid -%}
+  {%- set actor_group = actor_user -%}
+  {%- set auid_user = "unset" -%}
+  {%- set auid_uid = "4294967295" -%}
+{%- else -%}
+  {%- set u = samples.usernames | random -%}
+  {%- set actor_user = u.username -%}
+  {%- set actor_uid = u.uid | string -%}
+  {%- set actor_gid = u.gid | string -%}
+  {%- set actor_group = actor_user -%}
+  {%- set auid_user = actor_user -%}
+  {%- set auid_uid = actor_uid -%}
+{%- endif -%}
+{#- Pick connection target -#}
+{%- set conn_type = module.rand.weighted_choice(["external", "internal", "localhost"], [40, 40, 20]) -%}
+{%- if conn_type == "external" -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = module.rand.weighted_choice([443, 80, 8080, 5432, 6379, 53, 9200, 9300], [40, 20, 10, 10, 5, 5, 5, 5]) -%}
+{%- elif conn_type == "internal" -%}
+  {%- set dst_ip = module.rand.network.ip_v4_private_c() -%}
+  {%- set dst_port = module.rand.weighted_choice([5432, 6379, 9200, 3306, 27017, 8080, 8443, 9090], [20, 15, 15, 15, 10, 10, 10, 5]) -%}
+{%- else -%}
+  {%- set dst_ip = "127.0.0.1" -%}
+  {%- set dst_port = module.rand.weighted_choice([5432, 6379, 3306, 8080, 9090, 11211], [25, 25, 15, 15, 10, 10]) -%}
+{%- endif -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set ppid = module.rand.number.integer(1, 65535) -%}
+{%- set ses = module.rand.number.integer(1, 9999) | string -%}
+{%- if auid_user == "unset" -%}{%- set ses = "unset" -%}{%- endif -%}
+{%- set tty = module.rand.weighted_choice(["pts" ~ module.rand.number.integer(0, 9), "(none)"], [30, 70]) -%}
+{%- set comm = module.rand.weighted_choice(["curl", "wget", "python3", "node", "nginx", "postgres", "redis-server", "java", "dockerd"], [15, 10, 15, 10, 15, 10, 10, 10, 5]) -%}
+{%- set exe_map = {"curl": "/usr/bin/curl", "wget": "/usr/bin/wget", "python3": "/usr/bin/python3", "node": "/usr/bin/node", "nginx": "/usr/sbin/nginx", "postgres": "/usr/lib/postgresql/15/bin/postgres", "redis-server": "/usr/bin/redis-server", "java": "/usr/bin/java", "dockerd": "/usr/bin/dockerd"} -%}
+{%- set exe = exe_map[comm] -%}
+{%- set exit_code = module.rand.weighted_choice([0, -111, -113, -110], [85, 8, 4, 3]) -%}
+{%- set success = "yes" if exit_code == 0 else "no" -%}
+{%- set outcome = "success" if exit_code == 0 else "failure" -%}
+{%- if exit_code < 0 -%}{%- set exit_code = exit_code * -1 -%}{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "auditbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "auditd": {
+        "data": {
+            "a0": "{{ module.rand.string.hex(7) }}",
+            "a1": "{{ module.rand.string.hex(7) }}",
+            "a2": "{{ module.rand.string.hex(7) }}",
+            "a3": "{{ module.rand.string.hex(7) }}",
+            "arch": "x86_64",
+            "exit": "{{ exit_code }}",
+            "socket": {
+                "addr": "{{ dst_ip }}",
+                "family": "{{ 'inet' if dst_ip != '127.0.0.1' or module.rand.chance(0.9) else 'unix' }}",
+                "port": "{{ dst_port }}"
+            },
+            "success": "{{ success }}",
+            "syscall": "connect",
+            "tty": "{{ tty }}"
+        },
+        "message_type": "syscall",
+        "result": "{{ outcome }}",
+        "session": "{{ ses }}",
+        "summary": {
+            "actor": {
+                "primary": "{{ auid_user }}",
+                "secondary": "{{ actor_user }}"
+            },
+            "how": "{{ exe }}",
+            "object": {
+                "primary": "{{ dst_ip }}:{{ dst_port }}",
+                "type": "socket"
+            }
+        }
+    },
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "connected-to",
+        "category": ["network"],
+        "kind": "event",
+        "module": "auditd",
+        "outcome": "{{ outcome }}",
+        "sequence": {{ seq }},
+        "type": ["connection", "start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ params.os_kernel }}",
+            "name": "{{ params.os_name }}",
+            "platform": "{{ params.os_platform }}",
+            "type": "linux",
+            "version": "{{ params.os_version }}"
+        }
+    },
+    "network": {
+        "direction": "egress"
+    },
+    "process": {
+        "executable": "{{ exe }}",
+        "name": "{{ comm }}",
+        "parent": {
+            "pid": {{ ppid }}
+        },
+        "pid": {{ pid }}
+    },
+    "related": {
+        "ip": ["{{ dst_ip }}"],
+        "user": [{% if auid_user != "unset" and auid_user != actor_user %}"{{ auid_user }}", {% endif %}"{{ actor_user }}"]
+    },
+    "service": {
+        "type": "auditd"
+    },
+    "user": {
+        "audit": {
+            "id": "{{ auid_uid }}",
+            "name": "{{ auid_user }}"
+        },
+        "effective": {
+            "group": {
+                "id": "{{ actor_gid }}",
+                "name": "{{ actor_group }}"
+            },
+            "id": "{{ actor_uid }}",
+            "name": "{{ actor_user }}"
+        },
+        "group": {
+            "id": "{{ actor_gid }}",
+            "name": "{{ actor_group }}"
+        },
+        "id": "{{ actor_uid }}",
+        "name": "{{ actor_user }}"
+    }
+}
+{%- do shared.set('sequence', seq + 1) -%}

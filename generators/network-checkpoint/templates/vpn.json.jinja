@@ -1,0 +1,128 @@
+{%- set seq = shared.get('sequencenum', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set origin = params.gateway_ip -%}
+{%- set vpn_action = module.rand.weighted_choice(["Encrypt", "Decrypt", "Key Install"], [40, 40, 20]) -%}
+{%- set peer_gateways = ["203.0.113.10", "203.0.113.20", "198.51.100.50", "192.0.2.100"] -%}
+{%- set peer_gateway = peer_gateways | random -%}
+{%- set community = module.rand.choice(["Site-to-Site-VPN", "Remote-Access-VPN", "Branch-Office-VPN"]) -%}
+{%- set ike_version = module.rand.weighted_choice(["IKEv2", "IKEv1"], [75, 25]) -%}
+{%- set enc_methods = module.rand.weighted_choice(["AES-256 + SHA256", "AES-128 + SHA1", "AES-256 + SHA384"], [50, 30, 20]) -%}
+{%- set sessions = shared.get('active_sessions', []) -%}
+{%- if vpn_action in ["Encrypt", "Decrypt"] and sessions | length > 0 -%}
+  {%- set session_idx = module.rand.number.integer(0, sessions | length - 1) -%}
+  {%- set session = sessions[session_idx] -%}
+  {%- if vpn_action == "Encrypt" -%}
+    {%- set src_ip = session.src_ip -%}
+    {%- set dst_ip = session.dst_ip -%}
+    {%- set s_port = session.s_port -%}
+    {%- set d_port = session.d_port -%}
+    {%- set proto = session.proto -%}
+    {%- set service_name = session.service_name -%}
+  {%- else -%}
+    {%- set src_ip = peer_gateway -%}
+    {%- set dst_ip = session.src_ip -%}
+    {%- set s_port = module.rand.number.integer(500, 4500) -%}
+    {%- set d_port = session.s_port -%}
+    {%- set proto = session.proto -%}
+    {%- set service_name = session.service_name -%}
+  {%- endif -%}
+{%- else -%}
+  {%- if vpn_action == "Encrypt" -%}
+    {%- set src_host = samples.internal_hosts | random -%}
+    {%- set src_ip = src_host[0] -%}
+    {%- set dst_ip = peer_gateway -%}
+  {%- elif vpn_action == "Decrypt" -%}
+    {%- set src_ip = peer_gateway -%}
+    {%- set dst_host = samples.internal_hosts | random -%}
+    {%- set dst_ip = dst_host[0] -%}
+  {%- else -%}
+    {%- set src_ip = origin -%}
+    {%- set dst_ip = peer_gateway -%}
+  {%- endif -%}
+  {%- set s_port = module.rand.number.integer(1024, 65535) -%}
+  {%- set d_port = module.rand.weighted_choice([443, 80, 500, 4500], [40, 20, 20, 20]) -%}
+  {%- set proto = 6 -%}
+  {%- set service_name = "https" -%}
+{%- endif -%}
+{%- set transport = "tcp" if proto == 6 else "udp" -%}
+{%- set ts_hex = "%x" | format(timestamp.timestamp() | int) -%}
+{%- set loguid = "{0x%s,0x%s,0x%s,0x%s}" | format(ts_hex, module.rand.string.hex(1), module.rand.string.hex(8), "c" ~ module.rand.string.hex(7)) -%}
+{%- if vpn_action == "Key Install" -%}
+  {%- set ifname = "daemon" -%}
+  {%- set ike_phase = module.rand.weighted_choice(["PHASE1", "PHASE2"], [30, 70]) -%}
+{%- else -%}
+  {%- set ifname = "eth1" -%}
+{%- endif -%}
+{%- do shared.set('sequencenum', seq + 1) -%}
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "agent": {
+    "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+    "id": "{{ params.agent_id }}",
+    "name": "{{ hostname }}.{{ domain }}",
+    "type": "filebeat",
+    "version": "{{ params.agent_version }}"
+  },
+  "checkpoint": {
+    "community": "{{ community }}",
+    "flags": "2304",
+    "fw_subproduct": "VPN",
+    "ifdir": "{{ 'inbound' if vpn_action == 'Decrypt' else 'outbound' }}",
+    "ifname": "{{ ifname }}",
+    "logid": "0",
+    "loguid": "{{ loguid }}",
+    "methods": "{{ enc_methods }}",
+    "origin": "{{ origin }}",
+    "origin_sic_name": "cn=cp_mgmt,o={{ hostname }}.{{ domain }}",
+    "peer_gateway": "{{ peer_gateway }}",
+    "rule_action": "{{ vpn_action }}",
+    "sequencenum": {{ seq }},
+    "version": "5",
+    "vpn_feature_name": "{{ 'IKE' if vpn_action == 'Key Install' else 'VPN' }}"{% if vpn_action == "Key Install" %},
+    "ike": "{{ ike_phase }}",
+    "ike_ids": "{{ module.rand.string.hex(8) }}"{% endif %}
+  },
+  "destination": {
+    "ip": "{{ dst_ip }}",
+    "port": {{ d_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "{{ vpn_action }}",
+    "category": ["network"],
+    "dataset": "checkpoint.firewall",
+    "kind": "event",
+    "module": "checkpoint",
+    "outcome": "success",
+    "sequence": {{ seq }},
+    "type": ["connection"{% if vpn_action == "Key Install" %}, "start"{% endif %}]
+  },
+  "host": {
+    "hostname": "{{ hostname }}"
+  },
+  "network": {
+    "application": "{{ service_name }}",
+    "direction": "{{ 'inbound' if vpn_action == 'Decrypt' else 'outbound' }}",
+    "iana_number": "{{ proto }}",
+    "transport": "{{ transport }}"
+  },
+  "observer": {
+    "egress": { "zone": "{{ 'Internal' if vpn_action == 'Decrypt' else 'External' }}" },
+    "ingress": { "zone": "{{ 'External' if vpn_action == 'Decrypt' else 'Internal' }}" },
+    "name": "{{ origin }}",
+    "product": "VPN-1 & FireWall-1",
+    "type": "firewall",
+    "vendor": "Checkpoint"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}", "{{ peer_gateway }}"]
+  },
+  "source": {
+    "ip": "{{ src_ip }}",
+    "port": {{ s_port }}
+  },
+  "tags": ["checkpoint", "forwarded"]
+}

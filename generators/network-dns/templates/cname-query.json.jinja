@@ -1,0 +1,163 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set dns_server = params.dns_server_ip -%}
+{#- Client selection -#}
+{%- set src_ip = module.rand.network.ip_v4_private_c() -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dns_id = module.rand.number.integer(1, 65535) -%}
+{#- CNAME queries are mostly external (CDN, aliases) -#}
+{%- set domain = samples.domains | random -%}
+{%- set query_name = domain.name -%}
+{%- set registered_domain = domain.registered_domain -%}
+{%- set tld = domain.tld -%}
+{%- set subdomain = domain.subdomain -%}
+{%- set final_ip = domain.ip -%}
+{#- Generate CNAME target — CDN-like alias -#}
+{%- set cdn_prefixes = ["e", "d", "a", "lb", "edge", "cdn", "ghs", "dual"] -%}
+{%- set cdn_suffixes = ["cdn.cloudflare.net", "cloudfront.net", "akamaiedge.net", "fastly.net", "azurefd.net", "trafficmanager.net", "edgekey.net"] -%}
+{%- set cname_target = module.rand.choice(cdn_prefixes) ~ module.rand.string.digits(4) ~ "." ~ module.rand.choice(cdn_suffixes) -%}
+{#- Response code -#}
+{%- set rcode = module.rand.weighted_choice(["NOERROR", "NXDOMAIN", "SERVFAIL"], [88, 8, 4]) -%}
+{#- Timing -#}
+{%- set duration_ns = module.rand.number.integer(2000000, 120000000) -%}
+{%- set duration_td = module.datetime.timedelta(microseconds=duration_ns // 1000) -%}
+{%- set end_ts = timestamp + duration_td -%}
+{#- Byte sizes -#}
+{%- set query_bytes = 12 + (query_name | length) + 6 -%}
+{%- if rcode == "NOERROR" -%}
+  {%- set response_bytes = query_bytes + 12 + (cname_target | length) + 16 -%}
+{%- else -%}
+  {%- set response_bytes = query_bytes + 6 -%}
+{%- endif -%}
+{#- Transport -#}
+{%- set transport = module.rand.weighted_choice(["udp", "tcp"], [97, 3]) -%}
+{#- Community ID -#}
+{%- set _cid = module.hashlib.sha1((src_ip ~ ":" ~ src_port ~ ">" ~ dns_server ~ ":53").encode()).digest() -%}
+{%- set community_id = "1:" ~ module.base64.b64encode(_cid).decode() -%}
+{#- Status -#}
+{%- set status = "OK" if rcode == "NOERROR" else "Error" -%}
+{%- set answers_count = 2 if rcode == "NOERROR" else 0 -%}
+{%- set ttl = module.rand.weighted_choice([60, 120, 300, 600, 1800], [15, 20, 35, 20, 10]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "packetbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "client": {
+        "bytes": {{ query_bytes }},
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "destination": {
+        "bytes": {{ response_bytes }},
+        "ip": "{{ dns_server }}",
+        "port": 53
+    },
+    "dns": {
+{% if rcode == "NOERROR" %}
+        "answers": [
+            {
+                "class": "IN",
+                "data": "{{ cname_target }}",
+                "name": "{{ query_name }}",
+                "ttl": "{{ ttl }}",
+                "type": "CNAME"
+            },
+            {
+                "class": "IN",
+                "data": "{{ final_ip }}",
+                "name": "{{ cname_target }}",
+                "ttl": "{{ ttl }}",
+                "type": "A"
+            }
+        ],
+        "resolved_ip": ["{{ final_ip }}"],
+{% else %}
+        "answers": [],
+{% endif %}
+        "header_flags": ["RD", "RA"],
+        "id": {{ dns_id }},
+        "op_code": "QUERY",
+        "question": {
+            "class": "IN",
+            "name": "{{ query_name }}",
+            "registered_domain": "{{ registered_domain }}",
+{% if subdomain %}
+            "subdomain": "{{ subdomain }}",
+{% endif %}
+            "top_level_domain": "{{ tld }}",
+            "type": "CNAME"
+        },
+        "response_code": "{{ rcode }}",
+        "type": "answer"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "category": ["network"],
+        "dataset": "network_traffic.dns",
+        "duration": {{ duration_ns }},
+        "end": "{{ end_ts.isoformat() }}",
+        "kind": "event",
+        "module": "network_traffic",
+        "start": "{{ timestamp.isoformat() }}",
+        "type": ["connection", "protocol"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}"
+    },
+    "network": {
+        "bytes": {{ query_bytes + response_bytes }},
+        "community_id": "{{ community_id }}",
+        "direction": "unknown",
+        "protocol": "dns",
+        "transport": "{{ transport }}",
+        "type": "ipv4"
+    },
+    "network_traffic": {
+        "dns": {
+            "additionals_count": 0,
+            "answers_count": {{ answers_count }},
+            "authorities_count": 0,
+            "flags": {
+                "authentic_data": false,
+                "authoritative": false,
+                "checking_disabled": false,
+                "recursion_available": true,
+                "recursion_desired": true,
+                "truncated_response": false
+            },
+            "method": "QUERY",
+            "query": "class IN, type CNAME, {{ query_name }}",
+            "question": {
+                "etld_plus_one": "{{ registered_domain }}"
+            },
+            "resource": "{{ query_name }}"
+        },
+        "status": "{{ status }}"
+    },
+    "related": {
+{% if rcode == "NOERROR" %}
+        "ip": ["{{ src_ip }}", "{{ dns_server }}", "{{ final_ip }}"]
+{% else %}
+        "ip": ["{{ src_ip }}", "{{ dns_server }}"]
+{% endif %}
+    },
+    "server": {
+        "bytes": {{ response_bytes }},
+        "ip": "{{ dns_server }}",
+        "port": 53
+    },
+    "source": {
+        "bytes": {{ query_bytes }},
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

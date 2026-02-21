@@ -1,0 +1,183 @@
+{%- set hostname = params.hostname -%}
+{%- set server_name = params.server_name -%}
+{#- Failure type distribution -#}
+{%- set failure_type = module.rand.weighted_choice(
+  ["not_found", "client_error", "server_error", "auth_error"],
+  [45, 15, 20, 20]
+) -%}
+{#- Select URL based on failure type -#}
+{%- if failure_type == "not_found" -%}
+  {#- 404s: mix of probes and legitimate missing resources -#}
+  {%- set is_probe = module.rand.chance(0.4) -%}
+  {%- if is_probe -%}
+    {%- set probe_urls = [] -%}
+    {%- for u in samples.urls if u.category == "probe" -%}
+      {%- do probe_urls.append(u) -%}
+    {%- endfor -%}
+    {%- set url_entry = probe_urls | random -%}
+    {%- set method = url_entry.methods[0] -%}
+  {%- else -%}
+    {%- set url_path = module.rand.choice([
+      "/old-page", "/missing-image.jpg", "/blog/deleted-post",
+      "/products/discontinued", "/assets/images/removed.png",
+      "/api/v1/legacy/endpoint", "/docs/v1/old-guide"
+    ]) -%}
+    {%- set method = "GET" -%}
+    {%- set url_entry = {"path": url_path, "methods": ["GET"], "category": "page"} -%}
+  {%- endif -%}
+  {%- set status_code = 404 -%}
+  {%- set body_bytes = module.rand.weighted_choice([153, 548], [30, 70]) -%}
+{%- elif failure_type == "auth_error" -%}
+  {#- 401/403: auth failures on protected endpoints -#}
+  {%- set status_code = module.rand.weighted_choice([401, 403, 429], [45, 35, 20]) -%}
+  {%- set url_path = module.rand.choice([
+    "/api/v1/users", "/api/v1/orders", "/dashboard",
+    "/account/settings", "/api/v1/auth/login", "/admin/"
+  ]) -%}
+  {%- if status_code == 401 -%}
+    {%- set method = module.rand.choice(["GET", "POST"]) -%}
+  {%- elif status_code == 429 -%}
+    {%- set method = "POST" -%}
+  {%- else -%}
+    {%- set method = "GET" -%}
+  {%- endif -%}
+  {%- set url_entry = {"path": url_path, "methods": [method], "category": "api"} -%}
+  {%- if status_code == 429 -%}
+    {%- set body_bytes = module.rand.number.integer(50, 200) -%}
+  {%- else -%}
+    {%- set body_bytes = module.rand.number.integer(50, 300) -%}
+  {%- endif -%}
+{%- elif failure_type == "client_error" -%}
+  {#- 400/405/408: client mistakes -#}
+  {%- set status_code = module.rand.weighted_choice([400, 405, 408, 413], [50, 20, 15, 15]) -%}
+  {%- set url_path = module.rand.choice([
+    "/api/v1/users", "/api/v1/products", "/api/v1/orders",
+    "/api/v1/auth/login", "/contact"
+  ]) -%}
+  {%- set method = module.rand.choice(["POST", "PUT", "GET", "PATCH"]) -%}
+  {%- set url_entry = {"path": url_path, "methods": [method], "category": "api"} -%}
+  {%- set body_bytes = module.rand.number.integer(150, 500) -%}
+{%- else -%}
+  {#- 500/502/503/504: server errors -#}
+  {%- set status_code = module.rand.weighted_choice([500, 502, 503, 504], [40, 30, 15, 15]) -%}
+  {%- set url_path = module.rand.choice([
+    "/api/v1/users", "/api/v1/products", "/api/v1/orders",
+    "/api/v1/search", "/dashboard", "/api/v1/auth/login"
+  ]) -%}
+  {%- set method = module.rand.weighted_choice(["GET", "POST"], [60, 40]) -%}
+  {%- set url_entry = {"path": url_path, "methods": [method], "category": "api"} -%}
+  {%- if status_code == 502 -%}
+    {%- set body_bytes = 157 -%}
+  {%- elif status_code == 503 -%}
+    {%- set body_bytes = 163 -%}
+  {%- elif status_code == 504 -%}
+    {%- set body_bytes = 167 -%}
+  {%- else -%}
+    {%- set body_bytes = module.rand.number.integer(100, 800) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set url_path = url_entry.path -%}
+{#- HTTP version -#}
+{%- set http_version = module.rand.weighted_choice(["1.1", "2.0", "1.0"], [55, 43, 2]) -%}
+{#- User agent — probes tend to use older/odd user agents -#}
+{%- if url_entry.category == "probe" -%}
+  {%- set probe_uas = [] -%}
+  {%- for ua in samples.user_agents if ua.type in ["browser", "tool"] -%}
+    {%- do probe_uas.append(ua) -%}
+  {%- endfor -%}
+  {%- set ua = probe_uas | random -%}
+{%- else -%}
+  {%- set ua_type = module.rand.weighted_choice(["browser", "mobile", "tool"], [60, 25, 15]) -%}
+  {%- set type_uas = [] -%}
+  {%- for ua in samples.user_agents if ua.type == ua_type -%}
+    {%- do type_uas.append(ua) -%}
+  {%- endfor -%}
+  {%- set ua = type_uas | random -%}
+{%- endif -%}
+{#- Source IP -#}
+{%- set src_ip = module.rand.network.ip_v4_public() -%}
+{#- Referer -#}
+{%- if failure_type == "not_found" and url_entry.category != "probe" -%}
+  {%- set referer = "https://" ~ server_name ~ "/" -%}
+{%- elif failure_type in ["auth_error", "client_error", "server_error"] -%}
+  {%- set referer = module.rand.weighted_choice(
+    ["https://" ~ server_name ~ "/login", "https://" ~ server_name ~ "/dashboard", "-"],
+    [40, 30, 30]
+  ) -%}
+{%- else -%}
+  {%- set referer = "-" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "data_stream": {
+        "dataset": "nginx.access",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "category": ["web"],
+        "dataset": "nginx.access",
+        "kind": "event",
+        "module": "nginx",
+        "outcome": "failure",
+        "type": ["access"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}"
+    },
+    "http": {
+        "request": {
+            "method": "{{ method }}"{% if referer != "-" %},
+            "referrer": "{{ referer }}"
+{%- endif %}
+        },
+        "response": {
+            "body": {
+                "bytes": {{ body_bytes }}
+            },
+            "status_code": {{ status_code }}
+        },
+        "version": "{{ http_version }}"
+    },
+    "nginx": {
+        "access": {
+            "remote_ip_list": ["{{ src_ip }}"]
+        }
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}"
+    },
+    "url": {
+        "original": "{{ url_path }}",
+        "path": "{{ url_path }}"
+    },
+    "user_agent": {
+        "device": {
+            "name": "{{ ua.device_name }}"
+        },
+        "name": "{{ ua.ua_name }}",
+        "original": "{{ ua.ua_string }}",
+        "version": "{{ ua.ua_version }}"{% if ua.os_name and ua.os_name != "Other" %},
+        "os": {
+            "name": "{{ ua.os_name }}"{% if ua.os_version %},
+            "version": "{{ ua.os_version }}"
+{%- endif %}
+        }
+{%- endif %}
+    }
+}

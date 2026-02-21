@@ -1,0 +1,128 @@
+{%- set seq = shared.get('sequencenum', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set origin = params.gateway_ip -%}
+{#- applications.json: 0=app_name, 1=app_id, 2=app_category, 3=app_risk, 4=app_properties, 5=weight -#}
+{%- set app_items = [] -%}
+{%- set app_weights = [] -%}
+{%- for a in samples.applications -%}
+  {%- do app_items.append(a) -%}
+  {%- do app_weights.append(a[5]) -%}
+{%- endfor -%}
+{%- set app = module.rand.weighted_choice(app_items, app_weights) -%}
+{%- set app_risk = app[3] -%}
+{%- if app_risk >= 4 -%}
+  {%- set action = module.rand.weighted_choice(["Block", "Drop"], [70, 30]) -%}
+  {%- set event_type_val = ["connection", "denied"] -%}
+{%- elif app_risk >= 3 -%}
+  {%- set action = module.rand.weighted_choice(["Accept", "Block"], [40, 60]) -%}
+  {%- if action == "Accept" -%}
+    {%- set event_type_val = ["allowed", "connection"] -%}
+  {%- else -%}
+    {%- set event_type_val = ["connection", "denied"] -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set action = "Accept" -%}
+  {%- set event_type_val = ["allowed", "connection"] -%}
+{%- endif -%}
+{%- set direction_type = module.rand.weighted_choice(["outbound", "internal"], [85, 15]) -%}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set src_ip = src_host[0] -%}
+{%- if direction_type == "outbound" -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set inzone = "Internal" -%}
+  {%- set outzone = "External" -%}
+{%- else -%}
+  {%- set srv_hosts = [] -%}
+  {%- for h in samples.internal_hosts if h[3] == "servers" -%}
+    {%- do srv_hosts.append(h) -%}
+  {%- endfor -%}
+  {%- set dst_host = srv_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+  {%- set inzone = "Internal" -%}
+  {%- set outzone = "Internal" -%}
+{%- endif -%}
+{%- set s_port = module.rand.number.integer(1024, 65535) -%}
+{%- set d_port = module.rand.weighted_choice([443, 80, 8443, 8080], [50, 25, 15, 10]) -%}
+{%- set ts_hex = "%x" | format(timestamp.timestamp() | int) -%}
+{%- set loguid = "{0x%s,0x%s,0x%s,0x%s}" | format(ts_hex, module.rand.string.hex(1), module.rand.string.hex(8), "c" ~ module.rand.string.hex(7)) -%}
+{%- do shared.set('sequencenum', seq + 1) -%}
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "agent": {
+    "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+    "id": "{{ params.agent_id }}",
+    "name": "{{ hostname }}.{{ domain }}",
+    "type": "filebeat",
+    "version": "{{ params.agent_version }}"
+  },
+  "checkpoint": {
+    "app_category": "{{ app[2] }}",
+    "app_id": {{ app[1] }},
+    "app_name": "{{ app[0] }}",
+    "app_properties": "{{ app[4] }}",
+    "app_risk": {{ app_risk }},
+    "flags": "417028",
+    "ifdir": "outbound",
+    "ifname": "eth0",
+    "logid": "0",
+    "loguid": "{{ loguid }}",
+    "match_id": "1",
+    "origin": "{{ origin }}",
+    "origin_sic_name": "cn=cp_mgmt,o={{ hostname }}.{{ domain }}",
+    "parent_rule": "0",
+    "rule_action": "{{ action }}",
+    "sequencenum": {{ seq }},
+    "version": "5",
+    "layer_name": "Application",
+    "layer_uuid": "d1e2f3a4-b5c6-7890-abcd-ef1234567890"
+  },
+  "destination": {
+    "ip": "{{ dst_ip }}",
+    "port": {{ d_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "{{ action }}",
+    "category": ["network"],
+    "dataset": "checkpoint.firewall",
+    "kind": "event",
+    "module": "checkpoint",
+    "outcome": "success",
+    "risk_score": {{ app_risk }},
+    "sequence": {{ seq }},
+    "type": {{ event_type_val | tojson }}
+  },
+  "host": {
+    "hostname": "{{ hostname }}"
+  },
+  "network": {
+    "application": "{{ app[0] | lower | replace(' ', '-') }}",
+    "direction": "{{ direction_type }}",
+    "iana_number": "6",
+    "name": "Application",
+    "transport": "tcp"
+  },
+  "observer": {
+    "egress": {
+      "zone": "{{ outzone }}"
+    },
+    "ingress": {
+      "zone": "{{ inzone }}"
+    },
+    "name": "{{ origin }}",
+    "product": "Application Control",
+    "type": "firewall",
+    "vendor": "Checkpoint"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+  },
+  "source": {
+    "ip": "{{ src_ip }}",
+    "port": {{ s_port }}
+  },
+  "tags": ["checkpoint", "forwarded"]
+}

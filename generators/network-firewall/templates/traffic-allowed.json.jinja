@@ -1,0 +1,136 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- Traffic direction selection -#}
+{%- set direction_type = module.rand.weighted_choice(["outbound", "inbound", "internal"], [60, 25, 15]) -%}
+{#- Pick a service with weight-based selection -#}
+{%- set svc_items = [] -%}
+{%- set svc_weights = [] -%}
+{%- for svc in samples.network_services -%}
+  {%- do svc_items.append(svc) -%}
+  {%- do svc_weights.append(svc.weight) -%}
+{%- endfor -%}
+{%- set service = module.rand.weighted_choice(svc_items, svc_weights) -%}
+{#- Generate source and destination based on direction -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- if direction_type == "outbound" -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "untrust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth0" -%}
+{%- elif direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dmz_host = samples.internal_hosts | selectattr("subnet", "equalto", "dmz") | list | random -%}
+  {%- set dst_ip = dmz_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "untrust" -%}
+  {%- set egress_zone = "dmz" -%}
+  {%- set ingress_iface = "eth0" -%}
+  {%- set egress_iface = "eth2" -%}
+{%- else -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set srv_host = samples.internal_hosts | selectattr("role", "equalto", "server") | selectattr("subnet", "equalto", "servers") | list | random -%}
+  {%- set dst_ip = srv_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "trust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth1" -%}
+{%- endif -%}
+{#- Pick a matching allow rule -#}
+{%- set allow_rules = samples.firewall_rules | selectattr("action", "equalto", "allow") | list -%}
+{%- set rule = allow_rules | random -%}
+{#- Traffic metrics -#}
+{%- set duration_ms = module.rand.number.integer(10, 300000) -%}
+{%- set src_bytes = module.rand.number.integer(200, 500000) -%}
+{%- set dst_bytes = module.rand.number.integer(200, 2000000) -%}
+{%- set src_packets = module.rand.number.integer(1, 500) -%}
+{%- set dst_packets = module.rand.number.integer(1, 1000) -%}
+{#- Community ID computation placeholder -#}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": {{ dst_bytes }},
+        "ip": "{{ dst_ip }}",
+        "packets": {{ dst_packets }},
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "allow",
+        "category": ["network"],
+        "dataset": "firewall.traffic",
+        "duration": {{ duration_ms * 1000000 }},
+        "kind": "event",
+        "module": "firewall",
+        "outcome": "success",
+        "severity": 0,
+        "type": ["connection", "allowed"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational"
+    },
+    "network": {
+        "application": "{{ service.application }}",
+        "bytes": {{ src_bytes + dst_bytes }},
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction_type }}",
+        "packets": {{ src_packets + dst_packets }},
+        "transport": "{{ service.protocol }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ egress_iface }}"
+            },
+            "zone": "{{ egress_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_iface }}"
+            },
+            "zone": "{{ ingress_zone }}"
+        },
+        "name": "{{ fqdn }}",
+        "product": "Network Firewall",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Generic"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "id": "{{ rule.id }}",
+        "name": "{{ rule.name }}",
+        "ruleset": "{{ rule.ruleset }}"
+    },
+    "source": {
+        "bytes": {{ src_bytes }},
+        "ip": "{{ src_ip }}",
+        "packets": {{ src_packets }},
+        "port": {{ src_port }}
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

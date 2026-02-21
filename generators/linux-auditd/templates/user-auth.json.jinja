@@ -1,0 +1,138 @@
+{%- set seq = shared.get('sequence', 1000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Pick target user -#}
+{%- set u = samples.usernames | random -%}
+{%- set acct_user = u.username -%}
+{%- set acct_uid = u.uid | string -%}
+{#- Auth method -#}
+{%- set auth_method = module.rand.weighted_choice(["sshd", "sudo", "su", "cron", "login"], [40, 30, 10, 15, 5]) -%}
+{%- set outcome = module.rand.weighted_choice(["success", "failure"], [85, 15]) -%}
+{%- set result = "success" if outcome == "success" else "fail" -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set ses = module.rand.number.integer(1, 9999) | string -%}
+{#- PAM operation -#}
+{%- set pam_op = "PAM:authentication" -%}
+{%- set grantors = "pam_unix" -%}
+{%- if auth_method == "sshd" -%}
+  {%- set exe = "/usr/sbin/sshd" -%}
+  {%- set terminal = "ssh" -%}
+  {%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_public()], [60, 40]) -%}
+  {%- set src_hostname = "?" -%}
+{%- elif auth_method == "sudo" -%}
+  {%- set exe = "/usr/bin/sudo" -%}
+  {%- set terminal = "pts/" ~ module.rand.number.integer(0, 9) -%}
+  {%- set src_ip = "?" -%}
+  {%- set src_hostname = "?" -%}
+  {%- set grantors = "pam_unix" -%}
+{%- elif auth_method == "su" -%}
+  {%- set exe = "/usr/bin/su" -%}
+  {%- set terminal = "pts/" ~ module.rand.number.integer(0, 9) -%}
+  {%- set src_ip = "?" -%}
+  {%- set src_hostname = "?" -%}
+{%- elif auth_method == "cron" -%}
+  {%- set exe = "/usr/sbin/cron" -%}
+  {%- set terminal = "cron" -%}
+  {%- set src_ip = "?" -%}
+  {%- set src_hostname = "?" -%}
+{%- else -%}
+  {%- set exe = "/bin/login" -%}
+  {%- set terminal = "tty" ~ module.rand.number.integer(1, 6) -%}
+  {%- set src_ip = "?" -%}
+  {%- set src_hostname = "?" -%}
+{%- endif -%}
+{#- Store auth session for cred-acq/user-login correlation -#}
+{%- if outcome == "success" -%}
+  {%- set auth_sessions = shared.get('auth_sessions', []) -%}
+  {%- do auth_sessions.append({"user": acct_user, "uid": acct_uid, "exe": exe, "terminal": terminal, "src_ip": src_ip, "pid": pid, "ses": ses, "method": auth_method}) -%}
+  {%- if auth_sessions | length > 50 -%}{%- do auth_sessions.pop(0) -%}{%- endif -%}
+  {%- do shared.set('auth_sessions', auth_sessions) -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "auditbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "auditd": {
+        "data": {
+            "acct": "{{ acct_user }}",
+            "grantors": "{{ grantors }}",
+            "hostname": "{{ src_hostname }}",
+            "op": "{{ pam_op }}",
+            "terminal": "{{ terminal }}"
+        },
+        "message_type": "user_auth",
+        "result": "{{ result }}",
+        "session": "{{ ses }}",
+        "summary": {
+            "actor": {
+                "primary": "{{ acct_user }}",
+                "secondary": "root"
+            },
+            "how": "{{ exe }}",
+            "object": {
+                "primary": "{{ terminal }}",
+                "type": "user-session"
+            }
+        }
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "authenticated",
+        "category": ["authentication"],
+        "kind": "event",
+        "module": "auditd",
+        "outcome": "{{ outcome }}",
+        "sequence": {{ seq }},
+        "type": ["info"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ params.os_kernel }}",
+            "name": "{{ params.os_name }}",
+            "platform": "{{ params.os_platform }}",
+            "type": "linux",
+            "version": "{{ params.os_version }}"
+        }
+    },
+    "process": {
+        "executable": "{{ exe }}",
+        "pid": {{ pid }}
+    },
+{% if src_ip != "?" %}
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+{% endif %}
+    "related": {
+{% if src_ip != "?" %}
+        "ip": ["{{ src_ip }}"],
+{% endif %}
+        "user": ["{{ acct_user }}"]
+    },
+    "service": {
+        "type": "auditd"
+    },
+    "user": {
+        "audit": {
+            "id": "{{ acct_uid }}",
+            "name": "{{ acct_user }}"
+        },
+        "id": "0",
+        "name": "root",
+        "target": {
+            "id": "{{ acct_uid }}",
+            "name": "{{ acct_user }}"
+        }
+    }
+}
+{%- do shared.set('sequence', seq + 1) -%}

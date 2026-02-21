@@ -1,0 +1,124 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Pick an active process (non-consuming) or fallback -#}
+{%- set proc_pool = shared.get('proc_pool', []) -%}
+{%- if proc_pool | length > 0 -%}
+  {%- set active_proc = proc_pool | random -%}
+  {%- set process_guid = active_proc.guid -%}
+  {%- set process_id = active_proc.pid -%}
+  {%- set process_image = active_proc.image -%}
+  {%- set process_name = active_proc.name -%}
+  {%- set user_name = active_proc.user_name -%}
+  {%- set user_domain = active_proc.user_domain -%}
+{%- else -%}
+  {%- set proc = samples.processes | random -%}
+  {%- set process_guid = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
+  {%- set process_id = module.rand.number.integer(100, 65535) -%}
+  {%- set process_image = proc.path -%}
+  {%- set process_name = proc.name -%}
+  {%- set user_name = (samples.usernames | random).username -%}
+  {%- set user_domain = domain -%}
+{%- endif -%}
+{#- Pick a file path -#}
+{%- set fp = samples.file_paths | random -%}
+{%- set target_filename = fp.path | replace("{USER}", user_name) | replace("{GUID}", module.rand.crypto.uuid4()) -%}
+{%- set file_ext = fp.extension -%}
+{%- set path_parts = target_filename.split("\\") -%}
+{%- set file_name = path_parts[-1] -%}
+{%- set file_directory = "\\".join(path_parts[:-1]) -%}
+{#- Generate hashes for the deleted file -#}
+{%- set hash_sha1 = module.rand.string.hex(40) -%}
+{%- set hash_md5 = module.rand.string.hex(32) -%}
+{%- set hash_sha256 = module.rand.string.hex(64) -%}
+{%- set is_executable = module.rand.weighted_choice(["true", "false"], [10, 90]) -%}
+{%- set sysmon_pid = module.rand.number.integer(1000, 5000) -%}
+{%- set sysmon_tid = module.rand.number.integer(1000, 8000) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "FileDelete (File Delete archived)",
+        "category": ["file"],
+        "code": "23",
+        "created": "{{ timestamp.isoformat() }}",
+        "kind": "event",
+        "module": "sysmon",
+        "provider": "Microsoft-Windows-Sysmon",
+        "type": ["deletion"]
+    },
+    "file": {
+        "directory": "{{ file_directory }}",
+{% if file_ext %}
+        "extension": "{{ file_ext }}",
+{% endif %}
+        "name": "{{ file_name }}",
+        "path": "{{ target_filename }}"
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "process": {
+        "entity_id": "{{ process_guid }}",
+        "executable": "{{ process_image }}",
+        "hash": {
+            "md5": "{{ hash_md5 }}",
+            "sha1": "{{ hash_sha1 }}",
+            "sha256": "{{ hash_sha256 }}"
+        },
+        "name": "{{ process_name }}",
+        "pid": {{ process_id }}
+    },
+    "related": {
+        "hash": ["{{ hash_sha1 }}", "{{ hash_md5 }}", "{{ hash_sha256 }}"],
+        "user": ["{{ user_name }}"]
+    },
+    "sysmon": {
+        "file": {
+            "archived": true,
+            "is_executable": {{ is_executable }}
+        }
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "id": "S-1-5-18",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Microsoft-Windows-Sysmon/Operational",
+        "computer_name": "{{ fqdn }}",
+        "event_id": "23",
+        "opcode": "Info",
+        "process": {
+            "pid": {{ sysmon_pid }},
+            "thread": {
+                "id": {{ sysmon_tid }}
+            }
+        },
+        "provider_guid": "{5770385f-c22a-43e0-bf4c-06f5698ffbd9}",
+        "provider_name": "Microsoft-Windows-Sysmon",
+        "record_id": "{{ record_id }}",
+        "user": {
+            "identifier": "S-1-5-18"
+        },
+        "version": 5
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

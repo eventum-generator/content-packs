@@ -1,0 +1,150 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set domain_sid = params.domain_sid -%}
+{#- Pick a process from sample data -#}
+{%- set proc = samples.processes | random -%}
+{#- Generate GUIDs -#}
+{%- set process_guid = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
+{%- set parent_process_guid = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
+{%- set logon_guid = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
+{%- set process_id = module.rand.number.integer(100, 65535) -%}
+{%- set parent_process_id = module.rand.number.integer(4, 65535) -%}
+{#- Set user based on integrity level -#}
+{%- if proc.integrity_level == "System" -%}
+  {%- set user_name = "SYSTEM" -%}
+  {%- set user_domain = "NT AUTHORITY" -%}
+  {%- set logon_id = "0x3e7" -%}
+  {%- set terminal_session_id = "0" -%}
+{%- elif proc.integrity_level == "High" -%}
+  {%- set user_name = "Administrator" -%}
+  {%- set user_domain = domain -%}
+  {%- set logon_id = "0x" ~ module.rand.string.hex(5) -%}
+  {%- set terminal_session_id = "1" -%}
+{%- elif proc.integrity_level == "Low" -%}
+  {%- set user_name = (samples.usernames | random).username -%}
+  {%- set user_domain = domain -%}
+  {%- set logon_id = "0x" ~ module.rand.string.hex(5) -%}
+  {%- set terminal_session_id = "1" -%}
+{%- else -%}
+  {%- set user_name = (samples.usernames | random).username -%}
+  {%- set user_domain = domain -%}
+  {%- set logon_id = "0x" ~ module.rand.string.hex(5) -%}
+  {%- set terminal_session_id = module.rand.choice(["0", "1", "2"]) -%}
+{%- endif -%}
+{%- set user_full = user_domain ~ "\\" ~ user_name -%}
+{%- set parent_user_full = user_full -%}
+{#- Build hash string -#}
+{%- set hashes = "SHA1=" ~ proc.sha1 ~ ",MD5=" ~ proc.md5 ~ ",SHA256=" ~ proc.sha256 ~ ",IMPHASH=" ~ proc.imphash -%}
+{#- Store process in shared pool for correlation with events 3,5,11,12,13,22,23,26 -#}
+{%- set proc_pool = shared.get('proc_pool', []) -%}
+{%- do proc_pool.append({"guid": process_guid, "pid": process_id, "image": proc.path, "name": proc.name, "command_line": proc.command_line, "user": user_full, "user_name": user_name, "user_domain": user_domain, "integrity_level": proc.integrity_level}) -%}
+{%- if proc_pool | length > 100 -%}{%- do proc_pool.pop(0) -%}{%- endif -%}
+{%- do shared.set('proc_pool', proc_pool) -%}
+{%- set sysmon_pid = module.rand.number.integer(1000, 5000) -%}
+{%- set sysmon_tid = module.rand.number.integer(1000, 8000) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "Process creation",
+        "category": ["process"],
+        "code": "1",
+        "created": "{{ timestamp.isoformat() }}",
+        "kind": "event",
+        "module": "sysmon",
+        "provider": "Microsoft-Windows-Sysmon",
+        "type": ["start"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "process": {
+        "args": {{ proc.command_line.split() | tojson }},
+        "args_count": {{ proc.command_line.split() | length }},
+        "command_line": "{{ proc.command_line }}",
+        "entity_id": "{{ process_guid }}",
+        "executable": "{{ proc.path }}",
+        "hash": {
+            "md5": "{{ proc.md5 }}",
+            "sha1": "{{ proc.sha1 }}",
+            "sha256": "{{ proc.sha256 }}"
+        },
+        "name": "{{ proc.name }}",
+        "parent": {
+            "command_line": "{{ proc.parent_command_line }}",
+            "entity_id": "{{ parent_process_guid }}",
+            "executable": "{{ proc.parent_path }}",
+            "name": "{{ proc.parent_name }}",
+            "pid": {{ parent_process_id }}
+        },
+        "pe": {
+            "company": "{{ proc.company }}",
+            "description": "{{ proc.description }}",
+            "file_version": "{{ proc.file_version }}",
+            "imphash": "{{ proc.imphash }}",
+            "original_file_name": "{{ proc.original_file_name }}",
+            "product": "{{ proc.product }}"
+        },
+        "pid": {{ process_id }},
+        "working_directory": "{{ proc.current_directory }}"
+    },
+    "related": {
+        "hash": ["{{ proc.sha1 }}", "{{ proc.md5 }}", "{{ proc.sha256 }}", "{{ proc.imphash }}"],
+        "user": ["{{ user_name }}"]
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "id": "S-1-5-18",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Microsoft-Windows-Sysmon/Operational",
+        "computer_name": "{{ fqdn }}",
+        "event_data": {
+            "Company": "{{ proc.company }}",
+            "CurrentDirectory": "{{ proc.current_directory }}",
+            "Description": "{{ proc.description }}",
+            "FileVersion": "{{ proc.file_version }}",
+            "IntegrityLevel": "{{ proc.integrity_level }}",
+            "LogonGuid": "{{ logon_guid }}",
+            "LogonId": "{{ logon_id }}",
+            "OriginalFileName": "{{ proc.original_file_name }}",
+            "Product": "{{ proc.product }}",
+            "TerminalSessionId": "{{ terminal_session_id }}"
+        },
+        "event_id": "1",
+        "opcode": "Info",
+        "process": {
+            "pid": {{ sysmon_pid }},
+            "thread": {
+                "id": {{ sysmon_tid }}
+            }
+        },
+        "provider_guid": "{5770385f-c22a-43e0-bf4c-06f5698ffbd9}",
+        "provider_name": "Microsoft-Windows-Sysmon",
+        "record_id": "{{ record_id }}",
+        "user": {
+            "identifier": "S-1-5-18"
+        },
+        "version": 5
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

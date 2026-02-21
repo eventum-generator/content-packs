@@ -1,0 +1,136 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{#- IDS/IPS threat detection events -#}
+{%- set threat = samples.threat_signatures | random -%}
+{#- Threats are predominantly inbound -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound"], [85, 15]) -%}
+{#- Threat action: block most, alert on some -#}
+{%- set threat_action = module.rand.weighted_choice(["block", "alert", "reset-both"], [60, 25, 15]) -%}
+{#- Map severity string to numeric -#}
+{%- set severity_map = {"critical": 9, "high": 7, "medium": 5, "low": 2} -%}
+{%- set severity_num = severity_map.get(threat.severity, 5) -%}
+{#- Services targeted by threats -#}
+{%- set threat_services = [
+  {"port": 80, "protocol": "tcp", "application": "web-browsing"},
+  {"port": 443, "protocol": "tcp", "application": "ssl"},
+  {"port": 22, "protocol": "tcp", "application": "ssh"},
+  {"port": 3389, "protocol": "tcp", "application": "ms-rdp"},
+  {"port": 445, "protocol": "tcp", "application": "ms-ds-smb"},
+  {"port": 53, "protocol": "udp", "application": "dns"},
+  {"port": 8080, "protocol": "tcp", "application": "web-browsing"}
+] -%}
+{%- set service = module.rand.weighted_choice(threat_services, [25, 25, 10, 10, 10, 10, 10]) -%}
+{#- Generate IPs -#}
+{%- if direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set src_port = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "untrust" -%}
+  {%- set egress_zone = "trust" -%}
+  {%- set ingress_iface = "eth0" -%}
+  {%- set egress_iface = "eth1" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_port = service.port -%}
+  {%- set ingress_zone = "trust" -%}
+  {%- set egress_zone = "untrust" -%}
+  {%- set ingress_iface = "eth1" -%}
+  {%- set egress_iface = "eth0" -%}
+{%- endif -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{%- if threat_action == "block" or threat_action == "reset-both" -%}
+  {%- set outcome = "failure" -%}
+  {%- set event_type = ["connection", "denied"] -%}
+{%- else -%}
+  {%- set outcome = "success" -%}
+  {%- set event_type = ["connection", "allowed"] -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ threat_action }}",
+        "category": ["network", "intrusion_detection"],
+        "dataset": "firewall.threat",
+        "kind": "alert",
+        "module": "firewall",
+        "outcome": "{{ outcome }}",
+        "severity": {{ severity_num }},
+        "type": {{ event_type | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "log": {
+        "level": "{{ "critical" if severity_num >= 9 else ("error" if severity_num >= 7 else "warning") }}"
+    },
+    "network": {
+        "application": "{{ service.application }}",
+        "community_id": "{{ community_id }}",
+        "direction": "{{ direction_type }}",
+        "transport": "{{ service.protocol }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ egress_iface }}"
+            },
+            "zone": "{{ egress_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_iface }}"
+            },
+            "zone": "{{ ingress_zone }}"
+        },
+        "name": "{{ fqdn }}",
+        "product": "Network Firewall",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Generic"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "rule": {
+        "category": "{{ threat.category }}",
+        "id": "{{ threat.id }}",
+        "name": "{{ threat.name }}",
+        "ruleset": "ips"
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "threat": {
+        "indicator": {
+            "name": "{{ threat.name }}",
+            "type": "{{ threat.category }}"
+        },
+        "technique": {
+            "id": "{{ threat.id }}"
+        }
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

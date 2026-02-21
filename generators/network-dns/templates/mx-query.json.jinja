@@ -1,0 +1,181 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set dns_server = params.dns_server_ip -%}
+{%- set internal_domain = params.internal_domain -%}
+{#- Client selection -#}
+{%- set src_ip = module.rand.network.ip_v4_private_c() -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dns_id = module.rand.number.integer(1, 65535) -%}
+{#- MX queries: 20% internal, 80% external -#}
+{%- set is_internal = module.rand.chance(0.20) -%}
+{%- if is_internal -%}
+  {%- set query_name = internal_domain -%}
+  {%- set registered_domain = internal_domain -%}
+  {%- set tld = internal_domain.split(".")[-1] -%}
+  {%- set subdomain = "" -%}
+  {%- set mx1_host = "mail." ~ internal_domain -%}
+  {%- set mx2_host = "mail2." ~ internal_domain -%}
+{%- else -%}
+  {%- set domain = samples.domains | random -%}
+  {%- set query_name = domain.registered_domain -%}
+  {%- set registered_domain = domain.registered_domain -%}
+  {%- set tld = domain.tld -%}
+  {%- set subdomain = "" -%}
+  {#- Generate realistic MX hostnames -#}
+  {%- set mx_styles = ["mail", "mx1", "smtp", "mail-a", "alt1.aspmx.l"] -%}
+  {%- set mx1_host = module.rand.choice(mx_styles) ~ "." ~ domain.registered_domain -%}
+  {%- set mx2_host = "mx2." ~ domain.registered_domain -%}
+{%- endif -%}
+{#- Number of MX records: 2-3 -#}
+{%- set mx_count = module.rand.weighted_choice([2, 3], [70, 30]) -%}
+{#- Response code -#}
+{%- set rcode = module.rand.weighted_choice(["NOERROR", "NXDOMAIN", "SERVFAIL"], [85, 10, 5]) -%}
+{#- Timing -#}
+{%- set duration_ns = module.rand.number.integer(2000000, 100000000) -%}
+{%- set duration_td = module.datetime.timedelta(microseconds=duration_ns // 1000) -%}
+{%- set end_ts = timestamp + duration_td -%}
+{#- Byte sizes -#}
+{%- set query_bytes = 12 + (query_name | length) + 6 -%}
+{%- if rcode == "NOERROR" -%}
+  {%- set response_bytes = query_bytes + mx_count * (14 + (mx1_host | length)) -%}
+{%- else -%}
+  {%- set response_bytes = query_bytes + 6 -%}
+{%- endif -%}
+{#- Transport -#}
+{%- set transport = module.rand.weighted_choice(["udp", "tcp"], [95, 5]) -%}
+{#- Community ID -#}
+{%- set _cid = module.hashlib.sha1((src_ip ~ ":" ~ src_port ~ ">" ~ dns_server ~ ":53").encode()).digest() -%}
+{%- set community_id = "1:" ~ module.base64.b64encode(_cid).decode() -%}
+{#- Header flags -#}
+{%- set is_authoritative = is_internal and rcode == "NOERROR" -%}
+{%- if is_authoritative -%}
+  {%- set header_flags = ["AA", "RD", "RA"] -%}
+{%- else -%}
+  {%- set header_flags = ["RD", "RA"] -%}
+{%- endif -%}
+{#- Status -#}
+{%- set status = "OK" if rcode == "NOERROR" else "Error" -%}
+{%- set answers_count = mx_count if rcode == "NOERROR" else 0 -%}
+{%- set ttl = module.rand.weighted_choice([3600, 7200, 21600, 43200, 86400], [15, 20, 30, 20, 15]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "packetbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "client": {
+        "bytes": {{ query_bytes }},
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "destination": {
+        "bytes": {{ response_bytes }},
+        "ip": "{{ dns_server }}",
+        "port": 53
+    },
+    "dns": {
+{% if rcode == "NOERROR" %}
+        "answers": [
+            {
+                "class": "IN",
+                "data": "10 {{ mx1_host }}",
+                "name": "{{ query_name }}",
+                "ttl": "{{ ttl }}",
+                "type": "MX"
+            },
+            {
+                "class": "IN",
+                "data": "20 {{ mx2_host }}",
+                "name": "{{ query_name }}",
+                "ttl": "{{ ttl }}",
+                "type": "MX"
+            }{% if mx_count == 3 %},
+            {
+                "class": "IN",
+                "data": "30 mx3.{{ registered_domain }}",
+                "name": "{{ query_name }}",
+                "ttl": "{{ ttl }}",
+                "type": "MX"
+            }{% endif %}
+        ],
+{% else %}
+        "answers": [],
+{% endif %}
+        "header_flags": {{ header_flags | tojson }},
+        "id": {{ dns_id }},
+        "op_code": "QUERY",
+        "question": {
+            "class": "IN",
+            "name": "{{ query_name }}",
+            "registered_domain": "{{ registered_domain }}",
+            "top_level_domain": "{{ tld }}",
+            "type": "MX"
+        },
+        "response_code": "{{ rcode }}",
+        "type": "answer"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "category": ["network"],
+        "dataset": "network_traffic.dns",
+        "duration": {{ duration_ns }},
+        "end": "{{ end_ts.isoformat() }}",
+        "kind": "event",
+        "module": "network_traffic",
+        "start": "{{ timestamp.isoformat() }}",
+        "type": ["connection", "protocol"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}"
+    },
+    "network": {
+        "bytes": {{ query_bytes + response_bytes }},
+        "community_id": "{{ community_id }}",
+        "direction": "unknown",
+        "protocol": "dns",
+        "transport": "{{ transport }}",
+        "type": "ipv4"
+    },
+    "network_traffic": {
+        "dns": {
+            "additionals_count": 0,
+            "answers_count": {{ answers_count }},
+            "authorities_count": 0,
+            "flags": {
+                "authentic_data": false,
+                "authoritative": {{ "true" if is_authoritative else "false" }},
+                "checking_disabled": false,
+                "recursion_available": true,
+                "recursion_desired": true,
+                "truncated_response": false
+            },
+            "method": "QUERY",
+            "query": "class IN, type MX, {{ query_name }}",
+            "question": {
+                "etld_plus_one": "{{ registered_domain }}"
+            },
+            "resource": "{{ query_name }}"
+        },
+        "status": "{{ status }}"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dns_server }}"]
+    },
+    "server": {
+        "bytes": {{ response_bytes }},
+        "ip": "{{ dns_server }}",
+        "port": 53
+    },
+    "source": {
+        "bytes": {{ query_bytes }},
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

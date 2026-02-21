@@ -99,3 +99,17 @@ After implementation:
 2. Verify all sample files and template paths referenced in `generator.yml` exist
 3. Check that `chance` weights produce a reasonable distribution
 4. Ensure shared state is managed consistently (counters incremented, pools capped)
+5. Check that generator is working properly by running it (e.g. with `eventum generate`)
+
+## Phase 4: Improvement Proposals
+
+After completing the generator, reflect on the development experience and append any improvement proposals to `eventum` repo in `PROPOSALS.md`. Consider:
+
+- **Template API gaps** — Were there missing `module.rand.*` helpers, timestamp formatters, or filters that you had to work around?
+- **Shared state boilerplate** — Did the correlation pool pattern (push/pop/cap/fallback) feel repetitive? Were counters tedious to manage?
+- **Generator architecture** — Would a different picking mode or template grouping have been more natural for this data source?
+- **Sample data** — Was there anything you couldn't express with the current CSV/JSON sample format?
+- **Developer experience** — Were errors hard to debug? Was iteration slow?
+- **Other** — any other additions from you.
+
+Only add **new** proposals not already in the file. Each proposal should include: the problem encountered, a concrete example from this generator, and a suggested improvement.

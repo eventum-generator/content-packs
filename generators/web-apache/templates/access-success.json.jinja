@@ -1,0 +1,153 @@
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{#- Pick a URL from sample data — filter to page/static/api types -#}
+{%- set url_type = module.rand.weighted_choice(["page", "static", "api"], [30, 50, 20]) -%}
+{%- set url_candidates = [] -%}
+{%- for u in samples.urls -%}
+  {%- if u.type == url_type -%}
+    {%- do url_candidates.append(u) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set url = url_candidates | random -%}
+{#- HTTP method — depends on URL type -#}
+{%- if url_type == "api" -%}
+  {%- set method = module.rand.weighted_choice(["GET", "POST", "PUT", "DELETE"], [60, 25, 10, 5]) -%}
+{%- elif url_type == "static" -%}
+  {%- set method = "GET" -%}
+{%- else -%}
+  {%- set method = module.rand.weighted_choice(["GET", "POST", "HEAD"], [85, 12, 3]) -%}
+{%- endif -%}
+{#- Status code — mostly 200, some 304 for static assets -#}
+{%- if url_type == "static" -%}
+  {%- set status = module.rand.weighted_choice([200, 304], [70, 30]) -%}
+{%- else -%}
+  {%- set status = module.rand.weighted_choice([200, 201], [95, 5]) -%}
+  {%- if method != "POST" -%}{%- set status = 200 -%}{%- endif -%}
+{%- endif -%}
+{#- Response body size -#}
+{%- if status == 304 -%}
+  {%- set body_bytes = 0 -%}
+{%- else -%}
+  {%- set body_bytes = module.rand.number.integer(url.min_bytes, url.max_bytes) -%}
+{%- endif -%}
+{#- Source IP — mix of public and private -#}
+{%- set src_ip = module.rand.weighted_choice(["private", "public"], [30, 70]) -%}
+{%- if src_ip == "private" -%}
+  {%- set source_address = module.rand.network.ip_v4_private_c() -%}
+{%- else -%}
+  {%- set source_address = module.rand.network.ip_v4_public() -%}
+{%- endif -%}
+{#- User agent — pick a browser UA -#}
+{%- set browser_uas = [] -%}
+{%- set browser_weights = [] -%}
+{%- for ua in samples.user_agents -%}
+  {%- if ua.type == "browser" or ua.type == "tool" -%}
+    {%- do browser_uas.append(ua) -%}
+    {%- do browser_weights.append(ua.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set ua = module.rand.weighted_choice(browser_uas, browser_weights) -%}
+{#- Referrer — present for most page requests -#}
+{%- if url_type == "page" and module.rand.chance(0.6) -%}
+  {%- set referrer = module.rand.weighted_choice(["https://" ~ domain ~ "/", "https://www.google.com/", "https://www.bing.com/", "https://" ~ domain ~ "/blog", "https://" ~ domain ~ "/products"], [40, 30, 10, 10, 10]) -%}
+{%- elif url_type == "static" and module.rand.chance(0.8) -%}
+  {%- set referrer = "https://" ~ domain ~ (samples.urls | random).path -%}
+{%- else -%}
+  {%- set referrer = "" -%}
+{%- endif -%}
+{#- Response time in microseconds -#}
+{%- if url_type == "static" -%}
+  {%- set response_time = module.rand.number.integer(500, 15000) -%}
+{%- elif url_type == "api" -%}
+  {%- set response_time = module.rand.number.integer(5000, 200000) -%}
+{%- else -%}
+  {%- set response_time = module.rand.number.integer(10000, 500000) -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "apache": {
+        "access": {
+            "remote_addresses": ["{{ source_address }}"],
+            "response_time": {{ response_time }}
+        }
+    },
+    "data_stream": {
+        "dataset": "apache.access",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "category": ["web"],
+        "dataset": "apache.access",
+        "kind": "event",
+        "module": "apache",
+        "outcome": "success"
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "{{ params.os_family }}",
+            "name": "{{ params.os_name }}",
+            "type": "linux"
+        }
+    },
+    "http": {
+        "request": {
+{% if referrer %}
+            "method": "{{ method }}",
+            "referrer": "{{ referrer }}"
+{% else %}
+            "method": "{{ method }}"
+{% endif %}
+        },
+        "response": {
+            "body": {
+                "bytes": {{ body_bytes }}
+            },
+            "status_code": {{ status }}
+        },
+        "version": "1.1"
+    },
+    "related": {
+        "ip": ["{{ source_address }}"]
+    },
+    "source": {
+        "address": "{{ source_address }}",
+        "ip": "{{ source_address }}"
+    },
+    "tags": ["apache-access"],
+    "url": {
+{% if url.extension %}
+        "extension": "{{ url.extension }}",
+{% endif %}
+        "domain": "{{ domain }}",
+        "original": "{{ url.path }}",
+        "path": "{{ url.path }}"
+    },
+    "user_agent": {
+        "device": {
+            "name": "{{ ua.device }}"
+        },
+        "name": "{{ ua.name }}",
+        "original": "{{ ua.original }}",
+{% if ua.os_name != "Other" %}
+        "os": {
+            "full": "{{ ua.os_full }}",
+            "name": "{{ ua.os_name }}",
+            "version": "{{ ua.os_version }}"
+        },
+{% endif %}
+        "version": "{{ ua.version }}"
+    }
+}

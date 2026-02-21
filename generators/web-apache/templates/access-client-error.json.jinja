@@ -1,0 +1,149 @@
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{#- Status code — 404 most common, then 403, 400, 401 -#}
+{%- set status = module.rand.weighted_choice([404, 403, 400, 401, 405], [55, 15, 15, 10, 5]) -%}
+{#- URL paths for each error type -#}
+{%- if status == 404 -%}
+  {%- set error_paths = [
+      "/wp-admin", "/wp-login.php", "/wp-content/uploads/2024/backup.zip",
+      "/.env", "/admin/config.php", "/phpmyadmin", "/phpMyAdmin/",
+      "/api/v2/deprecated", "/old-page.html", "/images/old-banner.png",
+      "/assets/missing.js", "/blog/2020/deleted-post", "/download/report.pdf",
+      "/css/legacy.css", "/xmlrpc.php", "/admin.php",
+      "/backup.sql", "/config.yml", "/.git/config",
+      "/apple-touch-icon.png", "/apple-touch-icon-precomposed.png"
+  ] -%}
+  {%- set url_path = error_paths | random -%}
+{%- elif status == 403 -%}
+  {%- set error_paths = [
+      "/.htaccess", "/server-status", "/server-info",
+      "/cgi-bin/test.cgi", "/private/", "/internal/",
+      "/.ssh/authorized_keys", "/etc/passwd",
+      "/wp-includes/", "/config/"
+  ] -%}
+  {%- set url_path = error_paths | random -%}
+{%- elif status == 401 -%}
+  {%- set error_paths = [
+      "/admin", "/admin/dashboard", "/api/v1/admin/users",
+      "/monitoring", "/metrics", "/status"
+  ] -%}
+  {%- set url_path = error_paths | random -%}
+{%- elif status == 405 -%}
+  {%- set error_paths = ["/", "/about", "/contact", "/products"] -%}
+  {%- set url_path = error_paths | random -%}
+{%- else -%}
+  {%- set url_path = "/api/v1/" ~ module.rand.choice(["users", "products", "orders", "search"]) -%}
+{%- endif -%}
+{#- Method — mostly GET for 404/403, POST for 400/405 -#}
+{%- if status == 400 -%}
+  {%- set method = module.rand.weighted_choice(["POST", "PUT", "GET", "DELETE"], [50, 20, 20, 10]) -%}
+{%- elif status == 405 -%}
+  {%- set method = module.rand.weighted_choice(["POST", "PUT", "DELETE", "PATCH"], [40, 25, 25, 10]) -%}
+{%- else -%}
+  {%- set method = module.rand.weighted_choice(["GET", "POST", "HEAD"], [80, 15, 5]) -%}
+{%- endif -%}
+{#- Error page body size -#}
+{%- set body_bytes = module.rand.number.integer(200, 2000) -%}
+{#- Source IP — higher ratio of public IPs (includes scanners) -#}
+{%- set source_address = module.rand.weighted_choice(
+    [module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_public()],
+    [20, 80]
+) -%}
+{#- User agent -#}
+{%- set browser_uas = [] -%}
+{%- set browser_weights = [] -%}
+{%- for ua in samples.user_agents -%}
+  {%- if ua.type == "browser" or ua.type == "tool" -%}
+    {%- do browser_uas.append(ua) -%}
+    {%- do browser_weights.append(ua.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set ua = module.rand.weighted_choice(browser_uas, browser_weights) -%}
+{%- set response_time = module.rand.number.integer(1000, 50000) -%}
+{#- Push 404s to shared pool for correlation with error-file-not-found -#}
+{%- if status == 404 -%}
+  {%- set not_found_pool = shared.get('not_found_pool', []) -%}
+  {%- do not_found_pool.append({"path": url_path, "client_ip": source_address}) -%}
+  {%- if not_found_pool | length > 50 -%}{%- do not_found_pool.pop(0) -%}{%- endif -%}
+  {%- do shared.set('not_found_pool', not_found_pool) -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "apache": {
+        "access": {
+            "remote_addresses": ["{{ source_address }}"],
+            "response_time": {{ response_time }}
+        }
+    },
+    "data_stream": {
+        "dataset": "apache.access",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "category": ["web"],
+        "dataset": "apache.access",
+        "kind": "event",
+        "module": "apache",
+        "outcome": "failure"
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "{{ params.os_family }}",
+            "name": "{{ params.os_name }}",
+            "type": "linux"
+        }
+    },
+    "http": {
+        "request": {
+            "method": "{{ method }}"
+        },
+        "response": {
+            "body": {
+                "bytes": {{ body_bytes }}
+            },
+            "status_code": {{ status }}
+        },
+        "version": "1.1"
+    },
+    "related": {
+        "ip": ["{{ source_address }}"]
+    },
+    "source": {
+        "address": "{{ source_address }}",
+        "ip": "{{ source_address }}"
+    },
+    "tags": ["apache-access"],
+    "url": {
+        "domain": "{{ domain }}",
+        "original": "{{ url_path }}",
+        "path": "{{ url_path }}"
+    },
+    "user_agent": {
+        "device": {
+            "name": "{{ ua.device }}"
+        },
+        "name": "{{ ua.name }}",
+        "original": "{{ ua.original }}",
+{% if ua.os_name != "Other" %}
+        "os": {
+            "full": "{{ ua.os_full }}",
+            "name": "{{ ua.os_name }}",
+            "version": "{{ ua.os_version }}"
+        },
+{% endif %}
+        "version": "{{ ua.version }}"
+    }
+}

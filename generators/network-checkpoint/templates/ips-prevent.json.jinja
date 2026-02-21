@@ -1,0 +1,115 @@
+{%- set seq = shared.get('sequencenum', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set origin = params.gateway_ip -%}
+{#- ips_signatures.json: 0=protection_id, 1=protection_name, 2=protection_type, 3=attack, 4=attack_info, 5=severity, 6=severity_num, 7=confidence_level, 8=performance_impact, 9=industry_reference, 10=service, 11=weight -#}
+{%- set high_sigs = [] -%}
+{%- set high_weights = [] -%}
+{%- for s in samples.ips_signatures if s[6] >= 3 -%}
+  {%- do high_sigs.append(s) -%}
+  {%- do high_weights.append(s[11]) -%}
+{%- endfor -%}
+{%- set sig = module.rand.weighted_choice(high_sigs, high_weights) -%}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound"], [90, 10]) -%}
+{%- if direction_type == "inbound" -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host[0] -%}
+  {%- set inzone = "External" -%}
+  {%- set outzone = "Internal" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host[0] -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set inzone = "Internal" -%}
+  {%- set outzone = "External" -%}
+{%- endif -%}
+{%- set s_port = module.rand.number.integer(1024, 65535) -%}
+{%- set svc_port_map = {"http": 80, "https": 443, "ssh": 22, "rdp": 3389, "smb": 445, "dns": 53, "smtp": 25, "any": module.rand.number.integer(1, 65535)} -%}
+{%- set d_port = svc_port_map.get(sig[10], 80) -%}
+{%- set proto = 6 if sig[10] != "dns" else 17 -%}
+{%- set transport = "tcp" if proto == 6 else "udp" -%}
+{%- set ts_hex = "%x" | format(timestamp.timestamp() | int) -%}
+{%- set loguid = "{0x%s,0x%s,0x%s,0x%s}" | format(ts_hex, module.rand.string.hex(1), module.rand.string.hex(8), "c" ~ module.rand.string.hex(7)) -%}
+{%- do shared.set('sequencenum', seq + 1) -%}
+{
+  "@timestamp": "{{ timestamp.isoformat() }}",
+  "agent": {
+    "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+    "id": "{{ params.agent_id }}",
+    "name": "{{ hostname }}.{{ domain }}",
+    "type": "filebeat",
+    "version": "{{ params.agent_version }}"
+  },
+  "checkpoint": {
+    "attack": "{{ sig[3] }}",
+    "attack_info": "{{ sig[4] }}",
+    "confidence_level": "{{ sig[7] }}",
+    "flags": "147456",
+    "ifdir": "inbound",
+    "logid": "0",
+    "loguid": "{{ loguid }}",
+    "origin": "{{ origin }}",
+    "origin_sic_name": "cn=cp_mgmt,o={{ hostname }}.{{ domain }}",
+    "performance_impact": "{{ sig[8] }}",
+    "protection_id": "{{ sig[0] }}",
+    "protection_name": "{{ sig[1] }}",
+    "protection_type": "{{ sig[2] }}",
+    "rule_action": "Prevent",
+    "sequencenum": {{ seq }},
+    "severity": "{{ sig[6] }}",
+    "smartdefense_profile": "{{ params.ips_profile }}",
+    "version": "5"{% if sig[9] %},
+    "industry_reference": "{{ sig[9] }}"{% endif %}
+  },
+  "destination": {
+    "ip": "{{ dst_ip }}",
+    "port": {{ d_port }}
+  },
+  "ecs": {
+    "version": "8.17.0"
+  },
+  "event": {
+    "action": "Prevent",
+    "category": ["network", "intrusion_detection"],
+    "dataset": "checkpoint.firewall",
+    "kind": "alert",
+    "module": "checkpoint",
+    "outcome": "success",
+    "sequence": {{ seq }},
+    "severity": {{ sig[6] }},
+    "type": ["connection", "denied"]
+  },
+  "host": {
+    "hostname": "{{ hostname }}"
+  },
+  "network": {
+    "application": "{{ sig[10] }}",
+    "direction": "{{ direction_type }}",
+    "iana_number": "{{ proto }}",
+    "transport": "{{ transport }}"
+  },
+  "observer": {
+    "egress": { "zone": "{{ outzone }}" },
+    "ingress": { "zone": "{{ inzone }}" },
+    "name": "{{ origin }}",
+    "product": "SmartDefense",
+    "type": "firewall",
+    "vendor": "Checkpoint"
+  },
+  "related": {
+    "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+  },
+  "rule": {
+    "name": "{{ sig[1] }}",
+    "ruleset": "{{ params.ips_profile }}"
+  },
+  "source": {
+    "ip": "{{ src_ip }}",
+    "port": {{ s_port }}
+  }{% if sig[9] %},
+  "vulnerability": {
+    "id": "{{ sig[9] }}"
+  }{% endif %},
+  "tags": ["checkpoint", "forwarded"]
+}

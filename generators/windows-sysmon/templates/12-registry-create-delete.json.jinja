@@ -1,0 +1,122 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set domain_sid = params.domain_sid -%}
+{#- Pick an active process (non-consuming) or fallback -#}
+{%- set proc_pool = shared.get('proc_pool', []) -%}
+{%- if proc_pool | length > 0 -%}
+  {%- set active_proc = proc_pool | random -%}
+  {%- set process_guid = active_proc.guid -%}
+  {%- set process_id = active_proc.pid -%}
+  {%- set process_image = active_proc.image -%}
+  {%- set process_name = active_proc.name -%}
+  {%- set user_name = active_proc.user_name -%}
+  {%- set user_domain = active_proc.user_domain -%}
+{%- else -%}
+  {%- set proc = samples.processes | random -%}
+  {%- set process_guid = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
+  {%- set process_id = module.rand.number.integer(100, 65535) -%}
+  {%- set process_image = proc.path -%}
+  {%- set process_name = proc.name -%}
+  {%- set user_name = (samples.usernames | random).username -%}
+  {%- set user_domain = domain -%}
+{%- endif -%}
+{#- Event type: CreateKey (80%) or DeleteKey (20%) -#}
+{%- set event_type = module.rand.weighted_choice(["CreateKey", "DeleteKey"], [80, 20]) -%}
+{#- Pick appropriate registry path from samples -#}
+{%- set matching_paths = [] -%}
+{%- for rp in samples.registry_paths -%}
+  {%- if rp.event_type == event_type -%}
+    {%- do matching_paths.append(rp) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if matching_paths | length > 0 -%}
+  {%- set reg = matching_paths | random -%}
+{%- else -%}
+  {%- set reg = samples.registry_paths | random -%}
+{%- endif -%}
+{%- set target_object = reg.path | replace("{SID}", domain_sid ~ "-" ~ module.rand.number.integer(1100, 9999)) | replace("{GUID}", module.rand.crypto.uuid4()) | replace("{USER}", user_name) -%}
+{#- Parse registry path -#}
+{%- set reg_parts = target_object.split("\\") -%}
+{%- set reg_hive = reg_parts[0] -%}
+{%- set reg_key = "\\".join(reg_parts[1:]) -%}
+{%- set reg_value = reg_parts[-1] -%}
+{%- set sysmon_pid = module.rand.number.integer(1000, 5000) -%}
+{%- set sysmon_tid = module.rand.number.integer(1000, 8000) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "RegistryEvent (Object create and delete)",
+        "category": ["configuration", "registry"],
+        "code": "12",
+        "created": "{{ timestamp.isoformat() }}",
+        "kind": "event",
+        "module": "sysmon",
+        "provider": "Microsoft-Windows-Sysmon",
+        "type": ["change"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "process": {
+        "entity_id": "{{ process_guid }}",
+        "executable": "{{ process_image }}",
+        "name": "{{ process_name }}",
+        "pid": {{ process_id }}
+    },
+    "registry": {
+        "hive": "{{ reg_hive }}",
+        "key": "{{ reg_key }}",
+        "path": "{{ target_object }}",
+        "value": "{{ reg_value }}"
+    },
+    "related": {
+        "user": ["{{ user_name }}"]
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "id": "S-1-5-18",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Microsoft-Windows-Sysmon/Operational",
+        "computer_name": "{{ fqdn }}",
+        "event_data": {
+            "EventType": "{{ event_type }}"
+        },
+        "event_id": "12",
+        "opcode": "Info",
+        "process": {
+            "pid": {{ sysmon_pid }},
+            "thread": {
+                "id": {{ sysmon_tid }}
+            }
+        },
+        "provider_guid": "{5770385f-c22a-43e0-bf4c-06f5698ffbd9}",
+        "provider_name": "Microsoft-Windows-Sysmon",
+        "record_id": "{{ record_id }}",
+        "user": {
+            "identifier": "S-1-5-18"
+        },
+        "version": 2
+    }
+}
+{%- do shared.set('record_id', record_id + 1) -%}

@@ -1,0 +1,127 @@
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{#- Status code -#}
+{%- set status = module.rand.weighted_choice([500, 502, 503], [60, 20, 20]) -%}
+{#- Server errors hit dynamic/API endpoints -#}
+{%- set error_paths = [
+    "/api/v1/users", "/api/v1/products", "/api/v1/orders",
+    "/api/v1/search", "/api/v1/auth/token", "/api/v1/notifications",
+    "/login", "/register", "/dashboard", "/search",
+    "/products/catalog", "/contact"
+] -%}
+{%- set url_path = error_paths | random -%}
+{#- Method -#}
+{%- set method = module.rand.weighted_choice(["GET", "POST", "PUT"], [50, 40, 10]) -%}
+{#- Error page body size -#}
+{%- set body_bytes = module.rand.number.integer(200, 3000) -%}
+{#- Source IP -#}
+{%- set source_address = module.rand.weighted_choice(
+    [module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_public()],
+    [30, 70]
+) -%}
+{#- User agent — browser users hitting server errors -#}
+{%- set browser_uas = [] -%}
+{%- set browser_weights = [] -%}
+{%- for ua in samples.user_agents -%}
+  {%- if ua.type == "browser" or ua.type == "tool" -%}
+    {%- do browser_uas.append(ua) -%}
+    {%- do browser_weights.append(ua.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set ua = module.rand.weighted_choice(browser_uas, browser_weights) -%}
+{%- set response_time = module.rand.number.integer(100000, 3000000) -%}
+{#- Error module for correlation with error log -#}
+{%- set error_module = module.rand.weighted_choice(
+    ["proxy_http", "cgid", "proxy_fcgi", "core", "ssl"],
+    [30, 25, 25, 15, 5]
+) -%}
+{#- Push to shared pool for correlation with error-module -#}
+{%- set server_error_pool = shared.get('server_error_pool', []) -%}
+{%- do server_error_pool.append({
+    "path": url_path,
+    "client_ip": source_address,
+    "status": status,
+    "module": error_module
+}) -%}
+{%- if server_error_pool | length > 30 -%}{%- do server_error_pool.pop(0) -%}{%- endif -%}
+{%- do shared.set('server_error_pool', server_error_pool) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "apache": {
+        "access": {
+            "remote_addresses": ["{{ source_address }}"],
+            "response_time": {{ response_time }}
+        }
+    },
+    "data_stream": {
+        "dataset": "apache.access",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "category": ["web"],
+        "dataset": "apache.access",
+        "kind": "event",
+        "module": "apache",
+        "outcome": "failure"
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "{{ params.os_family }}",
+            "name": "{{ params.os_name }}",
+            "type": "linux"
+        }
+    },
+    "http": {
+        "request": {
+            "method": "{{ method }}"
+        },
+        "response": {
+            "body": {
+                "bytes": {{ body_bytes }}
+            },
+            "status_code": {{ status }}
+        },
+        "version": "1.1"
+    },
+    "related": {
+        "ip": ["{{ source_address }}"]
+    },
+    "source": {
+        "address": "{{ source_address }}",
+        "ip": "{{ source_address }}"
+    },
+    "tags": ["apache-access"],
+    "url": {
+        "domain": "{{ domain }}",
+        "original": "{{ url_path }}",
+        "path": "{{ url_path }}"
+    },
+    "user_agent": {
+        "device": {
+            "name": "{{ ua.device }}"
+        },
+        "name": "{{ ua.name }}",
+        "original": "{{ ua.original }}",
+{% if ua.os_name != "Other" %}
+        "os": {
+            "full": "{{ ua.os_full }}",
+            "name": "{{ ua.os_name }}",
+            "version": "{{ ua.os_version }}"
+        },
+{% endif %}
+        "version": "{{ ua.version }}"
+    }
+}
