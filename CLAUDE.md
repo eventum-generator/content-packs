@@ -62,11 +62,11 @@ content-packs/
   
 ### generator.yml conventions
 ```yaml
-# Default input: 1 event/second for live mode testing
+# Default input: 5 events/second for live mode testing
 input:
   - cron:
       expression: "* * * * * *"
-      count: 1
+      count: 5
 
 # Default output: stdout for easy testing
 output:
@@ -120,10 +120,20 @@ eventum run  # (requires eventum.yml + startup.yml at repo root)
 ## Dependencies
 
 - **Eventum >= 2.0.0** — install with `uv tool install eventum-generator`
-- **Python >= 3.12** — required by Eventum
+- **Python >= 3.13** — required by Eventum
 - No other dependencies; generators use only Eventum's built-in modules (`module.rand.*`, `module.faker.*`, samples)
 
 ## Git
 
 - Main branch: `master`
 - Don't commit unless asked
+
+## Keeping CLAUDE.md Accurate
+
+This file is the primary context for AI tools working on the codebase. It must stay current. Update it when:
+
+- **New generator added** — no change needed (generators are self-documenting via their own README)
+- **Convention change** — update naming, template, or output format conventions
+- **Default generator.yml pattern change** — update the generator.yml conventions example
+- **Eventum version requirement change** — update dependencies section
+- **Template API change in backend** — update `.claude/skills/create-generator/api-reference.md` (new `module.rand` functions, new context variables, new sample methods, etc.)

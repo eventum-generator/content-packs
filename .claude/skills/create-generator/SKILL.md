@@ -8,150 +8,300 @@ argument-hint: "[data-source-name]"
 
 # Create Event Generator
 
-You are building a new Eventum event generator that produces realistic synthetic events mimicking a real SIEM data source.
+Build a production-quality Eventum generator — a self-contained project that produces realistic synthetic events mimicking a real SIEM data source. Every generator is unique. Choose the Eventum features, template architecture, and data strategies that best fit this specific source.
 
 The user will specify the data source name (e.g. "linux-auditd", "web-nginx"). Use $ARGUMENTS as the generator name if provided.
 
+**Template API reference**: [api-reference.md](api-reference.md) has the full list of available variables, `module.rand` functions (including statistical distributions), Faker/Mimesis libraries, state management, sample access methods, picking modes, and FSM conditions. Consult it while designing templates.
+
+---
+
 ## Phase 1: Research
 
-Before writing any code, thoroughly research the target data source:
+Before writing any code, deeply understand what you're simulating.
 
-1. **Official specification** — Search for and read the official specification or documentation of the event source:
-   - Protocol RFCs (e.g. RFC 5424 for syslog, RFC 5952 for audit)
-   - Vendor documentation (e.g. Microsoft Learn for Windows events, man pages for auditd)
-   - Log format specifications (e.g. Common Log Format, CEF, LEEF)
-   - Event ID catalogs with field descriptions and possible values
-   - Investigate real-world log samples from security blogs, DFIR resources, and vendor examples
-   - Understand the full lifecycle of events (what triggers them, what fields change between states)
+### What to research
 
-2. **Elastic integration fields** — Fetch the Elastic integrations package for this data source from `https://github.com/elastic/integrations/tree/main/packages/<name>`. Look at:
+1. **Official specification** — Protocol RFCs, vendor docs (Microsoft Learn, man pages), log format specs (CLF, CEF, LEEF), event ID catalogs with field descriptions and possible values. Investigate real-world samples from security blogs, DFIR resources, and vendor examples. Understand the full lifecycle of events.
+
+2. **Elastic integration** — Fetch from `https://github.com/elastic/integrations/tree/main/packages/<name>`:
    - `data_stream/*/fields/*.yml` — field definitions
-   - `data_stream/*/sample_event.json` — example documents
+   - `data_stream/*/sample_event.json` — this is your ground truth for JSON structure
    - `data_stream/*/elasticsearch/ingest_pipeline/*.yml` — ECS enrichment pipelines
-   - Golden test files in `https://github.com/elastic/beats` for processed event examples
+   - Golden test files in `https://github.com/elastic/beats` for processed examples
 
-3. **Real event structure** — Cross-reference the specification with the Elastic integration to understand:
-   - What event types / IDs exist and their meaning
-   - Which fields are present in each event type
-   - Realistic value ranges, enumerations, and distributions
-   - How events correlate (sessions, parent-child, request-response)
-   - Field interdependencies (e.g. a field's value determines which other fields are present)
+3. **Event structure** — Cross-reference specs with Elastic integration: what event types exist, which fields belong to each, realistic value ranges and enumerations, how events correlate (sessions, parent-child, request-response), field interdependencies.
 
-4. **Frequency distribution** — Determine realistic ratios between event types in production environments. Use security research, SIEM tuning guides, and real-world telemetry data as references.
+4. **Frequency distribution** — Real production ratios between event types. Use security research, SIEM tuning guides, telemetry data.
 
-Present your research findings to the user before proceeding to implementation.
+### Research deliverable
 
-## Phase 2: Implementation
+Present to the user before proceeding:
+- Table of event types with frequencies and ECS categories
+- Key field interdependencies and correlation patterns
+- Proposed architecture (template count, picking mode, shared state strategy)
+- Which Eventum features you plan to leverage and why
 
-First, read the **Eventum documentation** at `https://eventum.run/llms-full.txt` to understand all available features: input plugins (cron, sample, time_patterns), event plugins (template, script), output plugins (stdout, opensearch, file, etc.), picking modes (chance, fsm, spin, all), and the full template API. This ensures you leverage the right Eventum features for each data source.
+---
 
-Then read the project's `CLAUDE.md` for conventions (naming, parameterization, output format). Also study the existing generators (e.g. `generators/windows-security/`) as reference implementations — but adapt the approach to fit the specific data source. Different sources may need different template structures, sample data shapes, and correlation strategies.
+## Phase 2: Learn Eventum
 
-For the full Eventum template API reference (available variables, module.rand, Faker/Mimesis, shared state, samples), see [api-reference.md](api-reference.md).
+Read these resources (in this order — most important first):
+
+1. **[api-reference.md](api-reference.md)** — Comprehensive template API: all variables, `module.rand` (including statistical distributions), Faker/Mimesis, state management, samples, picking modes, FSM conditions. This is your primary reference for building templates.
+
+2. **`CLAUDE.md`** in this repo — Conventions for naming, parameterization, output format, generator.yml structure.
+
+3. **Specific doc pages** — Fetch only what you need from `https://eventum.run/llms.mdx/docs/<path>/` (individual page markdown). Key pages:
+   - `plugins/event/template` — Template plugin deep dive (context, modules, samples, state, picking modes)
+   - `plugins/input/cron` / `time-patterns` / etc. — Input plugins (for choosing scheduling strategy)
+   - `plugins/output/opensearch` / `stdout` / etc. — Output plugins (for output section)
+   - `core/config/generator-yml` — Generator config reference
+   - Use `https://eventum.run/llms.txt` (lightweight index) to discover other pages if needed
+
+   **Do NOT fetch `llms-full.txt`** — it dumps the entire site and wastes context. Fetch specific pages instead.
+
+Study 2-3 existing generators in `generators/` to understand what's been done. When choosing Eventum features for your generator, pick what fits the data source best — but be aware of the full toolkit. If `fsm` mode is the natural fit for a session-based source, use it even if existing generators haven't. If `lognormal` distribution better models your byte counts than `integer(a, b)`, use it. The best generator is one that uses the right features for the job, which naturally leads to variety across the repository.
+
+---
+
+## Phase 3: Design
+
+Think through the architecture before writing templates. Each data source is different — the design should reflect that.
 
 ### Directory structure
 
 ```
 generators/<category>-<source>/
-  generator.yml
-  README.md
-  templates/                    # Jinja2 templates (.json.jinja)
-  samples/                      # CSV (header: true) or JSON sample data
+  generator.yml              # Pipeline config (input → event → output)
+  README.md                  # Documentation
+  templates/                 # Jinja2 templates (.json.jinja)
+  samples/                   # CSV (header: true) or JSON sample data
 ```
 
-### Key decisions to make per data source
+### Design decisions
 
-Based on your research, decide:
+These are the choices that shape the generator. There's no single right answer — pick what fits naturally:
 
-- **Template granularity** — One template per event type? Per event category? Per log format? Choose whatever maps naturally to the data source.
-- **Picking mode** — `chance` for independent events with frequency distribution, `fsm` for stateful session flows, `spin` for round-robin, `all` for always-on. Pick what fits the source.
-- **Correlation strategy** — Does this source have paired events (start/end, request/response)? Use `shared` state pools if so. Not every source needs correlation.
-- **Sample data** — What data needs to vary realistically? Usernames, IPs, URLs, file paths, hostnames? Create CSV for flat lists, JSON for nested structures.
-- **Parameterization** — What environment-specific values should be configurable via `params`? Hostnames, domains, network ranges, index names?
-- **Performance and stability** — create templates that does not have memory leaks or undefined behavior.
-- **Performance and stability** — You can use `module.<any python module>` in templates for complex cases. 
+- **Template granularity** — One per event type? Per category? One shared template with `vars` for variations? The answer depends on how much structure the event types share.
 
-### Correlation via shared state
+- **Picking mode** — `chance` for frequency-weighted independent events. `fsm` for stateful session flows. `spin` for deterministic cycling. `all` for multi-event sources. `chain` for ordered sequences. Think about what the data source actually does — does it have sessions? State transitions? Independent events?
 
-For event types that naturally pair (create/destroy, start/end), use a capped pool in `shared` state. The producer template appends entries; the consumer template pops them. Always include a fallback for when the pool is empty (generate standalone values). Cap pools to prevent unbounded growth.
+- **Correlation strategy** — Not every source needs it. But if events naturally pair (start/end, request/response, create/destroy), plan how they'll share state. Pools, counters, session IDs.
 
-### Output requirements
+- **Sample data** — CSV for flat lists. JSON for nested structures. Include `weight` columns for weighted picking where distributions matter. Think about what should be configurable via samples vs what can be procedurally generated.
 
-- Events must produce **ECS-compatible JSON** matching the Elastic integration's field structure
-- Include `@timestamp` and appropriate ECS fields (`event.*`, `host.*`, etc.)
-- Include source-specific namespace fields as discovered during research
-- Use `${params.*}` / `${secrets.*}` for output plugin connection details — never hardcode
+- **Data generation strategy** — Mix `module.rand` (fast, for hot paths), Faker/Mimesis (realistic, for names/emails/agents), samples (structured, for domain-specific data), and statistical distributions (for realistic metrics/durations/bytes).
 
-### README.md
+- **Parameterization** — Everything environment-specific goes in `params`. Hostnames, domains, network ranges, agent versions, ECS version. Include sensible defaults so the generator works out-of-the-box.
 
-Each generator README must include:
-- Data source description
-- Table of event types with frequency and category
-- Realism features
-- Event parameters (with defaults) and output parameters (with variable names)
-- Usage example and OpenSearch/startup.yml configuration
-- Sample JSON output (one representative event)
-- File structure tree
-- References to vendor docs and Elastic integration
+### Eventum features to consider
 
-## Phase 3: Validation
+The template API is rich. Don't limit yourself to the basics:
 
-After implementation:
-1. Review all templates for valid JSON (no trailing commas, proper quoting)
-2. Verify all sample files and template paths referenced in `generator.yml` exist
-3. Check that `chance` weights produce a reasonable distribution
-4. Ensure shared state is managed consistently (counters incremented, pools capped)
-5. Check that generator is working properly by running it (e.g. with `eventum generate`)
+| Feature | When It Shines |
+|---|---|
+| `chance` mode | Most event sources — weighted random selection |
+| `fsm` mode | Session-based sources (login→activity→logout, TCP lifecycle) |
+| `vars` per template | Event types sharing 90% structure, differing in a few fields |
+| `samples.weighted_pick('weight')` | Sample data with built-in frequency distribution |
+| `module.rand.number.lognormal()` | Byte counts, file sizes — always positive, right-skewed |
+| `module.rand.number.exponential()` | Session durations, inter-arrival times — most short, some very long |
+| `module.rand.number.gauss()` | Metrics clustering around a mean (response times) |
+| `module.rand.number.pareto()` | Extremely skewed data (network flow sizes) |
+| `module.rand.chance(prob)` | Branching without generating unused alternatives |
+| `module.faker.*` / `module.mimesis.*` | Realistic names, emails, user agents, URLs. [Full docs](https://faker.readthedocs.io/en/master/providers.html) / [Mimesis docs](https://mimesis.name/en/master/api.html) |
+| `locals` state | Per-template counters, value drift, gradual metric changes |
+| `shared` state | Cross-template correlation pools, monotonic IDs, session tracking |
+| `globals` state | Cross-generator coordination (rare but powerful) |
+| Jinja2 macros/imports | Reusable blocks to eliminate boilerplate across templates |
+| `module.<any_python_package>` | hashlib, base64, datetime, ipaddress — any stdlib or installed package |
+| `subprocess.run()` | Shell commands during generation (use sparingly) |
 
-## Phase 4: Improvement Proposals
+---
 
-After completing the generator, reflect on the development experience and create GitHub issues in the `eventum-generator/eventum` repository for any improvement proposals. Consider:
+## Phase 4: Implementation
 
-- **Template API gaps** — Were there missing `module.rand.*` helpers, timestamp formatters, or filters that you had to work around?
-- **Shared state boilerplate** — Did the correlation pool pattern (push/pop/cap/fallback) feel repetitive? Were counters tedious to manage?
-- **Generator architecture** — Would a different picking mode or template grouping have been more natural for this data source?
-- **Sample data** — Was there anything you couldn't express with the current CSV/JSON sample format?
-- **Developer experience** — Were errors hard to debug? Was iteration slow?
-- **Other** — any other additions from you.
+### generator.yml conventions
 
-First check existing issues to avoid duplicates: `gh issue list --repo eventum-generator/eventum --limit 100 --state open`.
+```yaml
+# Default input: 5 events/second for live-mode testing
+input:
+  - cron:
+      expression: "* * * * * *"
+      count: 5
 
-For each new proposal, create an issue and add it to the project board with appropriate fields:
+event:
+  template:
+    mode: chance    # Choose the mode that fits your source
+    params:
+      # All configurable values with sensible defaults
+    samples:
+      # All data files with explicit type
+    templates:
+      # Event types with frequency weights
+
+# Default output: stdout for testing + parameterized backend
+output:
+  - stdout:
+      formatter:
+        format: json
+  - opensearch:
+      hosts:
+        - ${params.opensearch_host}
+      username: ${params.opensearch_user}
+      password: ${secrets.opensearch_password}
+      index: ${params.opensearch_index}
+      verify: false
+      formatter:
+        format: json
+```
+
+Every generator.yml must work out-of-the-box with `eventum generate`.
+
+### Template quality guidelines
+
+These aren't strict rules — they're awareness of patterns that lead to better generators:
+
+**Eliminate unnecessary repetition.** If every template starts with the same 30-line agent/ecs/host block, extract it. Jinja2 macros (`{% macro %}`) and imports (`{% from '_base.json.jinja' import ... %}`) are one approach. Using `vars` to share a template is another. Sometimes a small amount of duplication is fine if it keeps templates self-contained and readable. Use your judgment.
+
+**Parameterize environment-specific values.** Hostnames, domains, ECS version, agent version, interface names, zone names — these shouldn't be hardcoded in templates. Put them in `params` with defaults, or in sample files. The generator should work in any environment by changing `params`.
+
+**Use the right tool for the data.**
+- `samples.weighted_pick('weight')` — when sample data has natural frequency distributions. This is cleaner than manually building parallel arrays for `weighted_choice()`.
+- `module.rand.chance(0.3)` with if/else — when you need probability branching. Avoids generating both options and throwing one away.
+- Statistical distributions — byte counts, durations, latencies aren't uniform in real systems. `lognormal`, `exponential`, `pareto` produce more realistic patterns.
+- Faker/Mimesis — when you need realistic contextual data (names, emails, user agents). Slower than `module.rand`, so use for variety, not on every field.
+
+**Manage shared state carefully.** Cap pool sizes (and make the cap configurable via params). Wrap counters to prevent unbounded integer growth. Always provide fallbacks for when pools are empty. Document what each shared state key is for.
+
+**Produce valid, consistent JSON.** Always include required ECS fields. Don't leave optional fields inconsistent (sometimes present, sometimes missing) — either always include them or use `null`. Test that output is valid JSON.
+
+**Keep templates readable.** Comment non-obvious magic numbers (port ranges, protocol IDs). Keep logic flow clear. If a template grows unwieldy, consider whether macros, `vars`, or splitting would help.
+
+### ECS output requirements
+
+- Match the Elastic integration's `sample_event.json` field structure
+- Always include: `@timestamp`, `agent.*`, `ecs.version`, `event.*` (action, category, code, kind, module, outcome, type), `host.*`
+- Include `related.*` arrays (ip, user, hash) for cross-referencing
+- Include source-specific namespace fields (e.g. `winlog.*`, `dns.*`, `http.*`)
+- Use `${params.*}` / `${secrets.*}` for output plugin connection details
+
+---
+
+## Phase 5: Validation
+
+### Correctness
+
+- All templates produce valid JSON (no trailing commas, no conditional gaps)
+- All sample/template paths in `generator.yml` exist
+- `chance` weights produce a realistic distribution
+- Shared state pools are capped and consumers have fallbacks
+- Parameters have sensible defaults — generator works out-of-the-box
+
+### Runtime test
 
 ```bash
-# Create the issue (use type Bug or Feature)
+# Generate a batch
+eventum generate --path generators/<name>/generator.yml --id test --no-live-mode
+
+# Validate JSON
+eventum generate --path generators/<name>/generator.yml --id test --no-live-mode | python3 -c "
+import sys, json
+for i, line in enumerate(sys.stdin, 1):
+    try:
+        json.loads(line)
+    except json.JSONDecodeError as e:
+        print(f'Invalid JSON on line {i}: {e}')
+        sys.exit(1)
+print(f'All {i} events are valid JSON')
+"
+
+# Live mode smoke test
+timeout 5 eventum generate --path generators/<name>/generator.yml --id test --live-mode || true
+```
+
+### Self-review
+
+Before presenting to the user, check your work against these common problems found in existing generators:
+
+| Problem | Check |
+|---|---|
+| Duplicated boilerplate across templates | Could macros, imports, or `vars` reduce it? |
+| Hardcoded values in templates | Should they be in `params` or samples? |
+| Manual weight-building loops | Could `weighted_pick('weight')` replace them? |
+| Generating unused alternatives | Could `module.rand.chance()` + if/else avoid waste? |
+| Uniform distributions for everything | Would `lognormal`/`exponential` be more realistic? |
+| Unbounded counters or pools | Are they capped and wrapped? |
+| Empty pool with no fallback | What happens when consumers read from an empty pool? |
+| Feature fit | Are you using the Eventum features that best match this data source's characteristics? |
+
+---
+
+## Phase 6: README.md
+
+Each generator needs clear documentation:
+
+1. **Data source description** — what system/service, version, log format
+2. **Event types table** — event ID/type, description, frequency (%), ECS category
+3. **Realism features** — techniques used (correlation, distributions, weighted data)
+4. **Parameters** — all `params` with defaults and descriptions
+5. **Output parameters** — `${params.*}` and `${secrets.*}` for output plugins
+6. **Usage** — `eventum generate` command and startup.yml example
+7. **Sample output** — one complete representative JSON event
+8. **File structure** — tree of all files
+9. **References** — vendor docs, Elastic integration links
+
+---
+
+## Phase 7: Improvement Proposals
+
+After completing the generator, create GitHub issues for improvements discovered during development:
+
+- Template API gaps — missing helpers or filters you had to work around?
+- Shared state boilerplate — was the pool pattern tedious?
+- Generator architecture — would a different mode or structure have been more natural?
+- Sample data limitations — anything you couldn't express with current formats?
+- Developer experience — errors hard to debug? Iteration slow?
+
+First check existing issues: `gh issue list --repo eventum-generator/eventum --limit 100 --state open`.
+
+```bash
 gh issue create \
     --repo eventum-generator/eventum \
     --title "<concise title>" \
     --body "<problem + concrete example from this generator + proposed solution>" \
     --project "Task tracker"
-
-# Then set type and project fields via GraphQL (see below)
 ```
 
-After creating each issue, set its type and project fields using the GraphQL API:
+After creating each issue, set project fields:
 
 ```bash
-# Get issue node ID
 NODE_ID=$(gh api graphql -f query='query { repository(owner: "eventum-generator", name: "eventum") { issue(number: ISSUE_NUM) { id } } }' --jq '.data.repository.issue.id')
 
 # Set issue type (Bug: IT_kwDOCiUXlc4BVM0Y, Feature: IT_kwDOCiUXlc4BVM0Z)
 gh api graphql -f query="mutation { updateIssue(input: { id: \"$NODE_ID\" issueTypeId: \"TYPE_ID\" }) { issue { id } } }" --silent
 
-# Get project item ID
 ITEM_ID=$(gh api graphql -f query='query { node(id: "'"$NODE_ID"'") { ... on Issue { projectItems(first: 10) { nodes { id project { id } } } } } }' --jq '.data.node.projectItems.nodes[] | select(.project.id == "PVT_kwDOCiUXlc4BP0JC") | .id')
 
-# Set Priority (High: 79628723, Medium: 0a877460, Low: da944a9c)
+# Priority (High: 79628723, Medium: 0a877460, Low: da944a9c)
 gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HXEM\" value: { singleSelectOptionId: \"PRIORITY_ID\" } }) { projectV2Item { id } } }" --silent
 
-# Set Component (Core: 73c7da0c, Plugins: b0be8b34, API/CLI: a93c596c, Other: 79a07051)
+# Component (Core: 73c7da0c, Plugins: b0be8b34, API/CLI: a93c596c, Other: 79a07051)
 gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HX4I\" value: { singleSelectOptionId: \"COMPONENT_ID\" } }) { projectV2Item { id } } }" --silent
 
-# Set Size (XS: 6c6483d2, S: f784b110, M: 7515a9f1, L: 817d0097, XL: db339eb2)
+# Size (XS: 6c6483d2, S: f784b110, M: 7515a9f1, L: 817d0097, XL: db339eb2)
 gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HXEQ\" value: { singleSelectOptionId: \"SIZE_ID\" } }) { projectV2Item { id } } }" --silent
 
-# Set Status to Backlog (f75ad846)
+# Status to Backlog (f75ad846)
 gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HW5U\" value: { singleSelectOptionId: \"f75ad846\" } }) { projectV2Item { id } } }" --silent
 ```
 
-Each issue body should include: the problem encountered, a concrete example from this generator, and a proposed solution.
+---
+
+## Important
+
+- Do NOT commit or push unless the user explicitly asks. When committing, use conventional commits: `feat:`, `fix:`, etc.
+- Track progress with the todo list throughout.
+- If blocked or uncertain, ask the user rather than guessing.
+- When done, check in with the user before creating improvement issues.
