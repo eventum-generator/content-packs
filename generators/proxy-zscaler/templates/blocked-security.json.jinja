@@ -1,0 +1,223 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, device_block, user_block, network_block, tls_block, zscaler_device_block, zscaler_datacenter_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick device and user -#}
+{%- set device = samples.devices | random -%}
+{%- set user = samples.users | random -%}
+{%- set external_dev_id = module.rand.string.digits(8) -%}
+{#- Pick URL category -#}
+{%- set category = samples.url_categories_blocked_security.weighted_pick('weight') -%}
+{%- set url_entry = category.urls | random -%}
+{#- Pick threat signature -#}
+{%- set threat = samples.threats.weighted_pick('weight') -%}
+{#- HTTP details -#}
+{%- set protocol = module.rand.weighted_choice(["HTTPS", "HTTP"], [80, 20]) -%}
+{%- set http_method = module.rand.weighted_choice(["GET", "POST", "CONNECT"], [65, 25, 10]) -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Network details -#}
+{%- set src_ip = "10." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set clt_pub_ip = params.get('client_public_ip', '203.0.113.' ~ module.rand.number.integer(1, 254)) -%}
+{%- set dst_ip = "0.0.0.0" -%}
+{%- set dst_port = 443 if protocol == "HTTPS" else 80 -%}
+{#- Byte sizes (small — blocked before full transfer) -#}
+{%- set req_header = module.rand.number.integer(200, 500) -%}
+{%- set req_payload = module.rand.number.integer(0, 300) -%}
+{%- set req_size = req_header + req_payload -%}
+{%- set resp_header = module.rand.number.integer(100, 300) -%}
+{%- set resp_payload = module.rand.number.integer(0, 1000) -%}
+{%- set resp_size = resp_header + resp_payload -%}
+{%- set total_size = req_size + resp_size -%}
+{#- TLS details -#}
+{%- set tls_version = module.rand.weighted_choice(["TLS1.3", "TLS1.2", "TLS1.1", "SSL3"], [50, 35, 10, 5]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "ECDHE-RSA-AES256-GCM-SHA384"], [40, 35, 25]) -%}
+{#- Risk score (high for security threats) -#}
+{%- set risk_score = module.rand.number.integer(50, 100) -%}
+{#- File hash (present if malware detected) -#}
+{%- set file_md5 = module.rand.crypto.md5() -%}
+{%- set file_sha256 = module.rand.crypto.sha256() -%}
+{#- Destination country (risky sources weighted) -#}
+{%- set dst_country = module.rand.weighted_choice(["Russia", "China", "Unknown", "United States", "Romania", "Brazil", "India", "Nigeria"], [20, 15, 20, 10, 10, 10, 10, 5]) -%}
+{%- set url_scheme = "https" if protocol == "HTTPS" else "http" -%}
+{%- set url_full = url_scheme ~ "://" ~ url_entry.domain ~ url_entry.path -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "cloud": {
+        "provider": "{{ params.cloudname }}"
+    },
+    "destination": {
+        "domain": "{{ url_entry.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ device_block(device, external_dev_id) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "blocked",
+        "category": ["web"],
+        "id": "{{ record_id }}",
+        "kind": "event",
+        "module": "zscaler_zia",
+        "outcome": "failure",
+        "reason": "{{ threat['class'] }} - {{ threat.category }}",
+        "timezone": "{{ params.get('timezone', 'UTC') }}",
+        "type": ["access"]
+    },
+    "file": {
+        "hash": {
+            "md5": "{{ file_md5 }}",
+            "sha256": "{{ file_sha256 }}"
+        }
+    },
+    {{ host_block(device) }},
+    "http": {
+        "request": {
+            "bytes": {{ req_size }},
+            "method": "{{ http_method }}"
+        },
+        "response": {
+            "bytes": {{ resp_size }}
+        },
+        "version": ["1.1"]
+    },
+    {{ network_block(protocol) }},
+    "organization": {
+        "name": "{{ params.company }}"
+    },
+    "related": {
+        "hash": ["{{ file_md5 }}", "{{ file_sha256 }}"],
+        "hosts": ["{{ device.hostname | lower }}"],
+        "ip": ["{{ src_ip }}", "{{ clt_pub_ip }}"],
+        "user": ["{{ user.email.split('@')[0] }}", "{{ user.email }}"]
+    },
+    "rule": {
+        "name": ["Malware_Protection_Policy"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "nat": {
+            "ip": "{{ clt_pub_ip }}"
+        },
+        "port": {{ src_port }}
+    },
+    "threat": {
+        "indicator": {
+            "name": "{{ file_md5 }}"
+        }
+    },
+    {{ tls_block(tls_version, cipher) }},
+    "url": {
+        "domain": "{{ url_entry.domain }}",
+        "full": {{ url_full | tojson }},
+        "original": {{ url_full | tojson }},
+        "path": "{{ url_entry.path }}",
+        "scheme": "{{ url_scheme }}"
+    },
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    },
+    "zscaler_zia": {
+        "web": {
+            "action": "Blocked",
+            "app": {
+                "class": "General Browsing",
+                "name": "General Browsing",
+                "risk_score": "None"
+            },
+            "bandwidth_throttle": "No",
+            "client": {
+                "cipher": "{{ cipher }}",
+                "cipher_reuse": "No",
+                "internet": {
+                    "ip": "{{ clt_pub_ip }}"
+                },
+                "ip": "{{ src_ip }}",
+                "public_ip": "{{ clt_pub_ip }}",
+                "source_port": {{ src_port }},
+                "tls_version": "{{ tls_version }}"
+            },
+            "cloud_name": "{{ params.cloudname }}",
+            "company": "{{ params.company }}",
+            "content_type": "",
+            {{ zscaler_datacenter_block(params) }},
+            "department": "{{ user.department }}",
+            {{ zscaler_device_block(device, user) }},
+            "dlp": {
+                "dictionaries": {
+                    "name": "None"
+                },
+                "engine": "None"
+            },
+            "dstip_country": "{{ dst_country }}",
+            "eedone": "Yes",
+            "flow_type": "Blocked",
+            "host": "{{ url_entry.domain }}",
+            "is_dst_cntry_risky": "{{ 'Yes' if dst_country in ['Russia', 'China', 'Nigeria', 'Romania'] else 'No' }}",
+            "location": "{{ user.location }}",
+            "malware": {
+                "category": "{{ threat.category }}",
+                "class": "{{ threat['class'] }}"
+            },
+            "md5_hash": "{{ file_md5 }}",
+            "module": "Malware Protection",
+            "product_version": "{{ params.product_version }}",
+            "reason": "Malware Detected",
+            "record": {
+                "id": "{{ record_id }}"
+            },
+            "request": {
+                "header_size": {{ req_header }},
+                "method": "{{ http_method }}",
+                "payload": {{ req_payload }},
+                "size": {{ req_size }},
+                "version": "1.1"
+            },
+            "response": {
+                "code": "403",
+                "header_size": {{ resp_header }},
+                "payload": {{ resp_payload }},
+                "size": {{ resp_size }},
+                "version": "1"
+            },
+            "risk": {
+                "score": {{ risk_score }}
+            },
+            "rule": {
+                "name": "Malware_Protection_Policy",
+                "type": "Malware Protection"
+            },
+            "server": {
+                "ip": "{{ dst_ip }}"
+            },
+            "sha256": "{{ file_sha256 }}",
+            "ssl_decrypted": "Yes",
+            "threat": {
+                "name": "{{ threat.name }}",
+                "severity": "{{ threat.severity }}"
+            },
+            "throttle": {
+                "request_size": 0,
+                "response_size": 0
+            },
+            "timezone": "{{ params.get('timezone', 'UTC') }}",
+            "total": {
+                "size": {{ total_size }}
+            },
+            "url": {
+                "category": {
+                    "sub": "{{ category.sub }}",
+                    "super": "{{ category.super }}"
+                },
+                "category_method": "{{ module.rand.weighted_choice(['Database A', 'Machine Learning'], [70, 30]) }}",
+                "class": "{{ category['class'] }}"
+            },
+            "user_agent": {
+                "class": "{{ module.rand.weighted_choice(['Firefox', 'Chrome', 'Safari', 'Edge'], [20, 50, 15, 15]) }}",
+                "name": {{ user_agent | tojson }}
+            },
+            "z_tunnel_version": "{{ device.ztunnel_version }}"
+        }
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

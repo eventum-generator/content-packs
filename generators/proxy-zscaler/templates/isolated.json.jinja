@@ -1,0 +1,214 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, device_block, user_block, network_block, tls_block, zscaler_device_block, zscaler_datacenter_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick device and user -#}
+{%- set device = samples.devices | random -%}
+{%- set user = samples.users | random -%}
+{%- set external_dev_id = module.rand.string.digits(8) -%}
+{#- Isolated sites: uncategorized, risky, newly observed domains -#}
+{%- set isolated_targets = [
+  {"domain": "unknown-saas-app.io", "path": "/dashboard", "sub": "Non Categorizable", "super": "Miscellaneous"},
+  {"domain": "new-startup-tool.com", "path": "/login", "sub": "Newly Registered and Observed Domains", "super": "Miscellaneous"},
+  {"domain": "beta-platform.dev", "path": "/workspace", "sub": "Non Categorizable", "super": "Miscellaneous"},
+  {"domain": "personal-blog-site.net", "path": "/2026/02/article", "sub": "Blogs", "super": "Internet Communication"},
+  {"domain": "regional-news.co", "path": "/breaking-news", "sub": "News and Media", "super": "News and Media"},
+  {"domain": "overseas-vendor.cn", "path": "/products/catalog", "sub": "Other Business and Economy", "super": "Business and Economy"},
+  {"domain": "niche-forum.xyz", "path": "/thread/12345", "sub": "Discussion Forums", "super": "Internet Communication"}
+] -%}
+{%- set target = isolated_targets | random -%}
+{#- HTTP details -#}
+{%- set protocol = "HTTPS" -%}
+{%- set http_method = module.rand.weighted_choice(["GET", "POST"], [85, 15]) -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Network details -#}
+{%- set src_ip = "10." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set clt_pub_ip = params.get('client_public_ip', '203.0.113.' ~ module.rand.number.integer(1, 254)) -%}
+{#- Byte sizes (moderate — isolation still loads content through CBI) -#}
+{%- set req_header = module.rand.number.integer(250, 700) -%}
+{%- set req_payload = module.rand.number.integer(0, 2000) -%}
+{%- set req_size = req_header + req_payload -%}
+{%- set resp_header = module.rand.number.integer(200, 800) -%}
+{%- set resp_payload = module.rand.number.clamp(module.rand.number.lognormal(9, 1.5) | int, 500, 2000000) -%}
+{%- set resp_size = resp_header + resp_payload -%}
+{%- set total_size = req_size + resp_size -%}
+{#- TLS details -#}
+{%- set tls_version = module.rand.weighted_choice(["TLS1.3", "TLS1.2"], [70, 30]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "TLS_CHACHA20_POLY1305_SHA256"], [35, 40, 25]) -%}
+{%- set risk_score = module.rand.number.integer(20, 50) -%}
+{%- set dst_country = module.rand.weighted_choice(["Unknown", "United States", "China", "Russia", "India", "Brazil", "Germany"], [30, 20, 15, 10, 10, 8, 7]) -%}
+{%- set url_full = "https://" ~ target.domain ~ target.path -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "cloud": {
+        "provider": "{{ params.cloudname }}"
+    },
+    "destination": {
+        "domain": "{{ target.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": 443
+    },
+    {{ device_block(device, external_dev_id) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "isolated",
+        "category": ["web"],
+        "id": "{{ record_id }}",
+        "kind": "event",
+        "module": "zscaler_zia",
+        "outcome": "success",
+        "reason": "Browser Isolation Policy",
+        "timezone": "{{ params.get('timezone', 'UTC') }}",
+        "type": ["access"]
+    },
+    {{ host_block(device) }},
+    "http": {
+        "request": {
+            "bytes": {{ req_size }},
+            "method": "{{ http_method }}"
+        },
+        "response": {
+            "bytes": {{ resp_size }}
+        },
+        "version": ["1.1"]
+    },
+    {{ network_block(protocol) }},
+    "organization": {
+        "name": "{{ params.company }}"
+    },
+    "related": {
+        "hosts": ["{{ device.hostname | lower }}"],
+        "ip": ["{{ src_ip }}", "{{ clt_pub_ip }}", "{{ dst_ip }}"],
+        "user": ["{{ user.email.split('@')[0] }}", "{{ user.email }}"]
+    },
+    "rule": {
+        "name": ["Cloud_Browser_Isolation_Policy"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "nat": {
+            "ip": "{{ clt_pub_ip }}"
+        },
+        "port": {{ src_port }}
+    },
+    {{ tls_block(tls_version, cipher) }},
+    "url": {
+        "domain": "{{ target.domain }}",
+        "full": {{ url_full | tojson }},
+        "original": {{ url_full | tojson }},
+        "path": "{{ target.path }}",
+        "scheme": "https"
+    },
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    },
+    "zscaler_zia": {
+        "web": {
+            "action": "Isolated",
+            "app": {
+                "class": "General Browsing",
+                "name": "General Browsing",
+                "risk_score": "None"
+            },
+            "bandwidth_throttle": "No",
+            "client": {
+                "cipher": "{{ cipher }}",
+                "cipher_reuse": "{{ module.rand.weighted_choice(['Yes', 'No'], [40, 60]) }}",
+                "internet": {
+                    "ip": "{{ clt_pub_ip }}"
+                },
+                "ip": "{{ src_ip }}",
+                "public_ip": "{{ clt_pub_ip }}",
+                "source_port": {{ src_port }},
+                "tls_version": "{{ tls_version }}"
+            },
+            "cloud_name": "{{ params.cloudname }}",
+            "company": "{{ params.company }}",
+            "content_type": "text/html",
+            {{ zscaler_datacenter_block(params) }},
+            "department": "{{ user.department }}",
+            {{ zscaler_device_block(device, user) }},
+            "dlp": {
+                "dictionaries": {
+                    "name": "None"
+                },
+                "engine": "None"
+            },
+            "dstip_country": "{{ dst_country }}",
+            "eedone": "Yes",
+            "flow_type": "Direct",
+            "host": "{{ target.domain }}",
+            "is_dst_cntry_risky": "{{ 'Yes' if dst_country in ['Russia', 'China', 'Unknown'] else 'No' }}",
+            "location": "{{ user.location }}",
+            "malware": {
+                "category": "None",
+                "class": "None"
+            },
+            "module": "Cloud Browser Isolation",
+            "product_version": "{{ params.product_version }}",
+            "reason": "Browser Isolation Policy",
+            "record": {
+                "id": "{{ record_id }}"
+            },
+            "request": {
+                "header_size": {{ req_header }},
+                "method": "{{ http_method }}",
+                "payload": {{ req_payload }},
+                "size": {{ req_size }},
+                "version": "1.1"
+            },
+            "response": {
+                "code": "200",
+                "header_size": {{ resp_header }},
+                "payload": {{ resp_payload }},
+                "size": {{ resp_size }},
+                "version": "1"
+            },
+            "risk": {
+                "score": {{ risk_score }}
+            },
+            "rule": {
+                "name": "Cloud_Browser_Isolation_Policy",
+                "type": "Cloud Browser Isolation"
+            },
+            "server": {
+                "certificate_validation_chain": "{{ module.rand.weighted_choice(['Pass', 'Unknown', 'Fail'], [60, 25, 15]) }}",
+                "certificate_validation_type": "{{ module.rand.weighted_choice(['DV (Domain Validation)', 'OV (Organization Validation)'], [70, 30]) }}",
+                "cipher": "{{ cipher }}",
+                "ip": "{{ dst_ip }}",
+                "ocsp_result": "{{ module.rand.weighted_choice(['Good', 'Unknown'], [70, 30]) }}",
+                "tls_version": "{{ tls_version }}",
+                "wildcard_certificate": "{{ module.rand.weighted_choice(['Yes', 'No', 'Unknown'], [20, 50, 30]) }}"
+            },
+            "ssl_decrypted": "Yes",
+            "threat": {
+                "name": "None",
+                "severity": "None (0)"
+            },
+            "throttle": {
+                "request_size": 0,
+                "response_size": 0
+            },
+            "timezone": "{{ params.get('timezone', 'UTC') }}",
+            "total": {
+                "size": {{ total_size }}
+            },
+            "url": {
+                "category": {
+                    "sub": "{{ target.sub }}",
+                    "super": "{{ target.super }}"
+                },
+                "category_method": "{{ module.rand.weighted_choice(['Database A', 'Machine Learning'], [60, 40]) }}",
+                "class": "General Surfing"
+            },
+            "user_agent": {
+                "class": "{{ module.rand.weighted_choice(['Chrome', 'Firefox', 'Safari', 'Edge'], [50, 20, 15, 15]) }}",
+                "name": {{ user_agent | tojson }}
+            },
+            "z_tunnel_version": "{{ device.ztunnel_version }}"
+        }
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

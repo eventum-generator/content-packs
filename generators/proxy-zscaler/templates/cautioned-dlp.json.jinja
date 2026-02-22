@@ -1,0 +1,257 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, device_block, user_block, network_block, tls_block, zscaler_device_block, zscaler_datacenter_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick device and user -#}
+{%- set device = samples.devices | random -%}
+{%- set user = samples.users | random -%}
+{%- set external_dev_id = module.rand.string.digits(8) -%}
+{#- DLP event — user uploading sensitive data to cloud service -#}
+{%- set dlp_engine = module.rand.weighted_choice(
+  ["HIPAA", "PCI", "GDPR", "Code Protection", "Standard"],
+  [15, 20, 25, 25, 15]
+) -%}
+{%- set dlp_dict_map = {
+  "HIPAA": "Social Security Numbers|Medical Information",
+  "PCI": "Credit Cards|Social Security Numbers",
+  "GDPR": "EU Identification Numbers|PII Data",
+  "Code Protection": "Source Code|Cloud Configuration",
+  "Standard": "PII Data|Financial Statements"
+} -%}
+{%- set dlp_dict = dlp_dict_map[dlp_engine] -%}
+{%- set dlp_hit_count = module.rand.number.integer(1, 25) -%}
+{#- Upload destination (typically cloud storage or code repos) -#}
+{%- set upload_targets = [
+  {"domain": "drive.google.com", "path": "/upload/resumable", "app": "Google Drive", "app_class": "Cloud Storage"},
+  {"domain": "www.dropbox.com", "path": "/upload", "app": "Dropbox", "app_class": "Cloud Storage"},
+  {"domain": "github.com", "path": "/user/repo/upload/main", "app": "GitHub", "app_class": "Development"},
+  {"domain": "outlook.office365.com", "path": "/owa/service.svc?action=CreateAttachmentFromLocalFile", "app": "Microsoft Office 365", "app_class": "Collaboration"},
+  {"domain": "mail.google.com", "path": "/mail/u/0/?view=att&disp=comp", "app": "Google Workspace", "app_class": "Collaboration"},
+  {"domain": "slack.com", "path": "/api/files.upload", "app": "Slack", "app_class": "Collaboration"},
+  {"domain": "paste.ee", "path": "/p/new", "app": "General Browsing", "app_class": "General Browsing"}
+] -%}
+{%- set target = upload_targets | random -%}
+{#- HTTP details (uploads are POST) -#}
+{%- set protocol = "HTTPS" -%}
+{%- set http_method = "POST" -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Network details -#}
+{%- set src_ip = "10." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set clt_pub_ip = params.get('client_public_ip', '203.0.113.' ~ module.rand.number.integer(1, 254)) -%}
+{#- Byte sizes (uploads have larger request payloads) -#}
+{%- set req_header = module.rand.number.integer(300, 800) -%}
+{%- set req_payload = module.rand.number.clamp(module.rand.number.lognormal(10, 1.5) | int, 1000, 50000000) -%}
+{%- set req_size = req_header + req_payload -%}
+{%- set resp_header = module.rand.number.integer(200, 600) -%}
+{%- set resp_payload = module.rand.number.integer(100, 5000) -%}
+{%- set resp_size = resp_header + resp_payload -%}
+{%- set total_size = req_size + resp_size -%}
+{#- TLS details -#}
+{%- set tls_version = module.rand.weighted_choice(["TLS1.3", "TLS1.2"], [75, 25]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "TLS_CHACHA20_POLY1305_SHA256"], [40, 40, 20]) -%}
+{#- Upload file info -#}
+{%- set upload_files = [
+  {"name": "quarterly-report.xlsx", "type": "Microsoft Excel Files", "class": "Document Content", "subtype": "xlsx"},
+  {"name": "employee-data.csv", "type": "CSV Files", "class": "Document Content", "subtype": "csv"},
+  {"name": "patient-records.pdf", "type": "PDF Documents", "class": "Document Content", "subtype": "pdf"},
+  {"name": "source-code.zip", "type": "Archive Files", "class": "Archive Content", "subtype": "zip"},
+  {"name": "database-export.sql", "type": "Other Files", "class": "Active Web Contents", "subtype": "sql"},
+  {"name": "config-secrets.yml", "type": "Other Files", "class": "Active Web Contents", "subtype": "yml"},
+  {"name": "customer-list.docx", "type": "Microsoft Word Files", "class": "Document Content", "subtype": "docx"}
+] -%}
+{%- set upload_file = upload_files | random -%}
+{%- set dlp_identifier = module.rand.string.digits(19) -%}
+{%- set dlp_md5 = module.rand.crypto.md5() -%}
+{%- set dst_country = module.rand.weighted_choice(["United States", "Ireland", "Germany", "Netherlands", "United Kingdom"], [50, 15, 15, 10, 10]) -%}
+{%- set url_full = "https://" ~ target.domain ~ target.path -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "cloud": {
+        "provider": "{{ params.cloudname }}"
+    },
+    "destination": {
+        "domain": "{{ target.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": 443
+    },
+    {{ device_block(device, external_dev_id) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "cautioned",
+        "category": ["web"],
+        "id": "{{ record_id }}",
+        "kind": "event",
+        "module": "zscaler_zia",
+        "outcome": "success",
+        "reason": "DLP Policy Violation - {{ dlp_engine }}",
+        "timezone": "{{ params.get('timezone', 'UTC') }}",
+        "type": ["access"]
+    },
+    "file": {
+        "extension": ["{{ upload_file.subtype }}"],
+        "name": ["{{ upload_file.name }}"]
+    },
+    {{ host_block(device) }},
+    "http": {
+        "request": {
+            "bytes": {{ req_size }},
+            "method": "{{ http_method }}"
+        },
+        "response": {
+            "bytes": {{ resp_size }}
+        },
+        "version": ["1.1"]
+    },
+    {{ network_block(protocol) }},
+    "organization": {
+        "name": "{{ params.company }}"
+    },
+    "related": {
+        "hash": ["{{ dlp_md5 }}"],
+        "hosts": ["{{ device.hostname | lower }}"],
+        "ip": ["{{ src_ip }}", "{{ clt_pub_ip }}", "{{ dst_ip }}"],
+        "user": ["{{ user.email.split('@')[0] }}", "{{ user.email }}"]
+    },
+    "rule": {
+        "name": ["DLP_{{ dlp_engine | replace(' ', '_') }}_Policy"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "nat": {
+            "ip": "{{ clt_pub_ip }}"
+        },
+        "port": {{ src_port }}
+    },
+    {{ tls_block(tls_version, cipher) }},
+    "url": {
+        "domain": "{{ target.domain }}",
+        "full": {{ url_full | tojson }},
+        "original": {{ url_full | tojson }},
+        "path": "{{ target.path }}",
+        "scheme": "https"
+    },
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    },
+    "zscaler_zia": {
+        "web": {
+            "action": "Cautioned",
+            "app": {
+                "class": "{{ target.app_class }}",
+                "name": "{{ target.app }}",
+                "risk_score": "{{ module.rand.weighted_choice(['Low', 'Medium'], [60, 40]) }}"
+            },
+            "bandwidth_throttle": "No",
+            "client": {
+                "cipher": "{{ cipher }}",
+                "cipher_reuse": "{{ module.rand.weighted_choice(['Yes', 'No'], [50, 50]) }}",
+                "internet": {
+                    "ip": "{{ clt_pub_ip }}"
+                },
+                "ip": "{{ src_ip }}",
+                "public_ip": "{{ clt_pub_ip }}",
+                "source_port": {{ src_port }},
+                "tls_version": "{{ tls_version }}"
+            },
+            "cloud_name": "{{ params.cloudname }}",
+            "company": "{{ params.company }}",
+            "content_type": "{{ module.rand.weighted_choice(['application/octet-stream', 'multipart/form-data', 'application/json'], [40, 40, 20]) }}",
+            {{ zscaler_datacenter_block(params) }},
+            "department": "{{ user.department }}",
+            {{ zscaler_device_block(device, user) }},
+            "dlp": {
+                "dictionaries": {
+                    "hit_count": "{{ dlp_hit_count }}",
+                    "name": "{{ dlp_dict }}"
+                },
+                "engine": "{{ dlp_engine }}",
+                "identifier": "{{ dlp_identifier }}",
+                "md5": "{{ dlp_md5 }}",
+                "rule": {
+                    "name": "DLP_{{ dlp_engine | replace(' ', '_') }}_Policy"
+                }
+            },
+            "dstip_country": "{{ dst_country }}",
+            "eedone": "Yes",
+            "flow_type": "Direct",
+            "host": "{{ target.domain }}",
+            "location": "{{ user.location }}",
+            "malware": {
+                "category": "None",
+                "class": "None"
+            },
+            "module": "DLP",
+            "product_version": "{{ params.product_version }}",
+            "reason": "DLP Policy Violation",
+            "record": {
+                "id": "{{ record_id }}"
+            },
+            "request": {
+                "header_size": {{ req_header }},
+                "method": "{{ http_method }}",
+                "payload": {{ req_payload }},
+                "size": {{ req_size }},
+                "version": "1.1"
+            },
+            "response": {
+                "code": "200",
+                "header_size": {{ resp_header }},
+                "payload": {{ resp_payload }},
+                "size": {{ resp_size }},
+                "version": "1"
+            },
+            "risk": {
+                "score": {{ module.rand.number.integer(5, 40) }}
+            },
+            "rule": {
+                "name": "DLP_{{ dlp_engine | replace(' ', '_') }}_Policy",
+                "type": "DLP Control"
+            },
+            "server": {
+                "certificate_validation_chain": "Pass",
+                "certificate_validation_type": "{{ module.rand.weighted_choice(['OV (Organization Validation)', 'DV (Domain Validation)'], [60, 40]) }}",
+                "cipher": "{{ cipher }}",
+                "ip": "{{ dst_ip }}",
+                "ocsp_result": "Good",
+                "tls_version": "{{ tls_version }}"
+            },
+            "ssl_decrypted": "Yes",
+            "threat": {
+                "name": "None",
+                "severity": "None (0)"
+            },
+            "throttle": {
+                "request_size": 0,
+                "response_size": 0
+            },
+            "timezone": "{{ params.get('timezone', 'UTC') }}",
+            "total": {
+                "size": {{ total_size }}
+            },
+            "upload": {
+                "file": {
+                    "class": "{{ upload_file['class'] }}",
+                    "name": "{{ upload_file.name }}",
+                    "subtype": "{{ upload_file.subtype }}",
+                    "type": "{{ upload_file.type }}"
+                }
+            },
+            "url": {
+                "category": {
+                    "sub": "{{ module.rand.weighted_choice(['Cloud Storage', 'Webmail', 'Online Chat', 'Other Information Technology'], [30, 30, 20, 20]) }}",
+                    "super": "Internet Communication"
+                },
+                "category_method": "Database A",
+                "class": "Business Use"
+            },
+            "user_agent": {
+                "class": "{{ module.rand.weighted_choice(['Chrome', 'Firefox', 'Edge'], [55, 25, 20]) }}",
+                "name": {{ user_agent | tojson }}
+            },
+            "z_tunnel_version": "{{ device.ztunnel_version }}"
+        }
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

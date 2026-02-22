@@ -1,0 +1,243 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, device_block, user_block, network_block, tls_block, zscaler_device_block, zscaler_datacenter_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick device and user -#}
+{%- set device = samples.devices | random -%}
+{%- set user = samples.users | random -%}
+{%- set external_dev_id = module.rand.string.digits(8) -%}
+{#- Blocked file types (executables, scripts, archives from untrusted sources) -#}
+{%- set blocked_files = [
+  {"name": "setup.exe", "type": "Executable Files", "class": "Executable Content", "subtype": "exe"},
+  {"name": "installer.msi", "type": "Executable Files", "class": "Executable Content", "subtype": "msi"},
+  {"name": "update.bat", "type": "Executable Files", "class": "Executable Content", "subtype": "bat"},
+  {"name": "script.ps1", "type": "Executable Files", "class": "Executable Content", "subtype": "ps1"},
+  {"name": "macro-doc.docm", "type": "Microsoft Word Files", "class": "Document Content", "subtype": "docm"},
+  {"name": "payload.dll", "type": "Executable Files", "class": "Executable Content", "subtype": "dll"},
+  {"name": "archive.7z", "type": "Archive Files", "class": "Archive Content", "subtype": "7z"},
+  {"name": "package.tar.gz", "type": "Archive Files", "class": "Archive Content", "subtype": "tar.gz"},
+  {"name": "binary.scr", "type": "Executable Files", "class": "Executable Content", "subtype": "scr"},
+  {"name": "macro-sheet.xlsm", "type": "Microsoft Excel Files", "class": "Document Content", "subtype": "xlsm"}
+] -%}
+{%- set blocked_file = blocked_files | random -%}
+{#- Download source (untrusted/unknown sites) -#}
+{%- set download_sources = [
+  {"domain": "free-software-hub.com", "path": "/download/" ~ blocked_file.name},
+  {"domain": "crack-tools.xyz", "path": "/get/" ~ blocked_file.name},
+  {"domain": "file-share-direct.net", "path": "/dl/" ~ module.rand.string.hex(12) ~ "/" ~ blocked_file.name},
+  {"domain": "download-manager-pro.com", "path": "/files/" ~ blocked_file.name},
+  {"domain": "tools-archive.org", "path": "/pub/" ~ blocked_file.name},
+  {"domain": "mirror-downloads.info", "path": "/stable/" ~ blocked_file.name}
+] -%}
+{%- set source = download_sources | random -%}
+{#- HTTP details -#}
+{%- set protocol = module.rand.weighted_choice(["HTTPS", "HTTP"], [70, 30]) -%}
+{%- set http_method = "GET" -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Network details -#}
+{%- set src_ip = "10." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = "0.0.0.0" -%}
+{%- set dst_port = 443 if protocol == "HTTPS" else 80 -%}
+{%- set clt_pub_ip = params.get('client_public_ip', '203.0.113.' ~ module.rand.number.integer(1, 254)) -%}
+{#- Byte sizes (small — blocked before download completes) -#}
+{%- set req_header = module.rand.number.integer(200, 500) -%}
+{%- set req_payload = module.rand.number.integer(0, 200) -%}
+{%- set req_size = req_header + req_payload -%}
+{%- set resp_header = module.rand.number.integer(100, 400) -%}
+{%- set resp_payload = module.rand.number.integer(0, 1500) -%}
+{%- set resp_size = resp_header + resp_payload -%}
+{%- set total_size = req_size + resp_size -%}
+{#- TLS details -#}
+{%- set tls_version = module.rand.weighted_choice(["TLS1.3", "TLS1.2", "TLS1.1"], [55, 35, 10]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "ECDHE-RSA-AES256-GCM-SHA384"], [35, 35, 30]) -%}
+{%- set risk_score = module.rand.number.integer(20, 60) -%}
+{%- set file_sha256 = module.rand.crypto.sha256() -%}
+{%- set file_md5 = module.rand.crypto.md5() -%}
+{%- set dst_country = module.rand.weighted_choice(["United States", "Russia", "Unknown", "China", "Romania", "Germany", "Netherlands"], [25, 15, 20, 10, 10, 10, 10]) -%}
+{%- set url_scheme = "https" if protocol == "HTTPS" else "http" -%}
+{%- set url_full = url_scheme ~ "://" ~ source.domain ~ source.path -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "cloud": {
+        "provider": "{{ params.cloudname }}"
+    },
+    "destination": {
+        "domain": "{{ source.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ device_block(device, external_dev_id) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "blocked",
+        "category": ["web"],
+        "id": "{{ record_id }}",
+        "kind": "event",
+        "module": "zscaler_zia",
+        "outcome": "failure",
+        "reason": "File Type Blocked - {{ blocked_file['class'] }}",
+        "timezone": "{{ params.get('timezone', 'UTC') }}",
+        "type": ["access"]
+    },
+    "file": {
+        "extension": ["{{ blocked_file.subtype }}"],
+        "hash": {
+            "md5": "{{ file_md5 }}",
+            "sha256": "{{ file_sha256 }}"
+        },
+        "name": ["{{ blocked_file.name }}"],
+        "type": "file"
+    },
+    {{ host_block(device) }},
+    "http": {
+        "request": {
+            "bytes": {{ req_size }},
+            "method": "{{ http_method }}"
+        },
+        "response": {
+            "bytes": {{ resp_size }}
+        },
+        "version": ["1.1"]
+    },
+    {{ network_block(protocol) }},
+    "organization": {
+        "name": "{{ params.company }}"
+    },
+    "related": {
+        "hash": ["{{ file_md5 }}", "{{ file_sha256 }}"],
+        "hosts": ["{{ device.hostname | lower }}"],
+        "ip": ["{{ src_ip }}", "{{ clt_pub_ip }}"],
+        "user": ["{{ user.email.split('@')[0] }}", "{{ user.email }}"]
+    },
+    "rule": {
+        "name": ["Block_Executable_Downloads"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "nat": {
+            "ip": "{{ clt_pub_ip }}"
+        },
+        "port": {{ src_port }}
+    },
+    {{ tls_block(tls_version, cipher) }},
+    "url": {
+        "domain": "{{ source.domain }}",
+        "full": {{ url_full | tojson }},
+        "original": {{ url_full | tojson }},
+        "path": {{ source.path | tojson }},
+        "scheme": "{{ url_scheme }}"
+    },
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    },
+    "zscaler_zia": {
+        "web": {
+            "action": "Blocked",
+            "app": {
+                "class": "General Browsing",
+                "name": "General Browsing",
+                "risk_score": "None"
+            },
+            "bandwidth_throttle": "No",
+            "client": {
+                "cipher": "{{ cipher }}",
+                "cipher_reuse": "No",
+                "internet": {
+                    "ip": "{{ clt_pub_ip }}"
+                },
+                "ip": "{{ src_ip }}",
+                "public_ip": "{{ clt_pub_ip }}",
+                "source_port": {{ src_port }},
+                "tls_version": "{{ tls_version }}"
+            },
+            "cloud_name": "{{ params.cloudname }}",
+            "company": "{{ params.company }}",
+            "content_type": "application/octet-stream",
+            {{ zscaler_datacenter_block(params) }},
+            "department": "{{ user.department }}",
+            {{ zscaler_device_block(device, user) }},
+            "dlp": {
+                "dictionaries": {
+                    "name": "None"
+                },
+                "engine": "None"
+            },
+            "dstip_country": "{{ dst_country }}",
+            "eedone": "Yes",
+            "file": {
+                "class": "{{ blocked_file['class'] }}",
+                "name": "{{ blocked_file.name }}",
+                "subtype": "{{ blocked_file.subtype }}",
+                "type": "{{ blocked_file.type }}"
+            },
+            "flow_type": "Blocked",
+            "ft_rulename": "Block_Executable_Downloads",
+            "host": "{{ source.domain }}",
+            "location": "{{ user.location }}",
+            "malware": {
+                "category": "None",
+                "class": "None"
+            },
+            "md5_hash": "{{ file_md5 }}",
+            "module": "File Type Control",
+            "product_version": "{{ params.product_version }}",
+            "reason": "File Type Blocked",
+            "record": {
+                "id": "{{ record_id }}"
+            },
+            "request": {
+                "header_size": {{ req_header }},
+                "method": "{{ http_method }}",
+                "payload": {{ req_payload }},
+                "size": {{ req_size }},
+                "version": "1.1"
+            },
+            "response": {
+                "code": "403",
+                "header_size": {{ resp_header }},
+                "payload": {{ resp_payload }},
+                "size": {{ resp_size }},
+                "version": "1"
+            },
+            "risk": {
+                "score": {{ risk_score }}
+            },
+            "rule": {
+                "name": "Block_Executable_Downloads",
+                "type": "File Type Control"
+            },
+            "server": {
+                "ip": "{{ dst_ip }}"
+            },
+            "sha256": "{{ file_sha256 }}",
+            "ssl_decrypted": "Yes",
+            "threat": {
+                "name": "None",
+                "severity": "None (0)"
+            },
+            "throttle": {
+                "request_size": 0,
+                "response_size": 0
+            },
+            "timezone": "{{ params.get('timezone', 'UTC') }}",
+            "total": {
+                "size": {{ total_size }}
+            },
+            "url": {
+                "category": {
+                    "sub": "{{ module.rand.weighted_choice(['Shareware Download', 'Newly Registered and Observed Domains', 'Non Categorizable'], [40, 35, 25]) }}",
+                    "super": "{{ module.rand.weighted_choice(['Information Technology', 'Miscellaneous'], [50, 50]) }}"
+                },
+                "category_method": "{{ module.rand.weighted_choice(['Database A', 'Machine Learning'], [75, 25]) }}",
+                "class": "{{ module.rand.weighted_choice(['Business Use', 'General Surfing'], [40, 60]) }}"
+            },
+            "user_agent": {
+                "class": "{{ module.rand.weighted_choice(['Chrome', 'Firefox', 'Edge'], [50, 30, 20]) }}",
+                "name": {{ user_agent | tojson }}
+            },
+            "z_tunnel_version": "{{ device.ztunnel_version }}"
+        }
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}
