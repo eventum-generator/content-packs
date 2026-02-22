@@ -1,0 +1,163 @@
+{#- RECEIVE event — External inbound message received via SMTP.
+     This is a PRODUCER template: pushes message context to shared pool
+     for downstream SUBMIT/SEND/DELIVER/AGENTINFO correlation. -#}
+{%- set seq = shared.get('internal_message_id_seq', 34359738368) -%}
+{%- set log_seq = shared.get('log_id_seq', 1000) -%}
+{%- set fqdn = params.hostname ~ '.' ~ params.domain -%}
+
+{#- Pick external sender from weighted domains -#}
+{%- set ext = samples.external_domains.weighted_pick('weight') -%}
+{%- set sender_user = module.faker.locale.en_US.user_name() -%}
+{%- set sender_email = sender_user ~ '@' ~ ext.domain -%}
+{%- set sender_domain = ext.domain -%}
+{%- set client_ip = ext.ip -%}
+{%- set client_hostname = ext.mx_host -%}
+
+{#- Pick internal recipient -#}
+{%- set rcpt = samples.internal_users.pick() -%}
+{%- set recipient_email = rcpt.username ~ '@' ~ params.domain -%}
+{%- set recipient_name = rcpt.username -%}
+
+{#- Additional recipients (10% chance of multi-recipient) -#}
+{%- set recipient_count = 1 -%}
+{%- if module.rand.chance(0.1) -%}
+  {%- set recipient_count = module.rand.number.integer(2, 5) -%}
+{%- endif -%}
+
+{#- Message metadata -#}
+{%- set msg_id = '<' ~ (module.rand.crypto.uuid4() | replace("-", "")) ~ '@' ~ ext.mx_host ~ '>' -%}
+{%- set network_msg_id = module.rand.crypto.uuid4() -%}
+{%- set total_bytes = module.rand.number.clamp(module.rand.number.lognormal(10.2, 1.4) | int, 800, 25000000) -%}
+{%- set log_id = module.rand.crypto.uuid4() -%}
+
+{#- Subject selection: weighted category then random within category -#}
+{%- set is_spam = module.rand.chance(0.08) -%}
+{%- if is_spam -%}
+  {%- set subject_cat = module.rand.weighted_choice(["spam", "phishing"], [65, 35]) -%}
+{%- else -%}
+  {%- set subject_cat = module.rand.weighted_choice(["business", "automated", "newsletter"], [50, 40, 10]) -%}
+{%- endif -%}
+{%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+
+{#- Connector: frontend receive connector -#}
+{%- set connector_id = params.hostname ~ '\\\\Default Frontend ' ~ params.hostname -%}
+
+{#- Source context: SMTP receipt acknowledgment -#}
+{%- set source_context = '08DC' ~ module.rand.string.hex(12) | upper ~ ';' ~ timestamp.strftime('%Y-%m-%dT%H:%M:%S.') ~ module.rand.string.digits(3) ~ 'Z;1' -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "domain": "{{ params.domain }}",
+        "ip": "{{ params.server_ip }}",
+        "user": {
+            "email": "{{ recipient_email }}",
+            "name": "{{ recipient_name }}"
+        }
+    },
+    "ecs": {
+        "version": "{{ params.ecs_version }}"
+    },
+    "email": {
+        "direction": "inbound",
+        "delivery_timestamp": "{{ timestamp.isoformat() }}",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "local_id": "{{ network_msg_id }}",
+        "message_id": "{{ msg_id }}",
+        "subject": "{{ subject }}",
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        },
+        "attachments": {
+            "file": {
+                "size": {{ total_bytes }}
+            }
+        }
+    },
+    "event": {
+        "action": "receive",
+        "category": ["email"],
+        "dataset": "microsoft_exchange.messagetracking",
+        "kind": "event",
+        "module": "microsoft_exchange",
+        "outcome": "success",
+        "type": ["info"]
+    },
+    "microsoft_exchange": {
+        "messagetracking": {
+            "client_ip": "{{ client_ip }}",
+            "client_hostname": "{{ client_hostname }}",
+            "server_ip": "{{ params.server_ip }}",
+            "server_hostname": "{{ fqdn }}",
+            "source_context": "{{ source_context }}",
+            "connector_id": "{{ connector_id }}",
+            "source": "SMTP",
+            "event_id": "RECEIVE",
+            "internal_message_id": {{ seq }},
+            "network_message_id": "{{ network_msg_id }}",
+            "recipient_status": "250 2.1.5 Recipient OK",
+            "recipient_count": {{ recipient_count }},
+            "related_recipient_address": "",
+            "reference": "",
+            "return_path": "{{ sender_email }}",
+            "message_info": "",
+            "directionality": "Incoming",
+            "original_client_ip": "{{ client_ip }}",
+            "original_server_ip": "{{ params.server_ip }}",
+            "custom_data": "{{ 'S:DeliveryPriority=Normal;S:AccountForest=' ~ params.domain }}",
+            "transport_traffic_type": "Email",
+            "log_id": "{{ log_id }}",
+            "schema_version": "{{ params.schema_version }}"
+        }
+    },
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "ip": ["{{ params.server_ip }}"],
+        "product": "Exchange Server",
+        "type": "mail",
+        "vendor": "Microsoft",
+        "version": "{{ params.schema_version }}"
+    },
+    "related": {
+        "ip": ["{{ client_ip }}", "{{ params.server_ip }}"],
+        "user": ["{{ sender_user }}", "{{ recipient_name }}"]
+    },
+    "source": {
+        "domain": "{{ sender_domain }}",
+        "ip": "{{ client_ip }}",
+        "user": {
+            "email": "{{ sender_email }}",
+            "name": "{{ sender_user }}"
+        }
+    },
+    "tags": ["microsoft-exchange", "forwarded"]
+}
+{#- Push message context to shared pool for downstream correlation -#}
+{%- set pool = shared.get('message_pool', []) -%}
+{%- do pool.append({
+    "message_id": msg_id,
+    "network_message_id": network_msg_id,
+    "sender_email": sender_email,
+    "sender_name": sender_user,
+    "sender_domain": sender_domain,
+    "recipient_email": recipient_email,
+    "recipient_name": recipient_name,
+    "subject": subject,
+    "total_bytes": total_bytes,
+    "directionality": "Incoming",
+    "client_ip": client_ip,
+    "client_hostname": client_hostname,
+    "recipient_count": recipient_count
+}) -%}
+{%- if pool | length > (params.get('max_message_pool', 80) | int) -%}{%- do pool.pop(0) -%}{%- endif -%}
+{%- do shared.set('message_pool', pool) -%}
+{%- do shared.set('internal_message_id_seq', (seq + 1) % 2147483647) -%}
+{%- do shared.set('log_id_seq', (log_seq + 1) % 2147483647) -%}

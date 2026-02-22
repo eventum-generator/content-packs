@@ -1,0 +1,142 @@
+{#- DELIVER event — Message delivered to local mailbox via STOREDRIVER.
+     Consumer template: reads from shared message pool for correlation. -#}
+{%- set seq = shared.get('internal_message_id_seq', 34359738368) -%}
+{%- set log_seq = shared.get('log_id_seq', 1000) -%}
+{%- set fqdn = params.hostname ~ '.' ~ params.domain -%}
+
+{#- Try to correlate with a message from the pool -#}
+{%- set pool = shared.get('message_pool', []) -%}
+{%- if pool | length > 0 -%}
+  {%- set msg = pool | random -%}
+  {%- set msg_id = msg.message_id -%}
+  {%- set network_msg_id = msg.network_message_id -%}
+  {%- set sender_email = msg.sender_email -%}
+  {%- set sender_name = msg.sender_name -%}
+  {%- set sender_domain = msg.sender_domain -%}
+  {%- set recipient_email = msg.recipient_email -%}
+  {%- set recipient_name = msg.recipient_name -%}
+  {%- set subject = msg.subject -%}
+  {%- set total_bytes = msg.total_bytes -%}
+  {%- set directionality = msg.directionality -%}
+  {%- set recipient_count = msg.recipient_count -%}
+{%- else -%}
+  {#- Standalone fallback -#}
+  {%- set sender = samples.internal_users.pick() -%}
+  {%- set sender_email = sender.username ~ '@' ~ params.domain -%}
+  {%- set sender_name = sender.username -%}
+  {%- set sender_domain = params.domain -%}
+  {%- set rcpt = samples.internal_users.pick() -%}
+  {%- set recipient_email = rcpt.username ~ '@' ~ params.domain -%}
+  {%- set recipient_name = rcpt.username -%}
+  {%- set msg_id = '<' ~ (module.rand.crypto.uuid4() | replace("-", "")) ~ '@' ~ fqdn ~ '>' -%}
+  {%- set network_msg_id = module.rand.crypto.uuid4() -%}
+  {%- set total_bytes = module.rand.number.clamp(module.rand.number.lognormal(10.2, 1.4) | int, 800, 25000000) -%}
+  {%- set subject_cat = module.rand.weighted_choice(["business", "automated"], [60, 40]) -%}
+  {%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+  {%- set directionality = "Originating" -%}
+  {%- set recipient_count = 1 -%}
+{%- endif -%}
+
+{%- set log_id = module.rand.crypto.uuid4() -%}
+{%- set email_direction = "inbound" if directionality == "Incoming" else "internal" -%}
+
+{#- message_info contains origination timestamp for DELIVER events -#}
+{%- set origination_ts = timestamp.strftime('%Y-%m-%dT%H:%M:%S.') ~ module.rand.string.digits(3) ~ 'Z' -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "domain": "{{ params.domain }}",
+        "ip": "{{ params.server_ip }}",
+        "user": {
+            "email": "{{ recipient_email }}",
+            "name": "{{ recipient_name }}"
+        }
+    },
+    "ecs": {
+        "version": "{{ params.ecs_version }}"
+    },
+    "email": {
+        "direction": "{{ email_direction }}",
+        "delivery_timestamp": "{{ timestamp.isoformat() }}",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "local_id": "{{ network_msg_id }}",
+        "message_id": "{{ msg_id }}",
+        "subject": "{{ subject }}",
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        },
+        "attachments": {
+            "file": {
+                "size": {{ total_bytes }}
+            }
+        }
+    },
+    "event": {
+        "action": "deliver",
+        "category": ["email"],
+        "dataset": "microsoft_exchange.messagetracking",
+        "kind": "event",
+        "module": "microsoft_exchange",
+        "outcome": "success",
+        "type": ["info"]
+    },
+    "microsoft_exchange": {
+        "messagetracking": {
+            "client_ip": "{{ params.server_ip }}",
+            "client_hostname": "{{ fqdn }}",
+            "server_ip": "{{ params.server_ip }}",
+            "server_hostname": "{{ fqdn }}",
+            "source_context": "MapiDelivery",
+            "connector_id": "",
+            "source": "STOREDRIVER",
+            "event_id": "DELIVER",
+            "internal_message_id": {{ seq }},
+            "network_message_id": "{{ network_msg_id }}",
+            "recipient_status": "250 2.1.5 STOREDRV.Deliver; delivered to mailbox",
+            "recipient_count": {{ recipient_count }},
+            "related_recipient_address": "",
+            "reference": "",
+            "return_path": "{{ sender_email }}",
+            "message_info": "{{ origination_ts }}",
+            "directionality": "{{ directionality }}",
+            "original_client_ip": "{{ params.server_ip }}",
+            "original_server_ip": "{{ params.server_ip }}",
+            "custom_data": "{{ 'S:DeliveryPriority=Normal;S:AccountForest=' ~ params.domain ~ ';S:MessageLatency=00:00:0' ~ module.rand.number.integer(0, 9) ~ '.' ~ module.rand.string.digits(7) }}",
+            "transport_traffic_type": "Email",
+            "log_id": "{{ log_id }}",
+            "schema_version": "{{ params.schema_version }}"
+        }
+    },
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "ip": ["{{ params.server_ip }}"],
+        "product": "Exchange Server",
+        "type": "mail",
+        "vendor": "Microsoft",
+        "version": "{{ params.schema_version }}"
+    },
+    "related": {
+        "ip": ["{{ params.server_ip }}"],
+        "user": ["{{ sender_name }}", "{{ recipient_name }}"]
+    },
+    "source": {
+        "domain": "{{ sender_domain }}",
+        "ip": "{{ params.server_ip }}",
+        "user": {
+            "email": "{{ sender_email }}",
+            "name": "{{ sender_name }}"
+        }
+    },
+    "tags": ["microsoft-exchange", "forwarded"]
+}
+{%- do shared.set('internal_message_id_seq', (seq + 1) % 2147483647) -%}
+{%- do shared.set('log_id_seq', (log_seq + 1) % 2147483647) -%}

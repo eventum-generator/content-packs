@@ -1,0 +1,130 @@
+{#- DEFER event — Message delivery delayed (temporary failure, retry pending). -#}
+{%- set seq = shared.get('internal_message_id_seq', 34359738368) -%}
+{%- set log_seq = shared.get('log_id_seq', 1000) -%}
+{%- set fqdn = params.hostname ~ '.' ~ params.domain -%}
+
+{#- External recipient for deferred delivery -#}
+{%- set sender = samples.internal_users.pick() -%}
+{%- set sender_email = sender.username ~ '@' ~ params.domain -%}
+{%- set ext = samples.external_domains.weighted_pick('weight') -%}
+{%- set recipient_user = module.faker.locale.en_US.user_name() -%}
+{%- set recipient_email = recipient_user ~ '@' ~ ext.domain -%}
+
+{%- set msg_id = '<' ~ (module.rand.crypto.uuid4() | replace("-", "")) ~ '@' ~ fqdn ~ '>' -%}
+{%- set network_msg_id = module.rand.crypto.uuid4() -%}
+{%- set total_bytes = module.rand.number.clamp(module.rand.number.lognormal(10.2, 1.4) | int, 800, 25000000) -%}
+{%- set log_id = module.rand.crypto.uuid4() -%}
+
+{%- set subject_cat = module.rand.weighted_choice(["business", "automated"], [60, 40]) -%}
+{%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+
+{#- Defer reason -#}
+{%- set defer_reason = module.rand.weighted_choice(
+    ["421 4.7.0 Try again later",
+     "451 4.7.1 Temporary server error. Please try again later",
+     "421 4.2.1 Unable to connect",
+     "451 4.4.0 DNS query failed",
+     "421 4.7.0 Connection timed out"],
+    [30, 25, 20, 15, 10]
+) -%}
+
+{#- Retry count -#}
+{%- set retry_count = module.rand.number.integer(1, 12) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "domain": "{{ ext.domain }}",
+        "ip": "{{ ext.ip }}",
+        "user": {
+            "email": "{{ recipient_email }}",
+            "name": "{{ recipient_user }}"
+        }
+    },
+    "ecs": {
+        "version": "{{ params.ecs_version }}"
+    },
+    "email": {
+        "direction": "outbound",
+        "delivery_timestamp": "{{ timestamp.isoformat() }}",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "local_id": "{{ network_msg_id }}",
+        "message_id": "{{ msg_id }}",
+        "subject": "{{ subject }}",
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        },
+        "attachments": {
+            "file": {
+                "size": {{ total_bytes }}
+            }
+        }
+    },
+    "event": {
+        "action": "defer",
+        "category": ["email"],
+        "dataset": "microsoft_exchange.messagetracking",
+        "kind": "event",
+        "module": "microsoft_exchange",
+        "outcome": "failure",
+        "type": ["info"]
+    },
+    "microsoft_exchange": {
+        "messagetracking": {
+            "client_ip": "{{ params.server_ip }}",
+            "client_hostname": "{{ fqdn }}",
+            "server_ip": "{{ ext.ip }}",
+            "server_hostname": "{{ ext.mx_host }}",
+            "source_context": "{{ defer_reason }}",
+            "connector_id": "Outbound to Internet",
+            "source": "QUEUE",
+            "event_id": "DEFER",
+            "internal_message_id": {{ seq }},
+            "network_message_id": "{{ network_msg_id }}",
+            "recipient_status": "{{ defer_reason }}",
+            "recipient_count": 1,
+            "related_recipient_address": "",
+            "reference": "",
+            "return_path": "{{ sender_email }}",
+            "message_info": "Retry count={{ retry_count }}",
+            "directionality": "Originating",
+            "original_client_ip": "{{ params.server_ip }}",
+            "original_server_ip": "{{ params.server_ip }}",
+            "custom_data": "{{ 'S:DeliveryPriority=Normal;S:AccountForest=' ~ params.domain }}",
+            "transport_traffic_type": "Email",
+            "log_id": "{{ log_id }}",
+            "schema_version": "{{ params.schema_version }}"
+        }
+    },
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "ip": ["{{ params.server_ip }}"],
+        "product": "Exchange Server",
+        "type": "mail",
+        "vendor": "Microsoft",
+        "version": "{{ params.schema_version }}"
+    },
+    "related": {
+        "ip": ["{{ params.server_ip }}", "{{ ext.ip }}"],
+        "user": ["{{ sender.username }}", "{{ recipient_user }}"]
+    },
+    "source": {
+        "domain": "{{ params.domain }}",
+        "ip": "{{ params.server_ip }}",
+        "user": {
+            "email": "{{ sender_email }}",
+            "name": "{{ sender.username }}"
+        }
+    },
+    "tags": ["microsoft-exchange", "forwarded"]
+}
+{%- do shared.set('internal_message_id_seq', (seq + 1) % 2147483647) -%}
+{%- do shared.set('log_id_seq', (log_seq + 1) % 2147483647) -%}

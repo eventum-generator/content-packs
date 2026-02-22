@@ -1,0 +1,153 @@
+{#- FAIL event — Permanent message delivery failure. -#}
+{%- set seq = shared.get('internal_message_id_seq', 34359738368) -%}
+{%- set log_seq = shared.get('log_id_seq', 1000) -%}
+{%- set fqdn = params.hostname ~ '.' ~ params.domain -%}
+
+{#- Sender and failed recipient -#}
+{%- set is_inbound_fail = module.rand.chance(0.3) -%}
+{%- if is_inbound_fail -%}
+  {%- set ext = samples.external_domains.weighted_pick('weight') -%}
+  {%- set sender_user = module.faker.locale.en_US.user_name() -%}
+  {%- set sender_email = sender_user ~ '@' ~ ext.domain -%}
+  {%- set sender_name = sender_user -%}
+  {%- set sender_domain = ext.domain -%}
+  {%- set recipient_user = module.faker.locale.en_US.user_name() -%}
+  {%- set recipient_email = recipient_user ~ '@' ~ params.domain -%}
+  {%- set fail_source = "SMTP" -%}
+  {%- set directionality = "Incoming" -%}
+  {%- set email_direction = "inbound" -%}
+  {%- set connector_id = params.hostname ~ '\\\\Default Frontend ' ~ params.hostname -%}
+  {%- set dst_ip = params.server_ip -%}
+  {%- set dst_hostname = fqdn -%}
+{%- else -%}
+  {%- set sender = samples.internal_users.pick() -%}
+  {%- set sender_email = sender.username ~ '@' ~ params.domain -%}
+  {%- set sender_name = sender.username -%}
+  {%- set sender_domain = params.domain -%}
+  {%- set ext = samples.external_domains.weighted_pick('weight') -%}
+  {%- set recipient_user = module.faker.locale.en_US.user_name() -%}
+  {%- set recipient_email = recipient_user ~ '@' ~ ext.domain -%}
+  {%- set fail_source = module.rand.weighted_choice(["SMTP", "QUEUE", "DNS"], [50, 30, 20]) -%}
+  {%- set directionality = "Originating" -%}
+  {%- set email_direction = "outbound" -%}
+  {%- set connector_id = "Outbound to Internet" -%}
+  {%- set dst_ip = ext.ip -%}
+  {%- set dst_hostname = ext.mx_host -%}
+{%- endif -%}
+
+{%- set msg_id = '<' ~ (module.rand.crypto.uuid4() | replace("-", "")) ~ '@' ~ fqdn ~ '>' -%}
+{%- set network_msg_id = module.rand.crypto.uuid4() -%}
+{%- set total_bytes = module.rand.number.clamp(module.rand.number.lognormal(10.2, 1.4) | int, 800, 25000000) -%}
+{%- set log_id = module.rand.crypto.uuid4() -%}
+
+{%- set subject_cat = module.rand.weighted_choice(["business", "automated"], [60, 40]) -%}
+{%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+
+{#- Failure reason -#}
+{%- set fail_reason = module.rand.weighted_choice(
+    ["550 5.1.1 The email account that you tried to reach does not exist",
+     "550 5.7.1 Unable to relay",
+     "550 5.4.1 Recipient address rejected: Access denied",
+     "550 5.2.1 Mailbox full",
+     "550 5.1.0 Address rejected",
+     "554 5.4.4 Unable to route: no matching connector"],
+    [30, 20, 15, 15, 10, 10]
+) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "domain": "{{ ext.domain if not is_inbound_fail else params.domain }}",
+        "ip": "{{ dst_ip }}",
+        "user": {
+            "email": "{{ recipient_email }}",
+            "name": "{{ recipient_user }}"
+        }
+    },
+    "ecs": {
+        "version": "{{ params.ecs_version }}"
+    },
+    "email": {
+        "direction": "{{ email_direction }}",
+        "delivery_timestamp": "{{ timestamp.isoformat() }}",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "local_id": "{{ network_msg_id }}",
+        "message_id": "{{ msg_id }}",
+        "subject": "{{ subject }}",
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        },
+        "attachments": {
+            "file": {
+                "size": {{ total_bytes }}
+            }
+        }
+    },
+    "event": {
+        "action": "fail",
+        "category": ["email"],
+        "dataset": "microsoft_exchange.messagetracking",
+        "kind": "event",
+        "module": "microsoft_exchange",
+        "outcome": "failure",
+        "type": ["info"]
+    },
+    "microsoft_exchange": {
+        "messagetracking": {
+            "client_ip": "{{ params.server_ip }}",
+            "client_hostname": "{{ fqdn }}",
+            "server_ip": "{{ dst_ip }}",
+            "server_hostname": "{{ dst_hostname }}",
+            "source_context": "{{ fail_reason }}",
+            "connector_id": "{{ connector_id }}",
+            "source": "{{ fail_source }}",
+            "event_id": "FAIL",
+            "internal_message_id": {{ seq }},
+            "network_message_id": "{{ network_msg_id }}",
+            "recipient_status": "{{ fail_reason }}",
+            "recipient_count": 1,
+            "related_recipient_address": "",
+            "reference": "",
+            "return_path": "{{ sender_email }}",
+            "message_info": "",
+            "directionality": "{{ directionality }}",
+            "original_client_ip": "{{ params.server_ip }}",
+            "original_server_ip": "{{ params.server_ip }}",
+            "custom_data": "{{ 'S:DeliveryPriority=Normal;S:AccountForest=' ~ params.domain }}",
+            "transport_traffic_type": "Email",
+            "log_id": "{{ log_id }}",
+            "schema_version": "{{ params.schema_version }}"
+        }
+    },
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "ip": ["{{ params.server_ip }}"],
+        "product": "Exchange Server",
+        "type": "mail",
+        "vendor": "Microsoft",
+        "version": "{{ params.schema_version }}"
+    },
+    "related": {
+        "ip": ["{{ params.server_ip }}", "{{ dst_ip }}"],
+        "user": ["{{ sender_name }}", "{{ recipient_user }}"]
+    },
+    "source": {
+        "domain": "{{ sender_domain }}",
+        "ip": "{{ params.server_ip }}",
+        "user": {
+            "email": "{{ sender_email }}",
+            "name": "{{ sender_name }}"
+        }
+    },
+    "tags": ["microsoft-exchange", "forwarded"]
+}
+{%- do shared.set('internal_message_id_seq', (seq + 1) % 2147483647) -%}
+{%- do shared.set('log_id_seq', (log_seq + 1) % 2147483647) -%}

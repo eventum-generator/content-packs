@@ -1,0 +1,141 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Pick a command from samples with weight -#}
+{%- set cmd_weights = samples.commands | map(attribute='weight') | list -%}
+{%- set cmd = module.rand.weighted_choice(samples.commands, cmd_weights) -%}
+{#- Reference active session if available -#}
+{%- set sessions = shared.get('sessions', []) -%}
+{%- if sessions | length > 0 -%}
+  {%- set session = sessions | random -%}
+  {%- set host_id = session.host_id -%}
+  {%- set host_app = session.host_app -%}
+  {%- set host_name_val = session.host_name -%}
+  {%- set runspace_id = session.runspace_id -%}
+  {%- set user = session.user -%}
+  {%- set user_sid = session.user_sid -%}
+  {%- set ps_version = session.ps_version -%}
+  {%- set engine_version = session.engine_version -%}
+{%- else -%}
+  {%- set host_id = module.rand.crypto.uuid4() -%}
+  {%- set host_app = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -%}
+  {%- set host_name_val = "ConsoleHost" -%}
+  {%- set runspace_id = module.rand.crypto.uuid4() -%}
+  {%- set user = (samples.usernames | random).username -%}
+  {%- set user_sid = params.domain_sid ~ "-" ~ module.rand.number.integer(1100, 9999) -%}
+  {%- set ps_version = params.powershell_version -%}
+  {%- set engine_version = params.engine_version -%}
+{%- endif -%}
+{%- set pipeline_id = module.rand.number.integer(1, 50) -%}
+{%- set sequence_num = module.rand.number.integer(1, 200) -%}
+{#- Build command invocation details -#}
+{%- set invocation_details = [] -%}
+{%- do invocation_details.append({
+  "type": "CommandInvocation",
+  "related_command": cmd.name,
+  "name": "",
+  "value": cmd.name ~ ": \"" ~ cmd.name ~ "\""
+}) -%}
+{%- if cmd.params -%}
+  {%- for param_pair in cmd.params.split('; ') -%}
+    {%- set parts = param_pair.split('=', 1) -%}
+    {%- if parts | length == 2 -%}
+      {%- do invocation_details.append({
+        "type": "ParameterBinding",
+        "related_command": cmd.name,
+        "name": parts[0],
+        "value": parts[1]
+      }) -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "category": ["process"],
+        "code": "800",
+        "kind": "event",
+        "module": "powershell",
+        "provider": "PowerShell",
+        "sequence": {{ sequence_num }},
+        "type": ["info"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "powershell": {
+        "command": {
+            "invocation_details": [
+{% for detail in invocation_details %}
+                {
+                    "type": "{{ detail.type }}",
+                    "related_command": "{{ detail.related_command }}",
+                    "name": {{ detail.name | tojson }},
+                    "value": {{ detail.value | tojson }}
+                }{{ "," if not loop.last else "" }}
+{% endfor %}
+            ],
+            "name": "{{ cmd.name }}",
+            "path": {{ cmd.path | tojson }},
+            "type": "{{ cmd.type }}",
+            "value": "{{ cmd.name }}"
+        },
+        "engine": {
+            "version": "{{ engine_version }}"
+        },
+        "id": "Microsoft.PowerShell",
+        "pipeline_id": "{{ pipeline_id }}",
+        "process": {
+            "executable_version": "{{ ps_version }}"
+        },
+        "runspace_id": "{{ runspace_id }}",
+        "sequence": {{ module.rand.number.integer(1, 50) }},
+        "total": {{ module.rand.number.integer(1, 5) }}
+    },
+    "process": {
+        "args": [{{ host_app.split(' ') | map('tojson') | join(', ') }}],
+        "args_count": {{ host_app.split(' ') | length }},
+        "command_line": {{ host_app | tojson }},
+        "entity_id": "{{ host_id }}",
+        "title": "{{ host_name_val }}"
+    },
+    "related": {
+        "user": ["{{ user }}"]
+    },
+    "user": {
+        "domain": "{{ domain }}",
+        "id": "{{ user_sid }}",
+        "name": "{{ user }}"
+    },
+    "winlog": {
+        "channel": "Windows PowerShell",
+        "computer_name": "{{ fqdn }}",
+        "event_id": "800",
+        "keywords": ["Classic"],
+        "level": "information",
+        "opcode": "Info",
+        "provider_name": "PowerShell",
+        "record_id": "{{ record_id }}",
+        "task": "Pipeline Execution Details",
+        "time_created": "{{ timestamp.isoformat() }}"
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

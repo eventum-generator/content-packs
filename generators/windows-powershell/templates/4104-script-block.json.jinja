@@ -1,0 +1,125 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{#- Pick a script from samples with weight -#}
+{%- set script_weights = samples.scripts | map(attribute='weight') | list -%}
+{%- set script = module.rand.weighted_choice(samples.scripts, script_weights) -%}
+{#- Script block identity -#}
+{%- set script_block_id = module.rand.crypto.uuid4() -%}
+{%- set message_number = 1 -%}
+{%- set message_total = 1 -%}
+{#- Multi-part script blocks for long scripts (>500 chars) -#}
+{%- if script.text | length > 500 -%}
+  {%- set message_total = module.rand.number.integer(2, 4) -%}
+  {%- set message_number = module.rand.number.integer(1, message_total) -%}
+{%- endif -%}
+{#- Level: warning for suspicious content (auto-flagged by PowerShell) -#}
+{%- if script.suspicious -%}
+  {%- set log_level = "warning" -%}
+  {%- set winlog_level = "warning" -%}
+{%- else -%}
+  {%- set log_level = "verbose" -%}
+  {%- set winlog_level = "verbose" -%}
+{%- endif -%}
+{#- User context -#}
+{%- set user = (samples.usernames | random).username -%}
+{%- set user_sid = params.domain_sid ~ "-" ~ module.rand.number.integer(1100, 9999) -%}
+{%- set process_id = module.rand.number.integer(1000, 65535) -%}
+{%- set thread_id = module.rand.number.integer(1, 8191) -%}
+{%- set activity_id = module.rand.crypto.uuid4() -%}
+{#- File path if script comes from a file -#}
+{%- set script_path = script.path -%}
+{#- Store script block for correlation with 4105/4106 -#}
+{%- set script_blocks = shared.get('script_blocks', []) -%}
+{%- do script_blocks.append({
+  "script_block_id": script_block_id,
+  "runspace_id": module.rand.crypto.uuid4(),
+  "user": user,
+  "user_sid": user_sid,
+  "pid": process_id
+}) -%}
+{%- if script_blocks | length > 100 -%}{%- do script_blocks.pop(0) -%}{%- endif -%}
+{%- do shared.set('script_blocks', script_blocks) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "category": ["process"],
+        "code": "4104",
+        "kind": "event",
+        "module": "powershell",
+        "provider": "Microsoft-Windows-PowerShell",
+        "type": ["info"]
+    },
+{% if script_path %}
+    "file": {
+        "directory": {{ script_path.rsplit('\\', 1)[0] | tojson }},
+        "extension": "{{ script_path.rsplit('.', 1)[-1] }}",
+        "name": {{ script_path.rsplit('\\', 1)[-1] | tojson }},
+        "path": {{ script_path | tojson }}
+    },
+{% endif %}
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "{{ log_level }}"
+    },
+    "powershell": {
+        "file": {
+            "script_block_id": "{{ script_block_id }}",
+            "script_block_text": {{ script.text | tojson }}
+        },
+        "sequence": {{ message_number }},
+        "total": {{ message_total }}
+    },
+    "related": {
+        "user": ["{{ user }}"]
+    },
+    "user": {
+        "domain": "{{ domain }}",
+        "id": "{{ user_sid }}",
+        "name": "{{ user }}"
+    },
+    "winlog": {
+        "activity_id": "{{ '{' ~ activity_id ~ '}' }}",
+        "channel": "Microsoft-Windows-PowerShell/Operational",
+        "computer_name": "{{ fqdn }}",
+        "event_id": "4104",
+        "level": "{{ winlog_level }}",
+        "opcode": "Info",
+        "process": {
+            "pid": {{ process_id }},
+            "thread": {
+                "id": {{ thread_id }}
+            }
+        },
+        "provider_guid": "{a0c1853b-5c40-4b15-8766-3cf1c58f985a}",
+        "provider_name": "Microsoft-Windows-PowerShell",
+        "record_id": "{{ record_id }}",
+        "task": "Execute a Remote Command",
+        "time_created": "{{ timestamp.isoformat() }}",
+        "user": {
+            "domain": "{{ domain }}",
+            "identifier": "{{ user_sid }}",
+            "name": "{{ user }}",
+            "type": "User"
+        },
+        "version": 1
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

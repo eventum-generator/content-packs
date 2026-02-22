@@ -1,0 +1,143 @@
+{#- RESOLVE event — Recipient resolved to different email address via AD lookup.
+     Consumer template with related_recipient_address for the resolved alias. -#}
+{%- set seq = shared.get('internal_message_id_seq', 34359738368) -%}
+{%- set log_seq = shared.get('log_id_seq', 1000) -%}
+{%- set fqdn = params.hostname ~ '.' ~ params.domain -%}
+
+{%- set pool = shared.get('message_pool', []) -%}
+{%- if pool | length > 0 -%}
+  {%- set msg = pool | random -%}
+  {%- set msg_id = msg.message_id -%}
+  {%- set network_msg_id = msg.network_message_id -%}
+  {%- set sender_email = msg.sender_email -%}
+  {%- set sender_name = msg.sender_name -%}
+  {%- set sender_domain = msg.sender_domain -%}
+  {%- set subject = msg.subject -%}
+  {%- set total_bytes = msg.total_bytes -%}
+  {%- set directionality = msg.directionality -%}
+  {%- set recipient_count = msg.recipient_count -%}
+{%- else -%}
+  {%- set sender = samples.internal_users.pick() -%}
+  {%- set sender_email = sender.username ~ '@' ~ params.domain -%}
+  {%- set sender_name = sender.username -%}
+  {%- set sender_domain = params.domain -%}
+  {%- set msg_id = '<' ~ (module.rand.crypto.uuid4() | replace("-", "")) ~ '@' ~ fqdn ~ '>' -%}
+  {%- set network_msg_id = module.rand.crypto.uuid4() -%}
+  {%- set total_bytes = module.rand.number.clamp(module.rand.number.lognormal(10.2, 1.4) | int, 800, 25000000) -%}
+  {%- set subject_cat = module.rand.weighted_choice(["business", "automated"], [60, 40]) -%}
+  {%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+  {%- set directionality = "Incoming" -%}
+  {%- set recipient_count = 1 -%}
+{%- endif -%}
+
+{#- Resolve: original address → canonical address -#}
+{%- set resolved_user = samples.internal_users.pick() -%}
+{%- set original_alias = module.rand.weighted_choice(
+    [resolved_user.display_name | lower | replace(" ", "."),
+     resolved_user.username ~ ".alias",
+     resolved_user.department | lower ~ "." ~ resolved_user.username],
+    [50, 30, 20]
+) -%}
+{%- set original_address = original_alias ~ '@' ~ params.domain -%}
+{%- set resolved_address = resolved_user.username ~ '@' ~ params.domain -%}
+
+{%- set log_id = module.rand.crypto.uuid4() -%}
+{%- set email_direction = "inbound" if directionality == "Incoming" else "internal" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "domain": "{{ params.domain }}",
+        "ip": "{{ params.server_ip }}",
+        "user": {
+            "email": "{{ resolved_address }}",
+            "name": "{{ resolved_user.username }}"
+        }
+    },
+    "ecs": {
+        "version": "{{ params.ecs_version }}"
+    },
+    "email": {
+        "direction": "{{ email_direction }}",
+        "delivery_timestamp": "{{ timestamp.isoformat() }}",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "local_id": "{{ network_msg_id }}",
+        "message_id": "{{ msg_id }}",
+        "subject": "{{ subject }}",
+        "to": {
+            "address": ["{{ resolved_address }}"]
+        },
+        "attachments": {
+            "file": {
+                "size": {{ total_bytes }}
+            }
+        }
+    },
+    "event": {
+        "action": "resolve",
+        "category": ["email"],
+        "dataset": "microsoft_exchange.messagetracking",
+        "kind": "event",
+        "module": "microsoft_exchange",
+        "outcome": "success",
+        "type": ["info"]
+    },
+    "microsoft_exchange": {
+        "messagetracking": {
+            "client_ip": "{{ params.server_ip }}",
+            "client_hostname": "{{ fqdn }}",
+            "server_ip": "{{ params.server_ip }}",
+            "server_hostname": "{{ fqdn }}",
+            "source_context": "CatResolveRecipient;{{ resolved_address }};resolved from {{ original_address }}",
+            "connector_id": "",
+            "source": "RESOLVER",
+            "event_id": "RESOLVE",
+            "internal_message_id": {{ seq }},
+            "network_message_id": "{{ network_msg_id }}",
+            "recipient_status": "",
+            "recipient_count": {{ recipient_count }},
+            "related_recipient_address": "{{ original_address }}",
+            "reference": "",
+            "return_path": "{{ sender_email }}",
+            "message_info": "",
+            "directionality": "{{ directionality }}",
+            "original_client_ip": "{{ params.server_ip }}",
+            "original_server_ip": "{{ params.server_ip }}",
+            "custom_data": "{{ 'S:DeliveryPriority=Normal;S:AccountForest=' ~ params.domain }}",
+            "transport_traffic_type": "Email",
+            "log_id": "{{ log_id }}",
+            "schema_version": "{{ params.schema_version }}"
+        }
+    },
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "ip": ["{{ params.server_ip }}"],
+        "product": "Exchange Server",
+        "type": "mail",
+        "vendor": "Microsoft",
+        "version": "{{ params.schema_version }}"
+    },
+    "related": {
+        "ip": ["{{ params.server_ip }}"],
+        "user": ["{{ sender_name }}", "{{ resolved_user.username }}"]
+    },
+    "source": {
+        "domain": "{{ sender_domain }}",
+        "ip": "{{ params.server_ip }}",
+        "user": {
+            "email": "{{ sender_email }}",
+            "name": "{{ sender_name }}"
+        }
+    },
+    "tags": ["microsoft-exchange", "forwarded"]
+}
+{%- do shared.set('internal_message_id_seq', (seq + 1) % 2147483647) -%}
+{%- do shared.set('log_id_seq', (log_seq + 1) % 2147483647) -%}

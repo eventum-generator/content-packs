@@ -1,0 +1,127 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set domain = params.domain -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set ps_version = params.powershell_version -%}
+{%- set engine_version = params.engine_version -%}
+{#- Host application — weighted mix of PowerShell hosts -#}
+{%- set host_app_type = module.rand.weighted_choice(
+  ["console", "ise", "pwsh", "remote"],
+  [55, 10, 20, 15]
+) -%}
+{%- if host_app_type == "console" -%}
+  {%- set host_app = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -%}
+  {%- set host_name_val = "ConsoleHost" -%}
+{%- elif host_app_type == "ise" -%}
+  {%- set host_app = "C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell_ise.exe" -%}
+  {%- set host_name_val = "Windows PowerShell ISE Host" -%}
+{%- elif host_app_type == "pwsh" -%}
+  {%- set host_app = "C:\\Program Files\\PowerShell\\7\\pwsh.exe" -%}
+  {%- set host_name_val = "ConsoleHost" -%}
+{%- else -%}
+  {%- set host_app = "C:\\Windows\\System32\\wsmprovhost.exe" -%}
+  {%- set host_name_val = "ServerRemoteHost" -%}
+{%- endif -%}
+{#- Add common flags to console/pwsh hosts -#}
+{%- if host_app_type in ["console", "pwsh"] -%}
+  {%- set flag_type = module.rand.weighted_choice(["none", "file", "command", "encoded"], [50, 25, 15, 10]) -%}
+  {%- if flag_type == "file" -%}
+    {%- set host_app = host_app ~ " -File C:\\Scripts\\" ~ module.rand.choice(["backup", "cleanup", "monitor", "deploy", "report"]) ~ ".ps1" -%}
+  {%- elif flag_type == "command" -%}
+    {%- set host_app = host_app ~ " -Command Get-Service" -%}
+  {%- elif flag_type == "encoded" -%}
+    {%- set host_app = host_app ~ " -EncodedCommand JABjAGwAaQBlAG4AdAA=" -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Session identifiers -#}
+{%- set host_id = module.rand.crypto.uuid4() -%}
+{%- set runspace_id = module.rand.crypto.uuid4() -%}
+{%- set user = (samples.usernames | random).username -%}
+{%- set user_sid = params.domain_sid ~ "-" ~ module.rand.number.integer(1100, 9999) -%}
+{%- set process_id = module.rand.number.integer(1000, 65535) -%}
+{#- Store session for correlation with 403, 600, 800 -#}
+{%- set sessions = shared.get('sessions', []) -%}
+{%- do sessions.append({
+  "host_id": host_id,
+  "host_app": host_app,
+  "host_name": host_name_val,
+  "runspace_id": runspace_id,
+  "user": user,
+  "user_sid": user_sid,
+  "pid": process_id,
+  "ps_version": ps_version,
+  "engine_version": engine_version
+}) -%}
+{%- if sessions | length > 100 -%}{%- do sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('sessions', sessions) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "category": ["process"],
+        "code": "400",
+        "kind": "event",
+        "module": "powershell",
+        "provider": "PowerShell",
+        "type": ["start"]
+    },
+    "host": {
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "type": "windows"
+        }
+    },
+    "log": {
+        "level": "information"
+    },
+    "powershell": {
+        "engine": {
+            "new_state": "Available",
+            "previous_state": "None",
+            "version": "{{ engine_version }}"
+        },
+        "pipeline_id": "1",
+        "process": {
+            "executable_version": "{{ ps_version }}"
+        },
+        "runspace_id": "{{ runspace_id }}"
+    },
+    "process": {
+        "args": [{{ host_app.split(' ') | map('tojson') | join(', ') }}],
+        "args_count": {{ host_app.split(' ') | length }},
+        "command_line": {{ host_app | tojson }},
+        "entity_id": "{{ host_id }}",
+        "title": "{{ host_name_val }}"
+    },
+    "related": {
+        "user": ["{{ user }}"]
+    },
+    "user": {
+        "domain": "{{ domain }}",
+        "id": "{{ user_sid }}",
+        "name": "{{ user }}"
+    },
+    "winlog": {
+        "channel": "Windows PowerShell",
+        "computer_name": "{{ fqdn }}",
+        "event_id": "400",
+        "keywords": ["Classic"],
+        "level": "information",
+        "opcode": "Info",
+        "provider_name": "PowerShell",
+        "record_id": "{{ record_id }}",
+        "task": "Engine Lifecycle",
+        "time_created": "{{ timestamp.isoformat() }}"
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}
