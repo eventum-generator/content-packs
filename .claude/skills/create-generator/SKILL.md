@@ -83,6 +83,13 @@ generators/<category>-<source>/
 
 These are the choices that shape the generator. There's no single right answer — pick what fits naturally:
 
+- **Host cardinality** — Decide whether this generator simulates a data stream from a single host or from many hosts. This must reflect how the data source actually appears in a SIEM:
+
+  - **Multi-host** (endpoint agents, per-machine logging): Windows event logs (Security, Sysmon, PowerShell), Linux auditd, EDR agents, endpoint AV — these are installed on every workstation and server. A SIEM typically ingests from dozens to hundreds of endpoints. Use a `hosts.csv` sample file with realistic hostnames, IPs, and OS versions, and pick a random host per event.
+  - **Single-host** (centralized infrastructure): Firewalls, web servers, mail servers, DNS servers, IDS/IPS sensors, VPN concentrators, wireless controllers — these are dedicated appliances or servers where one instance serves the whole network. Use a fixed `hostname` parameter. The generator represents one appliance's log stream.
+
+  Think about the real deployment: "If I walked into a SOC and looked at this data source in Splunk/Elastic, would I see events from one box or hundreds?" Match that. If unsure, research typical deployment architectures for the source. For multi-host sources, the sample `hosts.csv` should contain a realistic fleet (e.g., mix of workstations and servers with appropriate naming conventions).
+
 - **Template granularity** — One per event type? Per category? One shared template with `vars` for variations? The answer depends on how much structure the event types share.
 
 - **Picking mode** — `chance` for frequency-weighted independent events. `fsm` for stateful session flows. `spin` for deterministic cycling. `all` for multi-event sources. `chain` for ordered sequences. Think about what the data source actually does — does it have sessions? State transitions? Independent events?
