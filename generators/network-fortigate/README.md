@@ -49,15 +49,6 @@ Generates realistic Fortinet FortiGate firewall events in ECS-compatible JSON, m
 | `agent_id` | `e4f8c1a2-...` | Filebeat agent UUID |
 | `agent_version` | `8.17.0` | Filebeat version string |
 
-### Output Parameters
-
-| Parameter | Variable | Description |
-|-----------|----------|-------------|
-| OpenSearch host | `${params.opensearch_host}` | OpenSearch endpoint URL |
-| OpenSearch user | `${params.opensearch_user}` | OpenSearch username |
-| OpenSearch password | `${secrets.opensearch_password}` | OpenSearch password (from keyring) |
-| OpenSearch index | `${params.opensearch_index}` | Target index name |
-
 ## Usage
 
 ```bash
@@ -77,23 +68,7 @@ eventum generate \
 eventum generate \
   --path generators/network-fortigate/generator.yml \
   --id fortigate \
-  --no-live-mode
-```
-
-### OpenSearch Configuration
-
-To output to OpenSearch, uncomment the `opensearch` section in `generator.yml` and configure via `startup.yml`:
-
-```yaml
-# startup.yml
-generators:
-  - path: generators/network-fortigate/generator.yml
-    id: fortigate
-    live_mode: true
-    params:
-      opensearch_host: "https://localhost:9200"
-      opensearch_user: "admin"
-      opensearch_index: "logs-fortinet_fortigate.log-default"
+  --live-mode false
 ```
 
 ## Sample Output

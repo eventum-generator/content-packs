@@ -49,39 +49,12 @@ Simulates a well-tuned production endpoint running a SwiftOnSecurity-style Sysmo
 | `agent_id` | `a1b2c3d4-...` | Winlogbeat agent UUID |
 | `agent_version` | `8.17.0` | Agent version string |
 
-### Output Parameters
-
-| Variable | Description |
-|----------|-------------|
-| `${params.opensearch_host}` | OpenSearch/Elasticsearch URL |
-| `${params.opensearch_user}` | Username for authentication |
-| `${secrets.opensearch_password}` | Password (from Eventum keyring) |
-| `${params.opensearch_index}` | Target index name |
-
 ## Usage
 
 ```bash
-# Run with stdout output
+# Run the generator
 eventum generate --path generators/windows-sysmon/generator.yml --id sysmon --live-mode
-
-# Run as part of a multi-generator setup (startup.yml)
-eventum run
 ```
-
-### startup.yml configuration
-
-```yaml
-- id: sysmon
-  config: generators/windows-sysmon/generator.yml
-  params:
-    opensearch_host: https://localhost:9200
-    opensearch_user: admin
-    opensearch_index: winlogbeat-8.17.0
-```
-
-### OpenSearch Index Template
-
-Use the Elastic Windows integration mapping or create a compatible index template for the `winlogbeat-*` pattern.
 
 ## Sample Output
 

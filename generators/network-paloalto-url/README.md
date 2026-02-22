@@ -51,33 +51,24 @@ Produces realistic PAN-OS URL Filtering events in ECS-compatible JSON format, ma
 | `agent_id` | `e4f8c1a2-...` | Elastic Agent ID |
 | `agent_version` | `8.17.0` | Elastic Agent version |
 
-### Output Parameters
-
-| Parameter | Variable | Description |
-|-----------|----------|-------------|
-| OpenSearch host | `${params.opensearch_host}` | OpenSearch/Elasticsearch URL |
-| OpenSearch user | `${params.opensearch_user}` | OpenSearch username |
-| OpenSearch password | `${secrets.opensearch_password}` | OpenSearch password (from keyring) |
-| OpenSearch index | `${params.opensearch_index}` | Target index name |
-
 ## Usage
 
-### Quick test (sample mode)
-
-```bash
-eventum generate \
-  --path generators/network-paloalto-url/generator.yml \
-  --id panw-url \
-  --no-live-mode
-```
-
-### Live mode (real-time streaming)
+### Run the generator
 
 ```bash
 eventum generate \
   --path generators/network-paloalto-url/generator.yml \
   --id panw-url \
   --live-mode
+```
+
+### Sample mode (generate as fast as possible)
+
+```bash
+eventum generate \
+  --path generators/network-paloalto-url/generator.yml \
+  --id panw-url \
+  --live-mode false
 ```
 
 ### Adjust event rate
@@ -89,18 +80,6 @@ input:
   - cron:
       expression: "* * * * * *"
       count: 20  # 20 events per second
-```
-
-### OpenSearch / startup.yml configuration
-
-```yaml
-generators:
-  - id: panw-url
-    path: network-paloalto-url
-    params:
-      opensearch_host: https://localhost:9200
-      opensearch_user: admin
-      opensearch_index: panw-panos-8.17.0
 ```
 
 ## Sample Output

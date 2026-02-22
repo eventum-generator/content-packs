@@ -44,24 +44,13 @@ Edit the `params` section under `event.template` in `generator.yml`:
 | `agent_id` | `a7d2e4f1-...` | Filebeat agent ID |
 | `agent_version` | `8.17.0` | Filebeat version string |
 
-### Output Parameters
-
-Provide via `startup.yml` params/secrets (used by the OpenSearch output):
-
-| Parameter | Variable | Description |
-|-----------|----------|-------------|
-| `opensearch_host` | `${params.opensearch_host}` | OpenSearch URL (e.g. `https://localhost:9200`) |
-| `opensearch_user` | `${params.opensearch_user}` | OpenSearch username |
-| `opensearch_password` | `${secrets.opensearch_password}` | OpenSearch password (stored in keyring) |
-| `opensearch_index` | `${params.opensearch_index}` | Target index name (e.g. `filebeat-8.17.0`) |
-
 ## Usage
 
 ```bash
 # Install Eventum
 uv tool install eventum-generator
 
-# Run with console output only (for testing)
+# Run the generator
 eventum generate \
   --path generators/network-juniper-srx/generator.yml \
   --id srx \
@@ -78,20 +67,6 @@ input:
       expression: "* * * * * *"
       count: 10    # 10 events/second (600/min, 36K/hour)
 ```
-
-### OpenSearch Configuration
-
-```yaml
-# startup.yml
-- id: srx
-  path: network-juniper-srx
-  params:
-    opensearch_host: https://localhost:9200
-    opensearch_user: admin
-    opensearch_index: filebeat-8.17.0
-```
-
-Secrets (e.g. `opensearch_password`) are managed via the Eventum keyring. See [Eventum docs](https://eventum.run) for details.
 
 ## Sample Output
 

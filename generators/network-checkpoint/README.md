@@ -49,17 +49,6 @@ Edit in `generator.yml` under `event.template.params`:
 | `agent_version` | `8.17.0` | Filebeat agent version |
 | `ips_profile` | `Optimized` | SmartDefense/IPS profile name |
 
-### Output Parameters
-
-Provide via `startup.yml` or `--params` flag:
-
-| Variable | Description |
-|---|---|
-| `${params.opensearch_host}` | OpenSearch endpoint URL |
-| `${params.opensearch_user}` | OpenSearch username |
-| `${secrets.opensearch_password}` | OpenSearch password (stored in keyring) |
-| `${params.opensearch_index}` | Target index name |
-
 ## Usage
 
 ### Install Eventum
@@ -86,20 +75,6 @@ input:
   - cron:
       expression: "* * * * * *"
       count: 10  # 10 events/second
-```
-
-### OpenSearch Configuration
-
-Add to `startup.yml`:
-
-```yaml
-generators:
-  - generator: generators/network-checkpoint/generator.yml
-    id: checkpoint-gw
-    params:
-      opensearch_host: https://localhost:9200
-      opensearch_user: admin
-      opensearch_index: logs-checkpoint.firewall-default
 ```
 
 ## Sample Output

@@ -68,15 +68,6 @@ Generates realistic Fortinet FortiMail email security gateway events as ECS-comp
 | `agent_id` | `b3a1c4d5-...` | Elastic Agent ID |
 | `agent_version` | `8.17.0` | Elastic Agent version |
 
-### Output Parameters
-
-| Parameter | Variable | Description |
-|-----------|----------|-------------|
-| OpenSearch host | `${params.opensearch_host}` | OpenSearch endpoint URL |
-| OpenSearch user | `${params.opensearch_user}` | OpenSearch username |
-| OpenSearch password | `${secrets.opensearch_password}` | OpenSearch password (secret) |
-| OpenSearch index | `${params.opensearch_index}` | Target index name |
-
 ## Usage
 
 ```bash
@@ -92,24 +83,7 @@ eventum generate \
 eventum generate \
   --path generators/fortinet-fortimail/generator.yml \
   --id fml \
-  --no-live-mode
-```
-
-### OpenSearch Configuration
-
-To send events to OpenSearch, uncomment the `opensearch` output in `generator.yml` and provide connection details via a `startup.yml`:
-
-```yaml
-generators:
-  - id: fortimail
-    path: generators/fortinet-fortimail/generator.yml
-    params:
-      opensearch_host: "https://opensearch.example.com:9200"
-      opensearch_user: admin
-      opensearch_index: logs-fortinet_fortimail.log-default
-    secrets:
-      opensearch_password: your-password-here
-    live_mode: true
+  --live-mode false
 ```
 
 ### Adjusting Event Rate

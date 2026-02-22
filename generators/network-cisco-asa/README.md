@@ -49,15 +49,6 @@ Cisco ASA is one of the most widely deployed enterprise firewalls. It sends logs
 | `agent_id` | `a3b7e2c1-...` | Elastic Agent ID |
 | `agent_version` | `8.17.0` | Elastic Agent version |
 
-### Output Parameters
-
-| Parameter | Variable | Description |
-|-----------|----------|-------------|
-| OpenSearch host | `${params.opensearch_host}` | OpenSearch cluster URL |
-| OpenSearch user | `${params.opensearch_user}` | OpenSearch username |
-| OpenSearch password | `${secrets.opensearch_password}` | OpenSearch password (from keyring) |
-| OpenSearch index | `${params.opensearch_index}` | Target index name |
-
 ## Usage
 
 ```bash
@@ -71,23 +62,7 @@ eventum generate \
 eventum generate \
   --path generators/network-cisco-asa/generator.yml \
   --id asa \
-  --no-live-mode
-```
-
-### OpenSearch Output
-
-Add to your `startup.yml`:
-
-```yaml
-generators:
-  - id: cisco-asa
-    path: generators/network-cisco-asa/generator.yml
-    params:
-      hostname: EDGE-FW-01
-      nat_ip: "203.0.113.1"
-      opensearch_host: "https://opensearch:9200"
-      opensearch_user: admin
-      opensearch_index: logs-cisco_asa.log-default
+  --live-mode false
 ```
 
 ## Sample Output

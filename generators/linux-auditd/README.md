@@ -49,45 +49,18 @@ Edit the `params` section under `event.template` in `generator.yml`:
 | `agent_id` | `da084743-...` | Auditbeat agent ID |
 | `agent_version` | `8.17.0` | Auditbeat version string |
 
-### Output Parameters
-
-Provide via `startup.yml` params/secrets (used by the OpenSearch output):
-
-| Parameter | Variable | Description |
-|-----------|----------|-------------|
-| `opensearch_host` | `${params.opensearch_host}` | OpenSearch URL (e.g. `https://localhost:9200`) |
-| `opensearch_user` | `${params.opensearch_user}` | OpenSearch username |
-| `opensearch_password` | `${secrets.opensearch_password}` | OpenSearch password (stored in keyring) |
-| `opensearch_index` | `${params.opensearch_index}` | Target index name (e.g. `auditbeat-8.17.0`) |
-
 ## Usage
 
 ```bash
 # Install Eventum
 uv tool install eventum-generator
 
-# Run with console output only (for testing)
+# Run the generator
 eventum generate \
   --path generators/linux-auditd/generator.yml \
   --id auditd \
   --live-mode
 ```
-
-### OpenSearch Configuration
-
-The OpenSearch output uses `${params.*}` / `${secrets.*}` placeholders resolved from `startup.yml`:
-
-```yaml
-# startup.yml
-- id: auditd
-  path: linux-auditd
-  params:
-    opensearch_host: https://localhost:9200
-    opensearch_user: admin
-    opensearch_index: auditbeat-8.17.0
-```
-
-Secrets (e.g. `opensearch_password`) are managed via the Eventum keyring. See [Eventum docs](https://eventum.run) for details.
 
 ### Adjusting Event Rate
 

@@ -49,15 +49,6 @@ Generates synthetic Suricata EVE (Extensible Event Format) JSON events compatibl
 | `agent_id` | `7b2c5f18-...` | Filebeat agent UUID |
 | `agent_version` | `8.17.0` | Filebeat agent version |
 
-### Output Parameters
-
-| Parameter | Variable | Description |
-|-----------|----------|-------------|
-| OpenSearch host | `${params.opensearch_host}` | OpenSearch/Elasticsearch endpoint |
-| OpenSearch user | `${params.opensearch_user}` | Authentication username |
-| OpenSearch password | `${secrets.opensearch_password}` | Authentication password (encrypted) |
-| OpenSearch index | `${params.opensearch_index}` | Target index name |
-
 ## Usage
 
 ### Installation
@@ -81,26 +72,7 @@ eventum generate \
 eventum generate \
   --path generators/security-suricata/generator.yml \
   --id suricata-01 \
-  --no-live-mode
-```
-
-### OpenSearch Output
-
-Add the following to your `startup.yml` to send events to OpenSearch:
-
-```yaml
-generators:
-  - id: suricata-01
-    path: generators/security-suricata/generator.yml
-    live_mode: true
-
-params:
-  opensearch_host: "https://localhost:9200"
-  opensearch_user: admin
-  opensearch_index: logs-suricata.eve-default
-
-secrets:
-  opensearch_password: admin
+  --live-mode false
 ```
 
 ### Adjusting Event Rate
