@@ -263,15 +263,7 @@ Before presenting to the user, check your work against these common problems fou
 
 ---
 
-## Phase 6: Update CLAUDE.md
-
-Update the docs CLAUDE.md to reflect the new generator:
-
-1. **`../../docs/CLAUDE.md`** — Update the **Content Packs** section: increment the generator count and add the new generator to the table with its category and data source description.
-
-The content-packs `CLAUDE.md` in this repo does not need updating for new generators (they are self-documenting via README).
-
-## Phase 7: README.md
+## Phase 6: README.md
 
 Each generator needs clear documentation:
 
@@ -287,7 +279,7 @@ Each generator needs clear documentation:
 
 ---
 
-## Phase 8: Improvement Proposals
+## Phase 7: Improvement Proposals
 
 After completing the generator, create GitHub issues for improvements discovered during development:
 
