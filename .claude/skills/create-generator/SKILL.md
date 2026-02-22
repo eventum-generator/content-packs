@@ -105,7 +105,7 @@ After implementation:
 
 ## Phase 4: Improvement Proposals
 
-After completing the generator, reflect on the development experience and append any improvement proposals to `eventum` repo in `PROPOSALS.md`. Consider:
+After completing the generator, reflect on the development experience and create GitHub issues in the `eventum-generator/eventum` repository for any improvement proposals. Consider:
 
 - **Template API gaps** — Were there missing `module.rand.*` helpers, timestamp formatters, or filters that you had to work around?
 - **Shared state boilerplate** — Did the correlation pool pattern (push/pop/cap/fallback) feel repetitive? Were counters tedious to manage?
@@ -114,4 +114,44 @@ After completing the generator, reflect on the development experience and append
 - **Developer experience** — Were errors hard to debug? Was iteration slow?
 - **Other** — any other additions from you.
 
-Only add **new** proposals not already in the file. Each proposal should include: the problem encountered, a concrete example from this generator, and a suggested improvement. Mark with prefix and emoji whether it is a bug or new feature or something other. 
+First check existing issues to avoid duplicates: `gh issue list --repo eventum-generator/eventum --limit 100 --state open`.
+
+For each new proposal, create an issue and add it to the project board with appropriate fields:
+
+```bash
+# Create the issue (use type Bug or Feature)
+gh issue create \
+    --repo eventum-generator/eventum \
+    --title "<concise title>" \
+    --body "<problem + concrete example from this generator + proposed solution>" \
+    --project "Task tracker"
+
+# Then set type and project fields via GraphQL (see below)
+```
+
+After creating each issue, set its type and project fields using the GraphQL API:
+
+```bash
+# Get issue node ID
+NODE_ID=$(gh api graphql -f query='query { repository(owner: "eventum-generator", name: "eventum") { issue(number: ISSUE_NUM) { id } } }' --jq '.data.repository.issue.id')
+
+# Set issue type (Bug: IT_kwDOCiUXlc4BVM0Y, Feature: IT_kwDOCiUXlc4BVM0Z)
+gh api graphql -f query="mutation { updateIssue(input: { id: \"$NODE_ID\" issueTypeId: \"TYPE_ID\" }) { issue { id } } }" --silent
+
+# Get project item ID
+ITEM_ID=$(gh api graphql -f query='query { node(id: "'"$NODE_ID"'") { ... on Issue { projectItems(first: 10) { nodes { id project { id } } } } } }' --jq '.data.node.projectItems.nodes[] | select(.project.id == "PVT_kwDOCiUXlc4BP0JC") | .id')
+
+# Set Priority (High: 79628723, Medium: 0a877460, Low: da944a9c)
+gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HXEM\" value: { singleSelectOptionId: \"PRIORITY_ID\" } }) { projectV2Item { id } } }" --silent
+
+# Set Component (Core: 73c7da0c, Plugins: b0be8b34, API/CLI: a93c596c, Other: 79a07051)
+gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HX4I\" value: { singleSelectOptionId: \"COMPONENT_ID\" } }) { projectV2Item { id } } }" --silent
+
+# Set Size (XS: 6c6483d2, S: f784b110, M: 7515a9f1, L: 817d0097, XL: db339eb2)
+gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HXEQ\" value: { singleSelectOptionId: \"SIZE_ID\" } }) { projectV2Item { id } } }" --silent
+
+# Set Status to Backlog (f75ad846)
+gh api graphql -f query="mutation { updateProjectV2ItemFieldValue(input: { projectId: \"PVT_kwDOCiUXlc4BP0JC\" itemId: \"$ITEM_ID\" fieldId: \"PVTSSF_lADOCiUXlc4BP0JCzg-HW5U\" value: { singleSelectOptionId: \"f75ad846\" } }) { projectV2Item { id } } }" --silent
+```
+
+Each issue body should include: the problem encountered, a concrete example from this generator, and a proposed solution.
