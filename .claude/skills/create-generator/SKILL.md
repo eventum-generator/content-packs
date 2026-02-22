@@ -141,18 +141,11 @@ event:
     templates:
       # Event types with frequency weights
 
-# Default output: stdout for testing + parameterized backend
+# Output: file-based for portability
 output:
-  - stdout:
-      formatter:
-        format: json
-  - opensearch:
-      hosts:
-        - ${params.opensearch_host}
-      username: ${params.opensearch_user}
-      password: ${secrets.opensearch_password}
-      index: ${params.opensearch_index}
-      verify: false
+  - file:
+      path: output/events.json
+      write_mode: overwrite
       formatter:
         format: json
 ```
@@ -185,7 +178,7 @@ These aren't strict rules — they're awareness of patterns that lead to better 
 - Always include: `@timestamp`, `agent.*`, `ecs.version`, `event.*` (action, category, code, kind, module, outcome, type), `host.*`
 - Include `related.*` arrays (ip, user, hash) for cross-referencing
 - Include source-specific namespace fields (e.g. `winlog.*`, `dns.*`, `http.*`)
-- Use `${params.*}` / `${secrets.*}` for output plugin connection details
+- Output goes to `output/events.json` via the file output plugin
 
 ---
 
@@ -202,24 +195,56 @@ These aren't strict rules — they're awareness of patterns that lead to better 
 ### Runtime test
 
 ```bash
-# Generate a batch
-eventum generate --path generators/<name>/generator.yml --id test --no-live-mode
+# 1. Generate a batch (output goes to generators/<name>/output/events.json)
+#    Use -vvvvv to surface any template errors (missing variables, Jinja2 syntax, etc.)
+# This can generate many events because live mode is disabled! Events will be generated as fast as possible. Recommended to use short timeouts.
+eventum generate \
+  --path generators/<name>/generator.yml \
+  --id test \
+  --live-mode false \
+  -vvvvv
 
-# Validate JSON
-eventum generate --path generators/<name>/generator.yml --id test --no-live-mode | python3 -c "
-import sys, json
-for i, line in enumerate(sys.stdin, 1):
+# 2. Validate output: JSON syntax + has required ECS fields
+python3 -c "
+import json, sys
+
+path = 'generators/<name>/output/events.json'
+required_keys = {'@timestamp', 'event', 'ecs'}
+
+with open(path) as f:
+    lines = [l.strip() for l in f if l.strip()]
+
+if not lines:
+    print(f'FAIL: {path} is empty — no events generated')
+    sys.exit(1)
+
+for i, line in enumerate(lines, 1):
     try:
-        json.loads(line)
+        doc = json.loads(line)
     except json.JSONDecodeError as e:
-        print(f'Invalid JSON on line {i}: {e}')
+        print(f'FAIL: Invalid JSON on line {i}: {e}')
         sys.exit(1)
-print(f'All {i} events are valid JSON')
+    missing = required_keys - doc.keys()
+    if missing:
+        print(f'FAIL: Line {i} missing required ECS keys: {missing}')
+        sys.exit(1)
+
+print(f'OK: {len(lines)} events, all valid JSON with required ECS fields')
 "
 
-# Live mode smoke test
-timeout 5 eventum generate --path generators/<name>/generator.yml --id test --live-mode || true
+# 3. Live mode smoke test
+timeout 5 eventum generate \
+  --path generators/<name>/generator.yml \
+  --id test \
+  --live-mode \
+  -vvvvv || true
 ```
+
+**Debugging failures**: If the generator produces 0 events or errors silently, always run with `-vvvvv` and check stderr. Common causes: missing sample files, undefined template variables, invalid Jinja2 syntax.
+
+### Meaningful result
+
+We can look at results in generated file to understand whether the structure of event is proper for this data source.
 
 ### Self-review
 

@@ -26,14 +26,14 @@ uv tool install eventum-generator
 git clone https://github.com/eventum-generator/content-packs.git
 cd content-packs
 
-# Run a generator (outputs to console)
+# Run a generator (outputs to generators/windows-security/output/events.json)
 eventum generate \
   --path generators/windows-security/generator.yml \
   --id winlog \
   --live-mode
 ```
 
-Events stream to stdout as JSON, one per line:
+Events are written to `output/events.json` inside the generator directory as JSON, one per line:
 
 ```json
 {
@@ -97,8 +97,10 @@ eventum generate \
 eventum generate \
   --path generators/windows-security/generator.yml \
   --id winlog \
-  --no-live-mode
+  --live-mode false
 ```
+
+Events are written to `output/events.json` inside the generator directory.
 
 ### Multiple Generators (Server Mode)
 
@@ -108,10 +110,6 @@ Define instances in `config/startup.yml` and run the server:
 # config/startup.yml
 - id: winlog
   path: windows-security
-  params:
-    opensearch_host: https://localhost:9200
-    opensearch_user: admin
-    opensearch_index: winlogbeat-8.17.0
 ```
 
 ```bash
@@ -135,22 +133,9 @@ input:
       count: 5    # 5 events/second (~18K/hour)
 ```
 
-### Output to OpenSearch / Elasticsearch
+### Output
 
-Generators include a parameterized OpenSearch output. Connection details are provided via `startup.yml` params and secrets (credentials stored in the Eventum keyring):
-
-```yaml
-# In generator.yml (already configured)
-output:
-  - opensearch:
-      hosts:
-        - ${params.opensearch_host}
-      username: ${params.opensearch_user}
-      password: ${secrets.opensearch_password}
-      index: ${params.opensearch_index}
-```
-
-See the [Eventum documentation](https://eventum.run) for details on configuring output plugins and managing secrets.
+By default, generators write events to `output/events.json` inside the generator directory. To change the output destination (e.g., OpenSearch, ClickHouse, HTTP), edit the `output` section in `generator.yml`. See the [Eventum documentation](https://eventum.run) for details on available output plugins.
 
 ## Realism Techniques
 
@@ -169,8 +154,8 @@ Contributions are welcome! If you've built a generator for your own use case and
 - **Naming**: `<category>-<source>` in lowercase with hyphens (e.g., `linux-auditd`, `web-nginx`)
 - **Output format**: ECS-compatible JSON matching [Elastic Integration](https://github.com/elastic/integrations/tree/main/packages) field schemas
 - **Templates**: Named as `<event-id-or-type>.json.jinja`
-- **Configuration**: Must work out-of-the-box with `eventum generate` and stdout output
-- **Parameterization**: Use `${params.*}` and `${secrets.*}` for connection details — never hardcode environment-specific values
+- **Configuration**: Must work out-of-the-box with `eventum generate` (file output to `output/events.json`)
+- **Parameterization**: Use `params` for environment-specific values (hostnames, domains, etc.) — never hardcode them in templates
 - **Documentation**: Include a `README.md` with event types, parameters, usage examples, and sample output
 
 ## References
