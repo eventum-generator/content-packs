@@ -25,21 +25,25 @@ Generates realistic Windows PowerShell event log entries matching the [Elastic W
 - **Weighted provider distribution**: FileSystem (35%), Registry (20%), Variable (15%), Function (10%), and others
 - **Host application variety**: Weighted mix of `powershell.exe` (55%), `pwsh.exe` (20%), PSRemoting (15%), and ISE (10%) with realistic command-line flags
 - **Command invocation details**: 4103 and 800 events include structured `CommandInvocation` and `ParameterBinding` entries
-- **Monotonic record IDs**: Sequential counter across all events (wraps at 2^31)
-- **Pool management**: Session and script block pools capped at 100 with graceful fallback when empty
+- **120-host fleet**: Each event is attributed to a random host from a pool of domain controllers, servers, and workstations with unique agent IDs
+- **Per-host record IDs**: Sequential counter scoped per hostname (wraps at 2^31)
+- **Per-host correlation pools**: Sessions and script blocks are tracked per host so engine start→stop and script block→invocation correlations stay within the same machine
+- **Pool management**: Session and script block pools capped at 100 per host with graceful fallback when empty
 
 ## Parameters
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `hostname` | `DC01` | Windows hostname |
 | `domain` | `CONTOSO` | Active Directory domain name |
 | `fqdn_suffix` | `contoso.local` | FQDN suffix (hostname.fqdn_suffix) |
 | `domain_sid` | `S-1-5-21-3457937927-2839227994-823803824` | Domain SID prefix |
-| `agent_id` | `3cdc1e10-ded0-4f5d-8434-ede1d1120b17` | Elastic agent ID |
 | `agent_version` | `8.17.0` | Winlogbeat/agent version |
 | `powershell_version` | `5.1.22621.4111` | PowerShell host executable version |
 | `engine_version` | `5.1.22621.4111` | PowerShell engine version |
+
+### Host Pool
+
+Host identity (`hostname`, `agent_id`, IP, MAC, role) is defined per-host in `samples/hosts.csv` (120 hosts). Each event randomly selects a host from the pool. Edit the CSV to customize the fleet.
 
 ## Output Parameters
 
@@ -94,7 +98,6 @@ generators:
   windows-powershell:
     path: generators/windows-powershell/generator.yml
     params:
-      hostname: WEB01
       domain: CORP
       fqdn_suffix: corp.example.com
 ```
@@ -193,10 +196,10 @@ windows-powershell/
     4105-script-block-start.json.jinja       # Script block invocation start
     4106-script-block-stop.json.jinja        # Script block invocation stop
   samples/
+    hosts.csv                                # 120 hosts (DCs, servers, workstations)
     scripts.json                             # PowerShell script blocks (benign + suspicious)
     commands.json                            # Cmdlets with parameters and weights
     usernames.csv                            # Domain user accounts
-    workstations.csv                         # Windows hostnames
 ```
 
 ## References

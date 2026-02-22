@@ -33,7 +33,9 @@ Simulates a well-tuned production endpoint running a SwiftOnSecurity-style Sysmo
 - **Realistic process data** — 25 Windows processes with correct parent-child relationships, PE metadata (FileVersion, Description, Company, Product, OriginalFileName), integrity levels, and file hashes
 - **DNS query responses** — 30 real-world DNS domains (Microsoft services, Google, certificate authorities, internal AD) with CNAME chains, resolved IPs, and success/NXDOMAIN distribution
 - **Registry path diversity** — HKLM and HKU paths covering services, security policy, Explorer, Windows Defender, AppModel with correct event types (SetValue, CreateKey, DeleteKey)
-- **Monotonic record IDs** — Sequential `winlog.record_id` across all event types
+- **120-host fleet** — each event is attributed to a random host from a pool of domain controllers, servers, and workstations with unique agent IDs
+- **Per-host record IDs** — sequential `winlog.record_id` scoped per hostname
+- **Per-host process pool** — process lifecycle correlation is tracked per host so create→terminate and process-to-activity linkages stay within the same machine
 - **Process tampering realism** — Event 25 correctly attributes to browsers (Chrome, Edge, Firefox) which trigger benign tampering alerts
 
 ## Parameters
@@ -42,12 +44,14 @@ Simulates a well-tuned production endpoint running a SwiftOnSecurity-style Sysmo
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `hostname` | `WORKSTATION01` | Windows hostname |
 | `domain` | `CONTOSO` | NetBIOS domain name |
 | `fqdn_suffix` | `contoso.local` | DNS domain suffix |
 | `domain_sid` | `S-1-5-21-3457937927-...` | Domain SID prefix |
-| `agent_id` | `a1b2c3d4-...` | Winlogbeat agent UUID |
 | `agent_version` | `8.17.0` | Agent version string |
+
+### Host Pool
+
+Host identity (`hostname`, `agent_id`, IP, MAC, role) is defined per-host in `samples/hosts.csv` (120 hosts). Each event randomly selects a host from the pool. Edit the CSV to customize the fleet.
 
 ## Usage
 
@@ -177,8 +181,8 @@ windows-sysmon/
 │   ├── 25-process-tampering.json.jinja
 │   └── 26-file-delete-detected.json.jinja
 └── samples/
+    ├── hosts.csv
     ├── usernames.csv
-    ├── workstations.csv
     ├── processes.json
     ├── dns_domains.json
     ├── network_destinations.json

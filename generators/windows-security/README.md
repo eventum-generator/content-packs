@@ -28,7 +28,9 @@ Produces realistic Windows Security event log entries matching the output of **W
 - **Authentication packages** — NTLM vs Kerberos distribution based on logon type
 - **Failure codes** — 7 distinct Status/SubStatus pairs with realistic frequency
 - **Process trees** — 30 real Windows processes with correct parent-child relationships
-- **Monotonic record IDs** — sequential `winlog.record_id` across all events
+- **120-host fleet** — each event is attributed to a random host from a pool of domain controllers, servers, and workstations with unique agent IDs
+- **Per-host record IDs** — sequential `winlog.record_id` scoped per hostname
+- **Per-host correlation pools** — sessions and processes are tracked per host so logon→logoff and process create→terminate correlations stay within the same machine
 - **Private IPs** for internal network logons, public IPs for brute-force attempts
 
 ## Parameters
@@ -39,12 +41,14 @@ Edit the `params` section under `event.template` in `generator.yml`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `hostname` | `DC01` | Windows hostname |
 | `domain` | `CONTOSO` | Active Directory domain (NetBIOS name) |
 | `fqdn_suffix` | `contoso.local` | FQDN suffix appended to hostname |
 | `domain_sid` | `S-1-5-21-3457937927-...` | Domain SID prefix for user SIDs |
-| `agent_id` | `3cdc1e10-...` | Winlogbeat agent ID |
 | `agent_version` | `8.17.0` | Winlogbeat version string |
+
+### Host Pool
+
+Host identity (`hostname`, `agent_id`, IP, MAC, role) is defined per-host in `samples/hosts.csv` (120 hosts). Each event randomly selects a host from the pool. Edit the CSV to customize the fleet.
 
 ## Usage
 
@@ -128,8 +132,8 @@ windows-security/
     4732-member-added-group.json.jinja       # Group membership change
     1102-audit-log-cleared.json.jinja        # Security log cleared
   samples/
+    hosts.csv                                # 120 hosts (DCs, servers, workstations)
     usernames.csv                            # 20 domain usernames
-    workstations.csv                         # 15 workstation/server names
     processes.json                           # 30 process trees with parents
     services.json                            # 10 Windows services
 ```

@@ -22,7 +22,9 @@ Produces realistic Linux audit events matching the output of **Auditbeat / Elast
 - **Weighted event distribution** matching a production Linux server with standard audit rules
 - **Correlated authentication flow** — USER_AUTH → CRED_ACQ → USER_LOGIN → CRED_DISP using shared session pools
 - **Correlated services** — SERVICE_START creates entries consumed by SERVICE_STOP
-- **Monotonic sequence numbers** — sequential `event.sequence` across all events
+- **50-host fleet** — each event is attributed to a random host from a pool of web servers, app servers, databases, and other Linux roles with unique agent IDs and per-host OS metadata (Debian, Ubuntu, Rocky Linux)
+- **Per-host sequence numbers** — sequential `event.sequence` scoped per hostname
+- **Per-host correlation pools** — auth sessions are tracked per host so USER_AUTH → USER_LOGIN correlations stay within the same machine
 - **Realistic user contexts** — root, regular users, service accounts (www-data, nginx, postgres) with correct UIDs
 - **Multiple auth methods** — sshd (40%), sudo (30%), cron (15%), su (10%), login (5%)
 - **Network connection targets** — external (40%), internal (40%), localhost (20%) with protocol-appropriate ports
@@ -40,14 +42,12 @@ Edit the `params` section under `event.template` in `generator.yml`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `hostname` | `web01` | Linux hostname |
 | `fqdn_suffix` | `example.com` | Domain suffix appended to hostname |
-| `os_kernel` | `6.1.0-27-amd64` | Kernel version string |
-| `os_name` | `Debian GNU/Linux` | OS name |
-| `os_platform` | `debian` | OS platform identifier |
-| `os_version` | `12` | OS version |
-| `agent_id` | `da084743-...` | Auditbeat agent ID |
 | `agent_version` | `8.17.0` | Auditbeat version string |
+
+### Host Pool
+
+Host identity (`hostname`, `agent_id`, IP, MAC, role) and OS metadata (`os_name`, `os_version`, `os_kernel`, `os_platform`) are defined per-host in `samples/hosts.csv` (50 hosts across 3 distros: Debian 12, Ubuntu 24.04, Rocky Linux 9). Each event randomly selects a host from the pool. Edit the CSV to customize the fleet.
 
 ## Usage
 
@@ -141,6 +141,7 @@ linux-auditd/
     service-start.json.jinja                 # systemd service start
     service-stop.json.jinja                  # systemd service stop (correlated)
   samples/
+    hosts.csv                                # 50 hosts (web, app, db, cache, etc.)
     usernames.csv                            # 10 Linux user accounts with UIDs
     processes.json                           # 30 Linux processes with args/parents
     services.json                            # 12 systemd services
