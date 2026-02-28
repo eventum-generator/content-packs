@@ -11,7 +11,7 @@ This is the **content-packs** repository for [Eventum](https://github.com/eventu
 eventum generate --path generators/<name>/generator.yml --id test --live-mode
 
 # Run without live mode (generate a batch and exit)
-eventum generate --path generators/<name>/generator.yml --id test --no-live-mode
+eventum generate --path generators/<name>/generator.yml --id test --live-mode false
 ```
 
 ## Dependencies
