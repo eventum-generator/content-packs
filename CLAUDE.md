@@ -92,6 +92,17 @@ output:
 
 Each generator directory must have a README.md with: data source description, event types/IDs covered, required/optional params, usage example, sample output (one complete JSON event), references to real data source docs.
 
+## Agent Architecture
+
+This repo is part of the Eventum agent-orchestrated platform. When running from `../eventum/`, the **Team Lead** (main Claude session) delegates content pack work to specialized agents:
+
+- **generator-builder** — creates/updates generator projects (YAML config, Jinja2 templates, sample data, README). Primary agent for this repo.
+- **researcher** — researches data source specs, Elastic integration schemas, event structures before building.
+- **qa-engineer** — runs generator validation (sample mode, JSON validity, ECS fields, live mode smoke test).
+- **code-reviewer** — reviews template quality, parameterization, realism, README completeness.
+
+All agent definitions live in `../eventum/.claude/agents/`. If working standalone in this repo (not via TL), follow the conventions above directly.
+
 ## Git
 
 - Main branch: `master`
