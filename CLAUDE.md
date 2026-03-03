@@ -17,7 +17,7 @@ eventum generate --path generators/<name>/generator.yml --id test --live-mode fa
 ## Dependencies
 
 - **Eventum >= 2.0.0** — install with `uv tool install eventum-generator`
-- **Python >= 3.13**
+- **Python >= 3.14**
 - No other dependencies; generators use only Eventum's built-in modules
 
 ## Conventions
