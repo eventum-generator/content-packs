@@ -1,0 +1,86 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_az, gen_subnet_ip, flow_timestamps, detect_direction, vpcflow_block, original_log -%}
+{%- set record_id = shared.get('record_counter', 0) -%}
+{%- set account = samples.accounts | random -%}
+{%- set region = samples.regions | random -%}
+{%- set az_id = pick_az(region) -%}
+{%- set eni = samples.enis | random -%}
+{#- Pick a UDP service with weighted selection -#}
+{%- set udp_services = [] -%}
+{%- for svc in samples.common_services -%}
+    {%- if svc.protocol == 17 -%}
+        {%- do udp_services.append(svc) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set service = udp_services | random -%}
+{#- UDP traffic: mostly outbound DNS/NTP, some internal syslog/SNMP -#}
+{%- set dir_type = module.rand.weighted_choice(["outbound", "inbound", "internal"], [60, 10, 30]) -%}
+{%- if dir_type == "outbound" -%}
+    {%- set src_ip = gen_subnet_ip(eni.subnet_cidr) -%}
+    {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+    {%- set src_port = module.rand.number.integer(32768, 65535) -%}
+    {%- set dst_port = service.port -%}
+{%- elif dir_type == "inbound" -%}
+    {%- set src_ip = module.rand.network.ip_v4_public() -%}
+    {%- set dst_ip = gen_subnet_ip(eni.subnet_cidr) -%}
+    {%- set src_port = module.rand.number.integer(32768, 65535) -%}
+    {%- set dst_port = service.port -%}
+{%- else -%}
+    {%- set other_eni = samples.enis | random -%}
+    {%- set src_ip = gen_subnet_ip(eni.subnet_cidr) -%}
+    {%- set dst_ip = gen_subnet_ip(other_eni.subnet_cidr) -%}
+    {%- set src_port = module.rand.number.integer(32768, 65535) -%}
+    {%- set dst_port = service.port -%}
+{%- endif -%}
+{#- UDP flows are typically smaller and shorter -#}
+{%- set packets = module.rand.number.clamp(module.rand.number.lognormal(2.0, 1.0) | int, 1, 5000) -%}
+{%- set bytes = module.rand.number.clamp(module.rand.number.lognormal(6.0, 1.2) | int, 40, 500000) -%}
+{#- Flow timing — UDP flows tend to be short -#}
+{%- set ts_data = flow_timestamps(timestamp, 1, 60).split('|') -%}
+{%- set start_ts = ts_data[0] | int -%}
+{%- set end_ts = ts_data[1] | int -%}
+{%- set start_iso = ts_data[2] -%}
+{%- set end_iso = ts_data[3] -%}
+{%- set direction = detect_direction(src_ip, dst_ip) | trim -%}
+{
+    "@timestamp": "{{ end_iso }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(account, region, az_id) }},
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ ecs_block() }},
+    "event": {
+        "action": "accept",
+        "category": ["network"],
+        "dataset": "aws.vpcflow",
+        "end": "{{ end_iso }}",
+        "kind": "event",
+        "module": "aws",
+        "original": {{ original_log(account, eni, src_ip, dst_ip, src_port, dst_port, 17, packets, bytes, start_ts, end_ts, "ACCEPT", "OK") | tojson }},
+        "outcome": "success",
+        "start": "{{ start_iso }}",
+        "type": ["connection", "allowed"]
+    },
+    "network": {
+        "bytes": {{ bytes }},
+        "direction": "{{ direction }}",
+        "iana_number": "17",
+        "packets": {{ packets }},
+        "transport": "udp",
+        "type": "ipv4"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "bytes": {{ bytes }},
+        "ip": "{{ src_ip }}",
+        "packets": {{ packets }},
+        "port": {{ src_port }}
+    },
+    {{ vpcflow_block(eni, account, src_ip, dst_ip, src_port, dst_port, 17, packets, bytes, start_ts, end_ts, "ACCEPT", "OK") }}
+}
+{%- do shared.set('record_counter', record_id + 1) -%}

@@ -1,0 +1,94 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_source_ip, pick_user_agent, resource_name, resource_id, weighted_pick_from_list, identity_block, status_block, sub_status_block -%}
+{%- set subscription = samples.subscriptions | random -%}
+{%- set rg = samples.resource_groups | random -%}
+{%- set region = samples.regions | random -%}
+{%- set user = samples.users | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set event_data_id = module.rand.crypto.uuid4() -%}
+{%- set operation_id = module.rand.crypto.uuid4() -%}
+{#- Pick a delete operation using weights -#}
+{%- set op_idx = weighted_pick_from_list(samples.admin_delete_ops) | int -%}
+{%- set op = samples.admin_delete_ops[op_idx] -%}
+{%- set res_name = resource_name(op.resource_type) -%}
+{%- set res_id = resource_id(subscription, rg, op.provider, op.resource_type, res_name) -%}
+{#- Error injection -#}
+{%- set is_error = module.rand.chance(params.get('error_rate', 5) / 100.0) -%}
+{%- if is_error -%}
+    {%- set outcome = "failure" -%}
+    {%- set result_type = "Failed" -%}
+    {%- set result_signature = module.rand.choice(["Forbidden.", "NotFound.", "Conflict."]) -%}
+    {%- set status_value = "Failed" -%}
+    {%- set sub_status_value = module.rand.choice(["Forbidden", "NotFound", "Conflict"]) -%}
+    {%- set level = "Warning" -%}
+    {%- set http_status = module.rand.choice(["403", "404", "409"]) -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+    {%- set result_type = module.rand.weighted_choice(["Success", "Accept"], [70, 30]) -%}
+    {%- if result_type == "Success" -%}
+        {%- set result_signature = "Succeeded." -%}
+        {%- set status_value = "Succeeded" -%}
+        {%- set sub_status_value = "OK" -%}
+        {%- set http_status = "200" -%}
+    {%- else -%}
+        {%- set result_signature = "Accepted." -%}
+        {%- set status_value = "Accepted" -%}
+        {%- set sub_status_value = "Accepted" -%}
+        {%- set http_status = "202" -%}
+    {%- endif -%}
+    {%- set level = "Informational" -%}
+{%- endif -%}
+{%- set ua_type = module.rand.weighted_choice(["browser", "cli", "sdk", "service"], [30, 25, 30, 15]) -%}
+{%- set ua_value = pick_user_agent(samples.user_agents, ua_type) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(subscription, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": {{ op.operation | tojson }},
+        "category": ["configuration"],
+        "dataset": "azure.activitylogs",
+        "kind": "event",
+        "module": "azure",
+        "outcome": "{{ outcome }}",
+        "type": ["deletion"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+    "user": {
+        "id": "{{ user.object_id }}",
+        "name": "{{ user.upn }}",
+        "email": "{{ user.upn }}"
+    },
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ user.upn }}"]
+    },
+    "azure": {
+        "activitylogs": {
+            "category": "Administrative",
+            "event_category": "Administrative",
+            {{ identity_block(user, params, timestamp) }},
+            "level": "{{ level }}",
+            "operation_name": {{ op.operation | tojson }},
+            "result_type": "{{ result_type }}",
+            "result_signature": "{{ result_signature }}",
+            "properties": {
+                "statusCode": "{{ http_status }}",
+                "serviceRequestId": "{{ module.rand.crypto.uuid4() }}",
+                "statusMessage": {{ result_signature | tojson }}
+            },
+            {{ status_block(status_value) }},
+            {{ sub_status_block(sub_status_value) }},
+            "correlation_id": "{{ correlation_id }}",
+            "resource_id": {{ res_id | tojson }},
+            "tenant_id": "{{ params.tenant_id }}",
+            "subscription_id": "{{ subscription.subscription_id }}"
+        }
+    }
+}

@@ -1,0 +1,85 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_source_ip, resource_name, resource_id, weighted_pick_from_list, status_block, sub_status_block -%}
+{%- set subscription = samples.subscriptions | random -%}
+{%- set rg = samples.resource_groups | random -%}
+{%- set region = samples.regions | random -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set event_data_id = module.rand.crypto.uuid4() -%}
+{%- set operation_id = module.rand.crypto.uuid4() -%}
+{#- Pick a policy operation using weights -#}
+{%- set pol_op_idx = weighted_pick_from_list(samples.policy_ops) | int -%}
+{%- set pol_op = samples.policy_ops[pol_op_idx] -%}
+{#- Pick a policy definition using weights -#}
+{%- set pol_def_idx = weighted_pick_from_list(samples.policy_definitions) | int -%}
+{%- set pol_def = samples.policy_definitions[pol_def_idx] -%}
+{#- Pick a resource that is being evaluated — use admin_write operations as resource targets -#}
+{%- set target_op_idx = weighted_pick_from_list(samples.admin_write_ops) | int -%}
+{%- set target_op = samples.admin_write_ops[target_op_idx] -%}
+{%- set res_name = resource_name(target_op.resource_type) -%}
+{%- set res_id = resource_id(subscription, rg, target_op.provider, target_op.resource_type, res_name) -%}
+{#- Compliance check vs new resource deployment -#}
+{%- set is_compliance_check = module.rand.weighted_choice(["True", "False"], [70, 30]) -%}
+{#- Determine caller — compliance checks use service principal -#}
+{%- if is_compliance_check == "True" -%}
+    {%- set caller = "33a68b9d-63ce-484c-a97e-94aef4c89648" -%}
+{%- else -%}
+    {%- set user = samples.users | random -%}
+    {%- set caller = user.upn -%}
+{%- endif -%}
+{#- Determine result — Deny effect fails, others succeed -#}
+{%- if pol_op.effect == "Deny" -%}
+    {%- set outcome = "failure" -%}
+    {%- set status_value = "Failed" -%}
+    {%- set level = "Error" -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+    {%- set status_value = "Succeeded" -%}
+    {%- if pol_op.effect == "Audit" or pol_op.effect == "AuditIfNotExists" -%}
+        {%- set level = "Warning" -%}
+    {%- else -%}
+        {%- set level = "Informational" -%}
+    {%- endif -%}
+{%- endif -%}
+{%- set policy_assignment_id = "/subscriptions/" ~ subscription.subscription_id ~ "/providers/Microsoft.Authorization/policyAssignments/" ~ module.rand.string.hex(24) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(subscription, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": {{ pol_op.operation | tojson }},
+        "category": ["configuration"],
+        "dataset": "azure.activitylogs",
+        "kind": "event",
+        "module": "azure",
+        "outcome": "{{ outcome }}",
+        "type": ["info"]
+    },
+    "user": {
+        "id": "{{ caller }}"
+    },
+    "related": {
+        "user": ["{{ caller }}"]
+    },
+    "azure": {
+        "activitylogs": {
+            "category": "Policy",
+            "event_category": "Policy",
+            "level": "{{ level }}",
+            "operation_name": {{ pol_op.operation | tojson }},
+            "result_type": "{{ status_value }}",
+            "result_signature": "{{ status_value }}.",
+            "properties": {
+                "isComplianceCheck": "{{ is_compliance_check }}",
+                "resourceLocation": "{{ region.region_code }}",
+                "ancestors": "{{ params.tenant_id }}",
+                "policies": {{ ('[{"policyDefinitionId":"/subscriptions/' ~ subscription.subscription_id ~ '/providers/Microsoft.Authorization/policyDefinitions/' ~ pol_def.definition_id ~ '/","policyDefinitionName":"' ~ pol_def.definition_id ~ '","policyDefinitionEffect":"' ~ pol_def.effect ~ '","policyAssignmentId":"' ~ policy_assignment_id ~ '","policyAssignmentName":"' ~ module.rand.string.hex(24) ~ '","policyAssignmentScope":"/subscriptions/' ~ subscription.subscription_id ~ '","policyAssignmentParameters":{}}]') | tojson }}
+            },
+            {{ status_block(status_value) }},
+            {{ sub_status_block("") }},
+            "correlation_id": "{{ correlation_id }}",
+            "resource_id": {{ res_id | tojson }},
+            "tenant_id": "{{ params.tenant_id }}",
+            "subscription_id": "{{ subscription.subscription_id }}"
+        }
+    }
+}

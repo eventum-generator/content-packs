@@ -1,0 +1,145 @@
+{#- Shared macros for Microsoft 365 Unified Audit Log events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, organization_block, related_block, o365_base_block, pick_user_agent, pick_source_ip, record_type_for_workload, user_type_value %} -#}
+{#- For weighted picks on JSON samples, use: samples.sharepoint_sites.weighted_pick('weight'), samples.files.weighted_pick('weight') -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "o365-audit-forwarder",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block() -%}
+    "cloud": {
+        "provider": "azure"
+    }
+{%- endmacro -%}
+
+{%- macro event_block(action, categories, event_id, outcome, types) -%}
+    "event": {
+        "action": {{ action | tojson }},
+        "category": {{ categories | tojson }},
+        "dataset": "o365.audit",
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": "o365",
+        "outcome": "{{ outcome }}",
+        "type": {{ types | tojson }}
+    }
+{%- endmacro -%}
+
+{%- macro source_block(ip) -%}
+    "source": {
+        "ip": "{{ ip }}"
+    }
+{%- endmacro -%}
+
+{%- macro user_block(user) -%}
+    "user": {
+        "domain": "{{ user.upn.split('@')[1] }}",
+        "email": "{{ user.upn }}",
+        "id": "{{ user.object_id }}",
+        "name": "{{ user.upn.split('@')[0] }}"
+    }
+{%- endmacro -%}
+
+{%- macro organization_block(org) -%}
+    "organization": {
+        "id": "{{ org.org_id }}",
+        "name": "{{ org.org_name }}"
+    }
+{%- endmacro -%}
+
+{%- macro related_block(ips, users) -%}
+    "related": {
+        "ip": {{ ips | tojson }},
+        "user": {{ users | tojson }}
+    }
+{%- endmacro -%}
+
+{#- Core o365.audit fields shared by all workloads -#}
+{%- macro o365_base_block(audit_id, record_type, result_status, operation, workload, user, client_ip, object_id, user_type_val) -%}
+            "id": {{ audit_id | tojson }},
+            "record_type": {{ record_type | tojson }},
+            "result_status": {{ result_status | tojson }},
+            "operation": {{ operation | tojson }},
+            "workload": {{ workload | tojson }},
+            "user_id": {{ user.upn | tojson }},
+            "user_type": {
+                "value": {{ user_type_val }}
+            },
+            "client_ip": {{ client_ip | tojson }},
+            "object_id": {{ object_id | tojson }}
+{%- endmacro -%}
+
+{#- Pick a user agent by type -#}
+{%- macro pick_user_agent(ua_type, user_agents) -%}
+{%- set matching = [] -%}
+{%- for ua in user_agents -%}
+    {%- if ua.type == ua_type -%}
+        {%- do matching.append(ua.value) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if matching | length > 0 -%}
+    {{- module.rand.choice(matching) -}}
+{%- else -%}
+    {%- set all_uas = [] -%}
+    {%- for ua in user_agents -%}
+        {%- do all_uas.append(ua.value) -%}
+    {%- endfor -%}
+    {{- module.rand.choice(all_uas) -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Pick source IP from samples -#}
+{%- macro pick_source_ip(source_ips) -%}
+{{- (source_ips | random).ip -}}
+{%- endmacro -%}
+
+{#- Map workload to record type number -#}
+{#- AzureActiveDirectory = 8, AzureActiveDirectoryStsLogon = 15, ExchangeItem = 2, ExchangeAdmin = 1, SharePointFileOperation = 6, SharePoint = 4, MicrosoftTeams = 25 -#}
+{%- macro record_type_for_workload(workload, operation) -%}
+{%- if workload == "AzureActiveDirectory" -%}
+    {%- if operation in ["UserLoggedIn", "UserLoginFailed"] -%}
+        {{- "15" -}}
+    {%- else -%}
+        {{- "8" -}}
+    {%- endif -%}
+{%- elif workload == "Exchange" -%}
+    {%- if operation in ["MailItemsAccessed", "MailboxLogin", "Send"] -%}
+        {{- "2" -}}
+    {%- else -%}
+        {{- "1" -}}
+    {%- endif -%}
+{%- elif workload == "SharePoint" or workload == "OneDrive" -%}
+    {%- if operation in ["FileAccessed", "FileModified", "FileDeleted", "FileDownloaded", "FileUploaded", "FileMoved", "FileRenamed", "SharingSet"] -%}
+        {{- "6" -}}
+    {%- else -%}
+        {{- "4" -}}
+    {%- endif -%}
+{%- elif workload == "MicrosoftTeams" -%}
+    {{- "25" -}}
+{%- else -%}
+    {{- "1" -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- User type: 0 = Regular, 2 = Admin, 3 = DCAdmin, 4 = System, 5 = Application -#}
+{%- macro user_type_value(user) -%}
+{%- if user.upn == 'admin@contoso.com' -%}
+    {{- 2 -}}
+{%- elif user.upn.startswith('svc-') -%}
+    {{- 5 -}}
+{%- else -%}
+    {{- 0 -}}
+{%- endif -%}
+{%- endmacro -%}

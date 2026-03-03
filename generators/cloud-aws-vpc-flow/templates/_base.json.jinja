@@ -1,0 +1,98 @@
+{#- Shared macros for AWS VPC Flow Log events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_eni, pick_direction, gen_internal_ip, flow_timestamps %} -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "vpcflow-forwarder",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block(account, region, az_id) -%}
+    "cloud": {
+        "account": {
+            "id": "{{ account.account_id }}",
+            "name": "{{ account.account_name }}"
+        },
+        "availability_zone": "{{ az_id }}",
+        "provider": "aws",
+        "region": "{{ region.region_code }}"
+    }
+{%- endmacro -%}
+
+{%- macro pick_az(region) -%}
+{%- set azs = [region.az_a, region.az_b, region.az_c] -%}
+{{- module.rand.choice(azs) -}}
+{%- endmacro -%}
+
+{#- Generate a private IP from a given CIDR subnet (simplified: picks from the /24 range) -#}
+{%- macro gen_subnet_ip(subnet_cidr) -%}
+{%- set octets = subnet_cidr.split('/')[0].split('.') -%}
+{{- octets[0] ~ '.' ~ octets[1] ~ '.' ~ octets[2] ~ '.' ~ module.rand.number.integer(4, 250) -}}
+{%- endmacro -%}
+
+{#- Generate flow start/end unix timestamps from current timestamp -#}
+{#- Returns "start_unix|end_unix|start_iso|end_iso" to be split by caller -#}
+{%- macro flow_timestamps(ts, min_duration, max_duration) -%}
+{%- set duration = module.rand.number.integer(min_duration, max_duration) -%}
+{%- set start_epoch = module.calendar.timegm(ts.utctimetuple()) -%}
+{%- set end_epoch = start_epoch + duration -%}
+{%- set start_dt = module.datetime.datetime.fromtimestamp(start_epoch, tz=module.datetime.timezone.utc) -%}
+{%- set end_dt = module.datetime.datetime.fromtimestamp(end_epoch, tz=module.datetime.timezone.utc) -%}
+{{- start_epoch ~ '|' ~ end_epoch ~ '|' ~ start_dt.isoformat() ~ '|' ~ end_dt.isoformat() -}}
+{%- endmacro -%}
+
+{#- Network direction based on source/destination IP ranges -#}
+{%- macro detect_direction(src_ip, dst_ip) -%}
+{%- set src_private = src_ip.startswith('10.') or src_ip.startswith('172.16.') or src_ip.startswith('172.17.') or src_ip.startswith('172.18.') or src_ip.startswith('172.19.') or src_ip.startswith('172.2') or src_ip.startswith('172.30.') or src_ip.startswith('172.31.') or src_ip.startswith('192.168.') -%}
+{%- set dst_private = dst_ip.startswith('10.') or dst_ip.startswith('172.16.') or dst_ip.startswith('172.17.') or dst_ip.startswith('172.18.') or dst_ip.startswith('172.19.') or dst_ip.startswith('172.2') or dst_ip.startswith('172.30.') or dst_ip.startswith('172.31.') or dst_ip.startswith('192.168.') -%}
+{%- if src_private and dst_private -%}
+internal
+{%- elif src_private and not dst_private -%}
+outbound
+{%- elif not src_private and dst_private -%}
+inbound
+{%- else -%}
+external
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Build the aws.vpcflow sub-object -#}
+{%- macro vpcflow_block(eni, account, src_ip, dst_ip, src_port, dst_port, protocol_num, packets, bytes, start_ts, end_ts, action, log_status) -%}
+    "aws": {
+        "vpcflow": {
+            "version": 2,
+            "account_id": "{{ account.account_id }}",
+            "interface_id": "{{ eni.eni_id }}",
+            "srcaddr": "{{ src_ip }}",
+            "dstaddr": "{{ dst_ip }}",
+            "srcport": {{ src_port }},
+            "dstport": {{ dst_port }},
+            "protocol": {{ protocol_num }},
+            "packets": {{ packets }},
+            "bytes": {{ bytes }},
+            "start": {{ start_ts }},
+            "end": {{ end_ts }},
+            "action": "{{ action }}",
+            "log_status": "{{ log_status }}",
+            "instance_id": "{{ eni.instance_id }}",
+            "vpc_id": "{{ eni.vpc_id }}",
+            "subnet_id": "{{ eni.subnet_id }}",
+            "type": "IPv4"
+        }
+    }
+{%- endmacro -%}
+
+{#- Build the event.original raw log line (v2 format) -#}
+{%- macro original_log(account, eni, src_ip, dst_ip, src_port, dst_port, protocol_num, packets, bytes, start_ts, end_ts, action, log_status) -%}
+{{- "2 " ~ account.account_id ~ " " ~ eni.eni_id ~ " " ~ src_ip ~ " " ~ dst_ip ~ " " ~ src_port ~ " " ~ dst_port ~ " " ~ protocol_num ~ " " ~ packets ~ " " ~ bytes ~ " " ~ start_ts ~ " " ~ end_ts ~ " " ~ action ~ " " ~ log_status -}}
+{%- endmacro -%}

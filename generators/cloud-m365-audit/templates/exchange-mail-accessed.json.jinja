@@ -1,0 +1,74 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, organization_block, related_block, o365_base_block, pick_user_agent, pick_source_ip, user_type_value, record_type_for_workload -%}
+{#- Try to reuse a logged-in session for correlation -#}
+{%- set sessions = shared.get('active_sessions', []) -%}
+{%- if sessions | length > 0 and module.rand.chance(0.6) -%}
+    {%- set session = module.rand.choice(sessions) -%}
+    {%- set user_upn = session.user_upn -%}
+    {%- set src_ip = session.src_ip -%}
+    {#- Find the user object -#}
+    {%- set matched_users = [] -%}
+    {%- for u in samples.users -%}
+        {%- if u.upn == user_upn -%}
+            {%- do matched_users.append(u) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- if matched_users | length > 0 -%}
+        {%- set user = matched_users[0] -%}
+    {%- else -%}
+        {%- set user = samples.users | random -%}
+    {%- endif -%}
+{%- else -%}
+    {%- set user = samples.users | random -%}
+    {%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- endif -%}
+{%- set org = samples.organizations | random -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set mailbox_guid = module.rand.crypto.uuid4() -%}
+{%- set session_id = module.rand.crypto.uuid4() -%}
+{%- set internet_message_id = "<" ~ module.rand.string.hex(8) ~ "." ~ module.rand.string.hex(4) ~ "@" ~ org.domain ~ ">" -%}
+{#- User agent: mostly Outlook clients -#}
+{%- set ua_type = module.rand.weighted_choice(["outlook_desktop", "outlook_mobile", "browser_windows", "browser_mac", "graph_api"], [40, 15, 20, 10, 15]) -%}
+{%- set ua_value = pick_user_agent(ua_type, samples.user_agents) -%}
+{#- Email subjects -#}
+{%- set subjects = ["Re: Project Update", "Meeting Tomorrow", "Q4 Report Review", "Action Required: Approve Budget", "FYI: New Policy", "Weekly Standup Notes", "Invitation: Team Lunch", "Re: Client Feedback", "Invoice #" ~ module.rand.number.integer(1000, 9999), "Newsletter - March 2026", "Security Alert", "Re: Deployment Schedule", "Quarterly Review Prep", "New Hire Announcement", "Benefits Enrollment Reminder"] -%}
+{%- set subject = module.rand.choice(subjects) -%}
+{%- set operation = "MailItemsAccessed" -%}
+{%- set workload = "Exchange" -%}
+{%- set rec_type = record_type_for_workload(workload, operation) -%}
+{%- set ut_val = user_type_value(user) -%}
+{%- set logon_type = module.rand.weighted_choice([0, 1, 2], [80, 15, 5]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block() }},
+    {{ ecs_block() }},
+    {{ event_block(operation, ["email"], event_id, "success", ["access"]) }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    {{ organization_block(org) }},
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn]) }},
+    "o365": {
+        "audit": {
+            {{ o365_base_block(audit_id, rec_type, "Succeeded", operation, workload, user, src_ip, user.upn, ut_val) }},
+            "user_agent": {{ ua_value | tojson }},
+            "item": {
+                "subject": {{ subject | tojson }},
+                "internet_message_id": {{ internet_message_id | tojson }},
+                "parent_folder": {
+                    "name": "{{ module.rand.weighted_choice(["Inbox", "Sent Items", "Drafts", "Archive"], [70, 15, 5, 10]) }}"
+                }
+            },
+            "logon_type": {{ logon_type }},
+            "mailbox_guid": "{{ mailbox_guid }}",
+            "mailbox_owner_upn": "{{ user.upn }}",
+            "mailbox_owner_sid": "S-1-5-21-{{ module.rand.number.integer(100000000, 999999999) }}-{{ module.rand.number.integer(100000000, 999999999) }}-{{ module.rand.number.integer(100000000, 999999999) }}-{{ module.rand.number.integer(1000, 9999) }}",
+            "session_id": "{{ session_id }}",
+            "client_info_string": {{ ua_value | tojson }},
+            "external_access": false
+        }
+    }
+}

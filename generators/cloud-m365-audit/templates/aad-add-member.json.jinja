@@ -1,0 +1,94 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, organization_block, related_block, o365_base_block, pick_source_ip, user_type_value, record_type_for_workload -%}
+{#- Actor is admin or the user themselves -#}
+{%- set is_admin = module.rand.chance(0.4) -%}
+{%- if is_admin -%}
+    {%- set actor_users = [] -%}
+    {%- for u in samples.users -%}
+        {%- if u.upn == 'admin@contoso.com' or u.department == 'IT Operations' -%}
+            {%- do actor_users.append(u) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {%- set actor = module.rand.choice(actor_users) -%}
+{%- else -%}
+    {%- set actor = samples.users | random -%}
+{%- endif -%}
+{#- Target is a different user -#}
+{%- set target = samples.users | random -%}
+{%- set org = samples.organizations | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{#- Operation type -#}
+{%- set op_choices = [
+    {"operation": "Add member to group.", "target_type": "Group"},
+    {"operation": "Add member to role.", "target_type": "Role"},
+    {"operation": "Add user.", "target_type": "User"}
+] -%}
+{%- set op = module.rand.weighted_choice(op_choices, [60, 15, 25]) -%}
+{%- set operation = op.operation -%}
+{%- set workload = "AzureActiveDirectory" -%}
+{%- set rec_type = record_type_for_workload(workload, operation) -%}
+{%- set ut_val = user_type_value(actor) -%}
+{#- Group/role names -#}
+{%- set group_names = ["All Employees", "Engineering Team", "Marketing Team", "Sales Team", "Finance Team", "Project Alpha Members", "VPN Users", "SharePoint Admins", "Security Readers", "Compliance Officers"] -%}
+{%- set role_names = ["Global Reader", "User Administrator", "Helpdesk Administrator", "Exchange Administrator", "SharePoint Administrator", "Security Reader"] -%}
+{%- if op.target_type == "Group" -%}
+    {%- set target_name = module.rand.choice(group_names) -%}
+{%- elif op.target_type == "Role" -%}
+    {%- set target_name = module.rand.choice(role_names) -%}
+{%- else -%}
+    {%- set target_name = target.display_name -%}
+{%- endif -%}
+{%- set target_id = module.rand.crypto.uuid4() -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block() }},
+    {{ ecs_block() }},
+    {{ event_block(operation, ["iam"], event_id, "success", ["change"]) }},
+    {{ source_block(src_ip) }},
+    {{ user_block(actor) }},
+    {{ organization_block(org) }},
+    {{ related_block([src_ip], [actor.upn.split('@')[0], actor.upn, target.upn.split('@')[0]]) }},
+    "o365": {
+        "audit": {
+            {{ o365_base_block(audit_id, rec_type, "Succeeded", operation, workload, actor, src_ip, target.upn, ut_val) }},
+            "actor": [
+                {
+                    "id": "{{ actor.object_id }}",
+                    "type": 0
+                },
+                {
+                    "id": "{{ actor.upn }}",
+                    "type": 5
+                }
+            ],
+            "target": [
+                {
+                    "id": "{{ target.object_id }}",
+                    "type": 0
+                },
+                {
+                    "id": "{{ target.upn }}",
+                    "type": 5
+                },
+                {
+                    "id": "{{ target_id }}",
+                    "type": 2
+                },
+                {
+                    "id": {{ target_name | tojson }},
+                    "type": 1
+                }
+            ],
+            "modified_properties": [
+                {
+                    "name": "{{ op.target_type }}",
+                    "new_value": {{ target_name | tojson }}
+                }
+            ],
+            "correlation_id": "{{ correlation_id }}"
+        }
+    }
+}

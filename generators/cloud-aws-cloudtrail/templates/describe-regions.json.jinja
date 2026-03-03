@@ -1,0 +1,112 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, tls_block, pick_user_agent, pick_source_ip -%}
+{%- set record_id = shared.get('record_counter', 0) -%}
+{%- set account = samples.accounts | random -%}
+{%- set region = samples.regions | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set request_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{#- Identity -#}
+{%- set identity_type = module.rand.weighted_choice(["AssumedRole", "IAMUser"], [60, 40]) -%}
+{%- if identity_type == "AssumedRole" -%}
+    {%- set assumed_roles = shared.get('assumed_roles', []) -%}
+    {%- if assumed_roles | length > 0 -%}
+        {%- set role_entry = module.rand.choice(assumed_roles) -%}
+    {%- else -%}
+        {%- set role = samples.roles | random -%}
+        {%- set role_entry = {"role_name": role.role_name, "role_id": role.role_id, "session_name": role.session_prefix ~ "-" ~ module.rand.string.hex(6), "access_key_id": "ASIA" ~ module.rand.string.letters_uppercase(12) ~ module.rand.string.digits(4), "account_id": account.account_id} -%}
+    {%- endif -%}
+    {%- set identity_arn = "arn:aws:sts::" ~ role_entry.account_id ~ ":assumed-role/" ~ role_entry.role_name ~ "/" ~ role_entry.session_name -%}
+    {%- set identity_principal = role_entry.role_id ~ ":" ~ role_entry.session_name -%}
+    {%- set identity_key = role_entry.access_key_id -%}
+    {%- set identity_user_name = role_entry.role_name -%}
+    {%- set identity_account = role_entry.account_id -%}
+{%- else -%}
+    {%- set user = samples.users | random -%}
+    {%- set identity_arn = "arn:aws:iam::" ~ account.account_id ~ ":user/" ~ user.username -%}
+    {%- set identity_principal = user.principal_id -%}
+    {%- set identity_key = user.access_key_id -%}
+    {%- set identity_user_name = user.username -%}
+    {%- set identity_account = account.account_id -%}
+{%- endif -%}
+{%- set req_params = {"regionSet": {}} -%}
+{%- set ua_value = pick_user_agent(identity_type, samples.user_agents) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(account, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "DescribeRegions",
+        "category": ["configuration"],
+        "dataset": "aws.cloudtrail",
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": "aws",
+        "outcome": "success",
+        "provider": "cloudtrail",
+        "type": ["info"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}"
+    },
+    "user": {
+        "name": "{{ identity_user_name }}",
+        "id": "{{ identity_principal }}"
+    },
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ identity_user_name }}"]
+    },
+    "aws": {
+        "cloudtrail": {
+            "event_version": "{{ params.event_version }}",
+            "event_source": "ec2.amazonaws.com",
+            "event_name": "DescribeRegions",
+            "event_type": "AwsApiCall",
+            "event_category": "Management",
+            "management_event": true,
+            "read_only": true,
+            "recipient_account_id": "{{ account.account_id }}",
+            "request_id": "{{ request_id }}",
+{%- if identity_type == "AssumedRole" %}
+            "user_identity": {
+                "type": "AssumedRole",
+                "principal_id": "{{ identity_principal }}",
+                "arn": "{{ identity_arn }}",
+                "account_id": "{{ identity_account }}",
+                "access_key_id": "{{ identity_key }}",
+                "session_context": {
+                    "session_issuer": {
+                        "type": "Role",
+                        "principal_id": "{{ role_entry.role_id }}",
+                        "arn": "arn:aws:iam::{{ identity_account }}:role/{{ identity_user_name }}",
+                        "account_id": "{{ identity_account }}",
+                        "user_name": "{{ identity_user_name }}"
+                    },
+                    "attributes": {
+                        "creation_date": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%SZ') }}",
+                        "mfa_authenticated": "false"
+                    }
+                }
+            },
+{%- else %}
+            "user_identity": {
+                "type": "IAMUser",
+                "principal_id": "{{ identity_principal }}",
+                "arn": "{{ identity_arn }}",
+                "account_id": "{{ identity_account }}",
+                "access_key_id": "{{ identity_key }}",
+                "user_name": "{{ identity_user_name }}"
+            },
+{%- endif %}
+            "request_parameters": {{ req_params | tojson }},
+            "response_elements": null,
+            {{ tls_block("ec2.amazonaws.com", region) }}
+        }
+    }
+}
+{%- do shared.set('record_counter', record_id + 1) -%}

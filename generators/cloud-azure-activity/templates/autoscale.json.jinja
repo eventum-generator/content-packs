@@ -1,0 +1,75 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, resource_name, weighted_pick_from_list, status_block, sub_status_block -%}
+{%- set subscription = samples.subscriptions | random -%}
+{%- set rg = samples.resource_groups | random -%}
+{%- set region = samples.regions | random -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set event_data_id = module.rand.crypto.uuid4() -%}
+{#- Pick an autoscale resource type using weights -#}
+{%- set as_idx = weighted_pick_from_list(samples.autoscale_resources) | int -%}
+{%- set as_resource = samples.autoscale_resources[as_idx] -%}
+{%- set res_name = resource_name(as_resource.resource_type) -%}
+{%- set target_resource_id = "/subscriptions/" ~ subscription.subscription_id ~ "/resourceGroups/" ~ rg.name ~ "/providers/" ~ as_resource.provider ~ "/" ~ as_resource.resource_type.split("/")[-1] ~ "/" ~ res_name -%}
+{%- set autoscale_setting_id = "/subscriptions/" ~ subscription.subscription_id ~ "/resourceGroups/" ~ rg.name ~ "/providers/microsoft.insights/autoscalesettings/" ~ rg.name ~ "-" ~ res_name -%}
+{#- Scale direction -#}
+{%- set scale_direction = module.rand.weighted_choice(["Scaleup", "Scaledown"], [55, 45]) -%}
+{%- set old_count = module.rand.number.integer(2, 8) -%}
+{%- if scale_direction == "Scaleup" -%}
+    {%- set new_count = old_count + module.rand.number.integer(1, 3) -%}
+    {%- set op_name = "Microsoft.Insights/AutoscaleSettings/Scaleup/Action" -%}
+{%- else -%}
+    {%- set new_count = module.rand.number.clamp(old_count - module.rand.number.integer(1, 2), 1, old_count) -%}
+    {%- set op_name = "Microsoft.Insights/AutoscaleSettings/Scaledown/Action" -%}
+{%- endif -%}
+{#- Success or failure -#}
+{%- set is_error = module.rand.chance(0.05) -%}
+{%- if is_error -%}
+    {%- set outcome = "failure" -%}
+    {%- set status_value = "Failed" -%}
+    {%- set level = "Error" -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+    {%- set status_value = "Succeeded" -%}
+    {%- set level = "Informational" -%}
+{%- endif -%}
+{%- set description = "The autoscale engine attempting to scale resource '" ~ target_resource_id ~ "' from " ~ old_count ~ " instances count to " ~ new_count ~ " instances count." -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(subscription, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": {{ op_name | tojson }},
+        "category": ["configuration"],
+        "dataset": "azure.activitylogs",
+        "kind": "event",
+        "module": "azure",
+        "outcome": "{{ outcome }}",
+        "type": ["change"]
+    },
+    "related": {
+        "user": []
+    },
+    "azure": {
+        "activitylogs": {
+            "category": "Autoscale",
+            "event_category": "Autoscale",
+            "level": "{{ level }}",
+            "operation_name": {{ op_name | tojson }},
+            "result_type": "{{ status_value }}",
+            "result_signature": "{{ status_value }}.",
+            "properties": {
+                "Description": {{ description | tojson }},
+                "ResourceName": {{ target_resource_id | tojson }},
+                "OldInstancesCount": "{{ old_count }}",
+                "NewInstancesCount": "{{ new_count }}",
+                "LastScaleActionTime": "{{ timestamp.strftime('%a, %d %b %Y %H:%M:%S GMT') }}"
+            },
+            {{ status_block(status_value) }},
+            {{ sub_status_block("") }},
+            "correlation_id": "{{ correlation_id }}",
+            "resource_id": {{ autoscale_setting_id | tojson }},
+            "tenant_id": "{{ params.tenant_id }}",
+            "subscription_id": "{{ subscription.subscription_id }}"
+        }
+    }
+}

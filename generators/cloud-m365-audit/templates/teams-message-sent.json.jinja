@@ -1,0 +1,72 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, organization_block, related_block, o365_base_block, pick_user_agent, pick_source_ip, user_type_value, record_type_for_workload -%}
+{%- set user = samples.users | random -%}
+{%- set org = samples.organizations | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set message_id = module.rand.number.integer(1000000000000, 9999999999999) -%}
+{#- Pick a team and channel -#}
+{%- set team = samples.teams.weighted_pick('weight') -%}
+{%- set channel = module.rand.choice(team.channels) -%}
+{%- set ua_type = module.rand.weighted_choice(["teams_desktop", "teams_mobile", "browser_windows"], [55, 25, 20]) -%}
+{%- set ua_value = pick_user_agent(ua_type, samples.user_agents) -%}
+{%- set operation = "MessageSent" -%}
+{%- set workload = "MicrosoftTeams" -%}
+{%- set rec_type = record_type_for_workload(workload, operation) -%}
+{%- set ut_val = user_type_value(user) -%}
+{#- Message type: chat vs channel -#}
+{%- set is_chat = module.rand.chance(0.35) -%}
+{%- if is_chat -%}
+    {%- set chat_type = "OneOnOne" -%}
+    {%- set chat_recipient = samples.users | random -%}
+    {%- set object_id = user.upn -%}
+{%- else -%}
+    {%- set chat_type = "Channel" -%}
+    {%- set object_id = team.team_name ~ "/" ~ channel.name -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block() }},
+    {{ ecs_block() }},
+    {{ event_block(operation, ["web"], event_id, "success", ["creation"]) }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    {{ organization_block(org) }},
+{%- if is_chat %}
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn, chat_recipient.upn.split('@')[0]]) }},
+{%- else %}
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn]) }},
+{%- endif %}
+    "o365": {
+        "audit": {
+            {{ o365_base_block(audit_id, rec_type, "Succeeded", operation, workload, user, src_ip, object_id, ut_val) }},
+            "user_agent": {{ ua_value | tojson }},
+            "teams": {
+                "message_id": "{{ message_id }}",
+                "team_name": {{ team.team_name | tojson }},
+                "team_id": "{{ team.team_id }}",
+                "channel_name": {{ channel.name | tojson }},
+                "channel_id": "{{ channel.id }}",
+                "chat_type": "{{ chat_type }}"
+{%- if is_chat %},
+                "members": [
+                    {
+                        "id": "{{ user.object_id }}",
+                        "upn": "{{ user.upn }}",
+                        "role": "Owner"
+                    },
+                    {
+                        "id": "{{ chat_recipient.object_id }}",
+                        "upn": "{{ chat_recipient.upn }}",
+                        "role": "Member"
+                    }
+                ]
+{%- endif %}
+            }
+        }
+    }
+}

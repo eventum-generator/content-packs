@@ -1,0 +1,89 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, organization_block, related_block, o365_base_block, pick_user_agent, pick_source_ip, user_type_value, record_type_for_workload -%}
+{%- set user = samples.users | random -%}
+{%- set org = samples.organizations | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set ua_type = module.rand.weighted_choice(["browser_windows", "browser_mac", "outlook_desktop"], [50, 25, 25]) -%}
+{%- set ua_value = pick_user_agent(ua_type, samples.user_agents) -%}
+{#- Error scenarios for login failures -#}
+{%- set error_choices = [
+    {"code": "50126", "detail": "InvalidUserNameOrPassword", "message": "Error validating credentials due to invalid username or password."},
+    {"code": "50053", "detail": "IdsLocked", "message": "The account is locked, you've tried to sign in too many times with an incorrect user ID or password."},
+    {"code": "50057", "detail": "UserDisabled", "message": "The user account is disabled."},
+    {"code": "50076", "detail": "UserStrongAuthClientAuthNRequired", "message": "Due to a configuration change, or because you moved to a new location, you must use multi-factor authentication."},
+    {"code": "50074", "detail": "UserStrongAuthClientAuthNRequiredInterrupt", "message": "Strong authentication is required and the user did not pass MFA challenge."},
+    {"code": "530032", "detail": "BlockedByConditionalAccessOnSecurityPolicy", "message": "Tenant admin has configured a security policy that blocks this request."},
+    {"code": "50055", "detail": "InvalidPasswordExpiredPassword", "message": "The password is expired."},
+    {"code": "500121", "detail": "StrongAuthenticationIsRequiredButNotPerformed", "message": "Authentication failed during strong authentication request."}
+] -%}
+{%- set error = module.rand.choice(error_choices) -%}
+{%- set app_choices = [
+    {"id": "00000003-0000-0000-c000-000000000000", "name": "Microsoft Graph"},
+    {"id": "00000002-0000-0ff1-ce00-000000000000", "name": "Office 365 Exchange Online"},
+    {"id": "1fec8e78-bce4-4aaf-ab1b-5451cc387264", "name": "Microsoft Teams"}
+] -%}
+{%- set app = module.rand.choice(app_choices) -%}
+{%- set operation = "UserLoginFailed" -%}
+{%- set workload = "AzureActiveDirectory" -%}
+{%- set rec_type = record_type_for_workload(workload, operation) -%}
+{%- set ut_val = user_type_value(user) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block() }},
+    {{ ecs_block() }},
+    {{ event_block(operation, ["authentication"], event_id, "failure", ["start"]) }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    {{ organization_block(org) }},
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn]) }},
+    "o365": {
+        "audit": {
+            {{ o365_base_block(audit_id, rec_type, "Failed", operation, workload, user, src_ip, app.id, ut_val) }},
+            "user_agent": {{ ua_value | tojson }},
+            "extended_properties": [
+                {
+                    "name": "ResultStatusDetail",
+                    "value": {{ error.detail | tojson }}
+                },
+                {
+                    "name": "UserAuthenticationMethod",
+                    "value": "1"
+                },
+                {
+                    "name": "RequestType",
+                    "value": "OAuth2:Authorize"
+                }
+            ],
+            "actor": [
+                {
+                    "id": "{{ user.object_id }}",
+                    "type": 0
+                },
+                {
+                    "id": "{{ user.upn }}",
+                    "type": 5
+                }
+            ],
+            "target": [
+                {
+                    "id": "{{ app.id }}",
+                    "type": 0
+                },
+                {
+                    "id": {{ app.name | tojson }},
+                    "type": 1
+                }
+            ],
+            "application_id": "{{ app.id }}",
+            "correlation_id": "{{ correlation_id }}",
+            "error_number": {{ error.code | tojson }},
+            "logon_error": {{ error.message | tojson }}
+        }
+    }
+}

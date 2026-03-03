@@ -1,0 +1,143 @@
+{#- Shared macros for AWS CloudTrail management events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, tls_block, pick_user_agent, pick_source_ip, pick_error %} -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "cloudtrail-forwarder",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block(account, region) -%}
+    "cloud": {
+        "account": {
+            "id": "{{ account.account_id }}",
+            "name": "{{ account.account_name }}"
+        },
+        "provider": "aws",
+        "region": "{{ region.region_code }}"
+    }
+{%- endmacro -%}
+
+{%- macro tls_block(event_source, region) -%}
+{%- set tls_ver = module.rand.weighted_choice(["1.3", "1.2"], [75, 25]) -%}
+{%- if tls_ver == "1.3" -%}
+    {%- set cipher_suite = "TLS_AES_128_GCM_SHA256" -%}
+{%- else -%}
+    {%- set cipher_suite = "ECDHE-RSA-AES128-GCM-SHA256" -%}
+{%- endif -%}
+{%- set host_header = event_source -%}
+            "tls_details": {
+                "tls_version": "TLSv{{ tls_ver }}",
+                "cipher_suite": "{{ cipher_suite }}",
+                "client_provided_host_header": "{{ host_header }}"
+            }
+{%- endmacro -%}
+
+{%- macro pick_user_agent(identity_type, user_agents) -%}
+{%- if identity_type == "AWSService" -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type == "service" -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- elif identity_type == "console" -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type == "console" -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- else -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type in ["cli", "sdk_python", "sdk_js"] -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro pick_source_ip(source_ips) -%}
+{{- (source_ips | random).ip -}}
+{%- endmacro -%}
+
+{%- macro pick_error(event_name, error_scenarios) -%}
+{%- set matching = [] -%}
+{%- for scenario in error_scenarios -%}
+    {%- if scenario.event_name == event_name -%}
+        {%- do matching.append(scenario) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if matching | length > 0 -%}
+    {%- set err = module.rand.choice(matching) -%}
+    {{- err.error_code }}|||{{ err.error_message -}}
+{%- else -%}
+    {{- "AccessDenied|||You are not authorized to perform this operation." -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Identity block macros -#}
+
+{%- macro iam_user_identity(user, account) -%}
+            "user_identity": {
+                "type": "IAMUser",
+                "principal_id": "{{ user.principal_id }}",
+                "arn": "arn:aws:iam::{{ account.account_id }}:user/{{ user.username }}",
+                "account_id": "{{ account.account_id }}",
+                "access_key_id": "{{ user.access_key_id }}",
+                "user_name": "{{ user.username }}"
+            }
+{%- endmacro -%}
+
+{%- macro assumed_role_identity(role, account, session_name, access_key_id) -%}
+            "user_identity": {
+                "type": "AssumedRole",
+                "principal_id": "{{ role.role_id }}:{{ session_name }}",
+                "arn": "arn:aws:sts::{{ account.account_id }}:assumed-role/{{ role.role_name }}/{{ session_name }}",
+                "account_id": "{{ account.account_id }}",
+                "access_key_id": "{{ access_key_id }}",
+                "session_context": {
+                    "session_issuer": {
+                        "type": "Role",
+                        "principal_id": "{{ role.role_id }}",
+                        "arn": "arn:aws:iam::{{ account.account_id }}:role/{{ role.role_name }}",
+                        "account_id": "{{ account.account_id }}",
+                        "user_name": "{{ role.role_name }}"
+                    },
+                    "attributes": {
+                        "creation_date": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%SZ') }}",
+                        "mfa_authenticated": "false"
+                    }
+                }
+            }
+{%- endmacro -%}
+
+{%- macro aws_service_identity(service_name) -%}
+            "user_identity": {
+                "type": "AWSService",
+                "invoked_by": "{{ service_name }}"
+            }
+{%- endmacro -%}
+
+{%- macro root_identity(account) -%}
+            "user_identity": {
+                "type": "Root",
+                "principal_id": "{{ account.account_id }}",
+                "arn": "arn:aws:iam::{{ account.account_id }}:root",
+                "account_id": "{{ account.account_id }}"
+            }
+{%- endmacro -%}

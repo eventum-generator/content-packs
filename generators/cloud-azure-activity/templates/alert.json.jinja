@@ -1,0 +1,74 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, resource_name, resource_id, weighted_pick_from_list, status_block, sub_status_block -%}
+{%- set subscription = samples.subscriptions | random -%}
+{%- set rg = samples.resource_groups | random -%}
+{%- set region = samples.regions | random -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set event_data_id = module.rand.crypto.uuid4() -%}
+{#- Pick an alert rule using weights -#}
+{%- set rule_idx = weighted_pick_from_list(samples.alert_rules) | int -%}
+{%- set rule = samples.alert_rules[rule_idx] -%}
+{#- Pick a target resource — use admin_write resources -#}
+{%- set target_op_idx = weighted_pick_from_list(samples.admin_write_ops) | int -%}
+{%- set target_op = samples.admin_write_ops[target_op_idx] -%}
+{%- set res_name = resource_name(target_op.resource_type) -%}
+{%- set target_res_id = resource_id(subscription, rg, target_op.provider, target_op.resource_type, res_name) -%}
+{#- Alert state: Activated or Resolved -#}
+{%- set alert_state = module.rand.weighted_choice(["Activated", "Resolved"], [60, 40]) -%}
+{%- if alert_state == "Activated" -%}
+    {%- set op_name = "Microsoft.Insights/AlertRules/Activated/Action" -%}
+    {%- set status_value = "Activated" -%}
+    {%- set level = "Warning" -%}
+    {%- set description = "'" ~ rule.metric ~ " " ~ rule.operator ~ " " ~ rule.threshold ~ " ([" ~ rule.unit ~ "]) in the last " ~ rule.window_minutes ~ " minutes' has been activated for resource: " ~ rg.name -%}
+{%- else -%}
+    {%- set op_name = "Microsoft.Insights/AlertRules/Resolved/Action" -%}
+    {%- set status_value = "Resolved" -%}
+    {%- set level = "Informational" -%}
+    {%- set description = "'" ~ rule.metric ~ " " ~ rule.operator ~ " " ~ rule.threshold ~ " ([" ~ rule.unit ~ "]) in the last " ~ rule.window_minutes ~ " minutes' has been resolved for resource: " ~ rg.name -%}
+{%- endif -%}
+{%- set alert_rule_name = "alert-" ~ (rule.metric | lower | replace(" ", "-")) ~ "-" ~ module.rand.string.hex(6) -%}
+{%- set alert_rule_id = "/subscriptions/" ~ subscription.subscription_id ~ "/resourceGroups/" ~ rg.name ~ "/providers/microsoft.insights/alertrules/" ~ alert_rule_name -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(subscription, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": {{ op_name | tojson }},
+        "category": ["configuration"],
+        "dataset": "azure.activitylogs",
+        "kind": "alert",
+        "module": "azure",
+        "outcome": "success",
+        "type": ["info"]
+    },
+    "related": {
+        "user": []
+    },
+    "azure": {
+        "activitylogs": {
+            "category": "Alert",
+            "event_category": "Alert",
+            "level": "{{ level }}",
+            "operation_name": {{ op_name | tojson }},
+            "result_type": "{{ status_value }}",
+            "result_signature": "{{ status_value }}",
+            "properties": {
+                "RuleUri": {{ alert_rule_id | tojson }},
+                "RuleName": "{{ alert_rule_name }}",
+                "RuleDescription": {{ description | tojson }},
+                "Threshold": "{{ rule.threshold }}",
+                "WindowSizeInMinutes": "{{ rule.window_minutes }}",
+                "Aggregation": "{{ rule.aggregation }}",
+                "Operator": "{{ rule.operator }}",
+                "MetricName": "{{ rule.metric }}",
+                "MetricUnit": "{{ rule.unit }}"
+            },
+            {{ status_block(status_value) }},
+            {{ sub_status_block("") }},
+            "correlation_id": "{{ correlation_id }}",
+            "resource_id": {{ target_res_id | tojson }},
+            "tenant_id": "{{ params.tenant_id }}",
+            "subscription_id": "{{ subscription.subscription_id }}"
+        }
+    }
+}

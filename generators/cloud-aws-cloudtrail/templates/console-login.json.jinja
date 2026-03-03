@@ -1,0 +1,104 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_user_agent, pick_source_ip -%}
+{%- set record_id = shared.get('record_counter', 0) -%}
+{%- set account = samples.accounts | random -%}
+{%- set region = samples.regions | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set request_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{#- Console login is always IAMUser or Root -#}
+{%- set identity_type = module.rand.weighted_choice(["IAMUser", "Root"], [97, 3]) -%}
+{%- set user = samples.users | random -%}
+{%- if identity_type == "Root" -%}
+    {%- set identity_user_name = "root" -%}
+    {%- set identity_principal = account.account_id -%}
+    {%- set identity_arn = "arn:aws:iam::" ~ account.account_id ~ ":root" -%}
+{%- else -%}
+    {%- set identity_user_name = user.username -%}
+    {%- set identity_principal = user.principal_id -%}
+    {%- set identity_arn = "arn:aws:iam::" ~ account.account_id ~ ":user/" ~ user.username -%}
+{%- endif -%}
+{#- Console login failure rate ~5% -#}
+{%- set is_failure = module.rand.chance(0.05) -%}
+{%- if is_failure -%}
+    {%- set outcome = "failure" -%}
+    {%- set login_result = "Failure" -%}
+    {%- set mfa_used = "No" -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+    {%- set login_result = "Success" -%}
+    {%- set mfa_used = module.rand.weighted_choice(["Yes", "No"], [70, 30]) -%}
+    {#- Store session in shared state -#}
+    {%- set sessions = shared.get('console_sessions', []) -%}
+    {%- do sessions.append({"user": identity_user_name, "account_id": account.account_id, "src_ip": src_ip}) -%}
+    {%- if sessions | length > 30 -%}{%- do sessions.pop(0) -%}{%- endif -%}
+    {%- do shared.set('console_sessions', sessions) -%}
+{%- endif -%}
+{%- set ua_value = pick_user_agent("console", samples.user_agents) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(account, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "ConsoleLogin",
+        "category": ["authentication"],
+        "dataset": "aws.cloudtrail",
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": "aws",
+        "outcome": "{{ outcome }}",
+        "provider": "cloudtrail",
+        "type": ["start"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}"
+    },
+    "user": {
+        "name": "{{ identity_user_name }}",
+        "id": "{{ identity_principal }}"
+    },
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ identity_user_name }}"]
+    },
+    "aws": {
+        "cloudtrail": {
+            "event_version": "{{ params.event_version }}",
+            "event_source": "signin.amazonaws.com",
+            "event_name": "ConsoleLogin",
+            "event_type": "AwsConsoleSignIn",
+            "event_category": "Management",
+            "management_event": true,
+            "read_only": false,
+            "recipient_account_id": "{{ account.account_id }}",
+            "request_id": "{{ request_id }}",
+{%- if identity_type == "Root" %}
+            "user_identity": {
+                "type": "Root",
+                "principal_id": "{{ account.account_id }}",
+                "arn": "{{ identity_arn }}",
+                "account_id": "{{ account.account_id }}"
+            },
+{%- else %}
+            "user_identity": {
+                "type": "IAMUser",
+                "principal_id": "{{ user.principal_id }}",
+                "arn": "{{ identity_arn }}",
+                "account_id": "{{ account.account_id }}",
+                "user_name": "{{ user.username }}"
+            },
+{%- endif %}
+            "request_parameters": null,
+            "response_elements": {{ ({"ConsoleLogin": login_result}) | tojson }},
+{%- if is_failure %}
+            "error_message": "Failed authentication",
+{%- endif %}
+            "additional_event_data": {{ ({"MFAUsed": mfa_used, "LoginTo": "https://console.aws.amazon.com/console/home?state=hashArgs%23&isauthcode=true", "MobileVersion": "No"}) | tojson }}
+        }
+    }
+}
+{%- do shared.set('record_counter', record_id + 1) -%}

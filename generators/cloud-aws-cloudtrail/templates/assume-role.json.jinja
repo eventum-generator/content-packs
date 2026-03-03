@@ -1,0 +1,128 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, tls_block, pick_user_agent, pick_source_ip, pick_error, iam_user_identity, assumed_role_identity -%}
+{%- set record_id = shared.get('record_counter', 0) -%}
+{%- set account = samples.accounts | random -%}
+{%- set region = samples.regions | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set target_role = samples.roles | random -%}
+{%- set session_name = target_role.session_prefix ~ "-" ~ module.rand.string.hex(8) -%}
+{%- set request_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{#- Caller can be IAMUser or existing AssumedRole -#}
+{%- set caller_type = module.rand.weighted_choice(["IAMUser", "AssumedRole"], [60, 40]) -%}
+{%- set user = samples.users | random -%}
+{%- if caller_type == "AssumedRole" -%}
+    {%- set caller_role = samples.roles | random -%}
+    {%- set caller_session = caller_role.session_prefix ~ "-" ~ module.rand.string.hex(6) -%}
+    {%- set caller_key = "ASIA" ~ module.rand.string.letters_uppercase(12) ~ module.rand.string.digits(4) -%}
+    {%- set caller_arn = "arn:aws:sts::" ~ account.account_id ~ ":assumed-role/" ~ caller_role.role_name ~ "/" ~ caller_session -%}
+    {%- set caller_principal = caller_role.role_id ~ ":" ~ caller_session -%}
+    {%- set identity_user_name = caller_role.role_name -%}
+{%- else -%}
+    {%- set caller_arn = "arn:aws:iam::" ~ account.account_id ~ ":user/" ~ user.username -%}
+    {%- set caller_principal = user.principal_id -%}
+    {%- set caller_key = user.access_key_id -%}
+    {%- set identity_user_name = user.username -%}
+{%- endif -%}
+{#- Error injection -#}
+{%- set is_error = module.rand.chance(params.get('error_rate', 4) / 100.0) -%}
+{%- if is_error -%}
+    {%- set err_data = pick_error("AssumeRole", samples.error_scenarios) -%}
+    {%- set error_code = err_data.split("|||")[0] -%}
+    {%- set error_message = err_data.split("|||")[1] -%}
+    {%- set outcome = "failure" -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+    {%- set new_access_key = "ASIA" ~ module.rand.string.letters_uppercase(12) ~ module.rand.string.digits(4) -%}
+    {#- Store assumed role in shared pool -#}
+    {%- set assumed_roles = shared.get('assumed_roles', []) -%}
+    {%- do assumed_roles.append({"role_name": target_role.role_name, "role_id": target_role.role_id, "session_name": session_name, "access_key_id": new_access_key, "account_id": account.account_id}) -%}
+    {%- if assumed_roles | length > 50 -%}{%- do assumed_roles.pop(0) -%}{%- endif -%}
+    {%- do shared.set('assumed_roles', assumed_roles) -%}
+{%- endif -%}
+{%- set ua_value = pick_user_agent("api", samples.user_agents) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(account, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "AssumeRole",
+        "category": ["authentication"],
+        "dataset": "aws.cloudtrail",
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": "aws",
+        "outcome": "{{ outcome }}",
+        "provider": "cloudtrail",
+        "type": ["info"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}"
+    },
+    "user": {
+        "name": "{{ identity_user_name }}",
+        "id": "{{ caller_principal }}"
+    },
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ identity_user_name }}"]
+    },
+    "aws": {
+        "cloudtrail": {
+            "event_version": "{{ params.event_version }}",
+            "event_source": "sts.amazonaws.com",
+            "event_name": "AssumeRole",
+            "event_type": "AwsApiCall",
+            "event_category": "Management",
+            "management_event": true,
+            "read_only": false,
+            "recipient_account_id": "{{ account.account_id }}",
+            "request_id": "{{ request_id }}",
+{%- if caller_type == "AssumedRole" %}
+            "user_identity": {
+                "type": "AssumedRole",
+                "principal_id": "{{ caller_principal }}",
+                "arn": "{{ caller_arn }}",
+                "account_id": "{{ account.account_id }}",
+                "access_key_id": "{{ caller_key }}",
+                "session_context": {
+                    "session_issuer": {
+                        "type": "Role",
+                        "principal_id": "{{ caller_role.role_id }}",
+                        "arn": "arn:aws:iam::{{ account.account_id }}:role/{{ caller_role.role_name }}",
+                        "account_id": "{{ account.account_id }}",
+                        "user_name": "{{ caller_role.role_name }}"
+                    },
+                    "attributes": {
+                        "creation_date": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%SZ') }}",
+                        "mfa_authenticated": "false"
+                    }
+                }
+            },
+{%- else %}
+            "user_identity": {
+                "type": "IAMUser",
+                "principal_id": "{{ user.principal_id }}",
+                "arn": "{{ caller_arn }}",
+                "account_id": "{{ account.account_id }}",
+                "access_key_id": "{{ user.access_key_id }}",
+                "user_name": "{{ user.username }}"
+            },
+{%- endif %}
+            "request_parameters": {{ ({"roleArn": "arn:aws:iam::" ~ account.account_id ~ ":role/" ~ target_role.role_name, "roleSessionName": session_name, "durationSeconds": 3600}) | tojson }},
+{%- if is_error %}
+            "error_code": "{{ error_code }}",
+            "error_message": {{ error_message | tojson }},
+            "response_elements": null,
+{%- else %}
+            "response_elements": {{ ({"credentials": {"accessKeyId": new_access_key, "expiration": timestamp.strftime('%Y-%m-%dT%H:%M:%SZ'), "sessionToken": "FwoGZXIvYXdzE..." ~ module.rand.string.hex(20)}, "assumedRoleUser": {"assumedRoleId": target_role.role_id ~ ":" ~ session_name, "arn": "arn:aws:sts::" ~ account.account_id ~ ":assumed-role/" ~ target_role.role_name ~ "/" ~ session_name}}) | tojson }},
+{%- endif %}
+            {{ tls_block("sts.amazonaws.com", region) }}
+        }
+    }
+}
+{%- do shared.set('record_counter', record_id + 1) -%}

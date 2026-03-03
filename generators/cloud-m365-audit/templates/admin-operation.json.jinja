@@ -1,0 +1,55 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, organization_block, related_block, o365_base_block, pick_source_ip, user_type_value -%}
+{#- Admin operations come from IT Operations / admin users -#}
+{%- set admin_users = [] -%}
+{%- for u in samples.users -%}
+    {%- if u.department == 'IT Operations' or u.upn == 'admin@contoso.com' -%}
+        {%- do admin_users.append(u) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set user = module.rand.choice(admin_users) -%}
+{%- set org = samples.organizations | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{#- Admin operation types -#}
+{%- set admin_ops = [
+    {"operation": "Set-Mailbox", "workload": "Exchange", "record_type": "1", "category": ["configuration"], "type": ["change"], "desc": "Modified mailbox settings", "params": [{"name": "Identity", "value": (samples.users | random).upn}, {"name": "AuditEnabled", "value": "True"}]},
+    {"operation": "New-TransportRule", "workload": "Exchange", "record_type": "1", "category": ["configuration"], "type": ["creation"], "desc": "Created mail flow rule", "params": [{"name": "Name", "value": "Block External Forwarding"}, {"name": "Priority", "value": "0"}]},
+    {"operation": "Set-OrganizationConfig", "workload": "Exchange", "record_type": "1", "category": ["configuration"], "type": ["change"], "desc": "Modified organization settings", "params": [{"name": "AuditDisabled", "value": "False"}, {"name": "Identity", "value": org.org_name}]},
+    {"operation": "New-InboxRule", "workload": "Exchange", "record_type": "1", "category": ["configuration"], "type": ["creation"], "desc": "Created inbox rule", "params": [{"name": "Name", "value": "Auto-forward to backup"}, {"name": "Mailbox", "value": (samples.users | random).upn}]},
+    {"operation": "Set-ConditionalAccessPolicy", "workload": "AzureActiveDirectory", "record_type": "8", "category": ["configuration"], "type": ["change"], "desc": "Modified Conditional Access policy", "params": [{"name": "PolicyName", "value": "Require MFA for All Users"}, {"name": "State", "value": "Enabled"}]},
+    {"operation": "Update-RoleGroupMember", "workload": "Exchange", "record_type": "1", "category": ["iam"], "type": ["change"], "desc": "Modified role group membership", "params": [{"name": "Identity", "value": "Organization Management"}, {"name": "Member", "value": (samples.users | random).upn}]},
+    {"operation": "Set-SharingPolicy", "workload": "SharePoint", "record_type": "4", "category": ["configuration"], "type": ["change"], "desc": "Modified sharing policy", "params": [{"name": "Identity", "value": "Default Sharing Policy"}, {"name": "Domains", "value": "partner.com"}]},
+    {"operation": "New-DlpCompliancePolicy", "workload": "SecurityComplianceCenter", "record_type": "1", "category": ["configuration"], "type": ["creation"], "desc": "Created DLP policy", "params": [{"name": "Name", "value": "PII Protection Policy"}, {"name": "Mode", "value": "TestWithNotifications"}]},
+    {"operation": "Set-RetentionCompliancePolicy", "workload": "SecurityComplianceCenter", "record_type": "1", "category": ["configuration"], "type": ["change"], "desc": "Modified retention policy", "params": [{"name": "Identity", "value": "7 Year Retention"}, {"name": "Enabled", "value": "True"}]},
+    {"operation": "Set-TeamsMeetingPolicy", "workload": "MicrosoftTeams", "record_type": "25", "category": ["configuration"], "type": ["change"], "desc": "Modified Teams meeting policy", "params": [{"name": "Identity", "value": "Global"}, {"name": "AllowExternalParticipantGiveRequestControl", "value": "False"}]}
+] -%}
+{%- set op = module.rand.choice(admin_ops) -%}
+{%- set ut_val = user_type_value(user) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block() }},
+    {{ ecs_block() }},
+    {{ event_block(op.operation, op.category, event_id, "success", op.type) }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    {{ organization_block(org) }},
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn]) }},
+    "o365": {
+        "audit": {
+            {{ o365_base_block(audit_id, op.record_type, "Succeeded", op.operation, op.workload, user, src_ip, op.desc, ut_val) }},
+            "parameters": [
+{%- for param in op.params %}
+                {
+                    "name": {{ param.name | tojson }},
+                    "value": {{ param.value | tojson }}
+                }{{ "," if not loop.last else "" }}
+{%- endfor %}
+            ],
+            "external_access": false,
+            "correlation_id": "{{ correlation_id }}"
+        }
+    }
+}

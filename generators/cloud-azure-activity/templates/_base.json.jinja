@@ -1,0 +1,155 @@
+{#- Shared macros for Azure Activity Log events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_source_ip, pick_user, pick_user_agent, resource_id, resource_name, weighted_pick_from_list %} -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "azure-activity-forwarder",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block(subscription, region) -%}
+    "cloud": {
+        "account": {
+            "id": "{{ subscription.subscription_id }}",
+            "name": "{{ subscription.subscription_name }}"
+        },
+        "provider": "azure",
+        "region": "{{ region.region_code }}"
+    }
+{%- endmacro -%}
+
+{%- macro pick_source_ip(source_ips) -%}
+{{- (source_ips | random).ip -}}
+{%- endmacro -%}
+
+{%- macro pick_user(users) -%}
+{{- users | random -}}
+{%- endmacro -%}
+
+{%- macro pick_user_agent(user_agents_data, ua_type) -%}
+{%- set ua_items = [] -%}
+{%- for ua in user_agents_data -%}
+    {%- if ua.type == ua_type -%}
+        {%- do ua_items.append(ua.value) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if ua_items | length > 0 -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- else -%}
+    {%- set all_uas = [] -%}
+    {%- for ua in user_agents_data -%}
+        {%- do all_uas.append(ua.value) -%}
+    {%- endfor -%}
+    {{- module.rand.choice(all_uas) -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro resource_name(resource_type) -%}
+{#- Generate a realistic resource name based on type -#}
+{%- set type_lower = resource_type.split("/")[-1] | lower -%}
+{%- if "virtualMachines" in resource_type -%}
+    {{- module.rand.choice(["vm-web", "vm-api", "vm-worker", "vm-db", "vm-bastion", "vm-jump", "vm-monitor"]) ~ "-" ~ module.rand.string.digits(3) -}}
+{%- elif "storageAccounts" in resource_type -%}
+    {{- module.rand.choice(["stprod", "ststaging", "stdata", "stlogs", "stbackup", "stmedia"]) ~ module.rand.string.digits(4) -}}
+{%- elif "networkSecurityGroups" in resource_type -%}
+    {{- module.rand.choice(["nsg-web", "nsg-api", "nsg-db", "nsg-mgmt", "nsg-bastion", "nsg-default"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "sites" in resource_type -%}
+    {{- module.rand.choice(["app-web", "app-api", "app-portal", "app-admin", "func-processor", "func-worker"]) ~ "-" ~ module.rand.string.digits(3) -}}
+{%- elif "databases" in resource_type -%}
+    {{- module.rand.choice(["sqldb-main", "sqldb-analytics", "sqldb-users", "sqldb-orders", "sqldb-inventory"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "vaults" in resource_type -%}
+    {{- module.rand.choice(["kv-prod", "kv-staging", "kv-secrets", "kv-certs", "kv-keys"]) ~ "-" ~ module.rand.string.digits(3) -}}
+{%- elif "virtualNetworks" in resource_type -%}
+    {{- module.rand.choice(["vnet-hub", "vnet-spoke", "vnet-prod", "vnet-staging", "vnet-dev"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "managedClusters" in resource_type -%}
+    {{- module.rand.choice(["aks-prod", "aks-staging", "aks-dev", "aks-data"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "loadBalancers" in resource_type -%}
+    {{- module.rand.choice(["lb-web", "lb-api", "lb-internal", "lb-external"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "serverFarms" in resource_type -%}
+    {{- module.rand.choice(["asp-web", "asp-api", "asp-func", "asp-worker"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "virtualMachineScaleSets" in resource_type -%}
+    {{- module.rand.choice(["vmss-web", "vmss-api", "vmss-worker", "vmss-batch"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "Redis" in resource_type -%}
+    {{- module.rand.choice(["redis-cache", "redis-session", "redis-queue"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- elif "applicationGateways" in resource_type -%}
+    {{- module.rand.choice(["agw-web", "agw-api", "agw-public"]) ~ "-" ~ module.rand.string.digits(2) -}}
+{%- else -%}
+    {{- type_lower ~ "-" ~ module.rand.string.hex(6) -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro resource_id(subscription, rg, provider, resource_type, res_name) -%}
+{#- Build full resource path: strip the provider prefix to get the type path -#}
+{%- set type_path = resource_type[provider | length + 1:] -%}
+{%- if "/" in type_path -%}
+    {#- Multi-segment type like servers/databases: insert parent name -#}
+    {%- set parts = type_path.split("/") -%}
+    {%- set parent_name = parts[0] ~ "-" ~ module.rand.string.hex(4) -%}
+    {{- "/subscriptions/" ~ subscription.subscription_id ~ "/resourceGroups/" ~ rg.name ~ "/providers/" ~ provider ~ "/" ~ parts[0] ~ "/" ~ parent_name ~ "/" ~ parts[1] ~ "/" ~ res_name -}}
+{%- else -%}
+    {{- "/subscriptions/" ~ subscription.subscription_id ~ "/resourceGroups/" ~ rg.name ~ "/providers/" ~ provider ~ "/" ~ type_path ~ "/" ~ res_name -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro weighted_pick_from_list(items) -%}
+{#- Pick from a list of dicts with 'weight' keys -#}
+{%- set values = [] -%}
+{%- set weights = [] -%}
+{%- for item in items -%}
+    {%- do values.append(loop.index0) -%}
+    {%- do weights.append(item.weight) -%}
+{%- endfor -%}
+{{- module.rand.weighted_choice(values, weights) -}}
+{%- endmacro -%}
+
+{%- macro identity_block(user, params, timestamp) -%}
+            "identity": {
+                "claims_initiated_by_user": {
+                    "name": "{{ user.display_name }}",
+                    "givenname": "{{ user.display_name.split(' ')[0] }}",
+                    "surname": "{{ user.display_name.split(' ')[-1] }}",
+                    "fullname": "{{ user.display_name }}",
+                    "schema": "http://schemas.xmlsoap.org/ws/2005/05/identity/claims"
+                },
+                "claims": {
+                    "aud": "https://management.azure.com/",
+                    "iss": "https://sts.windows.net/{{ params.tenant_id }}/",
+                    "iat": "{{ timestamp.timestamp() | int }}",
+                    "nbf": "{{ timestamp.timestamp() | int }}",
+                    "exp": "{{ (timestamp.timestamp() | int) + 3600 }}",
+                    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/upn": "{{ user.upn }}",
+                    "http://schemas.xmlsoap.org/ws/2005/05/identity/claims/name": "{{ user.upn }}",
+                    "http://schemas.microsoft.com/identity/claims/objectidentifier": "{{ user.object_id }}",
+                    "http://schemas.microsoft.com/identity/claims/tenantid": "{{ params.tenant_id }}",
+                    "http://schemas.microsoft.com/identity/claims/scope": "user_impersonation",
+                    "appid": "{{ module.rand.crypto.uuid4() }}",
+                    "appidacr": "2"
+                },
+                "authorization": {
+                    "scope": "{{ _auth_scope | default('') }}",
+                    "action": "{{ _auth_action | default('') }}"
+                }
+            }
+{%- endmacro -%}
+
+{%- macro status_block(status_value) -%}
+            "status": {
+                "value": "{{ status_value }}"
+            }
+{%- endmacro -%}
+
+{%- macro sub_status_block(sub_status_value) -%}
+            "sub_status": {
+                "value": "{{ sub_status_value }}"
+            }
+{%- endmacro -%}

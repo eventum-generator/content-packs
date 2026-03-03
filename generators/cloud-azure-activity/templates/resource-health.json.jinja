@@ -1,0 +1,85 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, resource_name, resource_id, weighted_pick_from_list, status_block, sub_status_block -%}
+{%- set subscription = samples.subscriptions | random -%}
+{%- set rg = samples.resource_groups | random -%}
+{%- set region = samples.regions | random -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set event_data_id = module.rand.crypto.uuid4() -%}
+{#- Pick a resource health type using weights -#}
+{%- set rh_idx = weighted_pick_from_list(samples.resource_health_types) | int -%}
+{%- set rh_type = samples.resource_health_types[rh_idx] -%}
+{%- set res_name = resource_name(rh_type.resource_type) -%}
+{%- set res_id = resource_id(subscription, rg, rh_type.provider, rh_type.resource_type, res_name) -%}
+{#- Health status transition -#}
+{%- set health_status = module.rand.weighted_choice(["Unavailable", "Degraded", "Available"], [40, 30, 30]) -%}
+{%- set previous_health = module.rand.weighted_choice(["Available", "Unavailable", "Degraded"], [60, 20, 20]) -%}
+{#- Health event details -#}
+{%- if health_status == "Unavailable" -%}
+    {%- set health_event_type = "Downtime" -%}
+    {%- set level = "Critical" -%}
+    {%- set event_status = "Active" -%}
+    {%- set title = rh_type.title_prefix ~ " changed to unavailable" -%}
+    {%- set details = module.rand.choice(["Virtual machine has experienced an unexpected event", "The resource is currently unavailable", "Platform-initiated maintenance resulted in resource unavailability", "Resource health degraded to unavailable state"]) -%}
+{%- elif health_status == "Degraded" -%}
+    {%- set health_event_type = "Degraded" -%}
+    {%- set level = "Warning" -%}
+    {%- set event_status = "Active" -%}
+    {%- set title = rh_type.title_prefix ~ " changed to degraded" -%}
+    {%- set details = module.rand.choice(["Performance degradation detected", "Resource experiencing intermittent connectivity issues", "Degraded performance observed on this resource"]) -%}
+{%- else -%}
+    {%- set health_event_type = "Restored" -%}
+    {%- set level = "Informational" -%}
+    {%- set event_status = "Resolved" -%}
+    {%- set title = rh_type.title_prefix ~ " changed to available" -%}
+    {%- set details = module.rand.choice(["Resource health has been restored", "The resource is now available", "Recovery completed successfully"]) -%}
+{%- endif -%}
+{%- set health_event_cause = module.rand.weighted_choice(["PlatformInitiated", "UserInitiated"], [70, 30]) -%}
+{%- set health_event_category = module.rand.weighted_choice(["Unplanned", "Planned"], [60, 40]) -%}
+{%- set op_name = "Microsoft.Resourcehealth/healthevent/Activated/action" -%}
+{%- if event_status == "Resolved" -%}
+    {%- set op_name = "Microsoft.Resourcehealth/healthevent/Resolved/action" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(subscription, region) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": {{ op_name | tojson }},
+        "category": ["host"],
+        "dataset": "azure.activitylogs",
+        "kind": "event",
+        "module": "azure",
+        "outcome": "success",
+        "type": ["info"]
+    },
+    "related": {
+        "user": []
+    },
+    "azure": {
+        "activitylogs": {
+            "category": "ResourceHealth",
+            "event_category": "ResourceHealth",
+            "level": "{{ level }}",
+            "operation_name": {{ op_name | tojson }},
+            "result_type": "{{ event_status }}",
+            "result_signature": "{{ event_status }}",
+            "properties": {
+                "stage": "{{ event_status }}",
+                "title": {{ title | tojson }},
+                "details": {{ details | tojson }},
+                "healthStatus": "{{ health_status }}",
+                "healthEventType": "{{ health_event_type }}",
+                "healthEventCause": "{{ health_event_cause }}",
+                "healthEventCategory": "{{ health_event_category }}",
+                "currentHealthStatus": "{{ health_status }}",
+                "previousHealthStatus": "{{ previous_health }}"
+            },
+            {{ status_block(event_status) }},
+            {{ sub_status_block("") }},
+            "correlation_id": "{{ correlation_id }}",
+            "resource_id": {{ res_id | tojson }},
+            "tenant_id": "{{ params.tenant_id }}",
+            "subscription_id": "{{ subscription.subscription_id }}"
+        }
+    }
+}

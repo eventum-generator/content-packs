@@ -1,0 +1,83 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_az, gen_subnet_ip, flow_timestamps, detect_direction, vpcflow_block, original_log -%}
+{%- set record_id = shared.get('record_counter', 0) -%}
+{%- set account = samples.accounts | random -%}
+{%- set region = samples.regions | random -%}
+{%- set az_id = pick_az(region) -%}
+{%- set eni = samples.enis | random -%}
+{#- Rejected UDP: blocked DNS probes, SNMP scans, misconfigured services -#}
+{%- set reject_port = module.rand.weighted_choice(
+    [53, 161, 162, 123, 514, 69, 137, 138, 1900, 5353],
+    [25, 15, 10, 10, 8, 8, 7, 5, 7, 5]
+) -%}
+{#- Mostly inbound probes -#}
+{%- set dir_type = module.rand.weighted_choice(["inbound", "outbound", "internal"], [75, 10, 15]) -%}
+{%- if dir_type == "inbound" -%}
+    {%- set src_ip = module.rand.network.ip_v4_public() -%}
+    {%- set dst_ip = gen_subnet_ip(eni.subnet_cidr) -%}
+    {%- set src_port = module.rand.number.integer(32768, 65535) -%}
+    {%- set dst_port = reject_port -%}
+{%- elif dir_type == "outbound" -%}
+    {%- set src_ip = gen_subnet_ip(eni.subnet_cidr) -%}
+    {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+    {%- set src_port = module.rand.number.integer(32768, 65535) -%}
+    {%- set dst_port = reject_port -%}
+{%- else -%}
+    {%- set other_eni = samples.enis | random -%}
+    {%- set src_ip = gen_subnet_ip(eni.subnet_cidr) -%}
+    {%- set dst_ip = gen_subnet_ip(other_eni.subnet_cidr) -%}
+    {%- set src_port = module.rand.number.integer(32768, 65535) -%}
+    {%- set dst_port = reject_port -%}
+{%- endif -%}
+{#- Single packet probes -#}
+{%- set packets = module.rand.number.integer(1, 5) -%}
+{%- set bytes = module.rand.number.clamp(packets * module.rand.number.integer(40, 200), 40, 1000) -%}
+{#- Very short -#}
+{%- set ts_data = flow_timestamps(timestamp, 0, 5).split('|') -%}
+{%- set start_ts = ts_data[0] | int -%}
+{%- set end_ts = ts_data[1] | int -%}
+{%- set start_iso = ts_data[2] -%}
+{%- set end_iso = ts_data[3] -%}
+{%- set direction = detect_direction(src_ip, dst_ip) | trim -%}
+{
+    "@timestamp": "{{ end_iso }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(account, region, az_id) }},
+    "destination": {
+        "address": "{{ dst_ip }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ ecs_block() }},
+    "event": {
+        "action": "reject",
+        "category": ["network"],
+        "dataset": "aws.vpcflow",
+        "end": "{{ end_iso }}",
+        "kind": "event",
+        "module": "aws",
+        "original": {{ original_log(account, eni, src_ip, dst_ip, src_port, dst_port, 17, packets, bytes, start_ts, end_ts, "REJECT", "OK") | tojson }},
+        "outcome": "failure",
+        "start": "{{ start_iso }}",
+        "type": ["connection", "denied"]
+    },
+    "network": {
+        "bytes": {{ bytes }},
+        "direction": "{{ direction }}",
+        "iana_number": "17",
+        "packets": {{ packets }},
+        "transport": "udp",
+        "type": "ipv4"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"]
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "bytes": {{ bytes }},
+        "ip": "{{ src_ip }}",
+        "packets": {{ packets }},
+        "port": {{ src_port }}
+    },
+    {{ vpcflow_block(eni, account, src_ip, dst_ip, src_port, dst_port, 17, packets, bytes, start_ts, end_ts, "REJECT", "OK") }}
+}
+{%- do shared.set('record_counter', record_id + 1) -%}
