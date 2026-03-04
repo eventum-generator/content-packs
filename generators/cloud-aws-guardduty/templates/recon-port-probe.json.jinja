@@ -1,0 +1,86 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, remote_ip_block, severity_block, service_meta, evidence_block, event_block, rule_block, instance_resource_block, detector_id, finding_arn -%}
+{%- set account = samples.accounts | random -%}
+{%- set region = samples.regions | random -%}
+{%- set instance = samples.instances | random -%}
+{%- set actor = samples.threat_actors | random -%}
+{%- set det_id = detector_id(account) -%}
+{%- set finding_id = module.rand.string.hex(32) -%}
+{%- set f_arn = finding_arn(account, region, det_id, finding_id) -%}
+{%- set finding_count = module.rand.number.integer(1, 50) -%}
+{%- set first_seen = (timestamp - module.datetime.timedelta(hours=module.rand.number.integer(1, 72))).strftime('%Y-%m-%dT%H:%M:%S.000Z') -%}
+{%- set last_seen = timestamp.strftime('%Y-%m-%dT%H:%M:%S.000Z') -%}
+{%- set finding_type_name = module.rand.weighted_choice(["Recon:EC2/PortProbeUnprotectedPort", "Recon:EC2/Portscan", "Recon:EC2/PortProbeEMRUnprotectedPort"], [50, 35, 15]) -%}
+{%- set finding_types_map = {} -%}
+{%- for ft in samples.finding_types -%}
+    {%- do finding_types_map.update({ft.type: ft}) -%}
+{%- endfor -%}
+{%- set finding_type = finding_types_map[finding_type_name] -%}
+{%- set probed_port = module.rand.weighted_choice([22, 3389, 80, 443, 8080, 445, 1433, 3306, 5432, 27017], [20, 15, 15, 10, 10, 8, 7, 5, 5, 5]) -%}
+{%- set port_name_map = {22: "SSH", 3389: "RDP", 80: "HTTP", 443: "HTTPS", 8080: "HTTP-ALT", 445: "SMB", 1433: "MSSQL", 3306: "MySQL", 5432: "PostgreSQL", 27017: "MongoDB"} -%}
+{
+    "@timestamp": "{{ last_seen }}",
+    {{ agent_block(params) }},
+    "aws": {
+        "guardduty": {
+            "account_id": "{{ account.account_id }}",
+            "arn": "{{ f_arn }}",
+            "created_at": "{{ first_seen }}",
+            "description": "{{ finding_type.description | replace('{instance_id}', instance.instance_id) | replace('{remote_ip}', actor.ip) }}",
+            "id": "{{ finding_id }}",
+            "partition": "aws",
+            "region": "{{ region.region_code }}",
+            {{ instance_resource_block(instance, account, timestamp) }},
+            "schema_version": "2.0",
+            "service": {
+                "action": {
+                    "port_probe_action": {
+                        "blocked": false,
+                        "port_probe_details": [
+                            {
+                                "local_port_details": {
+                                    "port": {{ probed_port }},
+                                    "port_name": "{{ port_name_map[probed_port] }}"
+                                },
+                                {{ remote_ip_block(actor) }}
+                            }
+                        ]
+                    },
+                    "type": "PORT_PROBE"
+                },
+                {{ evidence_block(actor) }},
+                {{ service_meta(det_id, finding_count, first_seen, last_seen, "TARGET") }}
+            },
+            {{ severity_block(finding_type.severity_code, finding_type.severity_value) }},
+            "title": "{{ finding_type.title | replace('{instance_id}', instance.instance_id) }}",
+            "type": "{{ finding_type.type }}",
+            "updated_at": "{{ last_seen }}"
+        }
+    },
+    {{ cloud_block(account, region) }},
+    {{ ecs_block() }},
+    {{ event_block(finding_type, finding_id, finding_type.severity_code, first_seen, last_seen) }},
+    "message": "{{ finding_type.description | replace('{instance_id}', instance.instance_id) | replace('{remote_ip}', actor.ip) }}",
+    "related": {
+        "ip": ["{{ actor.ip }}", "{{ instance.private_ip }}"]
+    },
+    {{ rule_block(finding_type) }},
+    "source": {
+        "address": ["{{ actor.ip }}"],
+        "as": {
+            "number": [{{ actor.asn }}],
+            "organization": {
+                "name": ["{{ actor.asn_org }}"]
+            }
+        },
+        "geo": {
+            "city_name": "{{ actor.city }}",
+            "country_iso_code": "{{ actor.country_code }}",
+            "country_name": "{{ actor.country_name }}",
+            "location": {
+                "lat": {{ actor.lat }},
+                "lon": {{ actor.lon }}
+            }
+        },
+        "ip": ["{{ actor.ip }}"]
+    }
+}

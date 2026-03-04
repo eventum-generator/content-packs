@@ -1,0 +1,196 @@
+{#- Shared macros for Azure Entra ID Sign-In and Audit Log events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, related_block, pick_source_ip, pick_user_agent, device_detail_block, client_app_for_ua, geo_block, pick_risk_level %} -#}
+{#- For weighted picks on JSON samples, use: samples.applications.weighted_pick('weight'), samples.conditional_access_policies.weighted_pick('weight') -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "azure-entra-forwarder",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block(params) -%}
+    "cloud": {
+        "provider": "azure",
+        "account": {
+            "id": "{{ params.tenant_id }}"
+        }
+    }
+{%- endmacro -%}
+
+{%- macro event_block(action, categories, event_id, outcome, types, dataset, event_module) -%}
+    "event": {
+        "action": {{ action | tojson }},
+        "category": {{ categories | tojson }},
+        "dataset": {{ dataset | tojson }},
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": {{ event_module | tojson }},
+        "outcome": "{{ outcome }}",
+        "type": {{ types | tojson }}
+    }
+{%- endmacro -%}
+
+{%- macro source_block(ip) -%}
+    "source": {
+        "ip": "{{ ip }}"
+    }
+{%- endmacro -%}
+
+{%- macro user_block(user) -%}
+    "user": {
+        "domain": "{{ user.upn.split('@')[1] }}",
+        "email": "{{ user.upn }}",
+        "full_name": "{{ user.display_name }}",
+        "id": "{{ user.object_id }}",
+        "name": "{{ user.upn.split('@')[0] }}"
+    }
+{%- endmacro -%}
+
+{%- macro related_block(ips, users) -%}
+    "related": {
+        "ip": {{ ips | tojson }},
+        "user": {{ users | tojson }}
+    }
+{%- endmacro -%}
+
+{#- Pick source IP from samples -#}
+{%- macro pick_source_ip(source_ips) -%}
+{{- (source_ips | random).ip -}}
+{%- endmacro -%}
+
+{#- Pick a user agent by type -#}
+{%- macro pick_user_agent(ua_type, user_agents) -%}
+{%- set matching = [] -%}
+{%- for ua in user_agents -%}
+    {%- if ua.type == ua_type -%}
+        {%- do matching.append(ua.value) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if matching | length > 0 -%}
+    {{- module.rand.choice(matching) -}}
+{%- else -%}
+    {%- set all_uas = [] -%}
+    {%- for ua in user_agents -%}
+        {%- do all_uas.append(ua.value) -%}
+    {%- endfor -%}
+    {{- module.rand.choice(all_uas) -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Generate device detail block -#}
+{%- macro device_detail_block(ua_type) -%}
+{%- if ua_type in ["browser_windows", "outlook_desktop", "teams_desktop", "powershell"] -%}
+    {%- set _trust = module.rand.weighted_choice(["Hybrid Azure AD joined", "Azure AD joined", "Azure AD registered", ""], [30, 30, 20, 20]) -%}
+    {%- set _managed = _trust in ["Hybrid Azure AD joined", "Azure AD joined"] -%}
+            "device_detail": {
+                "browser": "{{ module.rand.choice(["Chrome 122.0.0", "Edge 121.0.2277", "Firefox 123.0"]) }}",
+                "device_id": "",
+                "display_name": "",
+                "is_compliant": {{ _managed | tojson }},
+                "is_managed": {{ _managed | tojson }},
+                "operating_system": "Windows 10",
+                "trust_type": "{{ _trust }}"
+            }
+{%- elif ua_type in ["browser_mac"] -%}
+    {%- set _trust = module.rand.weighted_choice(["Azure AD registered", ""], [40, 60]) -%}
+            "device_detail": {
+                "browser": "{{ module.rand.choice(["Chrome 122.0.0", "Safari 17.3"]) }}",
+                "device_id": "",
+                "display_name": "",
+                "is_compliant": false,
+                "is_managed": false,
+                "operating_system": "macOS",
+                "trust_type": "{{ _trust }}"
+            }
+{%- elif ua_type in ["mobile_ios", "outlook_mobile"] -%}
+    {%- set _trust = module.rand.weighted_choice(["Azure AD registered", ""], [50, 50]) -%}
+            "device_detail": {
+                "browser": "{{ module.rand.choice(["Mobile Safari", "Outlook-iOS"]) }}",
+                "device_id": "",
+                "display_name": "",
+                "is_compliant": false,
+                "is_managed": false,
+                "operating_system": "Ios 17.3.1",
+                "trust_type": "{{ _trust }}"
+            }
+{%- elif ua_type in ["mobile_android"] -%}
+            "device_detail": {
+                "browser": "{{ module.rand.choice(["Chrome Mobile 122.0", "Outlook-Android"]) }}",
+                "device_id": "",
+                "display_name": "",
+                "is_compliant": false,
+                "is_managed": false,
+                "operating_system": "Android 14",
+                "trust_type": ""
+            }
+{%- elif ua_type == "sdk" -%}
+            "device_detail": {
+                "browser": "Python Requests",
+                "device_id": "",
+                "display_name": "",
+                "is_compliant": false,
+                "is_managed": false,
+                "operating_system": "Linux",
+                "trust_type": ""
+            }
+{%- else -%}
+            "device_detail": {
+                "browser": "Rich Client",
+                "device_id": "",
+                "display_name": "",
+                "is_compliant": false,
+                "is_managed": false,
+                "operating_system": "Windows 10",
+                "trust_type": ""
+            }
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Map client app type for sign-in -#}
+{%- macro client_app_for_ua(ua_type) -%}
+{%- if ua_type in ["browser_windows", "browser_mac"] -%}
+    {{- "Browser" -}}
+{%- elif ua_type in ["outlook_desktop", "teams_desktop"] -%}
+    {{- "Mobile Apps and Desktop clients" -}}
+{%- elif ua_type in ["outlook_mobile", "mobile_ios", "mobile_android"] -%}
+    {{- "Mobile Apps and Desktop clients" -}}
+{%- elif ua_type == "powershell" -%}
+    {{- "Mobile Apps and Desktop clients" -}}
+{%- elif ua_type == "sdk" -%}
+    {{- "Mobile Apps and Desktop clients" -}}
+{%- else -%}
+    {{- "Browser" -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Top-level ECS geo block from a location object -#}
+{%- macro geo_block(location) -%}
+    "geo": {
+        "city_name": {{ location.city | tojson }},
+        "region_name": {{ location.state | tojson }},
+        "country_iso_code": {{ location.country_or_region | tojson }},
+        "location": {
+            "lat": {{ location.latitude }},
+            "lon": {{ location.longitude }}
+        }
+    }
+{%- endmacro -%}
+
+{#- Risk level picker -#}
+{%- macro pick_risk_level(outcome) -%}
+{%- if outcome == "failure" -%}
+    {{- module.rand.weighted_choice(["none", "low", "medium", "high"], [60, 20, 15, 5]) -}}
+{%- else -%}
+    {{- module.rand.weighted_choice(["none", "low"], [90, 10]) -}}
+{%- endif -%}
+{%- endmacro -%}

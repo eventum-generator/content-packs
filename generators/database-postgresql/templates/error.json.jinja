@@ -1,0 +1,141 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set user = samples.users | random -%}
+{%- set db_entry = samples.databases | random -%}
+{%- set db_name = db_entry.name -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_private_b(), "127.0.0.1"], [45, 40, 15]) -%}
+{%- set src_port = module.rand.number.integer(32768, 61000) -%}
+{%- set tbl = samples.tables | random -%}
+{%- set error_type = module.rand.weighted_choice(["syntax_error", "duplicate_key", "foreign_key", "permission_denied", "deadlock", "lock_timeout", "query_cancelled", "out_of_memory"], [25, 20, 15, 15, 8, 7, 7, 3]) -%}
+{%- if error_type == "syntax_error" -%}
+  {%- set sqlstate = "42601" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set msg = "syntax error at or near \\\"SELCT\\\"" -%}
+  {%- set detail = "" -%}
+  {%- set stmt = "SELCT * FROM " ~ tbl.schema ~ "." ~ tbl.name -%}
+{%- elif error_type == "duplicate_key" -%}
+  {%- set sqlstate = "23505" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set dup_id = module.rand.number.integer(1, 10000) -%}
+  {%- set msg = "duplicate key value violates unique constraint \\\"" ~ tbl.name ~ "_pkey\\\"" -%}
+  {%- set detail = "Key (id)=(" ~ dup_id ~ ") already exists." -%}
+  {%- set stmt = "INSERT INTO " ~ tbl.schema ~ "." ~ tbl.name ~ " (id, name) VALUES (" ~ dup_id ~ ", 'test')" -%}
+{%- elif error_type == "foreign_key" -%}
+  {%- set sqlstate = "23503" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set fk_id = module.rand.number.integer(90000, 99999) -%}
+  {%- set msg = "insert or update on table \\\"" ~ tbl.name ~ "\\\" violates foreign key constraint \\\"fk_" ~ tbl.name ~ "_user_id\\\"" -%}
+  {%- set detail = "Key (user_id)=(" ~ fk_id ~ ") is not present in table \\\"users\\\"." -%}
+  {%- set stmt = "INSERT INTO " ~ tbl.schema ~ "." ~ tbl.name ~ " (user_id, data) VALUES (" ~ fk_id ~ ", '{}')" -%}
+{%- elif error_type == "permission_denied" -%}
+  {%- set sqlstate = "42501" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set msg = "permission denied for table " ~ tbl.name -%}
+  {%- set detail = "" -%}
+  {%- set stmt = "DELETE FROM " ~ tbl.schema ~ "." ~ tbl.name -%}
+{%- elif error_type == "deadlock" -%}
+  {%- set sqlstate = "40P01" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set msg = "deadlock detected" -%}
+  {%- set detail = "Process " ~ pid ~ " waits for ShareLock on transaction " ~ module.rand.number.integer(100000, 999999) ~ "; blocked by process " ~ module.rand.number.integer(1000, 65535) ~ "." -%}
+  {%- set stmt = "UPDATE " ~ tbl.schema ~ "." ~ tbl.name ~ " SET status = 'locked' WHERE id = " ~ module.rand.number.integer(1, 10000) -%}
+{%- elif error_type == "lock_timeout" -%}
+  {%- set sqlstate = "55P03" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set msg = "canceling statement due to lock timeout" -%}
+  {%- set detail = "" -%}
+  {%- set stmt = "ALTER TABLE " ~ tbl.schema ~ "." ~ tbl.name ~ " ADD COLUMN new_col TEXT" -%}
+{%- elif error_type == "query_cancelled" -%}
+  {%- set sqlstate = "57014" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set msg = "canceling statement due to statement timeout" -%}
+  {%- set detail = "" -%}
+  {%- set stmt = "SELECT * FROM " ~ tbl.schema ~ "." ~ tbl.name ~ " WHERE data @> '{\\\"key\\\": \\\"value\\\"}'" -%}
+{%- else -%}
+  {%- set sqlstate = "53200" -%}
+  {%- set severity = "ERROR" -%}
+  {%- set msg = "out of memory" -%}
+  {%- set detail = "Failed on request of size " ~ module.rand.number.integer(1, 512) ~ " MB." -%}
+  {%- set stmt = "SELECT * FROM " ~ tbl.schema ~ "." ~ tbl.name ~ " t1 CROSS JOIN " ~ tbl.schema ~ "." ~ tbl.name ~ " t2" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "error": {
+        "code": "{{ sqlstate }}",
+        "message": "{{ msg }}"{% if detail %},
+        "stack_trace": "{{ detail }}"
+{%- endif %}
+
+    },
+    "event": {
+        "action": "error",
+        "category": ["database"],
+        "dataset": "postgresql.log",
+        "kind": "event",
+        "module": "postgresql",
+        "outcome": "failure",
+        "sequence": {{ seq }},
+        "type": ["error"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ host.os_kernel }}",
+            "name": "{{ host.os_name }}",
+            "platform": "{{ host.os_platform }}",
+            "type": "linux",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "log": {
+        "level": "{{ severity }}"
+    },
+    "message": "{{ msg }}",
+    "postgresql": {
+        "log": {
+            "database": "{{ db_name }}",
+            "query": "{{ stmt }}",
+            "sql_state_code": "{{ sqlstate }}",
+            "timestamp": "{{ timestamp.strftime('%Y-%m-%d %H:%M:%S.%f') }} UTC"
+        }
+    },
+    "process": {
+        "pid": {{ pid }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ user.username }}"]
+    },
+    "server": {
+        "address": "{{ host.ip }}",
+        "port": {{ host.pg_port }}
+    },
+    "service": {
+        "type": "postgresql"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "user": {
+        "name": "{{ user.username }}"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

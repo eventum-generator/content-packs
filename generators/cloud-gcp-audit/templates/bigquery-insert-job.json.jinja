@@ -1,0 +1,145 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block_global, pick_caller, pick_user_agent, pick_source_ip, pick_error, authentication_info_block, request_metadata_block -%}
+{%- set project = samples.projects | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set event_id = module.rand.string.hex(16) -%}
+{%- set caller_data = pick_caller(samples.users, samples.service_accounts) -%}
+{%- set caller_type = caller_data.split("|||")[0] -%}
+{%- set caller_email = caller_data.split("|||")[1] -%}
+{%- set dataset = samples.datasets | random -%}
+{%- set job_type = module.rand.weighted_choice(["QUERY", "LOAD", "EXTRACT", "COPY"], [60, 20, 10, 10]) -%}
+{%- set job_id = "bqjob_r" ~ module.rand.string.hex(16) ~ "_" ~ module.rand.string.digits(6) -%}
+{%- set is_error = module.rand.chance(params.get('error_rate', 4) / 100.0) -%}
+{%- if is_error -%}
+    {%- set err_data = pick_error("google.cloud.bigquery.v2.JobService.InsertJob", samples.error_scenarios) -%}
+    {%- set error_code = err_data.split("|||")[0] -%}
+    {%- set error_message = err_data.split("|||")[1] -%}
+    {%- set outcome = "failure" -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+{%- endif -%}
+{%- set ua_value = pick_user_agent(caller_type, samples.user_agents) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block_global(project) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "google.cloud.bigquery.v2.JobService.InsertJob",
+        "category": ["database", "configuration"],
+        "dataset": "gcp.audit",
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": "gcp",
+        "outcome": "{{ outcome }}",
+        "provider": "data_access",
+        "type": ["access", "{{ 'denied' if is_error else 'allowed' }}"]
+    },
+    "gcp": {
+        "audit": {
+            {{ authentication_info_block(caller_email) }},
+            "authorization_info": [
+                {
+                    "granted": {{ 'false' if is_error else 'true' }},
+                    "permission": "bigquery.jobs.create",
+                    "resource_attributes": {
+                        "name": "projects/{{ dataset.project_id }}",
+                        "service": "bigquery",
+                        "type": "bigquery.projects"
+                    }
+                }
+            ],
+            "method_name": "google.cloud.bigquery.v2.JobService.InsertJob",
+            "receive_timestamp": "{{ timestamp.isoformat() }}",
+            "request": {
+                "@type": "type.googleapis.com/google.cloud.bigquery.v2.Job",
+                "jobConfiguration": {
+                    "type": "{{ job_type }}",
+{%- if job_type == "QUERY" %}
+                    "query": {
+                        "destinationTable": {
+                            "projectId": "{{ dataset.project_id }}",
+                            "datasetId": "{{ dataset.dataset_id }}",
+                            "tableId": "query_results_{{ module.rand.string.hex(8) }}"
+                        },
+                        "createDisposition": "CREATE_IF_NEEDED",
+                        "writeDisposition": "WRITE_TRUNCATE",
+                        "priority": "{{ module.rand.choice(['INTERACTIVE', 'BATCH']) }}"
+                    }
+{%- elif job_type == "LOAD" %}
+                    "load": {
+                        "destinationTable": {
+                            "projectId": "{{ dataset.project_id }}",
+                            "datasetId": "{{ dataset.dataset_id }}",
+                            "tableId": "imported_data_{{ module.rand.string.hex(4) }}"
+                        },
+                        "sourceFormat": "{{ module.rand.choice(['CSV', 'NEWLINE_DELIMITED_JSON', 'PARQUET']) }}"
+                    }
+{%- else %}
+                    "extract": {
+                        "sourceTable": {
+                            "projectId": "{{ dataset.project_id }}",
+                            "datasetId": "{{ dataset.dataset_id }}",
+                            "tableId": "export_source"
+                        },
+                        "destinationFormat": "{{ module.rand.choice(['CSV', 'NEWLINE_DELIMITED_JSON']) }}"
+                    }
+{%- endif %}
+                },
+                "jobName": {
+                    "projectId": "{{ dataset.project_id }}",
+                    "jobId": "{{ job_id }}",
+                    "location": "{{ dataset.location }}"
+                }
+            },
+            {{ request_metadata_block(src_ip, ua_value) }},
+            "resource": {
+                "labels": {
+                    "project_id": "{{ dataset.project_id }}"
+                },
+                "type": "bigquery_project"
+            },
+            "resource_location": {
+                "current_locations": ["{{ dataset.location }}"]
+            },
+            "resource_name": "projects/{{ dataset.project_id }}/jobs/{{ job_id }}",
+{%- if is_error %}
+            "status": {
+                "code": {{ error_code }},
+                "message": {{ error_message | tojson }}
+            },
+{%- else %}
+            "response": {
+                "@type": "type.googleapis.com/google.cloud.bigquery.v2.Job",
+                "jobName": {
+                    "projectId": "{{ dataset.project_id }}",
+                    "jobId": "{{ job_id }}",
+                    "location": "{{ dataset.location }}"
+                },
+                "jobStatus": {
+                    "state": "RUNNING"
+                }
+            },
+{%- endif %}
+            "service_name": "bigquery.googleapis.com",
+            "type": "type.googleapis.com/google.cloud.audit.AuditLog"
+        }
+    },
+    "log": {
+        "level": "{{ 'WARNING' if is_error else 'INFO' }}",
+        "logger": "projects/{{ project.project_id }}/logs/cloudaudit.googleapis.com%2Fdata_access"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ caller_email }}"]
+    },
+    "service": {
+        "name": "bigquery.googleapis.com"
+    },
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+    "tags": ["forwarded", "gcp-audit"],
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    }
+}

@@ -1,0 +1,64 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, event_block, source_block, user_block, user_agent_block, related_block, okta_actor_block, okta_client_block, okta_debug_block, okta_outcome_block, okta_transaction_block, okta_target_block, okta_request_block, okta_security_context_block -%}
+{%- set admins = [] -%}
+{%- for u in samples.users -%}
+    {%- if u.alternate_id.startswith('okta.admin') or u.alternate_id.startswith('super.admin') -%}
+        {%- do admins.append(u) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- set admin = module.rand.choice(admins) if admins | length > 0 else samples.users | random -%}
+{%- set target_user = samples.users | random -%}
+{%- set ip_row = samples.source_ips | random -%}
+{%- set ua = samples.user_agents | random -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set request_id = module.rand.crypto.uuid4() -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "client": {
+        "geo": {
+            "city_name": {{ ip_row.city | tojson }},
+            "country_name": {{ ip_row.country | tojson }},
+            "location": {
+                "lat": {{ ip_row.lat }},
+                "lon": {{ ip_row.lon }}
+            },
+            "region_name": {{ ip_row.state | tojson }}
+        },
+        "ip": "{{ ip_row.ip }}",
+        "user": {
+            "email": "{{ admin.email }}",
+            "full_name": "{{ admin.display_name }}",
+            "id": "{{ admin.id }}",
+            "name": "{{ admin.alternate_id }}"
+        }
+    },
+    {{ ecs_block() }},
+    {{ event_block("user.lifecycle.deactivate", ["iam"], event_id, "success", ["user", "change"]) }},
+    {{ source_block(ip_row, admin) }},
+    "user": {
+        "email": "{{ admin.email }}",
+        "full_name": "{{ admin.display_name }}",
+        "id": "{{ admin.id }}",
+        "name": "{{ admin.alternate_id }}"
+    },
+    {{ user_agent_block(ua) }},
+    {{ related_block([ip_row.ip], [admin.display_name, admin.alternate_id, target_user.display_name, target_user.alternate_id]) }},
+    "okta": {
+        {{ okta_actor_block(admin) }},
+        {{ okta_client_block(ip_row, ua) }},
+        {{ okta_debug_block(request_id, "/api/v1/users/" ~ target_user.id ~ "/lifecycle/deactivate", "false") }},
+        "display_message": "Deactivate Okta user",
+        "event_type": "user.lifecycle.deactivate",
+        {{ okta_outcome_block("SUCCESS", none) }},
+        {{ okta_request_block(ip_row) }},
+        {{ okta_target_block([
+            {"alternate_id": target_user.alternate_id, "display_name": target_user.display_name, "id": target_user.id, "type": "User"}
+        ]) }},
+        {{ okta_transaction_block(request_id, "WEB") }},
+        "severity": "INFO",
+        {{ okta_security_context_block(ip_row) }},
+        "version": "0",
+        "uuid": "{{ event_id }}"
+    },
+    "tags": ["forwarded", "okta-system"]
+}

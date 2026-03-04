@@ -1,0 +1,67 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, event_block, source_block, user_block, user_agent_block, related_block, okta_actor_block, okta_auth_context_block, okta_client_block, okta_debug_block, okta_outcome_block, okta_transaction_block, okta_target_block, okta_request_block, okta_security_context_block -%}
+{%- set user = samples.users | random -%}
+{%- set ip_row = samples.source_ips | random -%}
+{%- set ua = samples.user_agents | random -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set session_id = module.rand.crypto.uuid4() -%}
+{%- set request_id = module.rand.crypto.uuid4() -%}
+{%- set policy_id = "00p" ~ module.rand.crypto.uuid4().replace("-", "")[:20] -%}
+{%- set rule_id = "0pr" ~ module.rand.crypto.uuid4().replace("-", "")[:20] -%}
+{%- set policy_choices = [
+    {"name": "Global Sign On Policy", "rule": "Default Rule"},
+    {"name": "Corporate Network Policy", "rule": "Office Network Rule"},
+    {"name": "Remote Access Policy", "rule": "MFA Required Rule"},
+    {"name": "High Security Apps Policy", "rule": "Step-Up Auth Rule"},
+    {"name": "Contractor Access Policy", "rule": "Limited Access Rule"}
+] -%}
+{%- set policy = module.rand.choice(policy_choices) -%}
+{%- set outcome_result = module.rand.weighted_choice(["ALLOW", "CHALLENGE", "DENY"], [75, 20, 5]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "client": {
+        "geo": {
+            "city_name": {{ ip_row.city | tojson }},
+            "country_name": {{ ip_row.country | tojson }},
+            "location": {
+                "lat": {{ ip_row.lat }},
+                "lon": {{ ip_row.lon }}
+            },
+            "region_name": {{ ip_row.state | tojson }}
+        },
+        "ip": "{{ ip_row.ip }}",
+        "user": {
+            "email": "{{ user.email }}",
+            "full_name": "{{ user.display_name }}",
+            "id": "{{ user.id }}",
+            "name": "{{ user.alternate_id }}"
+        }
+    },
+    {{ ecs_block() }},
+    {{ event_block("policy.evaluate_sign_on", ["configuration"], event_id, outcome_result | lower, ["info"]) }},
+    {{ source_block(ip_row, user) }},
+    {{ user_block(user) }},
+    {{ user_agent_block(ua) }},
+    {{ related_block([ip_row.ip], [user.display_name, user.alternate_id]) }},
+    "okta": {
+        {{ okta_actor_block(user) }},
+        {{ okta_auth_context_block(session_id, 0, "PASSWORD") }},
+        {{ okta_client_block(ip_row, ua) }},
+        {{ okta_debug_block(request_id, "/api/v1/authn", "false") }},
+        "display_message": "Evaluation of sign-on policy",
+        "event_type": "policy.evaluate_sign_on",
+        {{ okta_outcome_block(outcome_result, none) }},
+        {{ okta_request_block(ip_row) }},
+        {{ okta_target_block([
+            {"alternate_id": user.alternate_id, "display_name": user.display_name, "id": user.id, "type": "User"},
+            {"alternate_id": policy.name, "display_name": policy.name, "id": policy_id, "type": "Policy"},
+            {"alternate_id": policy.rule, "display_name": policy.rule, "id": rule_id, "type": "Rule"}
+        ]) }},
+        {{ okta_transaction_block(request_id, "WEB") }},
+        "severity": "INFO",
+        {{ okta_security_context_block(ip_row) }},
+        "version": "0",
+        "uuid": "{{ event_id }}"
+    },
+    "tags": ["forwarded", "okta-system"]
+}

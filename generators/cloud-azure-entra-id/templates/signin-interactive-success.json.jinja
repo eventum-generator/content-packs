@@ -1,0 +1,116 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, related_block, pick_source_ip, pick_user_agent, device_detail_block, client_app_for_ua, geo_block, pick_risk_level -%}
+{%- set user = samples.users | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set location = samples.locations | random -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set app = samples.applications.weighted_pick('weight') -%}
+{%- set ua_type = module.rand.weighted_choice(["browser_windows", "browser_mac", "outlook_desktop", "outlook_mobile", "teams_desktop", "mobile_ios"], [30, 15, 20, 10, 15, 10]) -%}
+{%- set ua_value = pick_user_agent(ua_type, samples.user_agents) -%}
+{%- set client_app = client_app_for_ua(ua_type) -%}
+{%- set risk = pick_risk_level("success") -%}
+{%- set auth_method = module.rand.weighted_choice(["Password", "FIDO2 Security Key", "Windows Hello for Business", "Microsoft Authenticator (push notification)", "Microsoft Authenticator (passwordless)"], [40, 10, 15, 25, 10]) -%}
+{%- set mfa_detail = module.rand.weighted_choice(["mfaAuthentication", "claims", "singleFactorAuthentication"], [50, 30, 20]) -%}
+{#- Pick 1-3 CA policies -#}
+{%- set ca_pol_1 = samples.conditional_access_policies.weighted_pick('weight') -%}
+{%- set ca_pol_2 = samples.conditional_access_policies.weighted_pick('weight') -%}
+{%- set num_ca = module.rand.weighted_choice([1, 2], [50, 50]) -%}
+{#- Track sessions -#}
+{%- set sessions = shared.get('active_sessions', []) -%}
+{%- do sessions.append({"user_upn": user.upn, "user_id": user.object_id, "src_ip": src_ip, "ts": timestamp.isoformat()}) -%}
+{%- if sessions | length > 50 -%}{%- do sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('active_sessions', sessions) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(params) }},
+    {{ ecs_block() }},
+    {{ event_block("UserLoggedIn", ["authentication"], event_id, "success", ["start", "allowed"], "azure.signinlogs", "azure") }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn]) }},
+    {{ geo_block(location) }},
+    "azure": {
+        "signinlogs": {
+            "category": "SignInLogs",
+            "operation_name": "Sign-in activity",
+            "result_type": "0",
+            "result_description": "",
+            "properties": {
+                "id": "{{ event_id }}",
+                "created_at": "{{ timestamp.isoformat() }}",
+                "user_display_name": {{ user.display_name | tojson }},
+                "user_principal_name": {{ user.upn | tojson }},
+                "user_id": "{{ user.object_id }}",
+                "app_id": "{{ app.id }}",
+                "app_display_name": {{ app.name | tojson }},
+                "ip_address": "{{ src_ip }}",
+                "client_app_used": {{ client_app | tojson }},
+                "conditional_access_status": "success",
+                "is_interactive": true,
+                "token_issuer_name": "",
+                "token_issuer_type": "AzureAD",
+                "processing_time_in_milliseconds": {{ module.rand.number.integer(50, 800) }},
+                "risk_detail": "none",
+                "risk_level_aggregated": {{ risk | tojson }},
+                "risk_level_during_signin": {{ risk | tojson }},
+                "risk_state": "none",
+                "resource_display_name": {{ app.name | tojson }},
+                "resource_id": "{{ app.id }}",
+                "status": {
+                    "error_code": 0,
+                    "failure_reason": ""
+                },
+                "location": {
+                    "city": {{ location.city | tojson }},
+                    "state": {{ location.state | tojson }},
+                    "country_or_region": {{ location.country_or_region | tojson }},
+                    "geo_coordinates": {
+                        "latitude": {{ location.latitude }},
+                        "longitude": {{ location.longitude }}
+                    }
+                },
+                {{ device_detail_block(ua_type) }},
+                "authentication_details": [
+                    {
+                        "authentication_method": {{ auth_method | tojson }},
+                        "authentication_method_detail": "",
+                        "authentication_step_date_time": "{{ timestamp.isoformat() }}",
+                        "authentication_step_requirement": {{ mfa_detail | tojson }},
+                        "authentication_step_result_detail": "MFA successfully completed",
+                        "succeeded": true
+                    }
+                ],
+                "applied_conditional_access_policies": [
+                    {
+                        "id": {{ ca_pol_1.id | tojson }},
+                        "display_name": {{ ca_pol_1.display_name | tojson }},
+                        "enforced_grant_controls": ["Mfa"],
+                        "enforced_session_controls": [],
+                        "result": "success"
+                    }{{ "," if num_ca > 1 else "" }}
+{%- if num_ca > 1 %}
+                    {
+                        "id": {{ ca_pol_2.id | tojson }},
+                        "display_name": {{ ca_pol_2.display_name | tojson }},
+                        "enforced_grant_controls": [],
+                        "enforced_session_controls": [],
+                        "result": "success"
+                    }
+{%- endif %}
+                ],
+                "user_agent": {{ ua_value | tojson }},
+                "correlation_id": "{{ correlation_id }}",
+                "user_type": "member",
+                "original_transfer_method": "{{ module.rand.weighted_choice(["none", "deviceCodeFlow", "authenticationTransfer"], [70, 20, 10]) }}",
+                "home_tenant_id": "{{ params.tenant_id }}",
+                "resource_tenant_id": "{{ params.tenant_id }}"
+            },
+            "tenant_id": "{{ params.tenant_id }}",
+            "correlation_id": "{{ correlation_id }}"
+        }
+    }
+}

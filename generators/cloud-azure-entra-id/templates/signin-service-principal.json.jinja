@@ -1,0 +1,79 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, related_block, pick_source_ip, geo_block -%}
+{%- set sp = samples.service_principals | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set location = samples.locations | random -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set app = samples.applications.weighted_pick('weight') -%}
+{#- Service principal sign-ins: ~90% success, ~10% failure -#}
+{%- set is_success = module.rand.weighted_choice([true, false], [90, 10]) -%}
+{%- set outcome = "success" if is_success else "failure" -%}
+{%- set sp_error_choices = [
+    {"code": 7000215, "detail": "InvalidClientSecret", "message": "The provided client secret does not match the expected value for this client."},
+    {"code": 7000222, "detail": "ExpiredClientSecret", "message": "The provided client secret for the app has expired."},
+    {"code": 700016, "detail": "ApplicationNotFound", "message": "The application was not found in the directory."},
+    {"code": 700027, "detail": "ClientAssertionInvalidSignature", "message": "Invalid client assertion. The signature on the client assertion is invalid."}
+] -%}
+{%- set error = module.rand.choice(sp_error_choices) if not is_success else none -%}
+{%- set credential_type = module.rand.weighted_choice(["ClientSecret", "Certificate", "FederatedIdentityCredential"], [50, 35, 15]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(params) }},
+    {{ ecs_block() }},
+    {{ event_block("ServicePrincipalSignIn" if is_success else "ServicePrincipalSignInFailed", ["authentication"], event_id, outcome, ["info"] if is_success else ["info", "denied"], "azure.signinlogs", "azure") }},
+    {{ source_block(src_ip) }},
+    "user": {
+        "id": "{{ sp.object_id }}",
+        "name": {{ sp.display_name | tojson }}
+    },
+    {{ related_block([src_ip], [sp.display_name]) }},
+    {{ geo_block(location) }},
+    "azure": {
+        "signinlogs": {
+            "category": "ServicePrincipalSignInLogs",
+            "operation_name": "Sign-in activity",
+            "result_type": "{{ 0 if is_success else error.code }}",
+            "result_description": "{{ '' if is_success else error.message }}",
+            "properties": {
+                "id": "{{ event_id }}",
+                "created_at": "{{ timestamp.isoformat() }}",
+                "app_id": "{{ sp.app_id }}",
+                "app_display_name": {{ sp.display_name | tojson }},
+                "service_principal_id": "{{ sp.object_id }}",
+                "service_principal_name": {{ sp.display_name | tojson }},
+                "ip_address": "{{ src_ip }}",
+                "is_interactive": false,
+                "processing_time_in_milliseconds": {{ module.rand.number.integer(5, 150) }},
+                "resource_display_name": {{ app.name | tojson }},
+                "resource_id": "{{ app.id }}",
+                "service_principal_credential_key_id": "{{ module.rand.crypto.uuid4() }}",
+                "service_principal_credential_type": {{ credential_type | tojson }},
+                "status": {
+{%- if is_success %}
+                    "error_code": 0,
+                    "failure_reason": ""
+{%- else %}
+                    "error_code": {{ error.code }},
+                    "failure_reason": {{ error.message | tojson }},
+                    "additional_details": {{ error.detail | tojson }}
+{%- endif %}
+                },
+                "location": {
+                    "city": {{ location.city | tojson }},
+                    "state": {{ location.state | tojson }},
+                    "country_or_region": {{ location.country_or_region | tojson }},
+                    "geo_coordinates": {
+                        "latitude": {{ location.latitude }},
+                        "longitude": {{ location.longitude }}
+                    }
+                },
+                "correlation_id": "{{ correlation_id }}",
+                "home_tenant_id": "{{ params.tenant_id }}",
+                "resource_tenant_id": "{{ params.tenant_id }}"
+            },
+            "tenant_id": "{{ params.tenant_id }}",
+            "correlation_id": "{{ correlation_id }}"
+        }
+    }
+}

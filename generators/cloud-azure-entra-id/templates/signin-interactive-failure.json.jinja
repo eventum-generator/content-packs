@@ -1,0 +1,116 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, related_block, pick_source_ip, pick_user_agent, device_detail_block, client_app_for_ua, geo_block, pick_risk_level -%}
+{%- set user = samples.users | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set location = samples.locations | random -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set app = samples.applications.weighted_pick('weight') -%}
+{%- set ua_type = module.rand.weighted_choice(["browser_windows", "browser_mac", "outlook_desktop"], [50, 25, 25]) -%}
+{%- set ua_value = pick_user_agent(ua_type, samples.user_agents) -%}
+{%- set client_app = client_app_for_ua(ua_type) -%}
+{%- set risk = pick_risk_level("failure") -%}
+{#- AADSTS error scenarios -#}
+{%- set error_choices = [
+    {"code": 50126, "detail": "InvalidUserNameOrPassword", "message": "Error validating credentials due to invalid username or password."},
+    {"code": 50053, "detail": "IdsLocked", "message": "The account is locked because the user tried to sign in too many times with an incorrect user ID or password."},
+    {"code": 50057, "detail": "UserDisabled", "message": "The user account is disabled."},
+    {"code": 50076, "detail": "UserStrongAuthClientAuthNRequired", "message": "Due to a configuration change made by your administrator, or because you moved to a new location, you must use multi-factor authentication."},
+    {"code": 50074, "detail": "UserStrongAuthClientAuthNRequiredInterrupt", "message": "Strong authentication is required and the user did not pass the MFA challenge."},
+    {"code": 530032, "detail": "BlockedByConditionalAccessOnSecurityPolicy", "message": "A tenant admin has configured a security policy that blocks this request."},
+    {"code": 50055, "detail": "InvalidPasswordExpiredPassword", "message": "The password is expired."},
+    {"code": 500121, "detail": "StrongAuthenticationIsRequiredButNotPerformed", "message": "Authentication failed during strong authentication request."},
+    {"code": 50140, "detail": "KmsiInterrupt", "message": "This error occurred due to Keep me signed in interrupt when the user was signing in."},
+    {"code": 50105, "detail": "EntitlementGrantsNotFound", "message": "The signed in user is not assigned to a role for the signed in app."},
+    {"code": 70008, "detail": "ExpiredOrRevokedGrant", "message": "The refresh token has expired due to inactivity."},
+    {"code": 50034, "detail": "UserAccountNotFound", "message": "The user account was not found in the directory."},
+    {"code": 50158, "detail": "ExternalSecurityChallenge", "message": "External security challenge was not satisfied."},
+    {"code": 50079, "detail": "UserStrongAuthEnrollmentRequired", "message": "Due to a configuration change made by the administrator, the user is required to use multi-factor authentication."}
+] -%}
+{%- set error = module.rand.choice(error_choices) -%}
+{%- set ca_pol = samples.conditional_access_policies.weighted_pick('weight') -%}
+{%- set ca_result = module.rand.weighted_choice(["failure", "notApplied"], [60, 40]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(params) }},
+    {{ ecs_block() }},
+    {{ event_block("UserLoginFailed", ["authentication"], event_id, "failure", ["start", "denied"], "azure.signinlogs", "azure") }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn]) }},
+    {{ geo_block(location) }},
+    "azure": {
+        "signinlogs": {
+            "category": "SignInLogs",
+            "operation_name": "Sign-in activity",
+            "result_type": "{{ error.code }}",
+            "result_description": {{ error.message | tojson }},
+            "properties": {
+                "id": "{{ event_id }}",
+                "created_at": "{{ timestamp.isoformat() }}",
+                "user_display_name": {{ user.display_name | tojson }},
+                "user_principal_name": {{ user.upn | tojson }},
+                "user_id": "{{ user.object_id }}",
+                "app_id": "{{ app.id }}",
+                "app_display_name": {{ app.name | tojson }},
+                "ip_address": "{{ src_ip }}",
+                "client_app_used": {{ client_app | tojson }},
+                "conditional_access_status": "{{ module.rand.weighted_choice(["failure", "notApplied"], [60, 40]) }}",
+                "is_interactive": true,
+                "token_issuer_name": "",
+                "token_issuer_type": "AzureAD",
+                "processing_time_in_milliseconds": {{ module.rand.number.integer(50, 1200) }},
+                "risk_detail": "{{ module.rand.weighted_choice(["none", "aiConfirmedSigninSafe", "userPassedMFADrivenByRiskBasedPolicy"], [60, 20, 20]) }}",
+                "risk_level_aggregated": {{ risk | tojson }},
+                "risk_level_during_signin": {{ risk | tojson }},
+                "risk_state": "{{ "atRisk" if risk != "none" else "none" }}",
+                "resource_display_name": {{ app.name | tojson }},
+                "resource_id": "{{ app.id }}",
+                "status": {
+                    "error_code": {{ error.code }},
+                    "failure_reason": {{ error.message | tojson }},
+                    "additional_details": {{ error.detail | tojson }}
+                },
+                "location": {
+                    "city": {{ location.city | tojson }},
+                    "state": {{ location.state | tojson }},
+                    "country_or_region": {{ location.country_or_region | tojson }},
+                    "geo_coordinates": {
+                        "latitude": {{ location.latitude }},
+                        "longitude": {{ location.longitude }}
+                    }
+                },
+                {{ device_detail_block(ua_type) }},
+                "authentication_details": [
+                    {
+                        "authentication_method": "Password",
+                        "authentication_method_detail": "",
+                        "authentication_step_date_time": "{{ timestamp.isoformat() }}",
+                        "authentication_step_requirement": "singleFactorAuthentication",
+                        "authentication_step_result_detail": {{ error.detail | tojson }},
+                        "succeeded": false
+                    }
+                ],
+                "applied_conditional_access_policies": [
+                    {
+                        "id": {{ ca_pol.id | tojson }},
+                        "display_name": {{ ca_pol.display_name | tojson }},
+                        "enforced_grant_controls": ["Mfa"],
+                        "enforced_session_controls": [],
+                        "result": {{ ca_result | tojson }}
+                    }
+                ],
+                "user_agent": {{ ua_value | tojson }},
+                "correlation_id": "{{ correlation_id }}",
+                "user_type": "member",
+                "home_tenant_id": "{{ params.tenant_id }}",
+                "resource_tenant_id": "{{ params.tenant_id }}"
+            },
+            "tenant_id": "{{ params.tenant_id }}",
+            "correlation_id": "{{ correlation_id }}"
+        }
+    }
+}

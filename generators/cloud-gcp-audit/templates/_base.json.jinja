@@ -1,0 +1,135 @@
+{#- Shared macros for GCP Cloud Audit Log events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_caller, pick_user_agent, pick_source_ip, pick_error, authentication_info_block, request_metadata_block %} -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "gcp-audit-forwarder",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block(project, zone) -%}
+    "cloud": {
+        "availability_zone": "{{ zone.zone }}",
+        "project": {
+            "id": "{{ project.project_id }}",
+            "name": "{{ project.project_name }}"
+        },
+        "provider": "gcp",
+        "region": "{{ zone.region }}"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block_global(project) -%}
+    "cloud": {
+        "availability_zone": "global",
+        "project": {
+            "id": "{{ project.project_id }}",
+            "name": "{{ project.project_name }}"
+        },
+        "provider": "gcp"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block_regional(project, region) -%}
+    "cloud": {
+        "availability_zone": "{{ region }}",
+        "project": {
+            "id": "{{ project.project_id }}",
+            "name": "{{ project.project_name }}"
+        },
+        "provider": "gcp",
+        "region": "{{ region }}"
+    }
+{%- endmacro -%}
+
+{#- Pick a caller identity: user (40%), service_account (55%), or gcp_service (5%) -#}
+{%- macro pick_caller(users, service_accounts) -%}
+{%- set caller_type = module.rand.weighted_choice(["user", "service_account", "gcp_service"], [40, 55, 5]) -%}
+{%- if caller_type == "user" -%}
+    {%- set user = users | random -%}
+    {{- "user|||" ~ user.email ~ "|||" ~ user.department -}}
+{%- elif caller_type == "service_account" -%}
+    {%- set sa = service_accounts | random -%}
+    {{- "service_account|||" ~ sa.email ~ "|||" ~ sa.unique_id -}}
+{%- else -%}
+    {%- set svc = module.rand.choice(["compute-system", "container-engine-robot", "cloudservices", "cloudbuild"]) -%}
+    {{- "gcp_service|||" ~ svc ~ "@system.gserviceaccount.com|||system" -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro pick_user_agent(caller_type, user_agents) -%}
+{%- if caller_type == "gcp_service" -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type == "service" -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- elif caller_type == "console" -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type == "console" -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- else -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type in ["gcloud", "sdk_python", "sdk_go", "sdk_java", "terraform"] -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro pick_source_ip(source_ips) -%}
+{{- (source_ips | random).ip -}}
+{%- endmacro -%}
+
+{%- macro pick_error(method_name, error_scenarios) -%}
+{%- set matching = [] -%}
+{%- for scenario in error_scenarios -%}
+    {%- if scenario.method_name == method_name -%}
+        {%- do matching.append(scenario) -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- if matching | length > 0 -%}
+    {%- set err = module.rand.choice(matching) -%}
+    {{- err.error_code | string }}|||{{ err.error_message -}}
+{%- else -%}
+    {{- "403|||Permission denied." -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Authentication info block -#}
+{%- macro authentication_info_block(caller_email) -%}
+            "authentication_info": {
+                "principal_email": "{{ caller_email }}"
+            }
+{%- endmacro -%}
+
+{#- Request metadata block -#}
+{%- macro request_metadata_block(ip, user_agent) -%}
+            "request_metadata": {
+                "caller_ip": "{{ ip }}",
+                "caller_supplied_user_agent": {{ user_agent | tojson }}
+            }
+{%- endmacro -%}
+
+{#- Log name helper -#}
+{%- macro log_name(project_id, log_type) -%}
+projects/{{ project_id }}/logs/cloudaudit.googleapis.com%2F{{ log_type }}
+{%- endmacro -%}

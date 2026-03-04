@@ -1,0 +1,79 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, event_block, source_block, user_block, user_agent_block, related_block, okta_actor_block, okta_auth_context_block, okta_client_block, okta_debug_block, okta_outcome_block, okta_transaction_block, okta_target_block, okta_request_block, okta_security_context_block -%}
+{%- set sessions = shared.get('active_sessions', []) -%}
+{%- if sessions | length > 0 -%}
+    {%- set session = module.rand.choice(sessions) -%}
+{%- else -%}
+    {%- set user = samples.users | random -%}
+    {%- set session = {"user_id": user.id, "user_email": user.email, "display_name": user.display_name, "alternate_id": user.alternate_id, "src_ip": (samples.source_ips | random).ip, "session_id": module.rand.crypto.uuid4()} -%}
+{%- endif -%}
+{%- set app = samples.applications | random -%}
+{%- set ip_row = samples.source_ips | random -%}
+{%- set ua = samples.user_agents | random -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set request_id = module.rand.crypto.uuid4() -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "client": {
+        "geo": {
+            "city_name": {{ ip_row.city | tojson }},
+            "country_name": {{ ip_row.country | tojson }},
+            "location": {
+                "lat": {{ ip_row.lat }},
+                "lon": {{ ip_row.lon }}
+            },
+            "region_name": {{ ip_row.state | tojson }}
+        },
+        "ip": "{{ ip_row.ip }}",
+        "user": {
+            "email": "{{ session.user_email }}",
+            "full_name": "{{ session.display_name }}",
+            "id": "{{ session.user_id }}",
+            "name": "{{ session.alternate_id }}"
+        }
+    },
+    {{ ecs_block() }},
+    {{ event_block("user.authentication.sso", ["authentication"], event_id, "success", ["info"]) }},
+    "source": {
+        "ip": "{{ ip_row.ip }}",
+        "user": {
+            "email": "{{ session.user_email }}",
+            "full_name": "{{ session.display_name }}",
+            "id": "{{ session.user_id }}",
+            "name": "{{ session.alternate_id }}"
+        }
+    },
+    "user": {
+        "email": "{{ session.user_email }}",
+        "full_name": "{{ session.display_name }}",
+        "id": "{{ session.user_id }}",
+        "name": "{{ session.alternate_id }}"
+    },
+    {{ user_agent_block(ua) }},
+    {{ related_block([ip_row.ip], [session.display_name, session.alternate_id]) }},
+    "okta": {
+        "actor": {
+            "alternate_id": "{{ session.alternate_id }}",
+            "display_name": "{{ session.display_name }}",
+            "id": "{{ session.user_id }}",
+            "type": "User"
+        },
+        {{ okta_auth_context_block(session.session_id, 0, "PASSWORD") }},
+        {{ okta_client_block(ip_row, ua) }},
+        {{ okta_debug_block(request_id, "/app/" ~ app.name | lower | replace(" ", "_") ~ "/" ~ app.id ~ "/sso/saml", "false") }},
+        "display_message": "User single sign on to app",
+        "event_type": "user.authentication.sso",
+        {{ okta_outcome_block("SUCCESS", none) }},
+        {{ okta_request_block(ip_row) }},
+        {{ okta_target_block([
+            {"alternate_id": session.alternate_id, "display_name": session.display_name, "id": session.user_id, "type": "User"},
+            {"alternate_id": app.label, "display_name": app.label, "id": app.id, "type": "AppInstance"}
+        ]) }},
+        {{ okta_transaction_block(request_id, "WEB") }},
+        "severity": "INFO",
+        {{ okta_security_context_block(ip_row) }},
+        "version": "0",
+        "uuid": "{{ event_id }}"
+    },
+    "tags": ["forwarded", "okta-system"]
+}

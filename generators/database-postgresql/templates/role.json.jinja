@@ -1,0 +1,107 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set user = module.rand.weighted_choice(samples.users | selectattr('role_type', 'equalto', 'admin') | list + samples.users | selectattr('role_type', 'equalto', 'superuser') | list, None) -%}
+{%- set db_name = "postgres" -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_private_b(), "127.0.0.1"], [35, 35, 30]) -%}
+{%- set src_port = module.rand.number.integer(32768, 61000) -%}
+{%- set stmt_id = module.rand.number.integer(1, 500) -%}
+{%- set target_roles = ["app_readonly", "app_readwrite", "reporting_user", "etl_user", "new_developer", "temp_access"] -%}
+{%- set target_role = module.rand.choice(target_roles) -%}
+{%- set role_action = module.rand.weighted_choice(["GRANT", "REVOKE", "CREATE ROLE", "ALTER ROLE", "DROP ROLE"], [35, 20, 20, 15, 10]) -%}
+{%- if role_action == "GRANT" -%}
+  {%- set privilege = module.rand.choice(["SELECT", "INSERT", "UPDATE", "ALL PRIVILEGES"]) -%}
+  {%- set tbl = samples.tables | random -%}
+  {%- set stmt = "GRANT " ~ privilege ~ " ON " ~ tbl.schema ~ "." ~ tbl.name ~ " TO " ~ target_role -%}
+  {%- set obj_name = tbl.schema ~ "." ~ tbl.name -%}
+{%- elif role_action == "REVOKE" -%}
+  {%- set privilege = module.rand.choice(["SELECT", "INSERT", "UPDATE", "ALL PRIVILEGES"]) -%}
+  {%- set tbl = samples.tables | random -%}
+  {%- set stmt = "REVOKE " ~ privilege ~ " ON " ~ tbl.schema ~ "." ~ tbl.name ~ " FROM " ~ target_role -%}
+  {%- set obj_name = tbl.schema ~ "." ~ tbl.name -%}
+{%- elif role_action == "CREATE ROLE" -%}
+  {%- set stmt = "CREATE ROLE " ~ target_role ~ " WITH LOGIN PASSWORD '***'" -%}
+  {%- set obj_name = target_role -%}
+{%- elif role_action == "ALTER ROLE" -%}
+  {%- set alter_opt = module.rand.choice(["SET statement_timeout = '30s'", "SET search_path = 'public,app'", "VALID UNTIL '2027-01-01'", "CONNECTION LIMIT 20"]) -%}
+  {%- set stmt = "ALTER ROLE " ~ target_role ~ " " ~ alter_opt -%}
+  {%- set obj_name = target_role -%}
+{%- else -%}
+  {%- set stmt = "DROP ROLE IF EXISTS " ~ target_role -%}
+  {%- set obj_name = target_role -%}
+{%- endif -%}
+{%- set obj_type = "TABLE" if role_action in ["GRANT", "REVOKE"] else "ROLE" -%}
+{%- set audit_line = "AUDIT: SESSION," ~ stmt_id ~ ",1,ROLE," ~ role_action ~ "," ~ obj_type ~ "," ~ obj_name ~ "," ~ stmt ~ ",<not logged>" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "{{ role_action }}",
+        "category": ["database", "iam"],
+        "dataset": "postgresql.log",
+        "kind": "event",
+        "module": "postgresql",
+        "outcome": "success",
+        "sequence": {{ seq }},
+        "type": ["admin"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ host.os_kernel }}",
+            "name": "{{ host.os_name }}",
+            "platform": "{{ host.os_platform }}",
+            "type": "linux",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "log": {
+        "level": "LOG"
+    },
+    "message": "{{ audit_line }}",
+    "postgresql": {
+        "log": {
+            "database": "{{ db_name }}",
+            "query": "{{ stmt }}",
+            "query_name": "{{ role_action }}",
+            "timestamp": "{{ timestamp.strftime('%Y-%m-%d %H:%M:%S.%f') }} UTC"
+        }
+    },
+    "process": {
+        "pid": {{ pid }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ user.username }}"]
+    },
+    "server": {
+        "address": "{{ host.ip }}",
+        "port": {{ host.pg_port }}
+    },
+    "service": {
+        "type": "postgresql"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "user": {
+        "name": "{{ user.username }}"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

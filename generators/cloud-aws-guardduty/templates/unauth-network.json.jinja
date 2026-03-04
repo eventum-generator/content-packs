@@ -1,0 +1,95 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, remote_ip_block, severity_block, service_meta, evidence_block, event_block, rule_block, instance_resource_block, detector_id, finding_arn -%}
+{%- set account = samples.accounts | random -%}
+{%- set region = samples.regions | random -%}
+{%- set instance = samples.instances | random -%}
+{%- set actor = samples.threat_actors | random -%}
+{%- set det_id = detector_id(account) -%}
+{%- set finding_id = module.rand.string.hex(32) -%}
+{%- set f_arn = finding_arn(account, region, det_id, finding_id) -%}
+{%- set finding_count = module.rand.number.integer(1, 100) -%}
+{%- set first_seen = (timestamp - module.datetime.timedelta(hours=module.rand.number.integer(1, 72))).strftime('%Y-%m-%dT%H:%M:%S.000Z') -%}
+{%- set last_seen = timestamp.strftime('%Y-%m-%dT%H:%M:%S.000Z') -%}
+{%- set finding_type_name = module.rand.weighted_choice(["UnauthorizedAccess:EC2/TorIPCaller", "UnauthorizedAccess:EC2/MaliciousIPCaller.Custom", "UnauthorizedAccess:EC2/RDPBruteForce"], [35, 40, 25]) -%}
+{%- set finding_types_map = {} -%}
+{%- for ft in samples.finding_types -%}
+    {%- do finding_types_map.update({ft.type: ft}) -%}
+{%- endfor -%}
+{%- set finding_type = finding_types_map[finding_type_name] -%}
+{%- set local_port = module.rand.weighted_choice([22, 3389, 80, 443, 5985], [25, 25, 20, 20, 10]) -%}
+{%- set port_name_map = {22: "SSH", 3389: "RDP", 80: "HTTP", 443: "HTTPS", 5985: "WinRM"} -%}
+{%- set remote_port = module.rand.number.integer(1024, 65535) -%}
+{%- set direction = module.rand.weighted_choice(["INBOUND", "OUTBOUND"], [70, 30]) -%}
+{%- set protocol = module.rand.weighted_choice(["TCP", "UDP"], [85, 15]) -%}
+{
+    "@timestamp": "{{ last_seen }}",
+    {{ agent_block(params) }},
+    "aws": {
+        "guardduty": {
+            "account_id": "{{ account.account_id }}",
+            "arn": "{{ f_arn }}",
+            "created_at": "{{ first_seen }}",
+            "description": "{{ finding_type.description | replace('{instance_id}', instance.instance_id) | replace('{remote_ip}', actor.ip) }}",
+            "id": "{{ finding_id }}",
+            "partition": "aws",
+            "region": "{{ region.region_code }}",
+            {{ instance_resource_block(instance, account, timestamp) }},
+            "schema_version": "2.0",
+            "service": {
+                "action": {
+                    "network_connection_action": {
+                        "blocked": {{ module.rand.weighted_choice(["false", "true"], [80, 20]) }},
+                        "connection_direction": "{{ direction }}",
+                        "local_ip_details": {
+                            "ip_address_v4": "{{ instance.private_ip }}"
+                        },
+                        "local_network_interface": "eni-{{ module.rand.string.hex(17) }}",
+                        "local_port_details": {
+                            "port": {{ local_port }},
+                            "port_name": "{{ port_name_map[local_port] }}"
+                        },
+                        "protocol": "{{ protocol }}",
+                        {{ remote_ip_block(actor) }},
+                        "remote_port_details": {
+                            "port": {{ remote_port }},
+                            "port_name": "Unknown"
+                        }
+                    },
+                    "type": "NETWORK_CONNECTION"
+                },
+                {{ evidence_block(actor) }},
+                {{ service_meta(det_id, finding_count, first_seen, last_seen, "TARGET") }}
+            },
+            {{ severity_block(finding_type.severity_code, finding_type.severity_value) }},
+            "title": "{{ finding_type.title | replace('{instance_id}', instance.instance_id) }}",
+            "type": "{{ finding_type.type }}",
+            "updated_at": "{{ last_seen }}"
+        }
+    },
+    {{ cloud_block(account, region) }},
+    {{ ecs_block() }},
+    {{ event_block(finding_type, finding_id, finding_type.severity_code, first_seen, last_seen) }},
+    "message": "{{ finding_type.description | replace('{instance_id}', instance.instance_id) | replace('{remote_ip}', actor.ip) }}",
+    "related": {
+        "ip": ["{{ actor.ip }}", "{{ instance.private_ip }}"]
+    },
+    {{ rule_block(finding_type) }},
+    "source": {
+        "address": ["{{ actor.ip }}"],
+        "as": {
+            "number": [{{ actor.asn }}],
+            "organization": {
+                "name": ["{{ actor.asn_org }}"]
+            }
+        },
+        "geo": {
+            "city_name": "{{ actor.city }}",
+            "country_iso_code": "{{ actor.country_code }}",
+            "country_name": "{{ actor.country_name }}",
+            "location": {
+                "lat": {{ actor.lat }},
+                "lon": {{ actor.lon }}
+            }
+        },
+        "ip": ["{{ actor.ip }}"]
+    }
+}

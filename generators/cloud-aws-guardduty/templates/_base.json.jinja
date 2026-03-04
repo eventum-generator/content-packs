@@ -1,0 +1,245 @@
+{#- Shared macros for AWS GuardDuty finding events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import ... %} -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "guardduty-forwarder",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{%- macro cloud_block(account, region) -%}
+    "cloud": {
+        "account": {
+            "id": "{{ account.account_id }}"
+        },
+        "provider": "aws",
+        "region": "{{ region.region_code }}",
+        "service": {
+            "name": "guardduty"
+        }
+    }
+{%- endmacro -%}
+
+{%- macro remote_ip_block(actor) -%}
+                            "remote_ip_details": {
+                                "city": {
+                                    "name": "{{ actor.city }}"
+                                },
+                                "country": {
+                                    "code": "{{ actor.country_code }}",
+                                    "name": "{{ actor.country_name }}"
+                                },
+                                "geo_location": {
+                                    "lat": {{ actor.lat }},
+                                    "lon": {{ actor.lon }}
+                                },
+                                "ip_address_v4": "{{ actor.ip }}",
+                                "organization": {
+                                    "asn": "{{ actor.asn }}",
+                                    "asnorg": "{{ actor.asn_org }}",
+                                    "isp": "{{ actor.isp }}",
+                                    "org": "{{ actor.org }}"
+                                }
+                            }
+{%- endmacro -%}
+
+{%- macro severity_block(code, value) -%}
+{%- if code <= 3 -%}
+{%- set confidence = module.rand.number.floating(3.0, 5.0) | round(1) -%}
+{%- elif code <= 6 -%}
+{%- set confidence = module.rand.number.floating(5.0, 7.0) | round(1) -%}
+{%- else -%}
+{%- set confidence = module.rand.number.floating(7.0, 9.0) | round(1) -%}
+{%- endif -%}
+            "confidence": {{ confidence }},
+            "severity": {
+                "code": {{ code }},
+                "value": "{{ value }}"
+            }
+{%- endmacro -%}
+
+{%- macro service_meta(detector_id, finding_count, first_seen, last_seen, resource_role) -%}
+                "archived": false,
+                "count": {{ finding_count }},
+                "detector_id": "{{ detector_id }}",
+                "event": {
+                    "first_seen": "{{ first_seen }}",
+                    "last_seen": "{{ last_seen }}"
+                },
+                "resource_role": "{{ resource_role }}",
+                "service_name": "guardduty"
+{%- endmacro -%}
+
+{%- macro evidence_block(actor) -%}
+                "evidence": {
+                    "threat_intelligence_details": [
+                        {
+                            "threat": {
+                                "list_name": "{{ actor.threat_list }}",
+                                "names": [
+                                    "{{ actor.threat_list }}"
+                                ]
+                            }
+                        }
+                    ]
+                }
+{%- endmacro -%}
+
+{%- macro event_block(finding_type, finding_id, severity_code, first_seen, last_seen) -%}
+    "event": {
+        "action": "{{ finding_type.action_type }}",
+        "created": "{{ first_seen }}",
+        "dataset": "aws.guardduty",
+        "end": "{{ last_seen }}",
+        "id": "{{ finding_id }}",
+        "kind": "event",
+        "module": "aws",
+        "severity": {{ severity_code }},
+        "start": "{{ first_seen }}",
+        "type": ["info"]
+    }
+{%- endmacro -%}
+
+{%- macro rule_block(finding_type) -%}
+{%- set parts = finding_type.type.split(":") -%}
+{%- set category = parts[0] -%}
+{%- set ruleset = parts[0] ~ ":" ~ parts[1].split("/")[0] if "/" in parts[1] else finding_type.type -%}
+    "rule": {
+        "category": "{{ category }}",
+        "name": "{{ finding_type.type }}",
+        "ruleset": "{{ ruleset }}"
+    }
+{%- endmacro -%}
+
+{%- macro pick_instance(instances) -%}
+{{- instances | random -}}
+{%- endmacro -%}
+
+{%- macro pick_threat_actor(threat_actors) -%}
+{{- threat_actors | random -}}
+{%- endmacro -%}
+
+{%- macro detector_id(account) -%}
+{{- module.hashlib.md5((account.account_id ~ "guardduty").encode()).hexdigest()[:32] -}}
+{%- endmacro -%}
+
+{%- macro finding_arn(account, region, det_id, finding_id) -%}
+arn:aws:guardduty:{{ region.region_code }}:{{ account.account_id }}:detector/{{ det_id }}/finding/{{ finding_id }}
+{%- endmacro -%}
+
+{%- macro instance_resource_block(instance, account, ts) -%}
+            "resource": {
+                "instance_details": {
+                    "availability_zone": "{{ instance.availability_zone }}",
+                    "image_id": "{{ instance.image_id }}",
+                    "instance_id": "{{ instance.instance_id }}",
+                    "iam_instance_profile": {
+                        "arn": "arn:aws:iam::{{ account.account_id }}:instance-profile/{{ instance.name_tag }}",
+                        "id": "{{ module.rand.string.hex(20) | upper }}"
+                    },
+                    "instance_state": "running",
+                    "instance_type": "{{ instance.instance_type }}",
+                    "launch_time": "{{ ts.strftime('%Y-%m-%dT%H:%M:%SZ') }}",
+                    "network_interfaces": [
+                        {
+                            "network_interface_id": "eni-{{ module.rand.string.hex(17) }}",
+                            "private_dns_name": "ip-{{ instance.private_ip | replace('.', '-') }}.ec2.internal",
+                            "private_ip_address": "{{ instance.private_ip }}",
+{%- if instance.public_ip %}
+                            "public_dns_name": "ec2-{{ instance.public_ip | replace('.', '-') }}.compute-1.amazonaws.com",
+                            "public_ip": "{{ instance.public_ip }}",
+{%- endif %}
+                            "security_groups": [
+                                {
+                                    "group_id": "{{ instance.sg_id }}",
+                                    "group_name": "{{ instance.sg_name }}"
+                                }
+                            ],
+                            "subnet_id": "{{ instance.subnet_id }}",
+                            "vpc_id": "{{ instance.vpc_id }}"
+                        }
+                    ],
+                    "platform": null,
+                    "tags": [
+                        {
+                            "key": "Name",
+                            "value": "{{ instance.name_tag }}"
+                        }
+                    ]
+                },
+                "type": "Instance"
+            }
+{%- endmacro -%}
+
+{%- macro accesskey_resource_block(user, account) -%}
+            "resource": {
+                "access_key_details": {
+                    "accesskey_id": "{{ user.access_key_id }}",
+                    "principal_id": "{{ user.principal_id }}",
+                    "user": {
+                        "name": "{{ user.username }}",
+                        "type": "{{ user.user_type }}"
+                    }
+                },
+                "type": "AccessKey"
+            }
+{%- endmacro -%}
+
+{%- macro s3bucket_resource_block(bucket, account) -%}
+            "resource": {
+                "s3_bucket_details": [
+                    {
+                        "arn": "{{ bucket.bucket_arn }}",
+                        "created_at": "{{ bucket.created_at }}",
+                        "default_server_side_encryption": {
+                            "encryption_type": "{{ bucket.encryption_type }}"
+                        },
+                        "name": "{{ bucket.bucket_name }}",
+                        "owner": {
+                            "id": "{{ account.account_id }}"
+                        },
+                        "public_access": {
+                            "effective_permission": "NOT_PUBLIC",
+                            "permission_configuration": {
+                                "account_level_permissions": {
+                                    "block_public_access": {
+                                        "block_public_acls": true,
+                                        "block_public_policy": true,
+                                        "ignore_public_acls": true,
+                                        "restrict_public_buckets": true
+                                    }
+                                },
+                                "bucket_level_permissions": {
+                                    "access_control_list": {
+                                        "allows_public_read_access": false,
+                                        "allows_public_write_access": false
+                                    },
+                                    "block_public_access": {
+                                        "block_public_acls": true,
+                                        "block_public_policy": true,
+                                        "ignore_public_acls": true,
+                                        "restrict_public_buckets": true
+                                    },
+                                    "bucket_policy": {
+                                        "allows_public_read_access": false,
+                                        "allows_public_write_access": false
+                                    }
+                                }
+                            }
+                        },
+                        "type": "Destination"
+                    }
+                ],
+                "type": "S3Bucket"
+            }
+{%- endmacro -%}

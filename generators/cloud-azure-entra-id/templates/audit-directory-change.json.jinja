@@ -1,0 +1,125 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, related_block, pick_source_ip -%}
+{%- set user = samples.users | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set target_user = samples.users | random -%}
+{%- set group = samples.groups | random -%}
+{%- set role = samples.directory_roles | random -%}
+{#- Pick audit operation with weights -#}
+{%- set op_indices = [] -%}
+{%- set op_weights = [] -%}
+{%- for op in samples.audit_operations -%}
+    {%- do op_indices.append(loop.index0) -%}
+    {%- do op_weights.append(op.weight) -%}
+{%- endfor -%}
+{%- set op_idx = module.rand.weighted_choice(op_indices, op_weights) -%}
+{%- set operation = samples.audit_operations[op_idx] -%}
+{#- Determine ECS event category based on audit category -#}
+{%- set ecs_category = "iam" if operation.category in ["UserManagement", "GroupManagement", "RoleManagement"] else "configuration" -%}
+{%- set ecs_type = ["user", "change"] if operation.category == "UserManagement" else (["group", "change"] if operation.category == "GroupManagement" else ["admin", "change"]) -%}
+{#- Determine target resources based on operation category -#}
+{%- if operation.target_type == "User" -%}
+    {%- set target_id = target_user.object_id -%}
+    {%- set target_display_name = target_user.display_name -%}
+    {%- set target_upn = target_user.upn -%}
+{%- elif operation.target_type == "Group" -%}
+    {%- set target_id = group.id -%}
+    {%- set target_display_name = group.display_name -%}
+    {%- set target_upn = "" -%}
+{%- elif operation.target_type == "Role" -%}
+    {%- set target_id = role.id -%}
+    {%- set target_display_name = role.display_name -%}
+    {%- set target_upn = "" -%}
+{%- elif operation.target_type == "ServicePrincipal" or operation.target_type == "Application" -%}
+    {%- set sp = samples.service_principals | random -%}
+    {%- set target_id = sp.object_id -%}
+    {%- set target_display_name = sp.display_name -%}
+    {%- set target_upn = "" -%}
+{%- elif operation.target_type == "Policy" -%}
+    {%- set pol = samples.conditional_access_policies | random -%}
+    {%- set target_id = pol.id -%}
+    {%- set target_display_name = pol.display_name -%}
+    {%- set target_upn = "" -%}
+{%- elif operation.target_type == "Device" -%}
+    {%- set target_id = module.rand.crypto.uuid4() -%}
+    {%- set target_display_name = module.rand.choice(["LAPTOP-", "DESKTOP-", "WORKSTATION-"]) ~ module.rand.string.letters_uppercase(5) -%}
+    {%- set target_upn = "" -%}
+{%- else -%}
+    {%- set target_id = module.rand.crypto.uuid4() -%}
+    {%- set target_display_name = "Unknown Resource" -%}
+    {%- set target_upn = "" -%}
+{%- endif -%}
+{#- Generate modified properties -#}
+{%- set modified_props = [] -%}
+{%- if "Add" in operation.activity or "Create" in operation.activity -%}
+    {%- do modified_props.append({"display_name": "DisplayName", "old_value": "[]", "new_value": '[\"' ~ target_display_name ~ '\"]'}) -%}
+{%- elif "Update" in operation.activity -%}
+    {%- do modified_props.append({"display_name": "DisplayName", "old_value": '[\"' ~ target_display_name ~ '\"]', "new_value": '[\"' ~ target_display_name ~ '\"]'}) -%}
+    {%- if operation.target_type == "User" -%}
+        {%- do modified_props.append({"display_name": "StrongAuthenticationRequirement", "old_value": "[]", "new_value": "[]"}) -%}
+    {%- endif -%}
+{%- elif "Delete" in operation.activity or "Remove" in operation.activity -%}
+    {%- do modified_props.append({"display_name": "DisplayName", "old_value": '[\"' ~ target_display_name ~ '\"]', "new_value": "[]"}) -%}
+{%- elif "Reset" in operation.activity -%}
+    {%- do modified_props.append({"display_name": "LastPasswordChangeDateTime", "old_value": "[]", "new_value": '[\"' ~ timestamp.isoformat() ~ '\"]'}) -%}
+{%- else -%}
+    {%- do modified_props.append({"display_name": "Action", "old_value": "[]", "new_value": '[\"' ~ operation.activity ~ '\"]'}) -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(params) }},
+    {{ ecs_block() }},
+    {{ event_block(operation.activity, [ecs_category], event_id, operation.result, ecs_type, "azure.auditlogs", "azure") }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn, target_display_name]) }},
+    "azure": {
+        "auditlogs": {
+            "category": "AuditLogs",
+            "operation_name": {{ operation.activity | tojson }},
+            "result": {{ operation.result | tojson }},
+            "properties": {
+                "id": "{{ event_id }}",
+                "activity_datetime": "{{ timestamp.isoformat() }}",
+                "activity_display_name": {{ operation.activity | tojson }},
+                "category": {{ operation.category | tojson }},
+                "correlation_id": "{{ correlation_id }}",
+                "initiated_by": {
+                    "user": {
+                        "displayName": {{ user.display_name | tojson }},
+                        "id": "{{ user.object_id }}",
+                        "ipAddress": "{{ src_ip }}",
+                        "userPrincipalName": {{ user.upn | tojson }}
+                    }
+                },
+                "logged_by_service": "Core Directory",
+                "operation_type": "{{ "Add" if "Add" in operation.activity or "Create" in operation.activity else ("Delete" if "Delete" in operation.activity or "Remove" in operation.activity else "Update") }}",
+                "result": {{ operation.result | tojson }},
+                "result_reason": "",
+                "target_resources": [
+                    {
+                        "display_name": {{ target_display_name | tojson }},
+                        "id": {{ target_id | tojson }},
+                        "type": {{ operation.target_type | tojson }},
+{%- if target_upn %}
+                        "user_principal_name": {{ target_upn | tojson }},
+{%- endif %}
+                        "modified_properties": [
+{%- for prop in modified_props %}
+                            {
+                                "display_name": {{ prop.display_name | tojson }},
+                                "new_value": {{ prop.new_value | tojson }},
+                                "old_value": {{ prop.old_value | tojson }}
+                            }{{ "," if not loop.last }}
+{%- endfor %}
+                        ]
+                    }
+                ]
+            },
+            "tenant_id": "{{ params.tenant_id }}",
+            "correlation_id": "{{ correlation_id }}"
+        }
+    }
+}

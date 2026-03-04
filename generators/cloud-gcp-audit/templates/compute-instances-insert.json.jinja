@@ -1,0 +1,117 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, pick_caller, pick_user_agent, pick_source_ip, pick_error, authentication_info_block, request_metadata_block -%}
+{%- set project = samples.projects | random -%}
+{%- set zone = samples.zones | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set event_id = module.rand.string.hex(16) -%}
+{%- set caller_data = pick_caller(samples.users, samples.service_accounts) -%}
+{%- set caller_type = caller_data.split("|||")[0] -%}
+{%- set caller_email = caller_data.split("|||")[1] -%}
+{%- set instance_name = module.rand.choice(["web-server", "api-server", "worker", "batch", "test-vm"]) ~ "-" ~ module.rand.string.hex(4) -%}
+{%- set machine_type = module.rand.weighted_choice(["e2-medium", "e2-small", "n2-standard-4", "n2-standard-8", "e2-micro", "c2-standard-16"], [30, 20, 20, 15, 10, 5]) -%}
+{%- set is_error = module.rand.chance(params.get('error_rate', 4) / 100.0) -%}
+{%- if is_error -%}
+    {%- set err_data = pick_error("v1.compute.instances.insert", samples.error_scenarios) -%}
+    {%- set error_code = err_data.split("|||")[0] -%}
+    {%- set error_message = err_data.split("|||")[1] -%}
+    {%- set outcome = "failure" -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+    {%- set new_instance_id = module.rand.string.digits(19) -%}
+{%- endif -%}
+{%- set ua_value = pick_user_agent(caller_type, samples.user_agents) -%}
+{%- set network = samples.networks | random -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(project, zone) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "v1.compute.instances.insert",
+        "category": ["host", "configuration"],
+        "dataset": "gcp.audit",
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": "gcp",
+        "outcome": "{{ outcome }}",
+        "provider": "activity",
+        "type": ["creation", "{{ 'denied' if is_error else 'allowed' }}"]
+    },
+    "gcp": {
+        "audit": {
+            {{ authentication_info_block(caller_email) }},
+            "authorization_info": [
+                {
+                    "granted": {{ 'false' if is_error else 'true' }},
+                    "permission": "compute.instances.create",
+                    "resource_attributes": {
+                        "name": "projects/{{ project.project_id }}/zones/{{ zone.zone }}/instances/{{ instance_name }}",
+                        "service": "compute",
+                        "type": "compute.instances"
+                    }
+                }
+            ],
+            "method_name": "v1.compute.instances.insert",
+            "receive_timestamp": "{{ timestamp.isoformat() }}",
+            "request": {
+                "@type": "type.googleapis.com/compute.instances.insert",
+                "name": "{{ instance_name }}",
+                "machineType": "projects/{{ project.project_id }}/zones/{{ zone.zone }}/machineTypes/{{ machine_type }}",
+                "networkInterfaces": [
+                    {
+                        "network": "projects/{{ project.project_id }}/global/networks/{{ network.network_name }}",
+                        "subnetwork": "projects/{{ project.project_id }}/regions/{{ zone.region }}/subnetworks/{{ network.subnet_name }}"
+                    }
+                ]
+            },
+            {{ request_metadata_block(src_ip, ua_value) }},
+            "resource": {
+                "labels": {
+                    "instance_id": "{{ new_instance_id if not is_error else '' }}",
+                    "project_id": "{{ project.project_id }}",
+                    "zone": "{{ zone.zone }}"
+                },
+                "type": "gce_instance"
+            },
+            "resource_location": {
+                "current_locations": ["{{ zone.zone }}"]
+            },
+            "resource_name": "projects/{{ project.project_id }}/zones/{{ zone.zone }}/instances/{{ instance_name }}",
+{%- if is_error %}
+            "status": {
+                "code": {{ error_code }},
+                "message": {{ error_message | tojson }}
+            },
+{%- else %}
+            "response": {
+                "@type": "type.googleapis.com/operation",
+                "id": "{{ module.rand.string.digits(19) }}",
+                "name": "operation-{{ module.rand.string.hex(12) }}",
+                "operationType": "insert",
+                "status": "RUNNING",
+                "targetLink": "https://www.googleapis.com/compute/v1/projects/{{ project.project_id }}/zones/{{ zone.zone }}/instances/{{ instance_name }}",
+                "zone": "https://www.googleapis.com/compute/v1/projects/{{ project.project_id }}/zones/{{ zone.zone }}"
+            },
+{%- endif %}
+            "service_name": "compute.googleapis.com",
+            "type": "type.googleapis.com/google.cloud.audit.AuditLog"
+        }
+    },
+    "log": {
+        "level": "{{ 'WARNING' if is_error else 'NOTICE' }}",
+        "logger": "projects/{{ project.project_id }}/logs/cloudaudit.googleapis.com%2Factivity"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ caller_email }}"]
+    },
+    "service": {
+        "name": "compute.googleapis.com"
+    },
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+    "tags": ["forwarded", "gcp-audit"],
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    }
+}

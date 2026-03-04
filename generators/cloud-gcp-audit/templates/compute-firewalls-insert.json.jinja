@@ -1,0 +1,123 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block_global, pick_caller, pick_user_agent, pick_source_ip, pick_error, authentication_info_block, request_metadata_block -%}
+{%- set project = samples.projects | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set event_id = module.rand.string.hex(16) -%}
+{%- set caller_data = pick_caller(samples.users, samples.service_accounts) -%}
+{%- set caller_type = caller_data.split("|||")[0] -%}
+{%- set caller_email = caller_data.split("|||")[1] -%}
+{%- set fw_name = module.rand.choice(["allow-ssh", "allow-https", "allow-internal", "allow-health-check", "deny-all-ingress", "allow-iap"]) ~ "-" ~ module.rand.string.hex(4) -%}
+{%- set network = samples.networks | random -%}
+{%- set direction = module.rand.weighted_choice(["INGRESS", "EGRESS"], [80, 20]) -%}
+{%- set protocol = module.rand.weighted_choice(["tcp", "udp", "icmp"], [70, 20, 10]) -%}
+{%- if protocol == "tcp" -%}
+    {%- set port = module.rand.choice(["22", "443", "80", "8080", "3306", "5432"]) -%}
+{%- elif protocol == "udp" -%}
+    {%- set port = module.rand.choice(["53", "123", "500"]) -%}
+{%- else -%}
+    {%- set port = "" -%}
+{%- endif -%}
+{%- set is_error = module.rand.chance(params.get('error_rate', 4) / 100.0) -%}
+{%- if is_error -%}
+    {%- set err_data = pick_error("v1.compute.firewalls.insert", samples.error_scenarios) -%}
+    {%- set error_code = err_data.split("|||")[0] -%}
+    {%- set error_message = err_data.split("|||")[1] -%}
+    {%- set outcome = "failure" -%}
+{%- else -%}
+    {%- set outcome = "success" -%}
+{%- endif -%}
+{%- set ua_value = pick_user_agent(caller_type, samples.user_agents) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block_global(project) }},
+    {{ ecs_block() }},
+    "event": {
+        "action": "v1.compute.firewalls.insert",
+        "category": ["network", "configuration"],
+        "dataset": "gcp.audit",
+        "id": "{{ event_id }}",
+        "kind": "event",
+        "module": "gcp",
+        "outcome": "{{ outcome }}",
+        "provider": "activity",
+        "type": ["creation", "{{ 'denied' if is_error else 'allowed' }}"]
+    },
+    "gcp": {
+        "audit": {
+            {{ authentication_info_block(caller_email) }},
+            "authorization_info": [
+                {
+                    "granted": {{ 'false' if is_error else 'true' }},
+                    "permission": "compute.firewalls.create",
+                    "resource_attributes": {
+                        "name": "projects/{{ project.project_id }}/global/firewalls/{{ fw_name }}",
+                        "service": "compute",
+                        "type": "compute.firewalls"
+                    }
+                }
+            ],
+            "method_name": "v1.compute.firewalls.insert",
+            "receive_timestamp": "{{ timestamp.isoformat() }}",
+            "request": {
+                "@type": "type.googleapis.com/compute.firewalls.insert",
+                "name": "{{ fw_name }}",
+                "network": "projects/{{ project.project_id }}/global/networks/{{ network.network_name }}",
+                "direction": "{{ direction }}",
+                "allowed": [
+                    {
+                        "IPProtocol": "{{ protocol }}"
+{%- if port %},
+                        "ports": ["{{ port }}"]
+{%- endif %}
+                    }
+                ],
+                "sourceRanges": ["{{ module.rand.choice(['0.0.0.0/0', '10.0.0.0/8', '192.168.0.0/16', '172.16.0.0/12']) }}"]
+            },
+            {{ request_metadata_block(src_ip, ua_value) }},
+            "resource": {
+                "labels": {
+                    "project_id": "{{ project.project_id }}"
+                },
+                "type": "gce_firewall_rule"
+            },
+            "resource_location": {
+                "current_locations": ["global"]
+            },
+            "resource_name": "projects/{{ project.project_id }}/global/firewalls/{{ fw_name }}",
+{%- if is_error %}
+            "status": {
+                "code": {{ error_code }},
+                "message": {{ error_message | tojson }}
+            },
+{%- else %}
+            "response": {
+                "@type": "type.googleapis.com/operation",
+                "id": "{{ module.rand.string.digits(19) }}",
+                "name": "operation-{{ module.rand.string.hex(12) }}",
+                "operationType": "insert",
+                "status": "RUNNING"
+            },
+{%- endif %}
+            "service_name": "compute.googleapis.com",
+            "type": "type.googleapis.com/google.cloud.audit.AuditLog"
+        }
+    },
+    "log": {
+        "level": "{{ 'WARNING' if is_error else 'NOTICE' }}",
+        "logger": "projects/{{ project.project_id }}/logs/cloudaudit.googleapis.com%2Factivity"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ caller_email }}"]
+    },
+    "service": {
+        "name": "compute.googleapis.com"
+    },
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+    "tags": ["forwarded", "gcp-audit"],
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    }
+}

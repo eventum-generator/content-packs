@@ -1,0 +1,127 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set user = module.rand.weighted_choice(samples.users | selectattr('role_type', 'equalto', 'admin') | list + samples.users | selectattr('role_type', 'equalto', 'maintenance') | list + samples.users | selectattr('role_type', 'equalto', 'superuser') | list, None) -%}
+{%- set db_entry = samples.databases | random -%}
+{%- set db_name = db_entry.name -%}
+{%- set schema_name = db_entry.schema -%}
+{%- set tbl = samples.tables | random -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_private_b(), "127.0.0.1"], [40, 40, 20]) -%}
+{%- set src_port = module.rand.number.integer(32768, 61000) -%}
+{%- set stmt_id = module.rand.number.integer(1, 500) -%}
+{%- set ddl_type = module.rand.weighted_choice(["CREATE INDEX", "ALTER TABLE", "CREATE TABLE", "DROP INDEX", "ALTER INDEX", "VACUUM", "ANALYZE", "REINDEX"], [20, 25, 10, 5, 5, 15, 15, 5]) -%}
+{%- set col_names = ["id", "email", "created_at", "updated_at", "status", "user_id", "name", "amount"] -%}
+{%- set col = module.rand.choice(col_names) -%}
+{%- set idx_name = "idx_" ~ tbl.name ~ "_" ~ col -%}
+{%- if ddl_type == "CREATE INDEX" -%}
+  {%- set stmt = "CREATE INDEX " ~ idx_name ~ " ON " ~ tbl.schema ~ "." ~ tbl.name ~ " (" ~ col ~ ")" -%}
+  {%- set obj_type = "INDEX" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ idx_name -%}
+{%- elif ddl_type == "ALTER TABLE" -%}
+  {%- set alter_action = module.rand.choice(["ADD COLUMN new_col TEXT", "ALTER COLUMN " ~ col ~ " SET NOT NULL", "ADD CONSTRAINT chk_" ~ col ~ " CHECK (" ~ col ~ " IS NOT NULL)"]) -%}
+  {%- set stmt = "ALTER TABLE " ~ tbl.schema ~ "." ~ tbl.name ~ " " ~ alter_action -%}
+  {%- set obj_type = "TABLE" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ tbl.name -%}
+{%- elif ddl_type == "CREATE TABLE" -%}
+  {%- set new_tbl = module.rand.choice(["temp_import", "staging_data", "archive_" ~ tbl.name, "backup_" ~ tbl.name]) -%}
+  {%- set stmt = "CREATE TABLE " ~ tbl.schema ~ "." ~ new_tbl ~ " (id serial PRIMARY KEY, data jsonb, created_at timestamptz DEFAULT now())" -%}
+  {%- set obj_type = "TABLE" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ new_tbl -%}
+{%- elif ddl_type == "DROP INDEX" -%}
+  {%- set stmt = "DROP INDEX IF EXISTS " ~ tbl.schema ~ "." ~ idx_name -%}
+  {%- set obj_type = "INDEX" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ idx_name -%}
+{%- elif ddl_type == "ALTER INDEX" -%}
+  {%- set stmt = "ALTER INDEX " ~ tbl.schema ~ "." ~ idx_name ~ " RENAME TO " ~ idx_name ~ "_old" -%}
+  {%- set obj_type = "INDEX" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ idx_name -%}
+{%- elif ddl_type == "VACUUM" -%}
+  {%- set stmt = "VACUUM (ANALYZE, VERBOSE) " ~ tbl.schema ~ "." ~ tbl.name -%}
+  {%- set obj_type = "TABLE" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ tbl.name -%}
+{%- elif ddl_type == "ANALYZE" -%}
+  {%- set stmt = "ANALYZE " ~ tbl.schema ~ "." ~ tbl.name -%}
+  {%- set obj_type = "TABLE" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ tbl.name -%}
+{%- else -%}
+  {%- set stmt = "REINDEX INDEX " ~ tbl.schema ~ "." ~ idx_name -%}
+  {%- set obj_type = "INDEX" -%}
+  {%- set obj_name = tbl.schema ~ "." ~ idx_name -%}
+{%- endif -%}
+{%- set duration_ms = module.rand.weighted_choice([module.rand.number.floating(1.0, 50.0), module.rand.number.floating(50.0, 500.0), module.rand.number.floating(500.0, 10000.0)], [40, 40, 20]) -%}
+{%- set audit_class = "MISC" if ddl_type in ["VACUUM", "ANALYZE", "REINDEX"] else "DDL" -%}
+{%- set audit_line = "AUDIT: SESSION," ~ stmt_id ~ ",1," ~ audit_class ~ "," ~ ddl_type ~ "," ~ obj_type ~ "," ~ obj_name ~ "," ~ stmt ~ ",<not logged>" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "{{ ddl_type }}",
+        "category": ["database"],
+        "dataset": "postgresql.log",
+        "duration": {{ (duration_ms * 1000000) | int }},
+        "kind": "event",
+        "module": "postgresql",
+        "outcome": "success",
+        "sequence": {{ seq }},
+        "type": ["admin"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "linux",
+            "kernel": "{{ host.os_kernel }}",
+            "name": "{{ host.os_name }}",
+            "platform": "{{ host.os_platform }}",
+            "type": "linux",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "log": {
+        "level": "LOG"
+    },
+    "message": "{{ audit_line }}",
+    "postgresql": {
+        "log": {
+            "database": "{{ db_name }}",
+            "query": "{{ stmt }}",
+            "query_name": "{{ ddl_type }}",
+            "timestamp": "{{ timestamp.strftime('%Y-%m-%d %H:%M:%S.%f') }} UTC"
+        }
+    },
+    "process": {
+        "pid": {{ pid }}
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ user.username }}"]
+    },
+    "server": {
+        "address": "{{ host.ip }}",
+        "port": {{ host.pg_port }}
+    },
+    "service": {
+        "type": "postgresql"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "user": {
+        "name": "{{ user.username }}"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

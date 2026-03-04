@@ -1,0 +1,90 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, cloud_block, event_block, source_block, user_block, related_block, pick_source_ip, pick_user_agent, device_detail_block, client_app_for_ua, geo_block, pick_risk_level -%}
+{%- set user = samples.users | random -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set location = samples.locations | random -%}
+{%- set event_id = module.rand.crypto.uuid4() -%}
+{%- set correlation_id = module.rand.crypto.uuid4() -%}
+{%- set app = samples.applications.weighted_pick('weight') -%}
+{%- set ua_type = module.rand.weighted_choice(["browser_windows", "outlook_desktop", "teams_desktop", "sdk"], [20, 25, 25, 30]) -%}
+{%- set ua_value = pick_user_agent(ua_type, samples.user_agents) -%}
+{%- set client_app = client_app_for_ua(ua_type) -%}
+{%- set risk = pick_risk_level("failure") -%}
+{#- Non-interactive failure errors (token refresh issues mostly) -#}
+{%- set error_choices = [
+    {"code": 50173, "detail": "FreshTokenNeeded", "message": "The provided grant has expired due to it being revoked, and a fresh auth token is needed."},
+    {"code": 70008, "detail": "ExpiredOrRevokedGrant", "message": "The refresh token has expired due to inactivity."},
+    {"code": 50078, "detail": "UserStrongAuthExpired", "message": "Presented multi-factor authentication has expired due to policies configured by your administrator."},
+    {"code": 50058, "detail": "UserInformationNotProvided", "message": "A silent sign-in request was sent but no user is signed in."},
+    {"code": 700016, "detail": "ApplicationNotFound", "message": "The application was not found in the directory."},
+    {"code": 50144, "detail": "InvalidPasswordExpiredOnPremPassword", "message": "User's Active Directory password has expired."}
+] -%}
+{%- set error = module.rand.choice(error_choices) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ cloud_block(params) }},
+    {{ ecs_block() }},
+    {{ event_block("UserLoginFailed", ["authentication"], event_id, "failure", ["info", "denied"], "azure.signinlogs", "azure") }},
+    {{ source_block(src_ip) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    },
+    {{ related_block([src_ip], [user.upn.split('@')[0], user.upn]) }},
+    {{ geo_block(location) }},
+    "azure": {
+        "signinlogs": {
+            "category": "NonInteractiveUserSignInLogs",
+            "operation_name": "Sign-in activity",
+            "result_type": "{{ error.code }}",
+            "result_description": {{ error.message | tojson }},
+            "properties": {
+                "id": "{{ event_id }}",
+                "created_at": "{{ timestamp.isoformat() }}",
+                "user_display_name": {{ user.display_name | tojson }},
+                "user_principal_name": {{ user.upn | tojson }},
+                "user_id": "{{ user.object_id }}",
+                "app_id": "{{ app.id }}",
+                "app_display_name": {{ app.name | tojson }},
+                "ip_address": "{{ src_ip }}",
+                "client_app_used": {{ client_app | tojson }},
+                "conditional_access_status": "notApplied",
+                "is_interactive": false,
+                "token_issuer_name": "",
+                "token_issuer_type": "AzureAD",
+                "processing_time_in_milliseconds": {{ module.rand.number.integer(10, 300) }},
+                "risk_detail": "none",
+                "risk_level_aggregated": {{ risk | tojson }},
+                "risk_level_during_signin": {{ risk | tojson }},
+                "risk_state": "{{ "atRisk" if risk != "none" else "none" }}",
+                "resource_display_name": {{ app.name | tojson }},
+                "resource_id": "{{ app.id }}",
+                "status": {
+                    "error_code": {{ error.code }},
+                    "failure_reason": {{ error.message | tojson }},
+                    "additional_details": {{ error.detail | tojson }}
+                },
+                "location": {
+                    "city": {{ location.city | tojson }},
+                    "state": {{ location.state | tojson }},
+                    "country_or_region": {{ location.country_or_region | tojson }},
+                    "geo_coordinates": {
+                        "latitude": {{ location.latitude }},
+                        "longitude": {{ location.longitude }}
+                    }
+                },
+                {{ device_detail_block(ua_type) }},
+                "authentication_details": [],
+                "applied_conditional_access_policies": [],
+                "user_agent": {{ ua_value | tojson }},
+                "correlation_id": "{{ correlation_id }}",
+                "user_type": "member",
+                "original_transfer_method": "none",
+                "home_tenant_id": "{{ params.tenant_id }}",
+                "resource_tenant_id": "{{ params.tenant_id }}"
+            },
+            "tenant_id": "{{ params.tenant_id }}",
+            "correlation_id": "{{ correlation_id }}"
+        }
+    }
+}
