@@ -30,7 +30,7 @@ cd content-packs
 eventum generate \
   --path generators/windows-security/generator.yml \
   --id winlog \
-  --live-mode
+  --live-mode true
 ```
 
 Events are written to `output/events.json` inside the generator directory as JSON, one per line:
