@@ -93,7 +93,7 @@ eventum generate \
   --id winlog \
   --live-mode true
 
-# Batch mode — generates a batch and exits
+# Live mode — generates as fast as possible untill stopped
 eventum generate \
   --path generators/windows-security/generator.yml \
   --id winlog \
