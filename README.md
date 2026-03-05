@@ -91,7 +91,7 @@ Each generator is **self-contained** — all file paths are relative to the gene
 eventum generate \
   --path generators/windows-security/generator.yml \
   --id winlog \
-  --live-mode
+  --live-mode true
 
 # Batch mode — generates a batch and exits
 eventum generate \
