@@ -64,13 +64,13 @@ output:
 ```bash
 # Live mode (5 events/second)
 eventum generate \
-  --path generators/crowdstrike-falcon/generator.yml \
+  --path generators/security-crowdstrike-falcon/generator.yml \
   --id falcon \
   --live-mode
 
 # Batch mode (generate as fast as possible)
 eventum generate \
-  --path generators/crowdstrike-falcon/generator.yml \
+  --path generators/security-crowdstrike-falcon/generator.yml \
   --id falcon \
   --live-mode false
 ```
@@ -80,7 +80,7 @@ eventum generate \
 ```yaml
 generators:
   falcon:
-    path: generators/crowdstrike-falcon/generator.yml
+    path: generators/security-crowdstrike-falcon/generator.yml
 ```
 
 ## Sample Output
@@ -144,7 +144,7 @@ generators:
 ## File Structure
 
 ```
-generators/crowdstrike-falcon/
+generators/security-crowdstrike-falcon/
   generator.yml                                    # Pipeline config
   README.md                                        # This file
   templates/
