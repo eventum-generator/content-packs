@@ -25,7 +25,7 @@ eventum generate --path generators/<name>/generator.yml --id test --live-mode fa
 ### Generator naming
 
 - Format: `<category>-<source>` — lowercase, hyphen-separated
-- Categories: `windows`, `linux`, `network`, `web`, `cloud`, `security`
+- Categories: `windows`, `linux`, `network`, `web`, `cloud`, `security`, `email`, `vpn`, `proxy`, `database`, `identity`
 
 ### Template naming
 
@@ -51,16 +51,16 @@ eventum generate --path generators/<name>/generator.yml --id test --live-mode fa
 
 ### Realism techniques
 
-- Prefer `template` event plugin if possible
-- Use `chance` picking mode for realistic event type distributions (e.g., 70% Event 4624, 20% Event 4688, 10% Event 4625)
-- Use `shared` state for monotonic counters (`record_id`), active sessions, correlation IDs
+- **Picking mode**: Choose based on data source behavior — `fsm` for sessions (VPN, auth), `chance` for independent events, `chain` for ordered pairs, `time_patterns` input for time-varying sources. See decision trees in `../eventum/.claude/agents/generator-builder.md`.
+- Use `shared` state for cross-template correlation (session pools, record IDs)
+- Use `locals` for per-template counters and drift values
+- Use `vars` to reuse one template with different bindings when event types share >70% structure
 - Use `module.rand.weighted_choice()` for status codes, logon types, protocols
-- Use sample CSV files for usernames, hostnames, process paths, URLs
-- Use value drift (`locals`) for metrics/counters that change gradually
-- Vary IPs, ports, SIDs consistently within a session using `shared` state
-- Use `time_patterns` input plugins where relevant
-- Use template modules `faker` and `mimesis` if needed
-- Use `fsm` (finite state machine) picking mode for session state transitions
+- Use appropriate distributions: `lognormal` for bytes, `exponential` for durations, `gauss` for metrics — never `integer(a,b)` for naturally skewed data
+- Use sample CSV/JSON files for usernames, hostnames, process paths, URLs
+- Use `time_patterns` input for sources with time-varying frequency (web, auth, email)
+- Use macros to DRY shared JSON blocks across templates
+- Always include `related.*` fields for SIEM correlation
 
 ### generator.yml conventions
 
@@ -71,9 +71,11 @@ input:
       expression: "* * * * * *"
       count: 5
 
-# Default output: stdout for easy testing
+# Default output: file with JSON formatter
 output:
-  - stdout:
+  - file:
+      path: output/events.json
+      write_mode: overwrite
       formatter:
         format: json
 ```
