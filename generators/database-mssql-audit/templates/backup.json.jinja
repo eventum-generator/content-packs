@@ -1,0 +1,111 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set instance = hostname ~ '\\\\' ~ host.instance_name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set txn_id = shared.get('txn_id:' ~ hostname, 100000) -%}
+{#- Backups are typically run by service accounts or sa -#}
+{%- set login = module.rand.weighted_choice(
+  samples.logins | selectattr('login_name', 'equalto', 'sa') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'svc_scheduler') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'dba_ops') | list,
+  None) -%}
+{%- if login.login_type == 'windows' -%}
+  {%- set server_principal = login.domain ~ '\\\\' ~ login.login_name -%}
+  {%- set user_domain = login.domain -%}
+  {%- set user_name = login.login_name -%}
+{%- else -%}
+  {%- set server_principal = login.login_name -%}
+  {%- set user_domain = "" -%}
+  {%- set user_name = login.login_name -%}
+{%- endif -%}
+{%- set session_id = module.rand.number.integer(50, 500) -%}
+{%- set src_ip = "127.0.0.1" -%}
+{%- set app_name = module.rand.weighted_choice(["SQLAgent - TSQL JobStep", "SQLCMD", login.app_name], [50, 30, 20]) -%}
+{%- set client_host = hostname -%}
+{#- Pick database to back up (not master) -#}
+{%- set db_entry = samples.databases | reject('equalto', samples.databases | last) | list | random -%}
+{%- set db_name = db_entry.name -%}
+{#- Build statement -#}
+{%- set query_entry = samples.stmts_backup | random -%}
+{%- set raw_stmt = query_entry.stmt -%}
+{%- set stmt = raw_stmt | replace('{db}', db_name) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "database-backup",
+        "category": ["database"],
+        "code": "33205",
+        "dataset": "microsoft_sqlserver.audit",
+        "kind": "event",
+        "module": "microsoft_sqlserver",
+        "outcome": "success",
+        "sequence": {{ seq }},
+        "type": ["info"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "name": "{{ host.os_name }}",
+            "type": "windows",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ host.ip }}"],
+        "user": ["{{ user_name }}"]
+    },
+    "service": {
+        "type": "microsoft_sqlserver"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ module.rand.number.integer(49152, 65535) }}
+    },
+    "sqlserver": {
+        "audit": {
+            "action_id": "BA",
+            "additional_information": "",
+            "application_name": "{{ app_name }}",
+            "class_type": "DB",
+            "client_ip": "{{ src_ip }}",
+            "database_name": "{{ db_name }}",
+            "database_principal_name": "dbo",
+            "host_name": "{{ client_host }}",
+            "object_name": "{{ db_name }}",
+            "schema_name": "",
+            "sequence_number": {{ seq }},
+            "server_instance_name": "{{ instance }}",
+            "server_principal_name": "{{ server_principal }}",
+            "session_id": {{ session_id }},
+            "statement": {{ stmt | tojson }},
+            "succeeded": 1,
+            "transaction_id": {{ txn_id }}
+        }
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "event_id": "33205",
+        "provider_name": "MSSQLSERVER$AUDIT"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}
+{%- do shared.set('txn_id:' ~ hostname, txn_id + 1) -%}

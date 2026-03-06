@@ -1,0 +1,244 @@
+{%- set seq_num = shared.get('sequence_number', 100000) -%}
+{%- set flow_id = shared.get('flow_id', 500000) -%}
+{%- set hostname = params.hostname -%}
+{#- Zone flow selection (weighted) -#}
+{%- set flow_dir = module.rand.weighted_choice(["outbound", "inbound_dmz", "internal", "dmz_to_internal"], [70, 15, 10, 5]) -%}
+{#- Derive zones, interfaces, NAT behavior, and IPs from flow direction -#}
+{%- if flow_dir == "outbound" -%}
+  {%- set src_zone = "trust" -%}
+  {%- set dst_zone = "untrust" -%}
+  {%- set ingress_if = "ethernet1/2" -%}
+  {%- set egress_if = "ethernet1/1" -%}
+  {%- set has_nat = true -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set dst_ip = module.rand.network.ip_v4_public() -%}
+  {%- set dst_country = module.rand.weighted_choice(["United States", "Germany", "United Kingdom", "Netherlands", "Ireland", "Japan", "Canada", "France", "Australia", "Singapore"], [35, 10, 10, 8, 8, 7, 7, 5, 5, 5]) -%}
+  {%- set src_country = params.src_network -%}
+{%- elif flow_dir == "inbound_dmz" -%}
+  {%- set src_zone = "untrust" -%}
+  {%- set dst_zone = "dmz" -%}
+  {%- set ingress_if = "ethernet1/1" -%}
+  {%- set egress_if = "ethernet1/3" -%}
+  {%- set has_nat = false -%}
+  {%- set src_ip = module.rand.network.ip_v4_public() -%}
+  {%- set srv = samples.server_hosts | random -%}
+  {%- set dst_ip = srv.ip -%}
+  {%- set src_country = module.rand.weighted_choice(["United States", "Germany", "United Kingdom", "China", "Netherlands", "Russia", "Japan", "Brazil", "India", "France"], [30, 10, 10, 8, 8, 7, 7, 7, 7, 6]) -%}
+  {%- set dst_country = params.src_network -%}
+{%- elif flow_dir == "internal" -%}
+  {%- set src_zone = "trust" -%}
+  {%- set dst_zone = "trust" -%}
+  {%- set ingress_if = "ethernet1/2" -%}
+  {%- set egress_if = "ethernet1/2" -%}
+  {%- set has_nat = false -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set src_ip = src_host.ip -%}
+  {%- set srv = samples.server_hosts | random -%}
+  {%- set dst_ip = srv.ip -%}
+  {%- set src_country = params.src_network -%}
+  {%- set dst_country = params.src_network -%}
+{%- else -%}
+  {%- set src_zone = "dmz" -%}
+  {%- set dst_zone = "trust" -%}
+  {%- set ingress_if = "ethernet1/3" -%}
+  {%- set egress_if = "ethernet1/2" -%}
+  {%- set has_nat = false -%}
+  {%- set srv = samples.server_hosts | random -%}
+  {%- set src_ip = srv.ip -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dst_ip = dst_host.ip -%}
+  {%- set src_country = params.src_network -%}
+  {%- set dst_country = params.src_network -%}
+{%- endif -%}
+{#- Application selection (weighted) -#}
+{%- set application = samples.applications.weighted_pick('weight') -%}
+{%- set app_protocol = application.protocol -%}
+{%- set dst_port = application.port -%}
+{%- if dst_port == 0 -%}
+  {%- set dst_port = module.rand.number.integer(1024, 65535) -%}
+{%- endif -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{#- Username (only for trust-originating flows) -#}
+{%- if src_zone == "trust" -%}
+  {%- set username = (samples.usernames | random).username -%}
+{%- else -%}
+  {%- set username = "" -%}
+{%- endif -%}
+{#- Security rule (weighted, matching zone pair) -#}
+{%- set matching_rules = [] -%}
+{%- set matching_weights = [] -%}
+{%- for r in samples.security_rules -%}
+  {%- if r.action == "allow" and (r.src_zone == src_zone or r.src_zone == "any") and (r.dst_zone == dst_zone or r.dst_zone == "any") -%}
+    {%- do matching_rules.append(r) -%}
+    {%- do matching_weights.append(r.weight) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if matching_rules | length > 0 -%}
+  {%- set rule = module.rand.weighted_choice(matching_rules, matching_weights) -%}
+{%- else -%}
+  {%- set rule = {"name": "Allow-Business-Web"} -%}
+{%- endif -%}
+{#- URL category (weighted) -#}
+{%- set url_cat = samples.url_categories.weighted_pick('weight') -%}
+{#- Session and community IDs -#}
+{%- set session_id = flow_id -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{#- NAT fields -#}
+{%- if has_nat -%}
+  {%- set nat_src_ip = params.nat_ip -%}
+  {%- set nat_src_port = module.rand.number.integer(10000, 60000) -%}
+  {%- set nat_dst_ip = dst_ip -%}
+  {%- set nat_dst_port = dst_port -%}
+{%- else -%}
+  {%- set nat_src_ip = "0.0.0.0" -%}
+  {%- set nat_src_port = 0 -%}
+  {%- set nat_dst_ip = "0.0.0.0" -%}
+  {%- set nat_dst_port = 0 -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "bytes": 0,
+        "geo": {
+            "name": "{{ dst_country }}"
+        },
+        "ip": "{{ dst_ip }}",
+        "packets": 0,
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "flow_started",
+        "category": ["network"],
+        "dataset": "panw.panos",
+        "kind": "event",
+        "module": "panw",
+        "outcome": "success",
+        "type": ["connection", "start", "allowed"]
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "labels": {
+        "nat_translated": {{ has_nat | tojson }}
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 1,
+                "name": "user-level"
+            },
+            "hostname": "{{ hostname }}",
+            "priority": 14,
+            "severity": {
+                "code": 6,
+                "name": "Informational"
+            }
+        }
+    },
+    "network": {
+        "application": "{{ application.name }}",
+        "bytes": 0,
+        "community_id": "{{ community_id }}",
+        "direction": "{% if flow_dir == 'outbound' %}outbound{% elif flow_dir == 'inbound_dmz' %}inbound{% else %}internal{% endif %}",
+        "packets": 0,
+        "transport": "{{ app_protocol }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ egress_if }}"
+            },
+            "zone": "{{ dst_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ ingress_if }}"
+            },
+            "zone": "{{ src_zone }}"
+        },
+        "product": "PAN-OS",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Palo Alto Networks"
+    },
+    "panw": {
+        "panos": {
+            "action": "allow",
+            "action_flags": "0x0",
+            "bytes_received": 0,
+            "bytes_sent": 0,
+            "elapsed_time": 0,
+            "flow_id": "{{ session_id }}",
+            "generated_time": "{{ timestamp.isoformat() }}",
+            "log_profile": "{{ params.log_profile }}",
+            "nat": {
+                "dst": {
+                    "ip": "{{ nat_dst_ip }}",
+                    "port": {{ nat_dst_port }}
+                },
+                "src": {
+                    "ip": "{{ nat_src_ip }}",
+                    "port": {{ nat_src_port }}
+                }
+            },
+            "packets_received": 0,
+            "packets_sent": 0,
+            "received_time": "{{ timestamp.isoformat() }}",
+            "repeat_count": 1,
+            "ruleset": "{{ rule.name }}",
+            "sequence_number": "{{ seq_num }}",
+            "session_flags": "0x400000",
+            "sub_type": "start",
+            "type": "TRAFFIC",
+            "url": {
+                "category": "{{ url_cat.category }}"
+            },
+            "virtual_sys": "{{ params.virtual_sys }}"
+        }
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}"{% if has_nat %}, "{{ nat_src_ip }}"{% endif %}],
+        "user": [{% if username %}"{{ username }}"{% endif %}]
+    },
+    "rule": {
+        "name": "{{ rule.name }}"
+    },
+    "source": {
+        "bytes": 0,
+        "geo": {
+            "name": "{{ src_country }}"
+        },
+        "ip": "{{ src_ip }}",
+        {% if has_nat %}"nat": {
+            "ip": "{{ nat_src_ip }}",
+            "port": {{ nat_src_port }}
+        },
+        {% endif %}"packets": 0,
+        "port": {{ src_port }},
+        "user": {
+            "domain": "{{ params.domain }}",
+            "name": "{{ username }}"
+        }
+    },
+    "user": {
+        "domain": "{{ params.domain }}",
+        "name": "{{ username }}"
+    }
+}
+{%- do shared.set('sequence_number', (seq_num + 1) % 2147483647) -%}
+{%- do shared.set('flow_id', (flow_id + 1) % 2147483647) -%}

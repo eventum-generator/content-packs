@@ -1,0 +1,88 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set mail = samples.mail_addresses | random -%}
+{%- set email = mail.local_part ~ '@' ~ mail.domain -%}
+{#- Pick variant -#}
+{%- set variant = module.rand.weighted_choice(['delivery', 'connect', 'disconnect'], [50, 25, 25]) -%}
+{%- set queue_id = module.rand.string.hex(10) | upper -%}
+{%- if variant == 'delivery' -%}
+  {%- set delay = module.rand.number.floating(0.01, 5.0) | round(2) -%}
+  {%- set delays = module.rand.number.floating(0.0, 0.5) | round(2) ~ '/' ~ module.rand.number.floating(0.0, 0.1) | round(2) ~ '/' ~ module.rand.number.floating(0.0, 0.5) | round(2) ~ '/' ~ module.rand.number.floating(0.01, 2.0) | round(2) -%}
+  {%- set dsn = module.rand.weighted_choice(['2.0.0', '4.7.1', '5.1.1'], [90, 5, 5]) -%}
+  {%- set status = 'sent' if dsn == '2.0.0' else 'deferred' if dsn == '4.7.1' else 'bounced' -%}
+  {%- set detail = '250 2.0.0 Ok: queued as ' ~ module.rand.string.hex(10) | upper if status == 'sent' else 'Connection timed out' if status == 'deferred' else 'User unknown' -%}
+  {%- set msg = queue_id ~ ': to=<' ~ email ~ '>, relay=' ~ mail.relay_host ~ '[' ~ mail.relay_ip ~ ']:25, delay=' ~ delay ~ ', delays=' ~ delays ~ ', dsn=' ~ dsn ~ ', status=' ~ status ~ ' (' ~ detail ~ ')' -%}
+  {%- set proc_name = 'postfix/smtp' -%}
+{%- elif variant == 'connect' -%}
+  {%- set remote_ip = module.rand.weighted_choice([params.network_prefix ~ '.' ~ module.rand.number.integer(1, 254) ~ '.' ~ module.rand.number.integer(1, 254), module.rand.network.ip_v4_public()], [40, 60]) -%}
+  {%- set remote_host = 'unknown' -%}
+  {%- set msg = 'connect from ' ~ remote_host ~ '[' ~ remote_ip ~ ']' -%}
+  {%- set proc_name = 'postfix/smtpd' -%}
+{%- else -%}
+  {%- set remote_ip = module.rand.weighted_choice([params.network_prefix ~ '.' ~ module.rand.number.integer(1, 254) ~ '.' ~ module.rand.number.integer(1, 254), module.rand.network.ip_v4_public()], [40, 60]) -%}
+  {%- set remote_host = 'unknown' -%}
+  {%- set cmds = module.rand.number.integer(3, 8) -%}
+  {%- set msg = 'disconnect from ' ~ remote_host ~ '[' ~ remote_ip ~ '] ehlo=1 mail=1 rcpt=1 data=1 quit=1 commands=' ~ cmds -%}
+  {%- set proc_name = 'postfix/smtpd' -%}
+{%- endif -%}
+{#- PRI: facility=mail(2) * 8 + severity=info(6) = 22 -#}
+{%- set pri = 22 -%}
+{%- set syslog_msg = '<' ~ pri ~ '>' ~ timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ hostname ~ ' ' ~ proc_name ~ '[' ~ pid ~ ']: ' ~ msg -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "event": {
+        "original": {{ syslog_msg | tojson }},
+        "dataset": "system.syslog",
+        "module": "system",
+        "kind": "event",
+        "category": ["network"],
+        "type": ["info"]
+    },
+    "message": {{ msg | tojson }},
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "os": {
+            "name": "{{ host.os_name }}",
+            "version": "{{ host.os_version }}",
+            "kernel": "{{ host.os_kernel }}",
+            "platform": "{{ host.os_platform }}"
+        }
+    },
+    "process": {
+        "name": "{{ proc_name }}",
+        "pid": {{ pid }}
+    },
+    "agent": {
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ fqdn }}",
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}"
+    },
+    "log": {
+        "file": {
+            "path": "{{ host.syslog_path }}"
+        },
+        "offset": {{ seq }}
+    },
+    "data_stream": {
+        "type": "logs",
+        "dataset": "system.syslog",
+        "namespace": "default"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"]
+    },
+    "system": {
+        "syslog": {}
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

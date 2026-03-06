@@ -1,0 +1,80 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{#- Pick variant -#}
+{%- set variant = module.rand.weighted_choice(['start', 'imuxsock', 'logrotate'], [40, 30, 30]) -%}
+{%- if variant == 'start' -%}
+  {%- set msg = '[origin software="rsyslogd" swVersion="8.2302.0" x-pid="' ~ pid ~ '" x-info="https://www.rsyslog.com"] start' -%}
+  {%- set proc_name = 'rsyslogd' -%}
+{%- elif variant == 'imuxsock' -%}
+  {%- set msg = 'imuxsock: Begining to drop messages due to rate-limiting' if module.rand.chance(0.3) else 'imuxsock: Begin running UxRcvMainQ' -%}
+  {%- set proc_name = 'rsyslogd' -%}
+{%- else -%}
+  {%- set log_path = module.rand.choice(['/var/log/syslog', '/var/log/auth.log', '/var/log/kern.log', '/var/log/mail.log', '/var/log/daemon.log']) -%}
+  {%- set msg = 'file ' ~ log_path ~ ' rotated' -%}
+  {%- set proc_name = 'logrotate' -%}
+{%- endif -%}
+{#- PRI: facility=syslog(5) * 8 + severity=info(6) = 46 -#}
+{%- set pri = 46 -%}
+{%- if proc_name == 'logrotate' -%}
+  {%- set syslog_msg = '<' ~ pri ~ '>' ~ timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ hostname ~ ' logrotate[' ~ pid ~ ']: ' ~ msg -%}
+{%- else -%}
+  {%- set syslog_msg = '<' ~ pri ~ '>' ~ timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ hostname ~ ' rsyslogd[' ~ pid ~ ']: ' ~ msg -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "event": {
+        "original": {{ syslog_msg | tojson }},
+        "dataset": "system.syslog",
+        "module": "system",
+        "kind": "event",
+        "category": ["process"],
+        "type": ["info"]
+    },
+    "message": {{ msg | tojson }},
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "os": {
+            "name": "{{ host.os_name }}",
+            "version": "{{ host.os_version }}",
+            "kernel": "{{ host.os_kernel }}",
+            "platform": "{{ host.os_platform }}"
+        }
+    },
+    "process": {
+        "name": "{{ proc_name }}",
+        "pid": {{ pid }}
+    },
+    "agent": {
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ fqdn }}",
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}"
+    },
+    "log": {
+        "file": {
+            "path": "{{ host.syslog_path }}"
+        },
+        "offset": {{ seq }}
+    },
+    "data_stream": {
+        "type": "logs",
+        "dataset": "system.syslog",
+        "namespace": "default"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"]
+    },
+    "system": {
+        "syslog": {}
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

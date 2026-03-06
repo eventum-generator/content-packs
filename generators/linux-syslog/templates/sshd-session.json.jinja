@@ -1,0 +1,91 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{#- Pick variant -#}
+{%- set variant = module.rand.weighted_choice(['opened', 'closed', 'disconnect'], [45, 45, 10]) -%}
+{#- Try to use a correlated session for close/disconnect -#}
+{%- set ssh_sessions = shared.get('ssh_sessions:' ~ hostname, []) -%}
+{%- if variant in ['closed', 'disconnect'] and ssh_sessions | length > 0 -%}
+  {%- set session = ssh_sessions.pop(0) -%}
+  {%- do shared.set('ssh_sessions:' ~ hostname, ssh_sessions) -%}
+  {%- set user = session.user -%}
+  {%- set session_ip = session.ip -%}
+  {%- set session_port = session.port -%}
+{%- else -%}
+  {%- set u = samples.usernames | random -%}
+  {%- set user = u.username -%}
+  {%- set session_ip = params.network_prefix ~ '.' ~ module.rand.number.integer(1, 254) ~ '.' ~ module.rand.number.integer(1, 254) -%}
+  {%- set session_port = module.rand.number.integer(32768, 60999) -%}
+{%- endif -%}
+{%- set uid = module.rand.number.integer(0, 1200) -%}
+{%- if variant == 'opened' -%}
+  {%- set msg = 'pam_unix(sshd:session): session opened for user ' ~ user ~ '(uid=' ~ uid ~ ') by (uid=0)' -%}
+{%- elif variant == 'closed' -%}
+  {%- set msg = 'pam_unix(sshd:session): session closed for user ' ~ user -%}
+{%- else -%}
+  {%- set msg = 'Disconnected from user ' ~ user ~ ' ' ~ session_ip ~ ' port ' ~ session_port -%}
+{%- endif -%}
+{#- PRI: facility=authpriv(10) * 8 + severity=info(6) = 86 -#}
+{%- set pri = 86 -%}
+{%- set syslog_msg = '<' ~ pri ~ '>' ~ timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ hostname ~ ' sshd[' ~ pid ~ ']: ' ~ msg -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "event": {
+        "original": {{ syslog_msg | tojson }},
+        "dataset": "system.syslog",
+        "module": "system",
+        "kind": "event",
+        "category": ["session"],
+        "type": ["info"]
+    },
+    "message": {{ msg | tojson }},
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "os": {
+            "name": "{{ host.os_name }}",
+            "version": "{{ host.os_version }}",
+            "kernel": "{{ host.os_kernel }}",
+            "platform": "{{ host.os_platform }}"
+        }
+    },
+    "process": {
+        "name": "sshd",
+        "pid": {{ pid }}
+    },
+    "agent": {
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ fqdn }}",
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}"
+    },
+    "log": {
+        "file": {
+            "path": "{{ host.syslog_path }}"
+        },
+        "offset": {{ seq }}
+    },
+    "data_stream": {
+        "type": "logs",
+        "dataset": "system.syslog",
+        "namespace": "default"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "user": ["{{ user }}"]
+    },
+    "user": {
+        "name": "{{ user }}"
+    },
+    "system": {
+        "syslog": {}
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

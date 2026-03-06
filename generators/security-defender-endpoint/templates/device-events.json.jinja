@@ -1,0 +1,112 @@
+{%- set host = samples.hosts.pick() -%}
+{%- set fqdn = host.name ~ '.' ~ params.fqdn_suffix -%}
+{%- set report_id = shared.get('report_id:' ~ host.device_id, 1000) -%}
+{%- do shared.set('report_id:' ~ host.device_id, report_id + 1) -%}
+{%- set action_type = module.rand.weighted_choice({"AntivirusScanCompleted": 30, "UsbDriveMounted": 15, "FirewallInboundConnectionBlocked": 25, "ServiceInstalled": 15, "ScheduledTaskCreated": 15}) -%}
+{#- Pick an initiating process from pool or sample -#}
+{%- set proc_pool = shared.get('proc_pool:' ~ host.device_id, []) -%}
+{%- if proc_pool | length > 0 -%}
+  {%- set proc = proc_pool | random -%}
+{%- else -%}
+  {%- set proc = samples.processes.pick() -%}
+{%- endif -%}
+{#- Determine account based on integrity level -#}
+{%- if proc.integrity_level == "System" -%}
+  {%- set acct_domain = "NT AUTHORITY" -%}
+  {%- set acct_name = "system" -%}
+  {%- set acct_sid = "S-1-5-18" -%}
+  {%- set acct_upn = "" -%}
+  {%- set acct_oid = "00000000-0000-0000-0000-000000000000" -%}
+  {%- set token_elevation = "TokenElevationTypeDefault" -%}
+{%- elif proc.integrity_level == "High" -%}
+  {%- set user = samples.usernames.pick() -%}
+  {%- set acct_domain = params.domain -%}
+  {%- set acct_name = user.username -%}
+  {%- set acct_sid = user.sid -%}
+  {%- set acct_upn = user.upn -%}
+  {%- set acct_oid = user.object_id -%}
+  {%- set token_elevation = "TokenElevationTypeFull" -%}
+{%- else -%}
+  {%- set user = samples.usernames.pick() -%}
+  {%- set acct_domain = params.domain -%}
+  {%- set acct_name = user.username -%}
+  {%- set acct_sid = user.sid -%}
+  {%- set acct_upn = user.upn -%}
+  {%- set acct_oid = user.object_id -%}
+  {%- set token_elevation = "TokenElevationTypeLimited" -%}
+{%- endif -%}
+{%- set logon_id = module.rand.number.integer(1000000, 9999999) -%}
+{%- set proc_pid = module.rand.number.integer(1000, 65535) -%}
+{%- set proc_creation = (timestamp - module.datetime.timedelta(seconds=module.rand.number.integer(10, 600))).strftime('%Y-%m-%dT%H:%M:%S.%f') ~ 'Z' -%}
+{%- set proc_parent_pid = module.rand.number.integer(1000, 65535) -%}
+{%- set proc_parent_creation = (timestamp - module.datetime.timedelta(seconds=module.rand.number.integer(600, 86400))).strftime('%Y-%m-%dT%H:%M:%S.%f') ~ 'Z' -%}
+{#- Build AdditionalFields based on action type -#}
+{%- if action_type == "AntivirusScanCompleted" -%}
+  {%- set scan_type = module.rand.choice(["QuickScan", "FullScan"]) -%}
+  {%- set items_scanned = module.rand.number.integer(50000, 500000) -%}
+  {%- set threats_found = module.rand.weighted_choice({0: 95, 1: 4, 2: 1}) -%}
+  {%- set additional = '{"ScanType": "' ~ scan_type ~ '", "ItemsScanned": ' ~ items_scanned ~ ', "ThreatsFound": ' ~ threats_found ~ '}' -%}
+{%- elif action_type == "UsbDriveMounted" -%}
+  {%- set drive_letter = module.rand.choice(["E:", "F:", "G:", "H:"]) -%}
+  {%- set vendor = module.rand.choice(["SanDisk", "Kingston", "Samsung", "Seagate"]) -%}
+  {%- set product = module.rand.choice(["Ultra USB 3.0", "DataTraveler", "Flash Drive", "Portable SSD"]) -%}
+  {%- set serial = module.rand.string.hex(16) | upper -%}
+  {%- set additional = '{"DriveLetter": "' ~ drive_letter ~ '", "Vendor": "' ~ vendor ~ '", "Product": "' ~ product ~ '", "SerialNumber": "' ~ serial ~ '"}' -%}
+{%- elif action_type == "FirewallInboundConnectionBlocked" -%}
+  {%- set blocked_ip = module.rand.network.ip_v4_public() -%}
+  {%- set blocked_port = module.rand.choice([22, 23, 80, 135, 445, 3389, 4444, 5900, 8080]) -%}
+  {%- set fw_protocol = module.rand.choice(["TCP", "UDP"]) -%}
+  {%- set additional = '{"RemoteIP": "' ~ blocked_ip ~ '", "RemotePort": ' ~ blocked_port ~ ', "Protocol": "' ~ fw_protocol ~ '"}' -%}
+{%- elif action_type == "ServiceInstalled" -%}
+  {%- set svc_name = module.rand.choice(["WinDefend", "wuauserv", "BITS", "Spooler", "Schedule", "EventLog", "CryptSvc"]) -%}
+  {%- set svc_display = module.rand.choice(["Windows Defender", "Windows Update", "BITS", "Print Spooler", "Task Scheduler", "Event Log", "Cryptographic Services"]) -%}
+  {%- set svc_start = module.rand.choice(["Automatic", "Manual", "Disabled"]) -%}
+  {%- set additional = '{"ServiceName": "' ~ svc_name ~ '", "ServiceDisplayName": "' ~ svc_display ~ '", "ServiceStartType": "' ~ svc_start ~ '"}' -%}
+{%- elif action_type == "ScheduledTaskCreated" -%}
+  {%- set task_name = module.rand.choice(["\\Microsoft\\Windows\\UpdateOrchestrator\\Schedule Scan", "\\Microsoft\\Windows\\Defrag\\ScheduledDefrag", "\\Microsoft\\Windows\\WindowsUpdate\\Scheduled Start", "\\Microsoft\\Office\\OfficeBackgroundTaskHandlerRegistration"]) -%}
+  {%- set additional = '{"TaskName": "' ~ task_name ~ '"}' -%}
+{%- endif -%}
+{
+  "Tenant": {{ params.tenant | tojson }},
+  "category": "AdvancedHunting-DeviceEvents",
+  "operationName": "Publish",
+  "properties": {
+    "Timestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') }}Z",
+    "DeviceId": "{{ host.device_id }}",
+    "DeviceName": "{{ fqdn }}",
+    "ActionType": "{{ action_type }}",
+    "InitiatingProcessAccountDomain": {{ acct_domain | tojson }},
+    "InitiatingProcessAccountName": {{ acct_name | tojson }},
+    "InitiatingProcessAccountSid": "{{ acct_sid }}",
+    "InitiatingProcessAccountUpn": "{{ acct_upn }}",
+    "InitiatingProcessAccountObjectId": "{{ acct_oid }}",
+    "InitiatingProcessLogonId": {{ logon_id }},
+    "InitiatingProcessIntegrityLevel": "{{ proc.integrity_level }}",
+    "InitiatingProcessTokenElevation": "{{ token_elevation }}",
+    "InitiatingProcessSHA1": "{{ proc.sha1 }}",
+    "InitiatingProcessSHA256": "{{ proc.sha256 }}",
+    "InitiatingProcessMD5": "{{ proc.md5 }}",
+    "InitiatingProcessFileName": {{ proc.name | tojson }},
+    "InitiatingProcessFileSize": {{ proc.file_size }},
+    "InitiatingProcessFolderPath": {{ proc.path | tojson }},
+    "InitiatingProcessId": {{ proc_pid }},
+    "InitiatingProcessCommandLine": {{ proc.command_line | tojson }},
+    "InitiatingProcessCreationTime": "{{ proc_creation }}",
+    "InitiatingProcessParentFileName": {{ proc.parent_name | tojson }},
+    "InitiatingProcessParentId": {{ proc_parent_pid }},
+    "InitiatingProcessParentCreationTime": "{{ proc_parent_creation }}",
+    "InitiatingProcessSignerType": "{{ proc.signer_type }}",
+    "InitiatingProcessSignatureStatus": "{{ proc.signature_status }}",
+    "InitiatingProcessVersionInfoCompanyName": {{ proc.company | tojson }},
+    "InitiatingProcessVersionInfoProductName": {{ proc.product | tojson }},
+    "InitiatingProcessVersionInfoProductVersion": "{{ proc.product_version }}",
+    "InitiatingProcessVersionInfoInternalFileName": {{ proc.internal_name | tojson }},
+    "InitiatingProcessVersionInfoOriginalFileName": {{ proc.original_file_name | tojson }},
+    "InitiatingProcessVersionInfoFileDescription": {{ proc.description | tojson }},
+    "AdditionalFields": {{ additional | tojson }},
+    "ReportId": {{ report_id }},
+    "MachineGroup": "{{ host.machine_group }}"
+  },
+  "tenantId": "{{ params.tenant_id }}",
+  "time": "{{ (timestamp + module.datetime.timedelta(seconds=module.rand.number.integer(60, 300))).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] }}Z"
+}

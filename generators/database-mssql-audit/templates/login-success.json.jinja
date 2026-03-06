@@ -1,0 +1,109 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set instance = hostname ~ '\\\\' ~ host.instance_name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set session_counter = shared.get('session_counter:' ~ hostname, 50) -%}
+{%- set txn_id = shared.get('txn_id:' ~ hostname, 100000) -%}
+{%- set login = samples.logins.weighted_pick('weight') -%}
+{%- set login_name = login.login_name -%}
+{%- if login.login_type == 'windows' -%}
+  {%- set server_principal = login.domain ~ '\\\\' ~ login.login_name -%}
+  {%- set user_domain = login.domain -%}
+  {%- set user_name = login.login_name -%}
+{%- else -%}
+  {%- set server_principal = login.login_name -%}
+  {%- set user_domain = "" -%}
+  {%- set user_name = login.login_name -%}
+{%- endif -%}
+{%- set db_entry = samples.databases | random -%}
+{%- set db_name = db_entry.name -%}
+{%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_private_b(), "127.0.0.1"], [45, 40, 15]) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set app_name = login.app_name -%}
+{%- set client_host = module.rand.weighted_choice(["APPSRV01", "WEBSRV01", "WEBSRV02", "RPTSRV01", "ETLSRV01", "DEVSTN01", hostname], [20, 20, 15, 10, 10, 10, 15]) -%}
+{#- Store session for correlation -#}
+{%- set sessions = shared.get('sessions:' ~ hostname, []) -%}
+{%- do sessions.append({"session_id": session_counter, "user": server_principal, "db": db_name, "client_ip": src_ip, "app": app_name, "host_name": client_host, "login_type": login.login_type, "domain": user_domain, "login_name": user_name}) -%}
+{%- if sessions | length > 50 -%}{%- do sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('sessions:' ~ hostname, sessions) -%}
+{%- do shared.set('session_counter:' ~ hostname, session_counter + 1) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "login-succeeded",
+        "category": ["database", "authentication"],
+        "code": "33205",
+        "dataset": "microsoft_sqlserver.audit",
+        "kind": "event",
+        "module": "microsoft_sqlserver",
+        "outcome": "success",
+        "sequence": {{ seq }},
+        "type": ["connection", "start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "name": "{{ host.os_name }}",
+            "type": "windows",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ host.ip }}"],
+        "user": ["{{ user_name }}"]
+    },
+    "service": {
+        "type": "microsoft_sqlserver"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "sqlserver": {
+        "audit": {
+            "action_id": "LGIS",
+            "additional_information": "<action_info xmlns=\"http://schemas.microsoft.com/sqlserver/2008/sqlaudit_data\"><pooled_connection>0</pooled_connection></action_info>",
+            "application_name": "{{ app_name }}",
+            "class_type": "LX",
+            "client_ip": "{{ src_ip }}",
+            "database_name": "{{ db_name }}",
+            "database_principal_name": "dbo",
+            "host_name": "{{ client_host }}",
+            "object_name": "",
+            "schema_name": "",
+            "sequence_number": {{ seq }},
+            "server_instance_name": "{{ instance }}",
+            "server_principal_name": "{{ server_principal }}",
+            "session_id": {{ session_counter }},
+            "statement": "{{ server_principal }}",
+            "succeeded": 1,
+            "transaction_id": {{ txn_id }}
+        }
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "event_id": "33205",
+        "provider_name": "MSSQLSERVER$AUDIT"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}
+{%- do shared.set('txn_id:' ~ hostname, txn_id + 1) -%}

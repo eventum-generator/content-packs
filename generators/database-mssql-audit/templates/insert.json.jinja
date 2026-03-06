@@ -1,0 +1,126 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set instance = hostname ~ '\\\\' ~ host.instance_name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set txn_id = shared.get('txn_id:' ~ hostname, 100000) -%}
+{#- Pick session context or generate standalone -#}
+{%- set sessions = shared.get('sessions:' ~ hostname, []) -%}
+{%- if sessions | length > 0 -%}
+  {%- set sess = sessions | random -%}
+  {%- set server_principal = sess.user -%}
+  {%- set session_id = sess.session_id -%}
+  {%- set src_ip = sess.client_ip -%}
+  {%- set app_name = sess.app -%}
+  {%- set client_host = sess.host_name -%}
+  {%- set user_domain = sess.domain -%}
+  {%- set user_name = sess.login_name -%}
+{%- else -%}
+  {%- set login = samples.logins.weighted_pick('weight') -%}
+  {%- if login.login_type == 'windows' -%}
+    {%- set server_principal = login.domain ~ '\\\\' ~ login.login_name -%}
+    {%- set user_domain = login.domain -%}
+    {%- set user_name = login.login_name -%}
+  {%- else -%}
+    {%- set server_principal = login.login_name -%}
+    {%- set user_domain = "" -%}
+    {%- set user_name = login.login_name -%}
+  {%- endif -%}
+  {%- set session_id = module.rand.number.integer(50, 500) -%}
+  {%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_private_b()], [55, 45]) -%}
+  {%- set app_name = login.app_name -%}
+  {%- set client_host = module.rand.choice(["APPSRV01", "WEBSRV01", "ETLSRV01", hostname]) -%}
+{%- endif -%}
+{#- Pick database and table -#}
+{%- set db_entry = samples.databases | reject('equalto', samples.databases | last) | list | random -%}
+{%- set db_name = db_entry.name -%}
+{%- set schema_entry = db_entry.schemas | random -%}
+{%- set schema_name = schema_entry.name -%}
+{%- if schema_entry.tables | length > 0 -%}
+  {%- set table_name = schema_entry.tables | random -%}
+{%- else -%}
+  {%- set table_name = "AuditLog" -%}
+{%- endif -%}
+{#- Build statement -#}
+{%- set query_entry = samples.stmts_insert | random -%}
+{%- set raw_stmt = query_entry.stmt -%}
+{%- set stmt = raw_stmt | replace('{schema}', schema_name) | replace('{table}', table_name) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "database-insert",
+        "category": ["database"],
+        "code": "33205",
+        "dataset": "microsoft_sqlserver.audit",
+        "kind": "event",
+        "module": "microsoft_sqlserver",
+        "outcome": "success",
+        "sequence": {{ seq }},
+        "type": ["change"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "name": "{{ host.os_name }}",
+            "type": "windows",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ host.ip }}"],
+        "user": ["{{ user_name }}"]
+    },
+    "service": {
+        "type": "microsoft_sqlserver"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ module.rand.number.integer(49152, 65535) }}
+    },
+    "sqlserver": {
+        "audit": {
+            "action_id": "IN",
+            "additional_information": "",
+            "application_name": "{{ app_name }}",
+            "class_type": "U",
+            "client_ip": "{{ src_ip }}",
+            "database_name": "{{ db_name }}",
+            "database_principal_name": "dbo",
+            "host_name": "{{ client_host }}",
+            "object_name": "{{ table_name }}",
+            "schema_name": "{{ schema_name }}",
+            "sequence_number": {{ seq }},
+            "server_instance_name": "{{ instance }}",
+            "server_principal_name": "{{ server_principal }}",
+            "session_id": {{ session_id }},
+            "statement": {{ stmt | tojson }},
+            "succeeded": 1,
+            "transaction_id": {{ txn_id }}
+        }
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "event_id": "33205",
+        "provider_name": "MSSQLSERVER$AUDIT"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}
+{%- do shared.set('txn_id:' ~ hostname, txn_id + 1) -%}

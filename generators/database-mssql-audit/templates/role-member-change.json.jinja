@@ -1,0 +1,116 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set instance = hostname ~ '\\\\' ~ host.instance_name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set txn_id = shared.get('txn_id:' ~ hostname, 100000) -%}
+{#- Role changes done by admins -#}
+{%- set login = module.rand.weighted_choice(
+  samples.logins | selectattr('login_name', 'equalto', 'sa') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'admin.jsmith') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'dba_ops') | list,
+  None) -%}
+{%- if login.login_type == 'windows' -%}
+  {%- set server_principal = login.domain ~ '\\\\' ~ login.login_name -%}
+  {%- set user_domain = login.domain -%}
+  {%- set user_name = login.login_name -%}
+{%- else -%}
+  {%- set server_principal = login.login_name -%}
+  {%- set user_domain = "" -%}
+  {%- set user_name = login.login_name -%}
+{%- endif -%}
+{%- set session_id = module.rand.number.integer(50, 500) -%}
+{%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), "127.0.0.1"], [65, 35]) -%}
+{%- set app_name = login.app_name -%}
+{%- set client_host = module.rand.weighted_choice(["DBASTN01", hostname], [60, 40]) -%}
+{#- Add or drop role member -#}
+{%- set role_op = module.rand.weighted_choice(["ADDP", "DPRL"], [70, 30]) -%}
+{%- set event_action = "database-role-member-add" if role_op == "ADDP" else "database-role-member-drop" -%}
+{%- set role_name = module.rand.weighted_choice(["db_datareader", "db_datawriter", "db_owner", "db_ddladmin", "db_securityadmin"], [35, 25, 15, 15, 10]) -%}
+{%- set member = module.rand.choice(["api_service", "web_api", "app_readonly", "svc_reporting", "etl_user", "svc_webapp"]) -%}
+{%- set db_entry = samples.databases | reject('equalto', samples.databases | last) | list | random -%}
+{%- set db_name = db_entry.name -%}
+{%- if role_op == "ADDP" -%}
+  {%- set stmt = "ALTER ROLE [" ~ role_name ~ "] ADD MEMBER [" ~ member ~ "]" -%}
+{%- else -%}
+  {%- set stmt = "ALTER ROLE [" ~ role_name ~ "] DROP MEMBER [" ~ member ~ "]" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "{{ event_action }}",
+        "category": ["database", "iam"],
+        "code": "33205",
+        "dataset": "microsoft_sqlserver.audit",
+        "kind": "event",
+        "module": "microsoft_sqlserver",
+        "outcome": "success",
+        "sequence": {{ seq }},
+        "type": ["admin", "change", "user"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "name": "{{ host.os_name }}",
+            "type": "windows",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ host.ip }}"],
+        "user": ["{{ user_name }}", "{{ member }}"]
+    },
+    "service": {
+        "type": "microsoft_sqlserver"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ module.rand.number.integer(49152, 65535) }}
+    },
+    "sqlserver": {
+        "audit": {
+            "action_id": "{{ role_op }}",
+            "additional_information": "",
+            "application_name": "{{ app_name }}",
+            "class_type": "RL",
+            "client_ip": "{{ src_ip }}",
+            "database_name": "{{ db_name }}",
+            "database_principal_name": "dbo",
+            "host_name": "{{ client_host }}",
+            "object_name": "{{ role_name }}",
+            "schema_name": "",
+            "sequence_number": {{ seq }},
+            "server_instance_name": "{{ instance }}",
+            "server_principal_name": "{{ server_principal }}",
+            "session_id": {{ session_id }},
+            "statement": {{ stmt | tojson }},
+            "succeeded": 1,
+            "transaction_id": {{ txn_id }}
+        }
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "event_id": "33205",
+        "provider_name": "MSSQLSERVER$AUDIT"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}
+{%- do shared.set('txn_id:' ~ hostname, txn_id + 1) -%}

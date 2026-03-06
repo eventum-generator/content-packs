@@ -1,0 +1,207 @@
+{%- set seq_num = shared.get('sequence_number', 100000) -%}
+{%- set hostname = params.hostname -%}
+{#- Pick threat signature -#}
+{%- set sig = samples.threat_signatures | selectattr("subtype", "equalto", "spyware_dns") | list | random -%}
+{#- Pick malicious domain based on threat category -#}
+{%- if sig.threat_category == "dns-phishing" -%}
+  {%- set domain_list = samples.malicious_domains | selectattr("category", "equalto", "dns_phishing") | list -%}
+{%- elif sig.threat_category == "dns-c2" -%}
+  {%- set domain_list = samples.malicious_domains | selectattr("category", "equalto", "dns_c2") | list -%}
+{%- elif sig.threat_category == "domain-edl" -%}
+  {%- set domain_list = samples.malicious_domains | selectattr("category", "equalto", "dns_edl") | list -%}
+{%- else -%}
+  {%- set domain_list = samples.malicious_domains | selectattr("category", "equalto", "dns_malware") | list -%}
+{%- endif -%}
+{%- set mal_domain = (domain_list | random).domain -%}
+{#- Source host and user -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set src_ip = src_host.ip -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set username = (samples.usernames | random).username -%}
+{#- DNS: always udp/53 -#}
+{%- set app_name = "dns-base" -%}
+{%- set transport = "udp" -%}
+{%- set dst_port = 53 -%}
+{#- Action: drop ~85%, sinkhole ~10%, drop-packet ~5% -#}
+{%- set action = module.rand.weighted_choice(["drop", "sinkhole", "drop-packet"], [85, 10, 5]) -%}
+{#- All actions are deny -#}
+{%- set event_outcome = "failure" -%}
+{%- set event_type_list = ["denied"] -%}
+{#- Severity mapping -#}
+{%- set sev = sig.severity -%}
+{%- if sev == "critical" -%}
+  {%- set event_severity = 1 -%}
+  {%- set syslog_code = 2 -%}
+  {%- set syslog_priority = 10 -%}
+  {%- set syslog_name = "Critical" -%}
+  {%- set log_level = "critical" -%}
+{%- elif sev == "high" -%}
+  {%- set event_severity = 2 -%}
+  {%- set syslog_code = 3 -%}
+  {%- set syslog_priority = 11 -%}
+  {%- set syslog_name = "Error" -%}
+  {%- set log_level = "high" -%}
+{%- elif sev == "medium" -%}
+  {%- set event_severity = 3 -%}
+  {%- set syslog_code = 4 -%}
+  {%- set syslog_priority = 12 -%}
+  {%- set syslog_name = "Warning" -%}
+  {%- set log_level = "medium" -%}
+{%- elif sev == "low" -%}
+  {%- set event_severity = 4 -%}
+  {%- set syslog_code = 5 -%}
+  {%- set syslog_priority = 13 -%}
+  {%- set syslog_name = "Notice" -%}
+  {%- set log_level = "low" -%}
+{%- else -%}
+  {%- set event_severity = 5 -%}
+  {%- set syslog_code = 6 -%}
+  {%- set syslog_priority = 14 -%}
+  {%- set syslog_name = "Informational" -%}
+  {%- set log_level = "informational" -%}
+{%- endif -%}
+{#- Security rule -#}
+{%- set rule = samples.security_rules | random -%}
+{#- Session and flow -#}
+{%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+{%- set community_id = "1:" ~ module.rand.string.hex(20) -%}
+{#- NAT -#}
+{%- set nat_src_ip = params.nat_ip -%}
+{%- set nat_src_port = module.rand.number.integer(10000, 60000) -%}
+{#- Content version -#}
+{%- set content_version = "AppThreat-" ~ module.rand.number.integer(8800, 8999) | string ~ "-" ~ module.rand.number.integer(8500, 8699) | string -%}
+{#- Destination country -#}
+{%- set dst_country = module.rand.weighted_choice(["United States", "Russia", "China", "Germany", "Netherlands", "Romania", "Brazil", "India", "Ukraine", "Vietnam"], [20, 15, 12, 10, 8, 8, 8, 7, 6, 6]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "geo": {
+            "name": "{{ dst_country }}"
+        },
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "threat",
+        "category": ["intrusion_detection", "threat", "network"],
+        "dataset": "panw.panos",
+        "kind": "alert",
+        "module": "panw",
+        "outcome": "{{ event_outcome }}",
+        "severity": {{ event_severity }},
+        "type": {{ event_type_list | tojson }}
+    },
+    "host": {
+        "name": "{{ hostname }}"
+    },
+    "labels": {
+        "nat_translated": true,
+        "threat_denied": true
+    },
+    "log": {
+        "level": "{{ log_level }}",
+        "syslog": {
+            "facility": {
+                "code": 1,
+                "name": "user-level"
+            },
+            "hostname": "{{ hostname }}",
+            "priority": {{ syslog_priority }},
+            "severity": {
+                "code": {{ syslog_code }},
+                "name": "{{ syslog_name }}"
+            }
+        }
+    },
+    "network": {
+        "application": "{{ app_name }}",
+        "community_id": "{{ community_id }}",
+        "direction": "outbound",
+        "transport": "{{ transport }}",
+        "type": "ipv4"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": "{{ params.outbound_interface }}"
+            },
+            "zone": "{{ params.dst_zone }}"
+        },
+        "hostname": "{{ hostname }}",
+        "ingress": {
+            "interface": {
+                "name": "{{ params.inbound_interface }}"
+            },
+            "zone": "{{ params.src_zone }}"
+        },
+        "product": "PAN-OS",
+        "serial_number": "{{ params.serial_number }}",
+        "type": "firewall",
+        "vendor": "Palo Alto Networks"
+    },
+    "panw": {
+        "panos": {
+            "action": "{{ action }}",
+            "action_flags": "0x0",
+            "content_version": "{{ content_version }}",
+            "flow_id": "{{ session_id }}",
+            "generated_time": "{{ timestamp.isoformat() }}",
+            "log_profile": "{{ params.log_profile }}",
+            "received_time": "{{ timestamp.isoformat() }}",
+            "repeat_count": 1,
+            "ruleset": "{{ rule.name }}",
+            "sequence_number": "{{ seq_num }}",
+            "sub_type": "spyware",
+            "threat": {
+                "id": "{{ sig.id }}",
+                "name": {{ sig.name | tojson }}
+            },
+            "threat_category": "{{ sig.threat_category }}",
+            "type": "THREAT",
+            "virtual_sys": "{{ params.virtual_sys }}"
+        }
+    },
+    "related": {
+        "hosts": ["{{ hostname }}", "{{ mal_domain }}"],
+        "ip": ["{{ src_ip }}", "{{ dst_ip }}", "{{ nat_src_ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "rule": {
+        "name": "{{ rule.name }}"
+    },
+    "source": {
+        "geo": {
+            "name": "{{ params.src_network }}"
+        },
+        "ip": "{{ src_ip }}",
+        "nat": {
+            "ip": "{{ nat_src_ip }}",
+            "port": {{ nat_src_port }}
+        },
+        "port": {{ src_port }},
+        "user": {
+            "domain": "{{ params.domain }}",
+            "name": "{{ username }}"
+        }
+    },
+    "url": {
+        "domain": "{{ mal_domain }}",
+        "original": "{{ mal_domain }}"
+    },
+    "user": {
+        "domain": "{{ params.domain }}",
+        "name": "{{ username }}"
+    }
+}
+{%- do shared.set('sequence_number', (seq_num + 1) % 2147483647) -%}

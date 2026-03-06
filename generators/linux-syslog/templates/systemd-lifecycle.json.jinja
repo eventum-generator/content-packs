@@ -1,0 +1,91 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{#- Pick variant -#}
+{%- set variant = module.rand.weighted_choice(['started', 'stopped', 'failed'], [50, 35, 15]) -%}
+{%- if variant == 'stopped' -%}
+  {#- Try to pop from running_services for correlation -#}
+  {%- set running = shared.get('running_services', []) -%}
+  {%- if running | length > 0 -%}
+    {%- set svc = running.pop(0) -%}
+    {%- do shared.set('running_services', running) -%}
+  {%- else -%}
+    {%- set svc = samples.services | random -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set svc = samples.services | random -%}
+{%- endif -%}
+{%- if variant == 'started' -%}
+  {%- set msg = 'Started ' ~ svc.description ~ '.' -%}
+  {%- set pri = 30 -%}
+  {#- Push to running_services -#}
+  {%- set running = shared.get('running_services', []) -%}
+  {%- do running.append({'unit': svc.unit, 'name': svc.name, 'description': svc.description}) -%}
+  {%- if running | length > 30 -%}{%- do running.pop(0) -%}{%- endif -%}
+  {%- do shared.set('running_services', running) -%}
+{%- elif variant == 'stopped' -%}
+  {%- set msg = 'Stopped ' ~ svc.description ~ '.' -%}
+  {%- set pri = 30 -%}
+{%- else -%}
+  {%- set exit_status = module.rand.number.integer(1, 255) -%}
+  {%- set msg = svc.unit ~ ': Main process exited, code=exited, status=' ~ exit_status ~ '/FAILURE' -%}
+  {#- PRI: facility=daemon(3) * 8 + severity=err(3) = 27 -#}
+  {%- set pri = 27 -%}
+{%- endif -%}
+{%- set syslog_msg = '<' ~ pri ~ '>' ~ timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ hostname ~ ' systemd[1]: ' ~ msg -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "event": {
+        "original": {{ syslog_msg | tojson }},
+        "dataset": "system.syslog",
+        "module": "system",
+        "kind": "event",
+        "category": ["process"],
+        "type": ["info"]
+    },
+    "message": {{ msg | tojson }},
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "os": {
+            "name": "{{ host.os_name }}",
+            "version": "{{ host.os_version }}",
+            "kernel": "{{ host.os_kernel }}",
+            "platform": "{{ host.os_platform }}"
+        }
+    },
+    "process": {
+        "name": "systemd",
+        "pid": 1
+    },
+    "agent": {
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ fqdn }}",
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}"
+    },
+    "log": {
+        "file": {
+            "path": "{{ host.syslog_path }}"
+        },
+        "offset": {{ seq }}
+    },
+    "data_stream": {
+        "type": "logs",
+        "dataset": "system.syslog",
+        "namespace": "default"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"]
+    },
+    "system": {
+        "syslog": {}
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

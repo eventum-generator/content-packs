@@ -1,0 +1,84 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{#- Pick variant -#}
+{%- set variant = module.rand.weighted_choice(['filesystem', 'device', 'oom', 'misc'], [40, 30, 5, 25]) -%}
+{%- if variant == 'filesystem' -%}
+  {%- set fs_msgs = ['EXT4-fs (sda1): re-mounted. Opts: errors=remount-ro', 'EXT4-fs (sda1): mounted filesystem with ordered data mode. Opts: (null)', 'EXT4-fs (sda2): re-mounted. Quota mode: none.', 'XFS (sda1): Mounting V5 Filesystem', 'EXT4-fs (dm-0): recovery complete'] -%}
+  {%- set msg = module.rand.choice(fs_msgs) -%}
+  {%- set severity = 6 -%}
+{%- elif variant == 'device' -%}
+  {%- set dev_num = module.rand.number.integer(2, 8) -%}
+  {%- set dev_msgs = ['usb 1-1: new high-speed USB device number ' ~ dev_num ~ ' using xhci_hcd', 'usb 1-1: New USB device found, idVendor=0781, idProduct=5567, bcdDevice= 1.00', 'sd 0:0:0:0: [sda] Attached SCSI disk', 'e1000: ens192 NIC Link is Up 10000 Mbps Full Duplex', 'virtio_net virtio0: Device ' ~ hostname ~ ' set_features'] -%}
+  {%- set msg = module.rand.choice(dev_msgs) -%}
+  {%- set severity = 6 -%}
+{%- elif variant == 'oom' -%}
+  {%- set oom_pid = module.rand.number.integer(1000, 65535) -%}
+  {%- set oom_name = module.rand.choice(['java', 'python3', 'node', 'mysqld', 'redis-server']) -%}
+  {%- set oom_vm = module.rand.number.integer(500000, 8000000) -%}
+  {%- set oom_rss = module.rand.number.integer(100000, 2000000) -%}
+  {%- set msg = 'Out of memory: Killed process ' ~ oom_pid ~ ' (' ~ oom_name ~ ') total-vm:' ~ oom_vm ~ 'kB, anon-rss:' ~ oom_rss ~ 'kB, file-rss:0kB, shmem-rss:0kB' -%}
+  {%- set severity = 2 -%}
+{%- else -%}
+  {%- set misc_msgs = ['ACPI: Preparing to enter system sleep state S3', 'audit: type=1400 audit(1709769600.000:1): apparmor="ALLOWED" operation="open" profile="/usr/sbin/sshd" name="/proc/sys/kernel/ngroups_max" pid=' ~ module.rand.number.integer(1000, 65535) ~ ' comm="sshd"', 'perf: interrupt took too long (' ~ module.rand.number.integer(2500, 9999) ~ ' > 2500), lowering kernel.perf_event_max_sample_rate to ' ~ module.rand.number.integer(10000, 50000), 'TCP: request_sock_TCP: Possible SYN flooding on port ' ~ module.rand.choice([80, 443, 8080]) ~ '. Sending cookies.'] -%}
+  {%- set msg = module.rand.choice(misc_msgs) -%}
+  {%- set severity = 4 -%}
+{%- endif -%}
+{#- PRI: facility=kern(0) * 8 + severity -#}
+{%- set pri = severity -%}
+{%- set syslog_msg = '<' ~ pri ~ '>' ~ timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ hostname ~ ' kernel: ' ~ msg -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "event": {
+        "original": {{ syslog_msg | tojson }},
+        "dataset": "system.syslog",
+        "module": "system",
+        "kind": "event",
+        "category": ["host"],
+        "type": ["info"]
+    },
+    "message": {{ msg | tojson }},
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "os": {
+            "name": "{{ host.os_name }}",
+            "version": "{{ host.os_version }}",
+            "kernel": "{{ host.os_kernel }}",
+            "platform": "{{ host.os_platform }}"
+        }
+    },
+    "process": {
+        "name": "kernel"
+    },
+    "agent": {
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ fqdn }}",
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}"
+    },
+    "log": {
+        "file": {
+            "path": "{{ host.syslog_path }}"
+        },
+        "offset": {{ seq }}
+    },
+    "data_stream": {
+        "type": "logs",
+        "dataset": "system.syslog",
+        "namespace": "default"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"]
+    },
+    "system": {
+        "syslog": {}
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}

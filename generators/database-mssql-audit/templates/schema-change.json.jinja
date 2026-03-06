@@ -1,0 +1,175 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set instance = hostname ~ '\\\\' ~ host.instance_name -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set txn_id = shared.get('txn_id:' ~ hostname, 100000) -%}
+{#- DDL is typically done by admins/DBAs -#}
+{%- set login = module.rand.weighted_choice(
+  samples.logins | selectattr('login_name', 'equalto', 'sa') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'admin.jsmith') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'admin.mchen') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'dba_ops') | list
+  + samples.logins | selectattr('login_name', 'equalto', 'dev.agarcia') | list,
+  None) -%}
+{%- if login.login_type == 'windows' -%}
+  {%- set server_principal = login.domain ~ '\\\\' ~ login.login_name -%}
+  {%- set user_domain = login.domain -%}
+  {%- set user_name = login.login_name -%}
+{%- else -%}
+  {%- set server_principal = login.login_name -%}
+  {%- set user_domain = "" -%}
+  {%- set user_name = login.login_name -%}
+{%- endif -%}
+{%- set session_id = module.rand.number.integer(50, 500) -%}
+{%- set src_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), module.rand.network.ip_v4_private_b(), "127.0.0.1"], [40, 40, 20]) -%}
+{%- set app_name = login.app_name -%}
+{%- set client_host = module.rand.weighted_choice(["DBASTN01", "DEVSTN01", hostname], [40, 30, 30]) -%}
+{#- Pick DDL operation -#}
+{%- set ddl_op = module.rand.weighted_choice(["CR", "AL", "DR"], [35, 50, 15]) -%}
+{%- set ddl_action_map = {"CR": "database-object-create", "AL": "database-object-alter", "DR": "database-object-drop"} -%}
+{%- set ddl_verb_map = {"CR": "CREATE", "AL": "ALTER", "DR": "DROP"} -%}
+{%- set event_action = ddl_action_map[ddl_op] -%}
+{%- set ddl_verb = ddl_verb_map[ddl_op] -%}
+{#- Pick object type -#}
+{%- set obj_type_choice = module.rand.weighted_choice(["TABLE", "VIEW", "INDEX", "PROCEDURE"], [35, 20, 25, 20]) -%}
+{%- set class_type_map = {"TABLE": "U", "VIEW": "V", "INDEX": "IX", "PROCEDURE": "P"} -%}
+{%- set class_type = class_type_map[obj_type_choice] -%}
+{#- Pick database and schema -#}
+{%- set db_entry = samples.databases | reject('equalto', samples.databases | last) | list | random -%}
+{%- set db_name = db_entry.name -%}
+{%- set schema_entry = db_entry.schemas | random -%}
+{%- set schema_name = schema_entry.name -%}
+{#- Generate object name and statement based on type -#}
+{%- if obj_type_choice == "TABLE" -%}
+  {%- if ddl_op == "CR" -%}
+    {%- set object_name = module.rand.choice(["temp_import", "staging_data", "archive_log", "audit_trail"]) -%}
+    {%- set stmt = ddl_verb ~ " TABLE [" ~ schema_name ~ "].[" ~ object_name ~ "] ([Id] INT IDENTITY(1,1) PRIMARY KEY, [Data] NVARCHAR(MAX), [CreatedDate] DATETIME2 DEFAULT SYSDATETIMEOFFSET())" -%}
+  {%- elif ddl_op == "AL" and schema_entry.tables | length > 0 -%}
+    {%- set object_name = schema_entry.tables | random -%}
+    {%- set alter_action = module.rand.choice(["ADD [NewColumn] NVARCHAR(255) NULL", "ALTER COLUMN [Status] NVARCHAR(50) NOT NULL", "ADD CONSTRAINT [CK_" ~ object_name ~ "_Status] CHECK ([Status] IN ('Active','Inactive'))"]) -%}
+    {%- set stmt = ddl_verb ~ " TABLE [" ~ schema_name ~ "].[" ~ object_name ~ "] " ~ alter_action -%}
+  {%- else -%}
+    {%- set object_name = module.rand.choice(["temp_import", "staging_data"]) -%}
+    {%- set stmt = ddl_verb ~ " TABLE [" ~ schema_name ~ "].[" ~ object_name ~ "]" -%}
+  {%- endif -%}
+{%- elif obj_type_choice == "VIEW" -%}
+  {%- if ddl_op == "CR" -%}
+    {%- set object_name = "vw_" ~ module.rand.choice(["Summary", "Report", "Dashboard", "Active"]) ~ module.rand.choice(["Data", "Items", "Records"]) -%}
+    {%- set base_table = schema_entry.tables | random if schema_entry.tables | length > 0 else "SysObjects" -%}
+    {%- set stmt = ddl_verb ~ " VIEW [" ~ schema_name ~ "].[" ~ object_name ~ "] AS SELECT * FROM [" ~ schema_name ~ "].[" ~ base_table ~ "] WHERE [Active] = 1" -%}
+  {%- elif schema_entry.views | length > 0 -%}
+    {%- set object_name = schema_entry.views | random -%}
+    {%- set stmt = ddl_verb ~ " VIEW [" ~ schema_name ~ "].[" ~ object_name ~ "]" -%}
+  {%- else -%}
+    {%- set object_name = "vw_TempReport" -%}
+    {%- set stmt = ddl_verb ~ " VIEW [" ~ schema_name ~ "].[" ~ object_name ~ "]" -%}
+  {%- endif -%}
+{%- elif obj_type_choice == "INDEX" -%}
+  {%- set base_table = schema_entry.tables | random if schema_entry.tables | length > 0 else "SysObjects" -%}
+  {%- set col = module.rand.choice(["Id", "Name", "Status", "CreatedDate", "CustomerId"]) -%}
+  {%- set object_name = "IX_" ~ base_table ~ "_" ~ col -%}
+  {%- if ddl_op == "CR" -%}
+    {%- set stmt = ddl_verb ~ " NONCLUSTERED INDEX [" ~ object_name ~ "] ON [" ~ schema_name ~ "].[" ~ base_table ~ "] ([" ~ col ~ "] ASC)" -%}
+  {%- elif ddl_op == "AL" -%}
+    {%- set stmt = "ALTER INDEX [" ~ object_name ~ "] ON [" ~ schema_name ~ "].[" ~ base_table ~ "] REBUILD WITH (ONLINE = ON)" -%}
+  {%- else -%}
+    {%- set stmt = ddl_verb ~ " INDEX [" ~ object_name ~ "] ON [" ~ schema_name ~ "].[" ~ base_table ~ "]" -%}
+  {%- endif -%}
+{%- else -%}
+  {%- if ddl_op == "CR" -%}
+    {%- set object_name = "sp_" ~ module.rand.choice(["Process", "Generate", "Validate", "Archive"]) ~ module.rand.choice(["Data", "Records", "Batch"]) -%}
+    {%- set stmt = ddl_verb ~ " PROCEDURE [" ~ schema_name ~ "].[" ~ object_name ~ "] @Id INT AS BEGIN SELECT 1 END" -%}
+  {%- elif schema_entry.procs | length > 0 -%}
+    {%- set object_name = schema_entry.procs | random -%}
+    {%- set stmt = ddl_verb ~ " PROCEDURE [" ~ schema_name ~ "].[" ~ object_name ~ "]" -%}
+  {%- else -%}
+    {%- set object_name = "sp_TempProc" -%}
+    {%- set stmt = ddl_verb ~ " PROCEDURE [" ~ schema_name ~ "].[" ~ object_name ~ "]" -%}
+  {%- endif -%}
+{%- endif -%}
+{#- event.type depends on DDL operation -#}
+{%- set event_type_map = {"CR": "creation", "AL": "change", "DR": "deletion"} -%}
+{%- set event_type = event_type_map[ddl_op] -%}
+{#- Outcome: mostly success, rarely failure -#}
+{%- set succeeded = module.rand.weighted_choice([1, 0], [95, 5]) -%}
+{%- set outcome = "success" if succeeded == 1 else "failure" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "winlogbeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "action": "{{ event_action }}",
+        "category": ["database", "configuration"],
+        "code": "33205",
+        "dataset": "microsoft_sqlserver.audit",
+        "kind": "event",
+        "module": "microsoft_sqlserver",
+        "outcome": "{{ outcome }}",
+        "sequence": {{ seq }},
+        "type": ["{{ event_type }}"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "windows",
+            "name": "{{ host.os_name }}",
+            "type": "windows",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "related": {
+        "ip": ["{{ src_ip }}", "{{ host.ip }}"],
+        "user": ["{{ user_name }}"]
+    },
+    "service": {
+        "type": "microsoft_sqlserver"
+    },
+    "source": {
+        "address": "{{ src_ip }}",
+        "ip": "{{ src_ip }}",
+        "port": {{ module.rand.number.integer(49152, 65535) }}
+    },
+    "sqlserver": {
+        "audit": {
+            "action_id": "{{ ddl_op }}",
+            "additional_information": "",
+            "application_name": "{{ app_name }}",
+            "class_type": "{{ class_type }}",
+            "client_ip": "{{ src_ip }}",
+            "database_name": "{{ db_name }}",
+            "database_principal_name": "dbo",
+            "host_name": "{{ client_host }}",
+            "object_name": "{{ object_name }}",
+            "schema_name": "{{ schema_name }}",
+            "sequence_number": {{ seq }},
+            "server_instance_name": "{{ instance }}",
+            "server_principal_name": "{{ server_principal }}",
+            "session_id": {{ session_id }},
+            "statement": {{ stmt | tojson }},
+            "succeeded": {{ succeeded }},
+            "transaction_id": {{ txn_id }}
+        }
+    },
+    "user": {
+        "domain": "{{ user_domain }}",
+        "name": "{{ user_name }}"
+    },
+    "winlog": {
+        "channel": "Security",
+        "event_id": "33205",
+        "provider_name": "MSSQLSERVER$AUDIT"
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}
+{%- do shared.set('txn_id:' ~ hostname, txn_id + 1) -%}

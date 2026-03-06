@@ -1,0 +1,84 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set fqdn = hostname ~ '.' ~ params.fqdn_suffix -%}
+{%- set seq = shared.get('sequence:' ~ hostname, 1000) -%}
+{%- set u = samples.usernames | random -%}
+{%- set user = u.username -%}
+{%- set uid = u.uid -%}
+{%- set pid = module.rand.number.integer(1000, 65535) -%}
+{%- set service = module.rand.weighted_choice(['sudo', 'login', 'su', 'cron', 'sshd'], [30, 15, 10, 25, 20]) -%}
+{#- Pick variant -#}
+{%- set variant = module.rand.weighted_choice(['opened', 'closed', 'auth_failure'], [40, 40, 20]) -%}
+{%- if variant == 'opened' -%}
+  {%- set login_uid = module.rand.number.integer(0, 1100) -%}
+  {%- set msg = 'pam_unix(' ~ service ~ ':session): session opened for user ' ~ user ~ '(uid=' ~ uid ~ ') by (uid=' ~ login_uid ~ ')' -%}
+{%- elif variant == 'closed' -%}
+  {%- set msg = 'pam_unix(' ~ service ~ ':session): session closed for user ' ~ user -%}
+{%- else -%}
+  {%- set tty = module.rand.choice(['pts/0', 'pts/1', 'pts/2', 'tty1', 'ssh']) -%}
+  {%- set rhost = module.rand.weighted_choice(['', params.network_prefix ~ '.' ~ module.rand.number.integer(1, 254) ~ '.' ~ module.rand.number.integer(1, 254)], [60, 40]) -%}
+  {%- set msg = 'pam_unix(' ~ service ~ ':auth): authentication failure; logname=' ~ user ~ ' uid=' ~ uid ~ ' euid=0 tty=' ~ tty ~ ' ruser=' ~ user ~ ' rhost=' ~ rhost ~ ' user=' ~ user -%}
+{%- endif -%}
+{#- PRI: facility=authpriv(10) * 8 + severity=info(6) = 86 -#}
+{%- set pri = 86 -%}
+{%- set proc_name = service if service != 'sshd' else 'sshd' -%}
+{%- set syslog_msg = '<' ~ pri ~ '>' ~ timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ hostname ~ ' ' ~ proc_name ~ '[' ~ pid ~ ']: ' ~ msg -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "event": {
+        "original": {{ syslog_msg | tojson }},
+        "dataset": "system.syslog",
+        "module": "system",
+        "kind": "event",
+        "category": ["authentication"],
+        "type": ["info"]
+    },
+    "message": {{ msg | tojson }},
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "os": {
+            "name": "{{ host.os_name }}",
+            "version": "{{ host.os_version }}",
+            "kernel": "{{ host.os_kernel }}",
+            "platform": "{{ host.os_platform }}"
+        }
+    },
+    "process": {
+        "name": "{{ proc_name }}",
+        "pid": {{ pid }}
+    },
+    "agent": {
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ fqdn }}",
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}"
+    },
+    "log": {
+        "file": {
+            "path": "{{ host.syslog_path }}"
+        },
+        "offset": {{ seq }}
+    },
+    "data_stream": {
+        "type": "logs",
+        "dataset": "system.syslog",
+        "namespace": "default"
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "user": ["{{ user }}"]
+    },
+    "user": {
+        "name": "{{ user }}"
+    },
+    "system": {
+        "syslog": {}
+    }
+}
+{%- do shared.set('sequence:' ~ hostname, (seq + 1) % 2147483647) -%}
