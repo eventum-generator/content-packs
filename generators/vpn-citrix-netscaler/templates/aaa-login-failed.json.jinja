@@ -1,0 +1,121 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set ppe = module.rand.weighted_choice(["0-PPE-0", "1-PPE-1", "2-PPE-2"], [50, 30, 20]) -%}
+{%- set client_ip = module.rand.network.ip_v4_public() -%}
+{#- 70% real users with typos, 30% attacker-style -#}
+{%- set is_real_user = module.rand.chance(0.7) -%}
+{%- if is_real_user -%}
+  {%- set user = (samples.usernames | random).username ~ module.rand.weighted_choice(["1", "!", ".", "123", ""], [15, 15, 10, 10, 50]) -%}
+{%- else -%}
+  {%- set user = module.rand.weighted_choice(
+    ["admin", "administrator", "root", "test", "guest", "vpnuser", "svc_admin", "backup"],
+    [25, 15, 15, 12, 10, 10, 8, 5]
+  ) -%}
+{%- endif -%}
+{#- Failure reasons -#}
+{%- set failure_reason = module.rand.weighted_choice(
+  ["Invalid credentials", "Account locked out", "Account disabled", "Certificate validation failed", "RADIUS server not responding", "LDAP authentication failed", "Maximum login attempts exceeded", "Password expired"],
+  [40, 15, 8, 10, 7, 10, 5, 5]
+) -%}
+{%- set syslog_ts = timestamp.strftime('%m/%d/%Y:%H:%M:%S') ~ " GMT" -%}
+{%- set syslog_msg = syslog_ts ~ " " ~ hostname ~ " " ~ ppe ~ " : default AAA LOGIN_FAILED " ~ record_id ~ " 0 : User " ~ user ~ " - Client_ip " ~ client_ip ~ " - Nat_ip \\\"Mapped Ip\\\" - Vserver " ~ params.vserver_ip ~ ":" ~ params.vserver_port ~ " - Failure_reason \\\"" ~ failure_reason ~ "\\\"" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "citrix": {
+        "cef_format": false,
+        "device_product": "NetScaler",
+        "device_vendor": "Citrix",
+        "device_version": "NS14.1",
+        "facility": "local0",
+        "hostname": "{{ hostname }}",
+        "name": "AAA LOGIN_FAILED",
+        "ppe_id": "{{ ppe }}",
+        "priority": "error",
+        "session_id": "0"
+    },
+    "citrix_adc": {
+        "log": {
+            "client_ip": "{{ client_ip }}",
+            "failure_reason": "{{ failure_reason }}",
+            "nat": {
+                "ip": "{{ params.nat_ip }}"
+            },
+            "user": "{{ user }}",
+            "username": "{{ user }}",
+            "vserver": {
+                "ip": "{{ params.vserver_ip }}",
+                "port": {{ params.vserver_port }}
+            }
+        }
+    },
+    "client": {
+        "ip": "{{ client_ip }}"
+    },
+    "data_stream": {
+        "dataset": "citrix_adc.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "logon-failed",
+        "category": ["authentication"],
+        "dataset": "citrix_adc.log",
+        "kind": "event",
+        "module": "citrix_adc",
+        "original": "{{ syslog_msg }}",
+        "outcome": "failure",
+        "reason": "{{ failure_reason }}",
+        "severity": 3,
+        "type": ["denied"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "error",
+        "syslog": {
+            "facility": {
+                "code": 16
+            },
+            "priority": 131,
+            "severity": {
+                "code": 3
+            }
+        }
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "Netscaler",
+        "type": "firewall",
+        "vendor": "Citrix"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ client_ip }}", "{{ params.vserver_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "user": {
+            "name": "{{ user }}"
+        }
+    },
+    "user": {
+        "name": "{{ user }}"
+    },
+    "tags": ["citrix_adc.log", "forwarded"]
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

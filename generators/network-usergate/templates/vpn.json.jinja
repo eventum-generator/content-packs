@@ -1,0 +1,145 @@
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set device_id = params.device_id -%}
+{#- VPN events: IPsec tunnel up/down, L2TP/IPsec client connections -#}
+{%- set vpn_tunnels = ["to-HQ", "to-Branch01", "to-Branch02", "to-DR-Site", "to-Cloud-VPC"] -%}
+{%- set active_tunnels = shared.get('active_vpn_tunnels', []) -%}
+{#- Decide: tunnel-up, tunnel-down, or client-vpn -#}
+{%- if active_tunnels | length > 0 and module.rand.chance(0.3) -%}
+  {#- Bring a tunnel down -#}
+  {%- set tunnel = active_tunnels.pop(0) -%}
+  {%- do shared.set('active_vpn_tunnels', active_tunnels) -%}
+  {%- set action = "tunnel-down" -%}
+  {%- set vpntunnel = tunnel.name -%}
+  {%- set remip = tunnel.remip -%}
+  {%- set locip = tunnel.locip -%}
+  {%- set duration = module.rand.number.integer(60, 86400) -%}
+  {%- set bytes_sent = module.rand.number.integer(10000, 50000000) -%}
+  {%- set bytes_recv = module.rand.number.integer(10000, 50000000) -%}
+  {%- set status = "success" -%}
+  {%- set msg = "IPsec tunnel " ~ vpntunnel ~ " disconnected" -%}
+  {%- set level = "informational" -%}
+  {%- set threat = 1 -%}
+{%- elif module.rand.chance(0.5) -%}
+  {#- Bring a tunnel up -#}
+  {%- set vpntunnel = module.rand.choice(vpn_tunnels) -%}
+  {%- set remip = module.rand.network.ip_v4_public() -%}
+  {%- set locip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set action = "tunnel-up" -%}
+  {%- set duration = 0 -%}
+  {%- set bytes_sent = 0 -%}
+  {%- set bytes_recv = 0 -%}
+  {%- set status = "success" -%}
+  {%- set msg = "IPsec tunnel " ~ vpntunnel ~ " established" -%}
+  {%- set level = "informational" -%}
+  {%- set threat = 1 -%}
+  {%- set tunnel_entry = {"name": vpntunnel, "remip": remip, "locip": locip} -%}
+  {%- do active_tunnels.append(tunnel_entry) -%}
+  {%- if active_tunnels | length > 20 -%}{%- do active_tunnels.pop(0) -%}{%- endif -%}
+  {%- do shared.set('active_vpn_tunnels', active_tunnels) -%}
+{%- elif module.rand.chance(0.6) -%}
+  {#- Client VPN connect -#}
+  {%- set user = samples.users.weighted_pick('weight') -%}
+  {%- set vpntunnel = "L2TP/IPsec-" ~ user.user -%}
+  {%- set remip = module.rand.network.ip_v4_public() -%}
+  {%- set locip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set action = "client-connect" -%}
+  {%- set duration = 0 -%}
+  {%- set bytes_sent = 0 -%}
+  {%- set bytes_recv = 0 -%}
+  {%- set status = "success" -%}
+  {%- set msg = "VPN client " ~ user.user ~ " connected from " ~ remip -%}
+  {%- set level = "informational" -%}
+  {%- set threat = 1 -%}
+{%- else -%}
+  {#- Negotiate error -#}
+  {%- set vpntunnel = module.rand.choice(vpn_tunnels) -%}
+  {%- set remip = module.rand.network.ip_v4_public() -%}
+  {%- set locip = params.get("nat_ip", "198.51.100.1") -%}
+  {%- set action = "negotiate-error" -%}
+  {%- set duration = 0 -%}
+  {%- set bytes_sent = 0 -%}
+  {%- set bytes_recv = 0 -%}
+  {%- set status = "failure" -%}
+  {%- set msg = "IPsec phase 1 negotiation failed for tunnel " ~ vpntunnel ~ ": SA proposal mismatch" -%}
+  {%- set level = "warning" -%}
+  {%- set threat = 4 -%}
+{%- endif -%}
+{%- set event_outcome = "failure" if status == "failure" else "success" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ locip }}",
+        "port": 500
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network"],
+        "dataset": "usergate.log",
+{%- if duration > 0 %}
+        "duration": {{ duration * 1000000000 }},
+{%- endif %}
+        "kind": "event",
+        "module": "usergate",
+        "outcome": "{{ event_outcome }}",
+{%- if status == "failure" %}
+        "reason": "SA proposal mismatch",
+{%- endif %}
+        "type": ["connection"{% if action == "tunnel-up" or action == "client-connect" %}, "start"{% elif action == "tunnel-down" %}, "end"{% endif %}]
+    },
+    "log": {
+        "level": "{{ level }}"
+    },
+    "message": "CEF:0|UserGate|NGFW|7|event|vpn|{{ threat }}|rt={{ (timestamp.timestamp() * 1000) | int }} deviceExternalId={{ device_id }} act={{ action }} src={{ remip }} spt=500 dst={{ locip }} dpt=500 msg={{ msg }}",
+    "network": {
+        "direction": "inbound",
+        "iana_number": "17",
+        "transport": "udp"
+    },
+    "observer": {
+        "egress": {
+            "zone": "Trusted"
+        },
+        "hostname": "{{ fqdn }}",
+        "ingress": {
+            "zone": "Untrusted"
+        },
+        "name": "{{ hostname }}",
+        "product": "NGFW",
+        "serial_number": "{{ device_id }}",
+        "type": "firewall",
+        "vendor": "UserGate"
+    },
+    "related": {
+        "ip": ["{{ remip }}", "{{ locip }}"]
+    },
+    "source": {
+        "ip": "{{ remip }}",
+        "port": 500
+    },
+    "tags": ["usergate", "usergate-ngfw", "forwarded"],
+    "usergate": {
+{%- if duration > 0 %}
+        "bytes_received": {{ bytes_recv }},
+        "bytes_sent": {{ bytes_sent }},
+        "duration": {{ duration }},
+{%- endif %}
+        "device_id": "{{ device_id }}",
+        "log_type": "event",
+        "rule_type": "vpn",
+        "threat_level": {{ threat }},
+        "tunnel_name": "{{ vpntunnel }}",
+        "user": "Unknown",
+        "vpn_status": "{{ status }}"
+    }
+}

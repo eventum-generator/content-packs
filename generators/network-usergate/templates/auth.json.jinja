@@ -1,0 +1,89 @@
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set device_id = params.device_id -%}
+{#- User authentication events: LDAP, Radius, Captive Portal, local -#}
+{%- set user = samples.users.weighted_pick('weight') -%}
+{%- set auth_events = [
+  {"action": "login", "status": "success", "method": "LDAP", "msg_tpl": "User USER logged in via LDAP authentication"},
+  {"action": "login", "status": "success", "method": "Radius", "msg_tpl": "User USER logged in via RADIUS authentication"},
+  {"action": "login", "status": "success", "method": "Captive Portal", "msg_tpl": "User USER logged in via Captive Portal"},
+  {"action": "login", "status": "failure", "method": "LDAP", "msg_tpl": "User USER authentication failed: invalid credentials"},
+  {"action": "login", "status": "failure", "method": "Radius", "msg_tpl": "User USER authentication failed: RADIUS timeout"},
+  {"action": "logout", "status": "success", "method": "Session", "msg_tpl": "User USER session expired and logged out"},
+  {"action": "logout", "status": "success", "method": "Manual", "msg_tpl": "User USER logged out manually"}
+] -%}
+{%- set auth_weights = [25, 15, 10, 8, 5, 20, 12] -%}
+{%- set evt = module.rand.weighted_choice(auth_events, auth_weights) -%}
+{%- set msg = evt.msg_tpl | replace("USER", user.user) -%}
+{#- Source IP -#}
+{%- set src_host = samples.internal_hosts | selectattr("role", "equalto", "workstation") | list | random -%}
+{%- set srcip = src_host.ip -%}
+{%- set event_outcome = evt.status -%}
+{%- if evt.action == "login" -%}
+  {%- set event_type = ["start"] -%}
+{%- elif evt.action == "logout" -%}
+  {%- set event_type = ["end"] -%}
+{%- else -%}
+  {%- set event_type = ["info"] -%}
+{%- endif -%}
+{%- set threat = 1 if evt.status == "success" else 4 -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ evt.action }}",
+        "category": ["authentication"],
+        "dataset": "usergate.log",
+        "kind": "event",
+        "module": "usergate",
+        "outcome": "{{ event_outcome }}",
+        "type": {{ event_type | tojson }}
+    },
+    "log": {
+        "level": "{{ "warning" if evt.status == "failure" else "informational" }}"
+    },
+    "message": "CEF:0|UserGate|NGFW|7|event|user auth|{{ threat }}|rt={{ (timestamp.timestamp() * 1000) | int }} deviceExternalId={{ device_id }} suser={{ user.user }} act={{ evt.action }} src={{ srcip }} msg={{ msg }}",
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "name": "{{ hostname }}",
+        "product": "NGFW",
+        "serial_number": "{{ device_id }}",
+        "type": "firewall",
+        "vendor": "UserGate"
+    },
+    "related": {
+        "ip": ["{{ srcip }}"],
+        "user": ["{{ user.user }}"]
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "user": {
+            "group": {
+                "name": "{{ user.group }}"
+            },
+            "name": "{{ user.user }}"
+        }
+    },
+    "tags": ["usergate", "usergate-ngfw", "forwarded"],
+    "user": {
+        "name": "{{ user.user }}"
+    },
+    "usergate": {
+        "auth_method": "{{ evt.method }}",
+        "device_id": "{{ device_id }}",
+        "log_type": "event",
+        "rule_type": "user auth",
+        "threat_level": {{ threat }},
+        "user": "{{ user.user }}",
+        "user_group": "{{ user.group }}"
+    }
+}

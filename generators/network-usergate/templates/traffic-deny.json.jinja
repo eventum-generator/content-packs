@@ -1,0 +1,117 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set device_id = params.device_id -%}
+{#- Denied traffic is primarily inbound attacks or policy violations -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound"], [75, 25]) -%}
+{%- set service = samples.network_services.weighted_pick('weight') -%}
+{#- Pick a deny rule -#}
+{%- set deny_rules = samples.firewall_rules | selectattr("action", "equalto", "deny") | list -%}
+{%- set rule_items = [] -%}
+{%- set rule_weights = [] -%}
+{%- for r in deny_rules -%}
+  {%- do rule_items.append(r) -%}
+  {%- do rule_weights.append(r.weight) -%}
+{%- endfor -%}
+{%- set rule = module.rand.weighted_choice(rule_items, rule_weights) -%}
+{#- Source/dest based on direction -#}
+{%- if direction_type == "inbound" -%}
+  {%- set srcip = module.rand.network.ip_v4_public() -%}
+  {%- set srcport = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dstip = dst_host.ip -%}
+  {%- set dstport = service.port -%}
+  {%- set src_zone = "Untrusted" -%}
+  {%- set dst_zone = "Trusted" -%}
+  {%- set srccountry = module.rand.weighted_choice(["CN", "RU", "US", "BR", "IN", "KR", "IR", "VN", "PK", "UA"], [20, 15, 12, 8, 8, 7, 6, 5, 5, 4]) -%}
+  {%- set dstcountry = "RU" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | selectattr("role", "equalto", "workstation") | list | random -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set dstport = service.port -%}
+  {%- set src_zone = "Trusted" -%}
+  {%- set dst_zone = "Untrusted" -%}
+  {%- set srccountry = "RU" -%}
+  {%- set dstcountry = module.rand.weighted_choice(["US", "CN", "DE", "NL", "GB"], [30, 20, 15, 15, 10]) -%}
+{%- endif -%}
+{%- set proto_name = "TCP" if service.proto == 6 else "UDP" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "geo": {
+            "country_iso_code": "{{ dstcountry }}"
+        },
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "deny",
+        "category": ["network"],
+        "dataset": "usergate.log",
+        "kind": "event",
+        "module": "usergate",
+        "outcome": "failure",
+        "type": ["connection", "denied"]
+    },
+    "log": {
+        "level": "warning"
+    },
+    "message": "CEF:0|UserGate|NGFW|7|traffic|firewall|5|rt={{ (timestamp.timestamp() * 1000) | int }} deviceExternalId={{ device_id }} suser=Unknown act=deny cs1Label=Rule cs1={{ rule.name }} src={{ srcip }} spt={{ srcport }} cs2Label=Source Zone cs2={{ src_zone }} cs3Label=Source Country cs3={{ srccountry }} proto={{ proto_name }} dst={{ dstip }} dpt={{ dstport }} cs4Label=Destination Zone cs4={{ dst_zone }} cs5Label=Destination Country cs5={{ dstcountry }} sourceTranslatedAddress=0.0.0.0 sourceTranslatedPort=0 in=0 out=0 cn1Label=Packets sent cn1=0 cn2Label=Packets received cn2=0",
+    "network": {
+        "direction": "{{ direction_type }}",
+        "iana_number": "{{ service.proto }}",
+        "protocol": "{{ service.name | lower }}",
+        "transport": "{{ "tcp" if service.proto == 6 else "udp" }}"
+    },
+    "observer": {
+        "egress": {
+            "zone": "{{ dst_zone }}"
+        },
+        "hostname": "{{ fqdn }}",
+        "ingress": {
+            "zone": "{{ src_zone }}"
+        },
+        "name": "{{ hostname }}",
+        "product": "NGFW",
+        "serial_number": "{{ device_id }}",
+        "type": "firewall",
+        "vendor": "UserGate"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "rule": {
+        "id": "{{ rule.id }}",
+        "name": "{{ rule.name }}"
+    },
+    "source": {
+        "geo": {
+            "country_iso_code": "{{ srccountry }}"
+        },
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["usergate", "usergate-ngfw", "forwarded"],
+    "usergate": {
+        "device_id": "{{ device_id }}",
+        "log_type": "traffic",
+        "rule_name": "{{ rule.name }}",
+        "rule_type": "firewall",
+        "session_id": {{ sessionid }},
+        "threat_level": 5,
+        "user": "Unknown"
+    }
+}
+{%- do shared.set('sessionid', (sessionid + 1) % 2147483647) -%}

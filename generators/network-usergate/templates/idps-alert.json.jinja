@@ -1,0 +1,125 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set device_id = params.device_id -%}
+{#- IDPS signature detection events -#}
+{%- set signature = samples.ips_signatures.weighted_pick('weight') -%}
+{#- Predominantly inbound -#}
+{%- set direction_type = module.rand.weighted_choice(["inbound", "outbound"], [85, 15]) -%}
+{#- Action: drop or alert -#}
+{%- set action = module.rand.weighted_choice(["drop", "alert"], [60, 40]) -%}
+{#- Severity to threat level mapping -#}
+{%- set severity_map = {"critical": 10, "high": 8, "medium": 5, "low": 2} -%}
+{%- set threat_level = severity_map.get(signature.severity, 5) -%}
+{#- Service-to-port mapping -#}
+{%- set svc_port_map = {"HTTP": 80, "HTTPS": 443, "SSH": 22, "RDP": 3389, "SMB": 445, "DNS": 53, "SMTP": 25} -%}
+{%- set dstport = svc_port_map.get(signature.service, 80) -%}
+{%- set proto_num = 6 -%}
+{%- if signature.service == "DNS" -%}
+  {%- set proto_num = 17 -%}
+{%- endif -%}
+{%- if direction_type == "inbound" -%}
+  {%- set srcip = module.rand.network.ip_v4_public() -%}
+  {%- set srcport = module.rand.number.integer(1024, 65535) -%}
+  {%- set dst_host = samples.internal_hosts | random -%}
+  {%- set dstip = dst_host.ip -%}
+  {%- set src_zone = "Untrusted" -%}
+  {%- set dst_zone = "Trusted" -%}
+  {%- set srccountry = module.rand.weighted_choice(["CN", "RU", "US", "DE", "BR", "IN", "NL", "KR", "IR", "VN"], [22, 15, 12, 8, 7, 7, 6, 5, 5, 3]) -%}
+  {%- set dstcountry = "RU" -%}
+{%- else -%}
+  {%- set src_host = samples.internal_hosts | random -%}
+  {%- set srcip = src_host.ip -%}
+  {%- set srcport = module.rand.number.integer(49152, 65535) -%}
+  {%- set dstip = module.rand.network.ip_v4_public() -%}
+  {%- set src_zone = "Trusted" -%}
+  {%- set dst_zone = "Untrusted" -%}
+  {%- set srccountry = "RU" -%}
+  {%- set dstcountry = module.rand.weighted_choice(["US", "CN", "DE", "NL", "GB"], [30, 20, 15, 15, 10]) -%}
+{%- endif -%}
+{%- set event_outcome = "success" if action == "drop" else "success" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "geo": {
+            "country_iso_code": "{{ dstcountry }}"
+        },
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network", "intrusion_detection"],
+        "dataset": "usergate.log",
+        "kind": "alert",
+        "module": "usergate",
+        "outcome": "{{ event_outcome }}",
+        "severity": {{ threat_level }},
+        "type": ["info"]
+    },
+    "log": {
+        "level": "alert"
+    },
+    "message": "CEF:0|UserGate|NGFW|7|ids|rule|{{ threat_level }}|rt={{ (timestamp.timestamp() * 1000) | int }} deviceExternalId={{ device_id }} suser=Unknown act={{ action }} cs1Label=Rule cs1=IDS/IPS default src={{ srcip }} spt={{ srcport }} cs2Label=Source Zone cs2={{ src_zone }} cs3Label=Source Country cs3={{ srccountry }} proto={{ signature.protocol }} dst={{ dstip }} dpt={{ dstport }} cs4Label=Destination Zone cs4={{ dst_zone }} cs5Label=Destination Country cs5={{ dstcountry }} msg={{ signature.name }}",
+    "network": {
+        "direction": "{{ direction_type }}",
+        "iana_number": "{{ proto_num }}",
+        "protocol": "{{ signature.service | lower }}",
+        "transport": "{{ "tcp" if proto_num == 6 else "udp" }}"
+    },
+    "observer": {
+        "egress": {
+            "zone": "{{ dst_zone }}"
+        },
+        "hostname": "{{ fqdn }}",
+        "ingress": {
+            "zone": "{{ src_zone }}"
+        },
+        "name": "{{ hostname }}",
+        "product": "NGFW",
+        "serial_number": "{{ device_id }}",
+        "type": "firewall",
+        "vendor": "UserGate"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]
+    },
+    "rule": {
+        "category": "{{ signature.category }}",
+        "id": "{{ signature.sid }}",
+        "name": "{{ signature.name }}"
+    },
+    "source": {
+        "geo": {
+            "country_iso_code": "{{ srccountry }}"
+        },
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["usergate", "usergate-ngfw", "forwarded"],
+    "usergate": {
+        "device_id": "{{ device_id }}",
+        "idps_action": "{{ action }}",
+        "log_type": "ids",
+        "rule_name": "IDS/IPS default",
+        "rule_type": "rule",
+        "session_id": {{ sessionid }},
+        "severity": "{{ signature.severity }}",
+        "signature_category": "{{ signature.category }}",
+        "signature_id": {{ signature.sid }},
+        "signature_name": "{{ signature.name }}",
+        "threat_level": {{ threat_level }},
+        "user": "Unknown"
+    }
+}
+{%- do shared.set('sessionid', (sessionid + 1) % 2147483647) -%}

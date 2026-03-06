@@ -1,0 +1,111 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set device_id = params.device_id -%}
+{#- DNS query logging -#}
+{%- set dns_domains = [
+  "google.com", "microsoft.com", "amazonaws.com", "cloudflare.com",
+  "github.com", "stackoverflow.com", "apple.com", "facebook.com",
+  "twitter.com", "linkedin.com", "office365.com", "azure.com",
+  "yandex.ru", "mail.ru", "vk.com", "ok.ru",
+  "update.microsoft.com", "cdn.cloudflare.com", "api.github.com"
+] -%}
+{%- set query_types = ["A", "AAAA", "CNAME", "MX", "TXT", "NS", "PTR", "SRV"] -%}
+{%- set query_type_weights = [55, 10, 10, 5, 5, 3, 5, 2] -%}
+{%- set query_domain = module.rand.choice(dns_domains) -%}
+{%- set query_type = module.rand.weighted_choice(query_types, query_type_weights) -%}
+{#- DNS action -#}
+{%- set action = module.rand.weighted_choice(["allow", "block"], [92, 8]) -%}
+{#- Source is always internal -#}
+{%- set src_host = samples.internal_hosts | random -%}
+{%- set srcip = src_host.ip -%}
+{%- set srcport = module.rand.number.integer(1024, 65535) -%}
+{#- DNS server -#}
+{%- set dns_servers = ["10.1.2.70", "8.8.8.8", "1.1.1.1"] -%}
+{%- set dstip = module.rand.weighted_choice(dns_servers, [60, 25, 15]) -%}
+{%- set has_user = module.rand.chance(0.6) -%}
+{%- if has_user -%}
+  {%- set user = samples.users.weighted_pick('weight') -%}
+  {%- set username = user.user -%}
+{%- else -%}
+  {%- set username = "Unknown" -%}
+{%- endif -%}
+{%- set threat = 1 if action == "allow" else 6 -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": 53
+    },
+    "dns": {
+        "question": {
+            "name": "{{ query_domain }}",
+            "type": "{{ query_type }}"
+        },
+        "type": "query"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ action }}",
+        "category": ["network"],
+        "dataset": "usergate.log",
+        "kind": "event",
+        "module": "usergate",
+        "outcome": "{{ "success" if action == "allow" else "failure" }}",
+        "type": ["{{ "allowed" if action == "allow" else "denied" }}"]
+    },
+    "log": {
+        "level": "{{ "informational" if action == "allow" else "warning" }}"
+    },
+    "message": "CEF:0|UserGate|NGFW|7|dns|rule|{{ threat }}|rt={{ (timestamp.timestamp() * 1000) | int }} deviceExternalId={{ device_id }} suser={{ username }} act={{ action }} cs1Label=Rule cs1=DNS filtering src={{ srcip }} spt={{ srcport }} cs2Label=Source Zone cs2=Trusted proto=UDP dst={{ dstip }} dpt=53 cs4Label=Destination Zone cs4={{ "Trusted" if dstip.startswith("10.") else "Untrusted" }} msg=DNS query {{ query_type }} {{ query_domain }}",
+    "network": {
+        "direction": "{{ "internal" if dstip.startswith("10.") else "outbound" }}",
+        "iana_number": "17",
+        "protocol": "dns",
+        "transport": "udp"
+    },
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "ingress": {
+            "zone": "Trusted"
+        },
+        "name": "{{ hostname }}",
+        "product": "NGFW",
+        "serial_number": "{{ device_id }}",
+        "type": "firewall",
+        "vendor": "UserGate"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"]{% if has_user %},
+        "user": ["{{ username }}"]{% endif %}
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["usergate", "usergate-ngfw", "forwarded"],
+    "usergate": {
+        "device_id": "{{ device_id }}",
+        "dns_query": "{{ query_domain }}",
+        "dns_query_type": "{{ query_type }}",
+        "log_type": "dns",
+        "rule_name": "DNS filtering",
+        "rule_type": "rule",
+        "session_id": {{ sessionid }},
+        "threat_level": {{ threat }},
+        "user": "{{ username }}"
+    }{% if has_user %},
+    "user": {
+        "name": "{{ username }}"
+    }{% endif %}
+}
+{%- do shared.set('sessionid', (sessionid + 1) % 2147483647) -%}

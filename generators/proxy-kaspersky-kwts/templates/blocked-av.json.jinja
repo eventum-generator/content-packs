@@ -1,0 +1,128 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, observer_block, user_block, network_block, tls_block, http_block, url_block, related_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick user and host -#}
+{%- set user = samples.users | random -%}
+{%- set host_entry = samples.hosts | random -%}
+{#- Pick blocked URL category and URL -#}
+{%- set category = samples.url_categories_blocked.weighted_pick('weight') -%}
+{%- set url_entry = category.urls | random -%}
+{#- Pick threat -#}
+{%- set threat = samples.threats.weighted_pick('weight') -%}
+{#- HTTP details -#}
+{%- set protocol = module.rand.weighted_choice(["HTTPS", "HTTP"], [70, 30]) -%}
+{%- set http_method = module.rand.weighted_choice(["GET", "POST", "CONNECT"], [60, 30, 10]) -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Network details -#}
+{%- set src_ip = host_entry.ip_prefix ~ "." ~ module.rand.number.integer(10, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set dst_port = 443 if protocol == "HTTPS" else 80 -%}
+{#- Byte sizes (partial transfer before AV detected threat) -#}
+{%- set req_bytes = module.rand.number.integer(200, 600) -%}
+{%- set resp_bytes = module.rand.number.integer(500, 50000) -%}
+{%- set processing_ms = module.rand.number.clamp(module.rand.number.lognormal(5, 1) | int, 20, 60000) -%}
+{#- TLS details -#}
+{%- set tls_version = module.rand.weighted_choice(["1.3", "1.2", "1.1", "1.0"], [45, 35, 12, 8]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "ECDHE-RSA-AES256-GCM-SHA384"], [35, 35, 30]) -%}
+{%- set url_scheme = "https" if protocol == "HTTPS" else "http" -%}
+{#- File hashes -#}
+{%- set file_md5 = module.rand.crypto.md5() -%}
+{%- set file_sha256 = module.rand.crypto.sha256() -%}
+{%- set filename = module.rand.weighted_choice(["payload.exe", "invoice.doc", "update.scr", "installer.msi", "document.pdf.exe", "report.js", "package.zip"], [20, 20, 10, 15, 10, 15, 10]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "destination": {
+        "domain": "{{ url_entry.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ ecs_block() }},
+    "event": {
+        "action": "blocked",
+        "category": ["web", "network", "malware"],
+        "dataset": "kaspersky_kwts.traffic",
+        "duration": {{ processing_ms * 1000000 }},
+        "id": "{{ record_id }}",
+        "kind": "alert",
+        "module": "kaspersky_kwts",
+        "outcome": "failure",
+        "reason": "{{ threat.name }}",
+        "severity": {{ 3 if "High" in threat.severity else 2 }},
+        "type": ["access", "denied", "connection"]
+    },
+    "file": {
+        "hash": {
+            "md5": "{{ file_md5 }}",
+            "sha256": "{{ file_sha256 }}"
+        },
+        "name": "{{ filename }}",
+        "size": {{ resp_bytes }}
+    },
+    {{ host_block(host_entry) }},
+    {{ http_block(http_method, 403, user_agent, req_bytes, resp_bytes, "application/octet-stream", "1.1") }},
+    "kaspersky": {
+        "kwts": {
+            "action": "Block",
+            "blocked_by_rule": "[Default/Antivirus_Scanning]",
+            "processing_time_ms": {{ processing_ms }},
+            "scan_result": "{{ threat.name }}",
+            "av_status": "Detected",
+            "ap_status": "NotDetected",
+            "mlf_status": "{{ module.rand.weighted_choice(['NotDetected', 'Detected (local bases)'], [60, 40]) }}",
+            "kata_alert": "{{ module.rand.weighted_choice(['NotDetected', 'Detected', 'NotScanned (NotConfigured)'], [50, 20, 30]) }}",
+            "encrypted": "NotDetected",
+            "macros": "{{ module.rand.weighted_choice(['NotDetected', 'Detected'], [75, 25]) }}",
+            "workspace": "Default",
+            "type": "Response",
+            "filename": "{{ filename }}",
+            "filesize": "{{ resp_bytes }}",
+            "content_type": "application/octet-stream",
+            "method": "{{ http_method }}",
+            "url_category": "{{ category.category }}",
+            "rules": "Antivirus_Scanning",
+            "threats": "{{ threat.name }}/Block",
+            "threat_name": "{{ threat.name }}",
+            "threat_category": "{{ threat.category }}",
+            "threat_severity": "{{ threat.severity }}",
+            "part": 1,
+            "part_mimetype": "application/octet-stream"
+        }
+    },
+    {{ network_block(protocol, "outbound") }},
+    {{ observer_block(params) }},
+    {{ related_block(src_ip, dst_ip, user.username, host_entry.hostname, [file_md5, file_sha256]) }},
+    "rule": {
+        "name": "Antivirus_Scanning",
+        "ruleset": "Malware Protection"
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "threat": {
+        "indicator": {
+            "file": {
+                "hash": {
+                    "md5": "{{ file_md5 }}",
+                    "sha256": "{{ file_sha256 }}"
+                },
+                "name": "{{ filename }}"
+            },
+            "type": "file"
+        },
+        "software": {
+            "name": "{{ threat.name }}",
+            "type": "{{ threat.category }}"
+        }
+    },
+    {%- if protocol == "HTTPS" %}
+    {{ tls_block(tls_version, cipher) }},
+    {%- endif %}
+    {{ url_block(url_entry, url_scheme) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

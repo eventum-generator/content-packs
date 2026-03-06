@@ -1,0 +1,93 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, observer_block, user_block, network_block, tls_block, http_block, url_block, related_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick user and host -#}
+{%- set user = samples.users | random -%}
+{%- set host_entry = samples.hosts | random -%}
+{#- Pick blocked URL category and URL -#}
+{%- set category = samples.url_categories_blocked.weighted_pick('weight') -%}
+{%- set url_entry = category.urls | random -%}
+{#- HTTP details (blocked before content transfer) -#}
+{%- set protocol = module.rand.weighted_choice(["HTTPS", "HTTP"], [75, 25]) -%}
+{%- set http_method = module.rand.weighted_choice(["GET", "POST", "CONNECT"], [70, 20, 10]) -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Network details -#}
+{%- set src_ip = host_entry.ip_prefix ~ "." ~ module.rand.number.integer(10, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set dst_port = 443 if protocol == "HTTPS" else 80 -%}
+{#- Byte sizes (small — blocked before transfer) -#}
+{%- set req_bytes = module.rand.number.integer(200, 800) -%}
+{%- set resp_bytes = module.rand.number.integer(100, 500) -%}
+{%- set processing_ms = module.rand.number.integer(2, 50) -%}
+{#- TLS details -#}
+{%- set tls_version = module.rand.weighted_choice(["1.3", "1.2", "1.1"], [55, 35, 10]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "ECDHE-RSA-AES256-GCM-SHA384"], [40, 35, 25]) -%}
+{%- set url_scheme = "https" if protocol == "HTTPS" else "http" -%}
+{#- Rule name -#}
+{%- set rule_name = module.rand.weighted_choice(["URL_Filtering_Corporate_Policy", "Block_Restricted_Categories", "Content_Compliance_Rule", "Acceptable_Use_Policy"], [35, 30, 20, 15]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "destination": {
+        "domain": "{{ url_entry.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ ecs_block() }},
+    "event": {
+        "action": "blocked",
+        "category": ["web", "network"],
+        "dataset": "kaspersky_kwts.traffic",
+        "duration": {{ processing_ms * 1000000 }},
+        "id": "{{ record_id }}",
+        "kind": "event",
+        "module": "kaspersky_kwts",
+        "outcome": "failure",
+        "reason": "Blocked by URL filtering policy: {{ category.category }}",
+        "type": ["access", "denied", "connection"]
+    },
+    {{ host_block(host_entry) }},
+    {{ http_block(http_method, 403, user_agent, req_bytes, resp_bytes, "text/html", "1.1") }},
+    "kaspersky": {
+        "kwts": {
+            "action": "Block",
+            "blocked_by_rule": "[Default/{{ rule_name }}]",
+            "processing_time_ms": {{ processing_ms }},
+            "scan_result": "Not scanned",
+            "av_status": "NotScanned (ByACL)",
+            "ap_status": "NotScanned (ByACL)",
+            "mlf_status": "NotScanned (ByACL)",
+            "kata_alert": "NotApplicable",
+            "encrypted": "NotDetected",
+            "macros": "NotDetected",
+            "workspace": "Default",
+            "type": "Request",
+            "filename": "nofile",
+            "filesize": "NotApplicable",
+            "content_type": "text/html",
+            "method": "{{ http_method }}",
+            "url_category": "{{ category.category }}",
+            "rules": "{{ rule_name }}"
+        }
+    },
+    {{ network_block(protocol, "outbound") }},
+    {{ observer_block(params) }},
+    {{ related_block(src_ip, dst_ip, user.username, host_entry.hostname, []) }},
+    "rule": {
+        "name": "{{ rule_name }}",
+        "ruleset": "URL Filtering"
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    {%- if protocol == "HTTPS" %}
+    {{ tls_block(tls_version, cipher) }},
+    {%- endif %}
+    {{ url_block(url_entry, url_scheme) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

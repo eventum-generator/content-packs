@@ -1,0 +1,189 @@
+{#- KSMG ScanLogic event — shared template for AV, AS, AP, CF, MA, KT scan results.
+     Uses vars.scan_type to differentiate: av_status, as_status, ap_status, cf_status, ma_status, kt_status
+     Uses vars.event_class for the LMS_EV_SCAN_LOGIC_* class name
+     Uses vars.outcome_weights for weighted scan outcome selection -#}
+{%- from 'templates/macros/envelope.jinja' import agent_block, ecs_block, observer_block, related_block -%}
+{%- set msg_seq = shared.get('msg_seq', 10000) -%}
+{#- Pick sender (external or internal based on direction) -#}
+{%- set is_inbound = module.rand.chance(0.72) -%}
+{%- if is_inbound -%}
+  {%- set ext = samples.external_domains.weighted_pick('weight') -%}
+  {%- set sender_user = module.faker.locale.en_US.user_name() -%}
+  {%- set sender_email = sender_user ~ '@' ~ ext.domain -%}
+  {%- set sender_ip = ext.ip -%}
+  {%- set sender_hostname = ext.mx_host -%}
+  {%- set rcpt = samples.internal_users.pick() -%}
+  {%- set recipient_email = rcpt.username ~ '@' ~ params.get('domain', 'corp.example.com') -%}
+  {%- set direction = "inbound" -%}
+{%- else -%}
+  {%- set sender_row = samples.internal_users.pick() -%}
+  {%- set sender_user = sender_row.username -%}
+  {%- set sender_email = sender_user ~ '@' ~ params.get('domain', 'corp.example.com') -%}
+  {%- set sender_ip = params.get('ksmg_ip', '10.1.0.20') -%}
+  {%- set sender_hostname = params.get('ksmg_hostname', 'ksmg-node01') ~ '.' ~ params.get('domain', 'corp.example.com') -%}
+  {%- set ext = samples.external_domains.weighted_pick('weight') -%}
+  {%- set recipient_email = module.faker.locale.en_US.user_name() ~ '@' ~ ext.domain -%}
+  {%- set direction = "outbound" -%}
+{%- endif -%}
+{#- Message metadata -#}
+{%- set message_id = '<' ~ module.rand.crypto.uuid4() ~ '@' ~ (sender_email.split('@')[1]) ~ '>' -%}
+{%- set msg_size = module.rand.number.clamp(module.rand.number.lognormal(10, 1.5) | int, 500, 30000000) -%}
+{%- set rule = samples.rules.weighted_pick('weight') -%}
+{#- Subject selection tied to scan type -#}
+{%- if vars.scan_type == 'as' -%}
+  {%- set subject_cat = module.rand.weighted_choice(["spam", "phishing"], [70, 30]) -%}
+{%- elif vars.scan_type == 'ap' -%}
+  {%- set subject_cat = "phishing" -%}
+{%- elif vars.scan_type == 'av' -%}
+  {%- set subject_cat = module.rand.weighted_choice(["business", "automated", "phishing"], [40, 30, 30]) -%}
+{%- else -%}
+  {%- set subject_cat = module.rand.weighted_choice(["business", "automated", "newsletter"], [50, 35, 15]) -%}
+{%- endif -%}
+{%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+{#- Determine scan outcome based on vars -#}
+{%- set outcome_map = {
+  'av_clean': {'status': 'Clean', 'action': 'Skip', 'outcome': 'success', 'severity': 1, 'reason': 'NotDetected'},
+  'av_infected': {'status': 'Infected', 'action': 'Reject', 'outcome': 'failure', 'severity': 7, 'reason': 'ThreatDetected'},
+  'av_disinfected': {'status': 'Disinfected', 'action': 'Skip', 'outcome': 'success', 'severity': 4, 'reason': 'ObjectDisinfected'},
+  'av_encrypted': {'status': 'Encrypted', 'action': 'Skip', 'outcome': 'unknown', 'severity': 3, 'reason': 'EncryptedObject'},
+  'av_error': {'status': 'Error', 'action': 'Skip', 'outcome': 'failure', 'severity': 5, 'reason': 'ScanError'},
+  'as_clean': {'status': 'Clean', 'action': 'Skip', 'outcome': 'success', 'severity': 1, 'reason': 'NotSpam'},
+  'as_spam': {'status': 'Spam', 'action': 'Reject', 'outcome': 'failure', 'severity': 5, 'reason': 'SpamDetected'},
+  'as_probable_spam': {'status': 'ProbableSpam', 'action': 'Skip', 'outcome': 'unknown', 'severity': 3, 'reason': 'ProbableSpam'},
+  'as_massmail': {'status': 'MassMail', 'action': 'Skip', 'outcome': 'success', 'severity': 2, 'reason': 'MassMailDetected'},
+  'as_blacklisted': {'status': 'Blacklisted', 'action': 'Reject', 'outcome': 'failure', 'severity': 5, 'reason': 'SenderBlacklisted'},
+  'ap_clean': {'status': 'Clean', 'action': 'Skip', 'outcome': 'success', 'severity': 1, 'reason': 'NotPhishing'},
+  'ap_phishing': {'status': 'Phishing', 'action': 'Reject', 'outcome': 'failure', 'severity': 7, 'reason': 'PhishingDetected'},
+  'ap_malicious_link': {'status': 'MaliciousLink', 'action': 'Reject', 'outcome': 'failure', 'severity': 6, 'reason': 'MaliciousLinkDetected'},
+  'cf_clean': {'status': 'Clean', 'action': 'Skip', 'outcome': 'success', 'severity': 1, 'reason': 'NotFiltered'},
+  'cf_banned_name': {'status': 'BannedFileName', 'action': 'DeleteAttachment', 'outcome': 'failure', 'severity': 4, 'reason': 'BannedFileName'},
+  'cf_banned_format': {'status': 'BannedFileFormat', 'action': 'DeleteAttachment', 'outcome': 'failure', 'severity': 4, 'reason': 'BannedFileFormat'},
+  'cf_size_exceeded': {'status': 'SizeExceeded', 'action': 'Reject', 'outcome': 'failure', 'severity': 3, 'reason': 'MessageSizeExceeded'},
+  'ma_clean': {'status': 'Clean', 'action': 'Skip', 'outcome': 'success', 'severity': 1, 'reason': 'NotDetected'},
+  'ma_spf_fail': {'status': 'SPFFail', 'action': 'Skip', 'outcome': 'failure', 'severity': 4, 'reason': 'SPFCheckFailed'},
+  'ma_dkim_fail': {'status': 'DKIMFail', 'action': 'Skip', 'outcome': 'failure', 'severity': 4, 'reason': 'DKIMCheckFailed'},
+  'ma_dmarc_fail': {'status': 'DMARCFail', 'action': 'Reject', 'outcome': 'failure', 'severity': 5, 'reason': 'DMARCCheckFailed'},
+  'kt_clean': {'status': 'Clean', 'action': 'Skip', 'outcome': 'success', 'severity': 1, 'reason': 'NotDetected'},
+  'kt_detected': {'status': 'Detected', 'action': 'Reject', 'outcome': 'failure', 'severity': 8, 'reason': 'KATAThreatDetected'}
+} -%}
+{#- Select outcome using weighted choice from vars.outcomes (list of [key, weight] pairs) -#}
+{%- set outcome_keys = [] -%}
+{%- set outcome_weights = [] -%}
+{%- for item in vars.outcomes -%}
+  {%- do outcome_keys.append(item[0]) -%}
+  {%- do outcome_weights.append(item[1]) -%}
+{%- endfor -%}
+{%- set chosen_key = module.rand.weighted_choice(outcome_keys, outcome_weights) -%}
+{%- set scan = outcome_map[chosen_key] -%}
+{#- Threat details for AV infected -#}
+{%- set threat = none -%}
+{%- if chosen_key == 'av_infected' -%}
+  {%- set threat = samples.threats.weighted_pick('weight') -%}
+{%- endif -%}
+{#- Auth details for MA events -#}
+{%- set spf_verdict = "pass" -%}
+{%- set dkim_verdict = "pass" -%}
+{%- set dmarc_verdict = "pass" -%}
+{%- if vars.scan_type == 'ma' -%}
+  {%- if chosen_key == 'ma_spf_fail' -%}
+    {%- set spf_verdict = module.rand.weighted_choice(["fail", "softfail", "temperror"], [60, 30, 10]) -%}
+  {%- elif chosen_key == 'ma_dkim_fail' -%}
+    {%- set dkim_verdict = module.rand.weighted_choice(["fail", "temperror", "permerror"], [70, 20, 10]) -%}
+  {%- elif chosen_key == 'ma_dmarc_fail' -%}
+    {%- set dmarc_verdict = module.rand.weighted_choice(["fail", "reject", "quarantine"], [50, 30, 20]) -%}
+    {%- set spf_verdict = module.rand.weighted_choice(["fail", "softfail", "none"], [40, 40, 20]) -%}
+    {%- set dkim_verdict = module.rand.weighted_choice(["fail", "none"], [60, 40]) -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Processing time -#}
+{%- set processing_ms = module.rand.number.clamp(module.rand.number.lognormal(4.5, 1.0) | int, 5, 60000) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ ecs_block() }},
+    "email": {
+        "direction": "{{ direction }}",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "message_id": {{ message_id | tojson }},
+        "subject": {{ subject | tojson }},
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        }
+    },
+    "event": {
+        "action": {{ scan.action | tojson }},
+        "category": ["email"],
+        "dataset": "kaspersky_ksmg.scanlogic",
+        "duration": {{ processing_ms * 1000000 }},
+        "kind": "event",
+        "module": "kaspersky_ksmg",
+        "outcome": "{{ scan.outcome }}",
+        "reason": {{ scan.reason | tojson }},
+        "severity": {{ scan.severity }},
+        "type": ["info"]
+    },
+    "kaspersky": {
+        "ksmg": {
+            "event_class": "{{ vars.event_class }}",
+            "message_id": {{ message_id | tojson }},
+            "message_size": {{ msg_size }},
+            "scan_status": "{{ scan.status }}",
+            "action": "{{ scan.action }}",
+            "rule": {{ rule.name | tojson }},
+            "rule_id": "{{ rule.id }}",
+            "scan_type": "{{ vars.scan_type }}",
+            "direction": "{{ direction }}",
+            "processing_time_ms": {{ processing_ms }},
+            {%- if vars.scan_type == 'av' %}
+            {%- if threat %}
+            "threat_name": {{ threat.name | tojson }},
+            "infected_object": {{ threat.file | tojson }},
+            {%- endif %}
+            "av_status": "{{ scan.status }}",
+            {%- elif vars.scan_type == 'as' %}
+            "as_status": "{{ scan.status }}",
+            {%- if chosen_key == 'as_spam' or chosen_key == 'as_probable_spam' %}
+            "spam_rate": {{ module.rand.number.integer(60, 100) }},
+            {%- endif %}
+            {%- elif vars.scan_type == 'ap' %}
+            "ap_status": "{{ scan.status }}",
+            {%- if chosen_key == 'ap_malicious_link' %}
+            "malicious_url": "{{ module.rand.weighted_choice(['http', 'https'], [30, 70]) }}://{{ module.faker.locale.en_US.hostname() }}/{{ module.rand.string.letters_lowercase(8) }}",
+            {%- endif %}
+            {%- elif vars.scan_type == 'cf' %}
+            "cf_status": "{{ scan.status }}",
+            {%- if chosen_key == 'cf_banned_name' %}
+            "banned_file_name": "{{ module.rand.weighted_choice(['payload.exe', 'script.bat', 'macro.vbs', 'config.ps1', 'setup.scr', 'install.com'], [25, 20, 20, 15, 10, 10]) }}",
+            {%- elif chosen_key == 'cf_banned_format' %}
+            "banned_file_format": "{{ module.rand.weighted_choice(['PE32 executable', 'Windows batch', 'VBScript', 'PowerShell', 'JavaScript'], [30, 20, 20, 15, 15]) }}",
+            {%- elif chosen_key == 'cf_size_exceeded' %}
+            "detected_size": {{ module.rand.number.integer(26214400, 104857600) }},
+            {%- endif %}
+            {%- elif vars.scan_type == 'ma' %}
+            "spf_verdict": "{{ spf_verdict }}",
+            "dkim_verdict": "{{ dkim_verdict }}",
+            "dmarc_verdict": "{{ dmarc_verdict }}",
+            "auth_status": "{{ scan.status }}",
+            {%- elif vars.scan_type == 'kt' %}
+            "kt_status": "{{ scan.status }}",
+            {%- if chosen_key == 'kt_detected' %}
+            "kata_alert_id": "{{ module.rand.crypto.uuid4() }}",
+            {%- endif %}
+            {%- endif %}
+            "node": "{{ params.get('ksmg_hostname', 'ksmg-node01') }}"
+        }
+    },
+    "log": {
+        "level": "{{ module.rand.weighted_choice(['informational', 'warning', 'error'], [70, 20, 10]) if scan.severity > 3 else 'informational' }}"
+    },
+    {{ observer_block(params) }},
+    {{ related_block([sender_ip, params.get('ksmg_ip', '10.1.0.20')], [sender_user, recipient_email.split('@')[0]], [params.get('ksmg_hostname', 'ksmg-node01')]) }},
+    "source": {
+        "domain": "{{ sender_email.split('@')[1] }}",
+        "ip": "{{ sender_ip }}"
+    },
+    "tags": ["kaspersky-ksmg", "forwarded"]
+}
+{%- do shared.set('msg_seq', (msg_seq + 1) % 2147483647) -%}

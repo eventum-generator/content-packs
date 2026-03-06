@@ -1,0 +1,119 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, pick_user, pick_source_ip, pick_user_agent, pick_resource, build_request_uri, response_status_block, object_ref_block, annotations_block -%}
+{#- RBAC operations — clusterroles, roles, bindings -#}
+{%- set user_type = module.rand.weighted_choice(["user", "serviceaccount", "system"], [60, 25, 15]) -%}
+{%- set user_data = pick_user(samples.users, user_type) -%}
+{%- set username = user_data.split("|||")[0] -%}
+{%- set groups = user_data.split("|||")[1] -%}
+{%- set uid = user_data.split("|||")[2] -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set ua_value = pick_user_agent(user_type, samples.user_agents) -%}
+{%- set ns = module.rand.weighted_choice(
+    ["default", "production", "staging", "kube-system", "monitoring"],
+    [20, 25, 20, 20, 15]
+) -%}
+{%- set verb = module.rand.weighted_choice(["get", "list", "create", "update", "delete"], [30, 25, 20, 15, 10]) -%}
+{%- set resource_type = module.rand.weighted_choice(
+    ["clusterroles", "roles"],
+    [60, 40]
+) -%}
+{%- set res_data = pick_resource(samples.resources, resource_type) -%}
+{%- set res_resource = res_data.split("|||")[0] -%}
+{%- set res_api_group = res_data.split("|||")[1] -%}
+{%- set res_api_version = res_data.split("|||")[2] -%}
+{%- set res_name = res_data.split("|||")[3] -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set is_error = module.rand.chance(params.get('error_rate', 3) / 100.0) -%}
+{%- if is_error -%}
+    {%- set status_code = 403 -%}
+    {%- set outcome = "failure" -%}
+    {%- set is_allowed = false -%}
+{%- else -%}
+    {%- if verb == "create" -%}
+        {%- set status_code = 201 -%}
+    {%- elif verb == "delete" -%}
+        {%- set status_code = 200 -%}
+    {%- else -%}
+        {%- set status_code = 200 -%}
+    {%- endif -%}
+    {%- set outcome = "success" -%}
+    {%- set is_allowed = true -%}
+{%- endif -%}
+{%- set rbac_reason = "RBAC: allowed by ClusterRoleBinding \"cluster-admin\" of ClusterRole \"cluster-admin\" to User \"" ~ username ~ "\"" if is_allowed else "RBAC: no rules matched; user is missing cluster-admin privileges" -%}
+{%- set request_uri = build_request_uri(verb, res_resource, res_api_group, res_name, ns) -%}
+{%- set event_type_map = {"get": "access", "list": "access", "create": "creation", "update": "change", "delete": "deletion"} -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ ecs_block() }},
+    "data_stream": {
+        "dataset": "kubernetes.audit_logs",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "event": {
+        "action": "{{ verb }}",
+        "category": ["web", "iam"],
+        "dataset": "kubernetes.audit_logs",
+        "kind": "event",
+        "module": "kubernetes",
+        "outcome": "{{ outcome }}",
+        "type": ["{{ event_type_map[verb] }}"]
+    },
+    "kubernetes": {
+        "audit": {
+            "auditID": "{{ audit_id }}",
+            "apiVersion": "audit.k8s.io/v1",
+            "kind": "Event",
+            "level": "RequestResponse",
+            "stage": "ResponseComplete",
+            "verb": "{{ verb }}",
+            "requestURI": "{{ request_uri }}",
+            "user": {
+                "username": "{{ username }}",
+                "uid": "{{ uid }}",
+                "groups": {{ groups.split(",") | tojson }}
+            },
+            "sourceIPs": ["{{ src_ip }}"],
+            "userAgent": {{ ua_value | tojson }},
+            {{ object_ref_block(res_resource, res_api_group, res_api_version, res_name, ns) }},
+            {{ response_status_block(status_code) }},
+            {{ annotations_block(is_allowed, rbac_reason) }},
+            "requestReceivedTimestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.') }}{{ '%06d' | format(module.rand.number.integer(0, 999999)) }}Z",
+            "stageTimestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.') }}{{ '%06d' | format(module.rand.number.integer(0, 999999)) }}Z"
+        }
+    },
+    "log": {
+        "file": {
+            "path": "/var/log/kubernetes/kube-apiserver-audit.log"
+        }
+    },
+    "orchestrator": {
+        "cluster": {
+            "name": "{{ params.get('cluster_name', 'production-cluster') }}"
+        },
+        "namespace": "{{ ns }}",
+        "resource": {
+            "name": "{{ res_name }}",
+            "type": "{{ res_resource }}"
+        },
+        "type": "kubernetes"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+    "tags": ["forwarded", "kubernetes-audit"],
+    "user": {
+        "name": "{{ username }}",
+        "id": "{{ uid }}",
+        "group": {
+            "name": "{{ groups.split(',')[0] }}"
+        }
+    },
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    }
+}

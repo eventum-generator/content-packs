@@ -1,0 +1,125 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set event_id = shared.get('event_id:' ~ hostname, 1000) -%}
+{%- set sessions = shared.get('sessions:' ~ hostname, []) -%}
+{%- if sessions | length > 0 -%}
+  {%- set sess = sessions | random -%}
+  {%- set username = sess.user -%}
+  {%- set client_ip = sess.client_ip -%}
+  {%- set conn_id = sess.conn_id -%}
+  {%- set client_host = sess.client_host -%}
+{%- else -%}
+  {%- set user = samples.users.weighted_pick('weight') -%}
+  {%- set username = user.username -%}
+  {%- if user.host == 'localhost' -%}
+    {%- set client_ip = "127.0.0.1" -%}
+  {%- else -%}
+    {%- set client_ip = module.rand.network.ip_v4_private_c() -%}
+  {%- endif -%}
+  {%- set conn_id = module.rand.number.integer(50, 5000) -%}
+  {%- set client_host = module.rand.choice(["app-server-01", "web-01", hostname]) -%}
+{%- endif -%}
+{#- Pick an error scenario -#}
+{%- set error = module.rand.weighted_choice([
+  {"status": 1146, "stmt": "SELECT * FROM `ecommerce`.`nonexistent_table`", "sql_cmd": "select"},
+  {"status": 1054, "stmt": "SELECT `bad_column` FROM `webapp`.`users`", "sql_cmd": "select"},
+  {"status": 1062, "stmt": "INSERT INTO `ecommerce`.`customers` (`id`, `email`) VALUES (1, 'dup@example.com')", "sql_cmd": "insert"},
+  {"status": 1064, "stmt": "SELEC * FROM `ecommerce`.`orders`", "sql_cmd": "error"},
+  {"status": 1142, "stmt": "DROP TABLE `ecommerce`.`orders`", "sql_cmd": "drop_table"},
+  {"status": 1044, "stmt": "USE `restricted_db`", "sql_cmd": "change_db"},
+  {"status": 1205, "stmt": "UPDATE `ecommerce`.`orders` SET `status` = 'shipped' WHERE `id` = 42", "sql_cmd": "update"},
+  {"status": 1213, "stmt": "UPDATE `inventory`.`stock_levels` SET `qty` = `qty` - 1 WHERE `product_id` = 100", "sql_cmd": "update"}
+], None) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.get('agent_version', '8.17.0') }}"
+    },
+    "client": {
+        "domain": "{{ client_host }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "data_stream": {
+        "dataset": "mysql_enterprise.audit",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "mysql-query",
+        "category": ["database"],
+        "dataset": "mysql_enterprise.audit",
+        "kind": "event",
+        "module": "mysql_enterprise",
+        "outcome": "failure",
+        "timezone": "+00:00",
+        "type": ["error"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "linux",
+            "full": "x86_64-Linux",
+            "name": "{{ host.os_name }}",
+            "type": "linux",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "mysqlenterprise": {
+        "audit": {
+            "account": {
+                "host": "{{ client_host }}",
+                "user": "{{ username }}"
+            },
+            "class": "general",
+            "connection_id": "{{ conn_id }}",
+            "general_data": {
+                "command": "Query",
+                "query": {{ error.stmt | tojson }},
+                "sql_command": "{{ error.sql_cmd }}",
+                "status": {{ error.status }}
+            },
+            "id": "{{ event_id }}",
+            "login": {
+                "ip": "{{ client_ip }}",
+                "os": "",
+                "proxy": "",
+                "user": "{{ username }}"
+            }
+        }
+    },
+    "related": {
+        "ip": ["{{ client_ip }}", "{{ host.ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "server": {
+        "user": {
+            "name": "{{ username }}"
+        }
+    },
+    "service": {
+        "id": "{{ host.server_id }}",
+        "type": "mysql_enterprise",
+        "version": "{{ host.mysql_version }}"
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "tags": ["mysql_enterprise-audit"],
+    "user": {
+        "name": "{{ username }}"
+    }
+}
+{%- do shared.set('event_id:' ~ hostname, event_id + 1) -%}

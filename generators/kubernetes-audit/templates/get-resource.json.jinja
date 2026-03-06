@@ -1,0 +1,109 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, pick_user, pick_source_ip, pick_user_agent, pick_resource, build_request_uri, response_status_block, object_ref_block, annotations_block -%}
+{#- GET single resource — the most common audit event -#}
+{%- set user_type = module.rand.weighted_choice(["user", "serviceaccount", "system"], [25, 35, 40]) -%}
+{%- set user_data = pick_user(samples.users, user_type) -%}
+{%- set username = user_data.split("|||")[0] -%}
+{%- set groups = user_data.split("|||")[1] -%}
+{%- set uid = user_data.split("|||")[2] -%}
+{%- set src_ip = pick_source_ip(samples.source_ips) -%}
+{%- set ua_value = pick_user_agent(user_type, samples.user_agents) -%}
+{%- set ns = (samples.namespaces | random).name -%}
+{%- set resource_type = module.rand.weighted_choice(
+    ["pods", "services", "configmaps", "secrets", "deployments", "nodes", "namespaces", "serviceaccounts", "endpoints"],
+    [30, 15, 15, 10, 10, 5, 5, 5, 5]
+) -%}
+{%- set res_data = pick_resource(samples.resources, resource_type) -%}
+{%- set res_resource = res_data.split("|||")[0] -%}
+{%- set res_api_group = res_data.split("|||")[1] -%}
+{%- set res_api_version = res_data.split("|||")[2] -%}
+{%- set res_name = res_data.split("|||")[3] -%}
+{%- set is_error = module.rand.chance(params.get('error_rate', 3) / 100.0) -%}
+{%- if is_error -%}
+    {%- set status_code = module.rand.weighted_choice([403, 404], [30, 70]) -%}
+    {%- set outcome = "failure" -%}
+    {%- set is_allowed = status_code != 403 -%}
+{%- else -%}
+    {%- set status_code = 200 -%}
+    {%- set outcome = "success" -%}
+    {%- set is_allowed = true -%}
+{%- endif -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set rbac_reason = "RBAC: allowed by ClusterRoleBinding \"system:public-info-viewer\" of ClusterRole \"system:public-info-viewer\" to Group \"system:authenticated\"" if is_allowed else "RBAC: no rules matched" -%}
+{%- set request_uri = build_request_uri("get", res_resource, res_api_group, res_name, ns) -%}
+{%- set stage_delay_us = module.rand.number.integer(500, 15000) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ ecs_block() }},
+    "data_stream": {
+        "dataset": "kubernetes.audit_logs",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "event": {
+        "action": "get",
+        "category": ["web"],
+        "dataset": "kubernetes.audit_logs",
+        "kind": "event",
+        "module": "kubernetes",
+        "outcome": "{{ outcome }}",
+        "type": ["access"]
+    },
+    "kubernetes": {
+        "audit": {
+            "auditID": "{{ audit_id }}",
+            "apiVersion": "audit.k8s.io/v1",
+            "kind": "Event",
+            "level": "{{ module.rand.weighted_choice(['Metadata', 'Request', 'RequestResponse'], [60, 20, 20]) }}",
+            "stage": "ResponseComplete",
+            "verb": "get",
+            "requestURI": "{{ request_uri }}",
+            "user": {
+                "username": "{{ username }}",
+                "uid": "{{ uid }}",
+                "groups": {{ groups.split(",") | tojson }}
+            },
+            "sourceIPs": ["{{ src_ip }}"],
+            "userAgent": {{ ua_value | tojson }},
+            {{ object_ref_block(res_resource, res_api_group, res_api_version, res_name, ns) }},
+            {{ response_status_block(status_code) }},
+            {{ annotations_block(is_allowed, rbac_reason) }},
+            "requestReceivedTimestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.') }}{{ '%06d' | format(module.rand.number.integer(0, 999999)) }}Z",
+            "stageTimestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.') }}{{ '%06d' | format(module.rand.number.integer(0, 999999)) }}Z"
+        }
+    },
+    "log": {
+        "file": {
+            "path": "/var/log/kubernetes/kube-apiserver-audit.log"
+        }
+    },
+    "orchestrator": {
+        "cluster": {
+            "name": "{{ params.get('cluster_name', 'production-cluster') }}"
+        },
+        "namespace": "{{ ns }}",
+        "resource": {
+            "name": "{{ res_name }}",
+            "type": "{{ res_resource }}"
+        },
+        "type": "kubernetes"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+    "tags": ["forwarded", "kubernetes-audit"],
+    "user": {
+        "name": "{{ username }}",
+        "id": "{{ uid }}",
+        "group": {
+            "name": "{{ groups.split(',')[0] }}"
+        }
+    },
+    "user_agent": {
+        "original": {{ ua_value | tojson }}
+    }
+}

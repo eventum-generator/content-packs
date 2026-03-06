@@ -1,0 +1,158 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set event_id = shared.get('event_id:' ~ hostname, 1000) -%}
+{#- DDL is typically done by admins/DBAs -#}
+{%- set admin_user = module.rand.weighted_choice(["root", "admin_jsmith", "admin_mchen", "dev_agarcia"], [20, 35, 25, 20]) -%}
+{%- set client_ip = module.rand.weighted_choice([module.rand.network.ip_v4_private_c(), "127.0.0.1"], [70, 30]) -%}
+{%- set conn_id = module.rand.number.integer(50, 5000) -%}
+{%- set client_host = module.rand.weighted_choice(["dev-workstation", hostname, "admin-pc"], [45, 30, 25]) -%}
+{%- set db_entry = samples.databases | rejectattr('tables', 'equalto', []) | list | random -%}
+{%- set db_name = db_entry.name -%}
+{#- Pick DDL operation -#}
+{%- set ddl_op = module.rand.weighted_choice(["CREATE", "ALTER", "DROP"], [35, 50, 15]) -%}
+{%- set obj_type = module.rand.weighted_choice(["TABLE", "INDEX", "VIEW", "PROCEDURE"], [35, 30, 20, 15]) -%}
+{%- if obj_type == "TABLE" -%}
+  {%- if ddl_op == "CREATE" -%}
+    {%- set obj_name = module.rand.choice(["tmp_import", "staging_data", "archive_log", "temp_report"]) -%}
+    {%- set stmt = ddl_op ~ " TABLE `" ~ db_name ~ "`.`" ~ obj_name ~ "` (`id` INT AUTO_INCREMENT PRIMARY KEY, `data` TEXT, `created_at` DATETIME DEFAULT CURRENT_TIMESTAMP)" -%}
+  {%- elif ddl_op == "ALTER" and db_entry.tables | length > 0 -%}
+    {%- set tbl = db_entry.tables | random -%}
+    {%- set obj_name = tbl.name -%}
+    {%- set alter_action = module.rand.choice(["ADD COLUMN `new_col` VARCHAR(255) DEFAULT NULL", "MODIFY COLUMN `status` VARCHAR(50) NOT NULL", "ADD INDEX `idx_created_at` (`created_at`)"]) -%}
+    {%- set stmt = ddl_op ~ " TABLE `" ~ db_name ~ "`.`" ~ obj_name ~ "` " ~ alter_action -%}
+  {%- else -%}
+    {%- set obj_name = module.rand.choice(["tmp_import", "staging_data"]) -%}
+    {%- set stmt = ddl_op ~ " TABLE IF EXISTS `" ~ db_name ~ "`.`" ~ obj_name ~ "`" -%}
+  {%- endif -%}
+  {%- set sql_cmd = ddl_op | lower ~ "_table" -%}
+{%- elif obj_type == "INDEX" -%}
+  {%- set tbl = db_entry.tables | random if db_entry.tables | length > 0 else {"name": "temp_table", "cols": ["id"]} -%}
+  {%- set col = module.rand.choice(tbl.cols) -%}
+  {%- set obj_name = "idx_" ~ tbl.name ~ "_" ~ col -%}
+  {%- if ddl_op == "CREATE" -%}
+    {%- set stmt = ddl_op ~ " INDEX `" ~ obj_name ~ "` ON `" ~ db_name ~ "`.`" ~ tbl.name ~ "` (`" ~ col ~ "`)" -%}
+  {%- elif ddl_op == "ALTER" -%}
+    {%- set stmt = "ALTER TABLE `" ~ db_name ~ "`.`" ~ tbl.name ~ "` DROP INDEX `" ~ obj_name ~ "`, ADD INDEX `" ~ obj_name ~ "` (`" ~ col ~ "`)" -%}
+  {%- else -%}
+    {%- set stmt = ddl_op ~ " INDEX `" ~ obj_name ~ "` ON `" ~ db_name ~ "`.`" ~ tbl.name ~ "`" -%}
+  {%- endif -%}
+  {%- set sql_cmd = ddl_op | lower ~ "_index" -%}
+{%- elif obj_type == "VIEW" -%}
+  {%- set tbl = db_entry.tables | random if db_entry.tables | length > 0 else {"name": "temp_table", "cols": ["id"]} -%}
+  {%- set obj_name = "vw_" ~ module.rand.choice(["summary", "report", "active", "dashboard"]) ~ "_" ~ tbl.name -%}
+  {%- if ddl_op == "CREATE" -%}
+    {%- set stmt = ddl_op ~ " VIEW `" ~ db_name ~ "`.`" ~ obj_name ~ "` AS SELECT * FROM `" ~ db_name ~ "`.`" ~ tbl.name ~ "` WHERE 1=1" -%}
+  {%- elif ddl_op == "ALTER" -%}
+    {%- set stmt = ddl_op ~ " VIEW `" ~ db_name ~ "`.`" ~ obj_name ~ "` AS SELECT * FROM `" ~ db_name ~ "`.`" ~ tbl.name ~ "`" -%}
+  {%- else -%}
+    {%- set stmt = ddl_op ~ " VIEW IF EXISTS `" ~ db_name ~ "`.`" ~ obj_name ~ "`" -%}
+  {%- endif -%}
+  {%- set sql_cmd = ddl_op | lower ~ "_view" -%}
+{%- else -%}
+  {%- set obj_name = "sp_" ~ module.rand.choice(["process", "generate", "validate", "archive"]) ~ "_" ~ module.rand.choice(["data", "records", "batch"]) -%}
+  {%- if ddl_op == "CREATE" -%}
+    {%- set stmt = ddl_op ~ " PROCEDURE `" ~ db_name ~ "`.`" ~ obj_name ~ "`(IN p_id INT) BEGIN SELECT 1; END" -%}
+  {%- elif ddl_op == "ALTER" -%}
+    {%- set stmt = ddl_op ~ " PROCEDURE `" ~ db_name ~ "`.`" ~ obj_name ~ "` COMMENT 'updated'" -%}
+  {%- else -%}
+    {%- set stmt = ddl_op ~ " PROCEDURE IF EXISTS `" ~ db_name ~ "`.`" ~ obj_name ~ "`" -%}
+  {%- endif -%}
+  {%- set sql_cmd = ddl_op | lower ~ "_procedure" -%}
+{%- endif -%}
+{%- set succeeded = module.rand.weighted_choice([0, 1], [5, 95]) -%}
+{%- set outcome = "success" if succeeded == 0 else "success" -%}
+{%- set status = 0 if succeeded == 0 else 0 -%}
+{%- set event_type_map = {"CREATE": "creation", "ALTER": "change", "DROP": "deletion"} -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.get('agent_version', '8.17.0') }}"
+    },
+    "client": {
+        "domain": "{{ client_host }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "data_stream": {
+        "dataset": "mysql_enterprise.audit",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "mysql-query",
+        "category": ["database", "configuration"],
+        "dataset": "mysql_enterprise.audit",
+        "kind": "event",
+        "module": "mysql_enterprise",
+        "outcome": "{{ outcome }}",
+        "timezone": "+00:00",
+        "type": ["{{ event_type_map[ddl_op] }}"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "linux",
+            "full": "x86_64-Linux",
+            "name": "{{ host.os_name }}",
+            "type": "linux",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "mysqlenterprise": {
+        "audit": {
+            "account": {
+                "host": "{{ client_host }}",
+                "user": "{{ admin_user }}"
+            },
+            "class": "general",
+            "connection_id": "{{ conn_id }}",
+            "general_data": {
+                "command": "Query",
+                "query": {{ stmt | tojson }},
+                "sql_command": "{{ sql_cmd }}",
+                "status": {{ status }}
+            },
+            "id": "{{ event_id }}",
+            "login": {
+                "ip": "{{ client_ip }}",
+                "os": "",
+                "proxy": "",
+                "user": "{{ admin_user }}"
+            }
+        }
+    },
+    "related": {
+        "ip": ["{{ client_ip }}", "{{ host.ip }}"],
+        "user": ["{{ admin_user }}"]
+    },
+    "server": {
+        "user": {
+            "name": "{{ admin_user }}"
+        }
+    },
+    "service": {
+        "id": "{{ host.server_id }}",
+        "type": "mysql_enterprise",
+        "version": "{{ host.mysql_version }}"
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "tags": ["mysql_enterprise-audit"],
+    "user": {
+        "name": "{{ admin_user }}"
+    }
+}
+{%- do shared.set('event_id:' ~ hostname, event_id + 1) -%}

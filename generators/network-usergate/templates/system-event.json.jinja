@@ -1,0 +1,86 @@
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set device_id = params.device_id -%}
+{#- System events: admin login/logout, config changes, updates, HA -#}
+{%- set system_events = [
+  {"action": "login", "status": "success", "msg": "Administrator admin logged in successfully via CLI", "level": "informational", "user": "admin", "threat": 1},
+  {"action": "login", "status": "success", "msg": "Administrator net-admin logged in successfully via Web Console from 10.1.2.10", "level": "informational", "user": "net-admin", "threat": 1},
+  {"action": "login", "status": "success", "msg": "Administrator admin logged in successfully via Web Console from 10.1.1.50", "level": "informational", "user": "admin", "threat": 1},
+  {"action": "login", "status": "failure", "msg": "Administrator admin login failed via Web Console from 10.1.1.30: invalid password", "level": "warning", "user": "admin", "threat": 4},
+  {"action": "logout", "status": "success", "msg": "Administrator admin logged out from CLI session", "level": "informational", "user": "admin", "threat": 1},
+  {"action": "config-change", "status": "success", "msg": "Firewall rule 'Allow trusted to untrusted' modified by admin", "level": "informational", "user": "admin", "threat": 1},
+  {"action": "config-change", "status": "success", "msg": "Content filtering rule updated by admin", "level": "informational", "user": "admin", "threat": 1},
+  {"action": "update", "status": "success", "msg": "IDPS signatures database updated successfully", "level": "informational", "user": "", "threat": 1},
+  {"action": "update", "status": "success", "msg": "Web categorization database updated successfully", "level": "informational", "user": "", "threat": 1},
+  {"action": "update", "status": "success", "msg": "Antivirus signatures updated successfully", "level": "informational", "user": "", "threat": 1},
+  {"action": "ha-heartbeat", "status": "success", "msg": "HA heartbeat received from peer node", "level": "informational", "user": "", "threat": 1},
+  {"action": "ha-state-change", "status": "success", "msg": "HA state changed from standby to active", "level": "warning", "user": "", "threat": 4},
+  {"action": "license-check", "status": "success", "msg": "License validation completed successfully", "level": "informational", "user": "", "threat": 1},
+  {"action": "backup", "status": "success", "msg": "Configuration backup completed successfully", "level": "informational", "user": "admin", "threat": 1}
+] -%}
+{%- set sys_weights = [8, 6, 8, 3, 8, 8, 6, 8, 8, 8, 15, 2, 5, 5] -%}
+{%- set evt = module.rand.weighted_choice(system_events, sys_weights) -%}
+{#- Determine ECS event classification -#}
+{%- if evt.action == "login" or evt.action == "logout" -%}
+  {%- set event_category = ["authentication"] -%}
+  {%- set event_type = ["start"] if evt.action == "login" else ["end"] -%}
+  {%- set event_outcome = evt.status -%}
+{%- elif evt.action == "config-change" -%}
+  {%- set event_category = ["configuration"] -%}
+  {%- set event_type = ["change"] -%}
+  {%- set event_outcome = "success" -%}
+{%- else -%}
+  {%- set event_category = ["host"] -%}
+  {%- set event_type = ["info"] -%}
+  {%- set event_outcome = "success" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ evt.action }}",
+        "category": {{ event_category | tojson }},
+        "dataset": "usergate.log",
+        "kind": "event",
+        "module": "usergate",
+        "outcome": "{{ event_outcome }}",
+        "type": {{ event_type | tojson }}
+    },
+    "log": {
+        "level": "{{ evt.level }}"
+    },
+    "message": "CEF:0|UserGate|NGFW|7|event|system|{{ evt.threat }}|rt={{ (timestamp.timestamp() * 1000) | int }} deviceExternalId={{ device_id }}{% if evt.user %} suser={{ evt.user }}{% endif %} act={{ evt.action }} msg={{ evt.msg }}",
+    "observer": {
+        "hostname": "{{ fqdn }}",
+        "name": "{{ hostname }}",
+        "product": "NGFW",
+        "serial_number": "{{ device_id }}",
+        "type": "firewall",
+        "vendor": "UserGate"
+    },
+{%- if evt.user %}
+    "related": {
+        "user": ["{{ evt.user }}"]
+    },
+    "user": {
+        "name": "{{ evt.user }}"
+    },
+{%- endif %}
+    "tags": ["usergate", "usergate-ngfw", "forwarded"],
+    "usergate": {
+        "device_id": "{{ device_id }}",
+        "log_type": "event",
+        "rule_type": "system",
+        "threat_level": {{ evt.threat }},
+        "user": "{{ evt.user if evt.user else "system" }}"
+    }
+}

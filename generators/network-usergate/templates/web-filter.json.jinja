@@ -1,0 +1,112 @@
+{%- set sessionid = shared.get('sessionid', 100000) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set device_id = params.device_id -%}
+{#- Web filter events — UserGate content filtering -#}
+{%- set category = samples.web_categories.weighted_pick('weight') -%}
+{%- set action = category.action -%}
+{#- Map action to CEF action -#}
+{%- set cef_action = "block" if action == "block" else ("warning" if action == "warn" else "allow") -%}
+{#- Generate realistic URLs -#}
+{%- set domain_prefixes = ["www", "cdn", "api", "app", "portal", "login", "mail", "static", "media"] -%}
+{%- set domain_names = ["example", "contoso", "acme", "globex", "initech", "umbrella", "waystar", "piedpiper", "hooli", "stark"] -%}
+{%- set domain_tlds = [".com", ".net", ".org", ".io", ".co", ".ru"] -%}
+{%- set target_domain = module.rand.choice(domain_prefixes) ~ "." ~ module.rand.choice(domain_names) ~ module.rand.choice(domain_tlds) -%}
+{%- set url_paths = ["/", "/index.html", "/login", "/api/v1/data", "/images/logo.png", "/download/file.zip", "/stream/video", "/config", "/admin", "/search?q=test"] -%}
+{%- set url_path = module.rand.choice(url_paths) -%}
+{#- Outbound web traffic from internal users -#}
+{%- set src_host = samples.internal_hosts | selectattr("role", "equalto", "workstation") | list | random -%}
+{%- set srcip = src_host.ip -%}
+{%- set srcport = module.rand.number.integer(49152, 65535) -%}
+{%- set dstip = module.rand.network.ip_v4_public() -%}
+{%- set dstport = module.rand.weighted_choice([80, 443], [30, 70]) -%}
+{#- Assign user -#}
+{%- set user = samples.users.weighted_pick('weight') -%}
+{%- set username = user.user -%}
+{%- set threat = 1 if action == "allow" else (6 if action == "warn" else 8) -%}
+{%- set event_outcome = "failure" if action == "block" else "success" -%}
+{%- set event_type_val = "denied" if action == "block" else "allowed" -%}
+{%- set log_level = "warning" if action == "block" else ("notice" if action == "warn" else "informational") -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "destination": {
+        "ip": "{{ dstip }}",
+        "port": {{ dstport }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "{{ cef_action }}",
+        "category": ["network", "web"],
+        "dataset": "usergate.log",
+        "kind": "event",
+        "module": "usergate",
+        "outcome": "{{ event_outcome }}",
+        "type": ["{{ event_type_val }}"]
+    },
+    "log": {
+        "level": "{{ log_level }}"
+    },
+    "message": "CEF:0|UserGate|NGFW|7|web access|content filter|{{ threat }}|rt={{ (timestamp.timestamp() * 1000) | int }} deviceExternalId={{ device_id }} suser={{ username }} act={{ cef_action }} cs1Label=Rule cs1=Content filtering src={{ srcip }} spt={{ srcport }} cs2Label=Source Zone cs2=Trusted cs3Label=Source Country cs3=RU proto=TCP dst={{ dstip }} dpt={{ dstport }} cs4Label=Destination Zone cs4=Untrusted cs5Label=Destination Country cs5={{ module.rand.weighted_choice(["US", "DE", "NL", "GB", "FR"], [40, 15, 15, 15, 15]) }} requestMethod=GET request=https://{{ target_domain }}{{ url_path }} cs6Label=Category cs6={{ category.name }}",
+    "network": {
+        "direction": "outbound",
+        "protocol": "{{ "https" if dstport == 443 else "http" }}",
+        "transport": "tcp"
+    },
+    "observer": {
+        "egress": {
+            "zone": "Untrusted"
+        },
+        "hostname": "{{ fqdn }}",
+        "ingress": {
+            "zone": "Trusted"
+        },
+        "name": "{{ hostname }}",
+        "product": "NGFW",
+        "serial_number": "{{ device_id }}",
+        "type": "firewall",
+        "vendor": "UserGate"
+    },
+    "related": {
+        "ip": ["{{ srcip }}", "{{ dstip }}"],
+        "user": ["{{ username }}"]
+    },
+    "rule": {
+        "category": "{{ category.name }}",
+        "name": "Content filtering"
+    },
+    "source": {
+        "ip": "{{ srcip }}",
+        "port": {{ srcport }}
+    },
+    "tags": ["usergate", "usergate-ngfw", "forwarded"],
+    "url": {
+        "domain": "{{ target_domain }}",
+        "full": "{{ "https" if dstport == 443 else "http" }}://{{ target_domain }}{{ url_path }}",
+        "path": "{{ url_path }}",
+        "scheme": "{{ "https" if dstport == 443 else "http" }}"
+    },
+    "user": {
+        "name": "{{ username }}"
+    },
+    "usergate": {
+        "category_id": {{ category.id }},
+        "category_name": "{{ category.name }}",
+        "device_id": "{{ device_id }}",
+        "log_type": "web access",
+        "rule_name": "Content filtering",
+        "rule_type": "content filter",
+        "session_id": {{ sessionid }},
+        "threat_level": {{ threat }},
+        "user": "{{ username }}"
+    }
+}
+{%- do shared.set('sessionid', (sessionid + 1) % 2147483647) -%}

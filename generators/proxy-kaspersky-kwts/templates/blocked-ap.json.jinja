@@ -1,0 +1,116 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, observer_block, user_block, network_block, tls_block, http_block, url_block, related_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick user and host -#}
+{%- set user = samples.users | random -%}
+{%- set host_entry = samples.hosts | random -%}
+{#- Phishing URLs specifically -#}
+{%- set phishing_domains = [
+    {"domain": "secure-login-update.xyz", "path": "/auth/verify"},
+    {"domain": "account-microsoft-verify.com", "path": "/signin"},
+    {"domain": "paypal-secure-update.net", "path": "/webapps/auth"},
+    {"domain": "bank-security-alert.ru", "path": "/online/confirm"},
+    {"domain": "apple-id-recovery.xyz", "path": "/iforgot"},
+    {"domain": "google-security-check.net", "path": "/accounts/verify"},
+    {"domain": "office365-login-portal.com", "path": "/login"},
+    {"domain": "amazon-order-confirm.xyz", "path": "/gp/css/order-history"}
+] -%}
+{%- set url_entry = phishing_domains | random -%}
+{#- HTTP details -#}
+{%- set protocol = module.rand.weighted_choice(["HTTPS", "HTTP"], [65, 35]) -%}
+{%- set http_method = module.rand.weighted_choice(["GET", "POST"], [55, 45]) -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{#- Network details -#}
+{%- set src_ip = host_entry.ip_prefix ~ "." ~ module.rand.number.integer(10, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set dst_port = 443 if protocol == "HTTPS" else 80 -%}
+{#- Byte sizes (blocked early) -#}
+{%- set req_bytes = module.rand.number.integer(200, 600) -%}
+{%- set resp_bytes = module.rand.number.integer(100, 800) -%}
+{%- set processing_ms = module.rand.number.integer(3, 80) -%}
+{#- TLS details (phishing sites often use weaker/newer certs) -#}
+{%- set tls_version = module.rand.weighted_choice(["1.3", "1.2", "1.1"], [40, 40, 20]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256"], [50, 50]) -%}
+{%- set url_scheme = "https" if protocol == "HTTPS" else "http" -%}
+{#- Detection method -#}
+{%- set detection_method = module.rand.weighted_choice(["Detected (local bases)", "Detected (KSN)", "Detected (heuristics)"], [40, 40, 20]) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "destination": {
+        "domain": "{{ url_entry.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ ecs_block() }},
+    "event": {
+        "action": "blocked",
+        "category": ["web", "network", "threat"],
+        "dataset": "kaspersky_kwts.traffic",
+        "duration": {{ processing_ms * 1000000 }},
+        "id": "{{ record_id }}",
+        "kind": "alert",
+        "module": "kaspersky_kwts",
+        "outcome": "failure",
+        "reason": "Anti-phishing triggered: {{ url_entry.domain }}",
+        "severity": 3,
+        "type": ["access", "denied", "connection"]
+    },
+    {{ host_block(host_entry) }},
+    {{ http_block(http_method, 403, user_agent, req_bytes, resp_bytes, "text/html", "1.1") }},
+    "kaspersky": {
+        "kwts": {
+            "action": "Block",
+            "blocked_by_rule": "[Default/Anti-Phishing_Protection]",
+            "processing_time_ms": {{ processing_ms }},
+            "scan_result": "Phishing URL",
+            "av_status": "NotScanned (ByACL)",
+            "ap_status": "{{ detection_method }}",
+            "mlf_status": "NotDetected",
+            "kata_alert": "{{ module.rand.weighted_choice(['NotDetected', 'Detected'], [70, 30]) }}",
+            "encrypted": "NotDetected",
+            "macros": "NotDetected",
+            "workspace": "Default",
+            "type": "Request",
+            "filename": "nofile",
+            "filesize": "NotApplicable",
+            "content_type": "text/html",
+            "method": "{{ http_method }}",
+            "url_category": "Phishing",
+            "rules": "Anti-Phishing_Protection"
+        }
+    },
+    {{ network_block(protocol, "outbound") }},
+    {{ observer_block(params) }},
+    {{ related_block(src_ip, dst_ip, user.username, host_entry.hostname, []) }},
+    "rule": {
+        "name": "Anti-Phishing_Protection",
+        "ruleset": "Anti-Phishing"
+    },
+    "source": {
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    "threat": {
+        "indicator": {
+            "type": "url",
+            "url": {
+                "domain": "{{ url_entry.domain }}",
+                "full": "{{ url_scheme }}://{{ url_entry.domain }}{{ url_entry.path }}"
+            }
+        },
+        "software": {
+            "name": "Phishing.URL.Generic",
+            "type": "Phishing"
+        }
+    },
+    {%- if protocol == "HTTPS" %}
+    {{ tls_block(tls_version, cipher) }},
+    {%- endif %}
+    {{ url_block(url_entry, url_scheme) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

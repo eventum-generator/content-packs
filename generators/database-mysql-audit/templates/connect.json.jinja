@@ -1,0 +1,117 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set event_id = shared.get('event_id:' ~ hostname, 1000) -%}
+{%- set conn_counter = shared.get('conn_counter:' ~ hostname, 100) -%}
+{%- set user = samples.users.weighted_pick('weight') -%}
+{%- set username = user.username -%}
+{%- set user_host = user.host -%}
+{#- Generate client IP based on user host pattern -#}
+{%- if user_host == 'localhost' -%}
+  {%- set client_ip = "127.0.0.1" -%}
+{%- elif '10.2.4.%' in user_host -%}
+  {%- set client_ip = "10.2.4." ~ module.rand.number.integer(50, 250) -%}
+{%- else -%}
+  {%- set client_ip = module.rand.network.ip_v4_private_c() -%}
+{%- endif -%}
+{%- set conn_type = module.rand.weighted_choice(["ssl", "tcp/ip", "socket"], [50, 35, 15]) -%}
+{%- set db_entry = samples.databases | rejectattr('tables', 'equalto', []) | list | random -%}
+{%- set db_name = db_entry.name -%}
+{%- set client_host = module.rand.weighted_choice(["app-server-01", "app-server-02", "web-01", "web-02", "report-srv", "etl-runner", "dev-workstation", hostname], [20, 15, 15, 10, 10, 10, 10, 10]) -%}
+{#- Store session for cross-template correlation -#}
+{%- set sessions = shared.get('sessions:' ~ hostname, []) -%}
+{%- do sessions.append({"conn_id": conn_counter, "user": username, "user_host": user_host, "db": db_name, "client_ip": client_ip, "app": user.app_name, "conn_type": conn_type, "client_host": client_host}) -%}
+{%- if sessions | length > 50 -%}{%- do sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('sessions:' ~ hostname, sessions) -%}
+{%- do shared.set('conn_counter:' ~ hostname, conn_counter + 1) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.get('agent_version', '8.17.0') }}"
+    },
+    "client": {
+        "domain": "{{ client_host }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "data_stream": {
+        "dataset": "mysql_enterprise.audit",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "mysql-connect",
+        "category": ["database", "authentication"],
+        "dataset": "mysql_enterprise.audit",
+        "kind": "event",
+        "module": "mysql_enterprise",
+        "outcome": "success",
+        "timezone": "+00:00",
+        "type": ["connection", "start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "linux",
+            "full": "x86_64-Linux",
+            "name": "{{ host.os_name }}",
+            "type": "linux",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "mysqlenterprise": {
+        "audit": {
+            "account": {
+                "host": "{{ client_host }}",
+                "user": "{{ username }}"
+            },
+            "class": "connection",
+            "connection_data": {
+                "connection_type": "{{ conn_type }}",
+                "db": "{{ db_name }}",
+                "status": 0
+            },
+            "connection_id": "{{ conn_counter }}",
+            "id": "{{ event_id }}",
+            "login": {
+                "ip": "{{ client_ip }}",
+                "os": "",
+                "proxy": "",
+                "user": "{{ username }}"
+            }
+        }
+    },
+    "related": {
+        "ip": ["{{ client_ip }}", "{{ host.ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "server": {
+        "user": {
+            "name": "{{ username }}"
+        }
+    },
+    "service": {
+        "id": "{{ host.server_id }}",
+        "type": "mysql_enterprise",
+        "version": "{{ host.mysql_version }}"
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "tags": ["mysql_enterprise-audit"],
+    "user": {
+        "name": "{{ username }}"
+    }
+}
+{%- do shared.set('event_id:' ~ hostname, event_id + 1) -%}

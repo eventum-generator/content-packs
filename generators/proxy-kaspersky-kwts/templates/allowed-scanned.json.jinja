@@ -1,0 +1,102 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, host_block, observer_block, user_block, network_block, tls_block, http_block, url_block, related_block -%}
+{%- set record_id = shared.get('record_id', 1) -%}
+{#- Pick user and host -#}
+{%- set user = samples.users | random -%}
+{%- set host_entry = samples.hosts | random -%}
+{#- Pick URL category and URL -#}
+{%- set category = samples.url_categories_allowed.weighted_pick('weight') -%}
+{%- set url_entry = category.urls | random -%}
+{#- HTTP details -#}
+{%- set protocol = module.rand.weighted_choice(["HTTPS", "HTTP"], [88, 12]) -%}
+{%- set http_method = module.rand.weighted_choice(["GET", "POST", "PUT"], [65, 25, 10]) -%}
+{%- set resp_code = module.rand.weighted_choice([200, 301, 302, 304], [80, 5, 8, 7]) -%}
+{%- set user_agent = module.faker.locale.en_US.user_agent() -%}
+{%- set content_type = module.rand.weighted_choice(["application/octet-stream", "application/zip", "application/pdf", "application/x-executable", "application/vnd.ms-excel", "application/msword"], [25, 20, 20, 10, 15, 10]) -%}
+{#- Network details -#}
+{%- set src_ip = host_entry.ip_prefix ~ "." ~ module.rand.number.integer(10, 254) -%}
+{%- set src_port = module.rand.number.integer(49152, 65535) -%}
+{%- set dst_ip = module.rand.network.ip_v4_public() -%}
+{%- set dst_port = 443 if protocol == "HTTPS" else 80 -%}
+{#- Byte sizes (file downloads — larger than average) -#}
+{%- set req_bytes = module.rand.number.clamp(module.rand.number.lognormal(6, 1) | int, 200, 100000) -%}
+{%- set resp_bytes = module.rand.number.clamp(module.rand.number.lognormal(10, 2) | int, 5000, 50000000) -%}
+{%- set processing_ms = module.rand.number.clamp(module.rand.number.lognormal(5, 1.5) | int, 50, 120000) -%}
+{%- set filesize = resp_bytes -%}
+{%- set filename = module.rand.weighted_choice(["document.pdf", "report_2026.xlsx", "setup.exe", "archive.zip", "update.msi", "presentation.pptx", "data_export.csv"], [20, 15, 15, 15, 10, 15, 10]) -%}
+{#- TLS details -#}
+{%- set tls_version = module.rand.weighted_choice(["1.3", "1.2"], [65, 35]) -%}
+{%- set cipher = module.rand.weighted_choice(["TLS_AES_256_GCM_SHA384", "TLS_AES_128_GCM_SHA256", "ECDHE-RSA-AES256-GCM-SHA384"], [40, 35, 25]) -%}
+{%- set url_scheme = "https" if protocol == "HTTPS" else "http" -%}
+{#- File hash -#}
+{%- set file_md5 = module.rand.crypto.md5() -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    "destination": {
+        "domain": "{{ url_entry.domain }}",
+        "ip": "{{ dst_ip }}",
+        "port": {{ dst_port }}
+    },
+    {{ ecs_block() }},
+    "event": {
+        "action": "allowed",
+        "category": ["web", "network"],
+        "dataset": "kaspersky_kwts.traffic",
+        "duration": {{ processing_ms * 1000000 }},
+        "id": "{{ record_id }}",
+        "kind": "event",
+        "module": "kaspersky_kwts",
+        "outcome": "success",
+        "reason": "Not detected",
+        "type": ["access", "allowed", "connection"]
+    },
+    "file": {
+        "hash": {
+            "md5": "{{ file_md5 }}"
+        },
+        "name": "{{ filename }}",
+        "size": {{ filesize }}
+    },
+    {{ host_block(host_entry) }},
+    {{ http_block(http_method, resp_code, user_agent, req_bytes, resp_bytes, content_type, "1.1") }},
+    "kaspersky": {
+        "kwts": {
+            "action": "Allow",
+            "blocked_by_rule": "-",
+            "processing_time_ms": {{ processing_ms }},
+            "scan_result": "Not detected",
+            "av_status": "NotDetected",
+            "ap_status": "NotDetected",
+            "mlf_status": "NotDetected",
+            "kata_alert": "NotDetected",
+            "encrypted": "{{ module.rand.weighted_choice(['NotDetected', 'Detected'], [90, 10]) }}",
+            "macros": "{{ module.rand.weighted_choice(['NotDetected', 'Detected'], [85, 15]) }}",
+            "workspace": "Default",
+            "type": "Response",
+            "filename": "{{ filename }}",
+            "filesize": "{{ filesize }}",
+            "content_type": "{{ content_type }}",
+            "method": "{{ http_method }}",
+            "url_category": "{{ category.category }}",
+            "rules": "Default Scan Rule",
+            "part": 1,
+            "part_mimetype": "{{ content_type }}"
+        }
+    },
+    {{ network_block(protocol, "outbound") }},
+    {{ observer_block(params) }},
+    {{ related_block(src_ip, dst_ip, user.username, host_entry.hostname, [file_md5]) }},
+    "source": {
+        "ip": "{{ src_ip }}",
+        "port": {{ src_port }}
+    },
+    {%- if protocol == "HTTPS" %}
+    {{ tls_block(tls_version, cipher) }},
+    {%- endif %}
+    {{ url_block(url_entry, url_scheme) }},
+    {{ user_block(user) }},
+    "user_agent": {
+        "original": {{ user_agent | tojson }}
+    }
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

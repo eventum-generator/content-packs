@@ -1,0 +1,183 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set ppe = module.rand.weighted_choice(["0-PPE-0", "1-PPE-1", "2-PPE-2"], [50, 30, 20]) -%}
+{#- Consume from sessions pool for correlation -#}
+{%- set sessions = shared.get('vpn_sessions', []) -%}
+{%- if sessions | length > 0 -%}
+  {%- set session = sessions.pop(0) -%}
+  {%- do shared.set('vpn_sessions', sessions) -%}
+  {%- set user = session.user -%}
+  {%- set client_ip = session.client_ip -%}
+  {%- set session_id = session.session_id -%}
+  {%- set group = session.group -%}
+{%- else -%}
+  {#- Fallback: standalone logout -#}
+  {%- set user = (samples.usernames | random).username -%}
+  {%- set client_ip = module.rand.network.ip_v4_public() -%}
+  {%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+  {%- set group = module.rand.weighted_choice(
+    ["Domain Users", "VPN_Users", "VPN_Contractors", "VPN_Admins", "VPN_FullAccess"],
+    [35, 30, 15, 10, 10]
+  ) -%}
+{%- endif -%}
+{#- Session duration (seconds) — weighted toward workday lengths -#}
+{%- set duration_type = module.rand.weighted_choice(["short", "medium", "long", "workday", "extended"], [10, 20, 25, 35, 10]) -%}
+{%- if duration_type == "short" -%}
+  {%- set duration_secs = module.rand.number.integer(60, 300) -%}
+{%- elif duration_type == "medium" -%}
+  {%- set duration_secs = module.rand.number.integer(300, 3600) -%}
+{%- elif duration_type == "long" -%}
+  {%- set duration_secs = module.rand.number.integer(3600, 14400) -%}
+{%- elif duration_type == "workday" -%}
+  {%- set duration_secs = module.rand.number.integer(14400, 32400) -%}
+{%- else -%}
+  {%- set duration_secs = module.rand.number.integer(32400, 57600) -%}
+{%- endif -%}
+{%- set dur_hours = duration_secs // 3600 -%}
+{%- set dur_minutes = (duration_secs % 3600) // 60 -%}
+{%- set dur_seconds = duration_secs % 60 -%}
+{%- set duration_str = "%02d:%02d:%02d" | format(dur_hours, dur_minutes, dur_seconds) -%}
+{#- Traffic statistics — lognormal-ish distribution -#}
+{%- set bytes_sent = module.rand.number.integer(100000, 500000000) -%}
+{%- set bytes_rcv = module.rand.number.integer(500000, 2000000000) -%}
+{#- Connection counts -#}
+{%- set total_tcp = module.rand.number.integer(5, 500) -%}
+{%- set total_udp = module.rand.number.integer(0, 50) -%}
+{%- set policies_allowed = module.rand.number.integer(1, 20) -%}
+{%- set policies_denied = module.rand.number.integer(0, 3) -%}
+{#- Logout method -#}
+{%- set logout_method = module.rand.weighted_choice(
+  ["UserLogout", "InternalError", "TimedOut", "AdminLogout", "ForceLogout"],
+  [55, 5, 25, 10, 5]
+) -%}
+{#- Compute start/end time strings in NetScaler format -#}
+{%- set syslog_ts = timestamp.strftime('%m/%d/%Y:%H:%M:%S') ~ " GMT" -%}
+{%- set syslog_msg = syslog_ts ~ " " ~ hostname ~ " " ~ ppe ~ " : default SSLVPN LOGOUT " ~ record_id ~ " 0 : Context " ~ user ~ "@" ~ client_ip ~ " - SessionId: " ~ session_id ~ " - User " ~ user ~ " - Client_ip " ~ client_ip ~ " - Nat_ip \\\"" ~ params.nat_ip ~ "\\\" - Vserver " ~ params.vserver_ip ~ ":" ~ params.vserver_port ~ " - Start_time \\\"" ~ timestamp.strftime('%m/%d/%Y:%H:%M:%S') ~ " GMT\\\" - End_time \\\"" ~ timestamp.strftime('%m/%d/%Y:%H:%M:%S') ~ " GMT\\\" - Duration " ~ duration_str ~ " - Http_resources_accessed 0 - NonHttp_services_accessed 0 - Total_TCP_connections " ~ total_tcp ~ " - Total_UDP_flows " ~ total_udp ~ " - Total_policies_allowed " ~ policies_allowed ~ " - Total_policies_denied " ~ policies_denied ~ " - Total_bytes_send " ~ bytes_sent ~ " - Total_bytes_recv " ~ bytes_rcv ~ " - Total_compressedbytes_send 0 - Total_compressedbytes_recv 0 - Compression_ratio_send 0.00% - Compression_ratio_recv 0.00% - LogoutMethod \\\"" ~ logout_method ~ "\\\" - Group(s) \\\"" ~ group ~ "\\\"" -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "citrix": {
+        "cef_format": false,
+        "device_product": "NetScaler",
+        "device_vendor": "Citrix",
+        "device_version": "NS14.1",
+        "facility": "local0",
+        "hostname": "{{ hostname }}",
+        "name": "SSLVPN LOGOUT",
+        "ppe_id": "{{ ppe }}",
+        "priority": "info",
+        "session_id": "{{ session_id }}"
+    },
+    "citrix_adc": {
+        "log": {
+            "browser_type": "",
+            "bytes": {
+                "received": {{ bytes_rcv }},
+                "sent": {{ bytes_sent }}
+            },
+            "client_ip": "{{ client_ip }}",
+            "duration": "{{ duration_str }}",
+            "group": "{{ group }}",
+            "groups": "{{ group }}",
+            "logout_method": "{{ logout_method }}",
+            "nat": {
+                "ip": "{{ params.nat_ip }}"
+            },
+            "session_id": "{{ session_id }}",
+            "total_tcp_connections": {{ total_tcp }},
+            "total_udp_flows": {{ total_udp }},
+            "total_policies_allowed": {{ policies_allowed }},
+            "total_policies_denied": {{ policies_denied }},
+            "total_bytes_send": {{ bytes_sent }},
+            "total_bytes_received": {{ bytes_rcv }},
+            "user": "{{ user }}",
+            "username": "{{ user }}",
+            "vserver": {
+                "ip": "{{ params.vserver_ip }}",
+                "port": {{ params.vserver_port }}
+            }
+        }
+    },
+    "client": {
+        "ip": "{{ client_ip }}"
+    },
+    "data_stream": {
+        "dataset": "citrix_adc.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "logged-out",
+        "category": ["authentication", "session"],
+        "dataset": "citrix_adc.log",
+        "duration": {{ duration_secs * 1000000000 }},
+        "end": "{{ timestamp.isoformat() }}",
+        "kind": "event",
+        "module": "citrix_adc",
+        "original": "{{ syslog_msg }}",
+        "outcome": "success",
+        "reason": "{{ logout_method }}",
+        "severity": 6,
+        "type": ["end"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 16
+            },
+            "priority": 134,
+            "severity": {
+                "code": 6
+            }
+        }
+    },
+    "network": {
+        "bytes": {{ bytes_sent + bytes_rcv }}
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "Netscaler",
+        "type": "firewall",
+        "vendor": "Citrix"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ client_ip }}", "{{ params.vserver_ip }}", "{{ params.nat_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "bytes": {{ bytes_sent }},
+        "ip": "{{ client_ip }}",
+        "user": {
+            "group": {
+                "name": "{{ group }}"
+            },
+            "name": "{{ user }}"
+        }
+    },
+    "destination": {
+        "bytes": {{ bytes_rcv }}
+    },
+    "user": {
+        "name": "{{ user }}",
+        "domain": "{{ params.domain }}"
+    },
+    "tags": ["citrix_adc.log", "forwarded"]
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

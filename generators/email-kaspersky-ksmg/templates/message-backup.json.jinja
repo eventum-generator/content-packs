@@ -1,0 +1,68 @@
+{#- KSMG LMS_EV_SCAN_LOGIC_MESSAGE_BACKUP — message backed up to quarantine/backup storage.
+     Occurs after scan detects a threat, spam, or policy violation. -#}
+{%- from 'templates/macros/envelope.jinja' import agent_block, ecs_block, observer_block, related_block -%}
+{%- set backup_seq = shared.get('backup_seq', 1) -%}
+{#- Pick sender -#}
+{%- set ext = samples.external_domains.weighted_pick('weight') -%}
+{%- set sender_user = module.faker.locale.en_US.user_name() -%}
+{%- set sender_email = sender_user ~ '@' ~ ext.domain -%}
+{%- set rcpt = samples.internal_users.pick() -%}
+{%- set recipient_email = rcpt.username ~ '@' ~ params.get('domain', 'corp.example.com') -%}
+{%- set message_id = '<' ~ module.rand.crypto.uuid4() ~ '@' ~ ext.domain ~ '>' -%}
+{%- set msg_size = module.rand.number.clamp(module.rand.number.lognormal(10, 1.5) | int, 500, 30000000) -%}
+{#- Backup reason -#}
+{%- set backup_reason = module.rand.weighted_choice(
+  ["AntiVirusDetection", "AntiSpamDetection", "AntiPhishingDetection", "ContentFilterMatch", "KATAAlert", "ManualBackup"],
+  [25, 35, 15, 12, 8, 5]
+) -%}
+{%- set subject_cat = module.rand.weighted_choice(["spam", "phishing", "business"], [40, 35, 25]) -%}
+{%- set subject = (samples.subjects | selectattr("category", "equalto", subject_cat) | list | random).text -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ ecs_block() }},
+    "email": {
+        "direction": "inbound",
+        "from": {
+            "address": ["{{ sender_email }}"]
+        },
+        "message_id": {{ message_id | tojson }},
+        "subject": {{ subject | tojson }},
+        "to": {
+            "address": ["{{ recipient_email }}"]
+        }
+    },
+    "event": {
+        "action": "Backup",
+        "category": ["email"],
+        "dataset": "kaspersky_ksmg.scanlogic",
+        "kind": "event",
+        "module": "kaspersky_ksmg",
+        "outcome": "success",
+        "reason": {{ backup_reason | tojson }},
+        "type": ["info"]
+    },
+    "kaspersky": {
+        "ksmg": {
+            "event_class": "LMS_EV_SCAN_LOGIC_MESSAGE_BACKUP",
+            "message_id": {{ message_id | tojson }},
+            "message_size": {{ msg_size }},
+            "backup_reason": "{{ backup_reason }}",
+            "backup_id": "{{ module.rand.crypto.uuid4() }}",
+            "rule": "{{ (samples.rules.weighted_pick('weight')).name }}",
+            "direction": "inbound",
+            "node": "{{ params.get('ksmg_hostname', 'ksmg-node01') }}"
+        }
+    },
+    "log": {
+        "level": "informational"
+    },
+    {{ observer_block(params) }},
+    {{ related_block([ext.ip, params.get('ksmg_ip', '10.1.0.20')], [sender_user, rcpt.username], [params.get('ksmg_hostname', 'ksmg-node01')]) }},
+    "source": {
+        "domain": "{{ ext.domain }}",
+        "ip": "{{ ext.ip }}"
+    },
+    "tags": ["kaspersky-ksmg", "forwarded"]
+}
+{%- do shared.set('backup_seq', (backup_seq + 1) % 2147483647) -%}

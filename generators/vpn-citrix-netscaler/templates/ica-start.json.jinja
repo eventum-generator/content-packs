@@ -1,0 +1,145 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set user = (samples.usernames | random).username -%}
+{%- set client_ip = module.rand.network.ip_v4_public() -%}
+{%- set client_port = module.rand.number.integer(49152, 65535) -%}
+{%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+{%- set ppe = module.rand.weighted_choice(["0-PPE-0", "1-PPE-1", "2-PPE-2"], [50, 30, 20]) -%}
+{%- set ica_uuid = module.rand.crypto.uuid4() -%}
+{#- Select ICA app -#}
+{%- set app_weights = samples.ica_apps | map(attribute='weight') | list -%}
+{%- set app = module.rand.weighted_choice(samples.ica_apps, app_weights) -%}
+{%- set dest_ip = params.internal_network ~ "." ~ module.rand.number.integer(1, 254) ~ "." ~ module.rand.number.integer(1, 254) -%}
+{%- set dest_port = module.rand.weighted_choice([1494, 2598, 443], [40, 45, 15]) -%}
+{%- set syslog_ts = timestamp.strftime('%m/%d/%Y:%H:%M:%S') ~ " GMT" -%}
+{%- set syslog_msg = syslog_ts ~ " " ~ hostname ~ " " ~ ppe ~ " : default SSLVPN ICASTART " ~ record_id ~ " 0 : [TECHSUPPORT][LAUNCH][" ~ app.name ~ "][" ~ app.server ~ "][ICAUUID=" ~ ica_uuid ~ "] - Source " ~ client_ip ~ ":" ~ client_port ~ " - Destination " ~ dest_ip ~ ":" ~ dest_port ~ " - username:domainname " ~ user ~ ":" ~ params.domain ~ " - applicationName \\\"" ~ app.name ~ "\\\"" -%}
+{#- Track ICA sessions for ICA end correlation -#}
+{%- set ica_sessions = shared.get('ica_sessions', []) -%}
+{%- do ica_sessions.append({
+  "user": user,
+  "client_ip": client_ip,
+  "client_port": client_port,
+  "dest_ip": dest_ip,
+  "dest_port": dest_port,
+  "app_name": app.name,
+  "app_server": app.server,
+  "ica_uuid": ica_uuid,
+  "session_id": session_id
+}) -%}
+{%- if ica_sessions | length > 200 -%}{%- do ica_sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('ica_sessions', ica_sessions) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "citrix": {
+        "cef_format": false,
+        "device_product": "NetScaler",
+        "device_vendor": "Citrix",
+        "device_version": "NS14.1",
+        "facility": "local0",
+        "hostname": "{{ hostname }}",
+        "name": "SSLVPN ICASTART",
+        "ppe_id": "{{ ppe }}",
+        "priority": "info",
+        "session_id": "{{ session_id }}"
+    },
+    "citrix_adc": {
+        "log": {
+            "application_name": "{{ app.name }}",
+            "client_ip": "{{ client_ip }}",
+            "client_port": {{ client_port }},
+            "destination": {
+                "ip": "{{ dest_ip }}",
+                "port": {{ dest_port }}
+            },
+            "session_id": "{{ session_id }}",
+            "source": {
+                "ip": "{{ client_ip }}",
+                "port": {{ client_port }}
+            },
+            "user": "{{ user }}",
+            "username": "{{ user }}",
+            "domain_name": "{{ params.domain }}",
+            "vserver": {
+                "ip": "{{ params.vserver_ip }}",
+                "port": {{ params.vserver_port }}
+            }
+        }
+    },
+    "client": {
+        "ip": "{{ client_ip }}",
+        "port": {{ client_port }}
+    },
+    "data_stream": {
+        "dataset": "citrix_adc.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "destination": {
+        "address": "{{ dest_ip }}",
+        "ip": "{{ dest_ip }}",
+        "port": {{ dest_port }}
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "application-launched",
+        "category": ["network", "session"],
+        "dataset": "citrix_adc.log",
+        "kind": "event",
+        "module": "citrix_adc",
+        "original": "{{ syslog_msg }}",
+        "outcome": "success",
+        "severity": 6,
+        "type": ["connection", "start"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 16
+            },
+            "priority": 134,
+            "severity": {
+                "code": 6
+            }
+        }
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "Netscaler",
+        "type": "firewall",
+        "vendor": "Citrix"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}", "{{ app.server }}"],
+        "ip": ["{{ client_ip }}", "{{ dest_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ client_port }},
+        "user": {
+            "name": "{{ user }}"
+        }
+    },
+    "user": {
+        "name": "{{ user }}",
+        "domain": "{{ params.domain }}"
+    },
+    "tags": ["citrix_adc.log", "forwarded"]
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

@@ -1,0 +1,199 @@
+{#- Shared macros for Kubernetes Audit Log events -#}
+{#- Import with: {% from 'templates/_base.json.jinja' import agent_block, ecs_block, pick_user, pick_source_ip, pick_user_agent, pick_resource, build_request_uri, response_status_block, object_ref_block, annotations_block %} -#}
+
+{%- macro agent_block(params) -%}
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ params.get('agent_name', 'kind-control-plane') }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    }
+{%- endmacro -%}
+
+{%- macro ecs_block() -%}
+    "ecs": {
+        "version": "8.17.0"
+    }
+{%- endmacro -%}
+
+{#- Pick a user identity based on weighted distribution -#}
+{%- macro pick_user(users, user_type) -%}
+{%- if user_type == "system" -%}
+    {%- set sys_user = module.rand.weighted_choice(
+        ["system:kube-controller-manager", "system:kube-scheduler", "system:kube-proxy", "system:node:node-01.k8s.local", "system:node:node-02.k8s.local", "system:apiserver"],
+        [25, 15, 20, 15, 15, 10]
+    ) -%}
+    {%- if sys_user.startswith("system:node:") -%}
+        {{- sys_user ~ "|||system:nodes,system:authenticated|||" ~ module.rand.crypto.uuid4() -}}
+    {%- elif sys_user == "system:kube-controller-manager" -%}
+        {{- sys_user ~ "|||system:kube-controller-manager,system:authenticated|||" ~ module.rand.crypto.uuid4() -}}
+    {%- elif sys_user == "system:kube-scheduler" -%}
+        {{- sys_user ~ "|||system:kube-scheduler,system:authenticated|||" ~ module.rand.crypto.uuid4() -}}
+    {%- elif sys_user == "system:apiserver" -%}
+        {{- sys_user ~ "|||system:masters,system:authenticated|||" ~ module.rand.crypto.uuid4() -}}
+    {%- else -%}
+        {{- sys_user ~ "|||system:authenticated|||" ~ module.rand.crypto.uuid4() -}}
+    {%- endif -%}
+{%- elif user_type == "serviceaccount" -%}
+    {%- set sa_name = module.rand.choice(["default", "ci-deployer", "prometheus", "argocd-application-controller", "cert-manager", "ingress-nginx", "grafana"]) -%}
+    {%- set sa_ns = module.rand.choice(["default", "kube-system", "monitoring", "argocd", "cert-manager", "ingress-nginx"]) -%}
+    {{- "system:serviceaccount:" ~ sa_ns ~ ":" ~ sa_name ~ "|||system:serviceaccounts,system:serviceaccounts:" ~ sa_ns ~ ",system:authenticated|||" ~ module.rand.crypto.uuid4() -}}
+{%- else -%}
+    {%- set user = users | random -%}
+    {{- user.username ~ "|||" ~ user.groups ~ "|||" ~ module.rand.crypto.uuid4() -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Pick user agent based on user type -#}
+{%- macro pick_user_agent(user_type, user_agents) -%}
+{%- if user_type == "system" -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type in ["controller", "kubelet", "probe"] -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- elif user_type == "serviceaccount" -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type in ["client", "controller"] -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- else -%}
+    {%- set ua_items = [] -%}
+    {%- for ua in user_agents -%}
+        {%- if ua.type in ["kubectl", "client"] -%}
+            {%- do ua_items.append(ua.value) -%}
+        {%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.choice(ua_items) -}}
+{%- endif -%}
+{%- endmacro -%}
+
+{%- macro pick_source_ip(source_ips) -%}
+{{- (source_ips | random).ip -}}
+{%- endmacro -%}
+
+{#- Pick a resource entry from resources.json matching the given resource type -#}
+{%- macro pick_resource(resources, resource_type) -%}
+{%- for r in resources -%}
+    {%- if r.resource == resource_type -%}
+        {{- r.resource ~ "|||" ~ r.apiGroup ~ "|||" ~ r.apiVersion ~ "|||" ~ module.rand.choice(r.names) -}}
+        {%- break -%}
+    {%- endif -%}
+{%- endfor -%}
+{%- endmacro -%}
+
+{#- Build request URI -#}
+{%- macro build_request_uri(verb, resource, api_group, name, namespace) -%}
+{%- if api_group == "" -%}
+    {%- set base = "/api/v1" -%}
+{%- else -%}
+    {%- set base = "/apis/" ~ api_group ~ "/v1" -%}
+{%- endif -%}
+{%- if resource in ["namespaces", "nodes", "clusterroles", "clusterrolebindings", "persistentvolumes"] -%}
+    {%- if verb in ["get", "update", "patch", "delete"] -%}
+        {{- base ~ "/" ~ resource ~ "/" ~ name -}}
+    {%- elif verb == "list" or verb == "watch" -%}
+        {{- base ~ "/" ~ resource -}}
+        {%- if verb == "watch" -%}?watch=true{%- endif -%}
+    {%- else -%}
+        {{- base ~ "/" ~ resource -}}
+    {%- endif -%}
+{%- else -%}
+    {%- if verb in ["get", "update", "patch", "delete"] -%}
+        {{- base ~ "/namespaces/" ~ namespace ~ "/" ~ resource ~ "/" ~ name -}}
+    {%- elif verb == "list" or verb == "watch" -%}
+        {{- base ~ "/namespaces/" ~ namespace ~ "/" ~ resource -}}
+        {%- if verb == "watch" -%}?watch=true{%- endif -%}
+    {%- else -%}
+        {{- base ~ "/namespaces/" ~ namespace ~ "/" ~ resource -}}
+    {%- endif -%}
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Response status block -#}
+{%- macro response_status_block(code) -%}
+{%- if code == 200 -%}
+        "responseStatus": {
+            "metadata": {},
+            "code": 200
+        }
+{%- elif code == 201 -%}
+        "responseStatus": {
+            "metadata": {},
+            "status": "Success",
+            "code": 201
+        }
+{%- elif code == 204 -%}
+        "responseStatus": {
+            "metadata": {},
+            "status": "Success",
+            "code": 204
+        }
+{%- elif code == 403 -%}
+        "responseStatus": {
+            "metadata": {},
+            "status": "Failure",
+            "message": "forbidden: User cannot perform this action",
+            "reason": "Forbidden",
+            "code": 403
+        }
+{%- elif code == 404 -%}
+        "responseStatus": {
+            "metadata": {},
+            "status": "Failure",
+            "message": "the server could not find the requested resource",
+            "reason": "NotFound",
+            "code": 404
+        }
+{%- elif code == 409 -%}
+        "responseStatus": {
+            "metadata": {},
+            "status": "Failure",
+            "message": "the object has been modified; please apply your changes to the latest version and try again",
+            "reason": "Conflict",
+            "code": 409
+        }
+{%- elif code == 422 -%}
+        "responseStatus": {
+            "metadata": {},
+            "status": "Failure",
+            "message": "the server rejected the request due to invalid data",
+            "reason": "Invalid",
+            "code": 422
+        }
+{%- else -%}
+        "responseStatus": {
+            "metadata": {},
+            "code": {{ code }}
+        }
+{%- endif -%}
+{%- endmacro -%}
+
+{#- Object reference block -#}
+{%- macro object_ref_block(resource, api_group, api_version, name, namespace) -%}
+        "objectRef": {
+            "resource": "{{ resource }}",
+{%- if resource not in ["namespaces", "nodes", "clusterroles", "clusterrolebindings", "persistentvolumes"] %}
+            "namespace": "{{ namespace }}",
+{%- endif %}
+            "name": "{{ name }}",
+{%- if api_group != "" %}
+            "apiGroup": "{{ api_group }}",
+{%- endif %}
+            "apiVersion": "{{ api_version }}"
+        }
+{%- endmacro -%}
+
+{#- Annotations block for authorization decisions -#}
+{%- macro annotations_block(is_allowed, reason) -%}
+        "annotations": {
+            "authorization_k8s_io/decision": "{{ 'allow' if is_allowed else 'forbid' }}",
+            "authorization_k8s_io/reason": {{ reason | tojson }}
+        }
+{%- endmacro -%}

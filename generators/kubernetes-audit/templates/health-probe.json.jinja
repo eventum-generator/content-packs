@@ -1,0 +1,86 @@
+{%- from 'templates/_base.json.jinja' import agent_block, ecs_block, response_status_block, annotations_block -%}
+{#- Health/readiness probe — the most frequent audit event in any cluster -#}
+{%- set src_ip = (samples.source_ips | random).ip -%}
+{%- set endpoint = module.rand.weighted_choice(
+    ["/readyz", "/healthz", "/livez", "/readyz?verbose", "/healthz?verbose", "/api/v1/namespaces/kube-system/configmaps/kube-root-ca.crt"],
+    [30, 25, 20, 10, 10, 5]
+) -%}
+{%- set audit_id = module.rand.crypto.uuid4() -%}
+{%- set user_type = module.rand.weighted_choice(["anonymous", "kubelet"], [60, 40]) -%}
+{%- if user_type == "anonymous" -%}
+    {%- set username = "system:anonymous" -%}
+    {%- set user_groups = ["system:unauthenticated"] -%}
+    {%- set ua_value = module.rand.choice(["kube-probe/1.29", "kube-probe/1.28", "Go-http-client/2.0"]) -%}
+    {%- set rbac_reason = "RBAC: allowed by ClusterRoleBinding \"system:public-info-viewer\" of ClusterRole \"system:public-info-viewer\" to Group \"system:unauthenticated\"" -%}
+{%- else -%}
+    {%- set node_num = module.rand.number.integer(1, 4) -%}
+    {%- set username = "system:node:node-0" ~ node_num ~ ".k8s.local" -%}
+    {%- set user_groups = ["system:nodes", "system:authenticated"] -%}
+    {%- set ua_value = module.rand.choice(["kubelet/v1.29.2 (linux/amd64) kubernetes/4b8e819", "kubelet/v1.29.1 (linux/amd64) kubernetes/bc401b9"]) -%}
+    {%- set rbac_reason = "RBAC: allowed by ClusterRoleBinding \"system:node\" of ClusterRole \"system:node\" to Group \"system:nodes\"" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    {{ agent_block(params) }},
+    {{ ecs_block() }},
+    "data_stream": {
+        "dataset": "kubernetes.audit_logs",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "event": {
+        "action": "get",
+        "category": ["web"],
+        "dataset": "kubernetes.audit_logs",
+        "kind": "event",
+        "module": "kubernetes",
+        "outcome": "success",
+        "type": ["access"]
+    },
+    "kubernetes": {
+        "audit": {
+            "auditID": "{{ audit_id }}",
+            "apiVersion": "audit.k8s.io/v1",
+            "kind": "Event",
+            "level": "RequestResponse",
+            "stage": "ResponseComplete",
+            "verb": "get",
+            "requestURI": "{{ endpoint }}",
+            "user": {
+                "username": "{{ username }}",
+                "groups": {{ user_groups | tojson }}
+            },
+            "sourceIPs": ["{{ src_ip }}"],
+            "userAgent": "{{ ua_value }}",
+            {{ response_status_block(200) }},
+            {{ annotations_block(true, rbac_reason) }},
+            "requestReceivedTimestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.') }}{{ '%06d' | format(module.rand.number.integer(0, 999999)) }}Z",
+            "stageTimestamp": "{{ timestamp.strftime('%Y-%m-%dT%H:%M:%S.') }}{{ '%06d' | format(module.rand.number.integer(0, 999999)) }}Z"
+        }
+    },
+    "log": {
+        "file": {
+            "path": "/var/log/kubernetes/kube-apiserver-audit.log"
+        }
+    },
+    "orchestrator": {
+        "cluster": {
+            "name": "{{ params.get('cluster_name', 'production-cluster') }}"
+        },
+        "type": "kubernetes"
+    },
+    "related": {
+        "ip": ["{{ src_ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "source": {
+        "ip": "{{ src_ip }}"
+    },
+    "tags": ["forwarded", "kubernetes-audit"],
+    "user": {
+        "name": "{{ username }}"
+    },
+    "user_agent": {
+        "original": "{{ ua_value }}"
+    }
+}

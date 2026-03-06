@@ -1,0 +1,170 @@
+# Kaspersky Secure Mail Gateway (KSMG) Event Generator
+#
+# Produces realistic KSMG ScanLogic events (ECS-compatible JSON) covering:
+# - Anti-Virus (AV) scanning: clean, infected, disinfected, encrypted
+# - Anti-Spam (AS) scanning: clean, spam, probable spam, mass mail
+# - Anti-Phishing (AP) scanning: clean, phishing, malicious links
+# - Content Filtering (CF): clean, banned files, size violations
+# - Mail Authentication (MA): SPF/DKIM/DMARC checks
+# - KATA integration (KT): APT/zero-day detection
+# - Message backup: quarantine events
+# - Not processed: scan failure events
+#
+# KSMG is Kaspersky's enterprise email security gateway that scans all inbound
+# and outbound mail through multiple protection modules. Events are modeled
+# after the CEF syslog format documented for KSMG 2.0/2.1.
+#
+# Usage:
+#   eventum generate --path generators/email-kaspersky-ksmg/generator.yml --id ksmg --live-mode
+
+# Default input: 5 events/second for live mode testing
+input:
+  - cron:
+      expression: "* * * * * *"
+      count: 5
+
+event:
+  template:
+    mode: chance
+
+    # KSMG environment parameters
+    params:
+      ksmg_hostname: ksmg-node01
+      ksmg_ip: "10.1.0.20"
+      ksmg_version: "2.0.1.6960"
+      domain: corp.example.com
+      agent_id: "c4d5e6f7-a1b2-4c3d-9e8f-0a1b2c3d4e5f"
+      agent_version: "8.17.0"
+
+    # Sample data
+    samples:
+      internal_users:
+        type: csv
+        source: samples/internal_users.csv
+        header: true
+      external_domains:
+        type: json
+        source: samples/external_domains.json
+      subjects:
+        type: json
+        source: samples/subjects.json
+      threats:
+        type: json
+        source: samples/threats.json
+      rules:
+        type: json
+        source: samples/rules.json
+
+    # Event templates with realistic frequency distribution
+    #
+    # Distribution rationale (based on typical enterprise email gateway):
+    # - AV scan results dominate: every message is AV-scanned (~25%)
+    # - AS scan results are very common: every message is AS-scanned (~25%)
+    # - AP scan results: every message checked for phishing (~15%)
+    # - MA (SPF/DKIM/DMARC) auth checks on all inbound (~15%)
+    # - CF content filtering: applies to messages with attachments (~10%)
+    # - KATA integration: subset of suspicious messages (~4%)
+    # - Message backup: threat/policy triggered quarantine (~4%)
+    # - Not processed: rare scan failures (~2%)
+    templates:
+      # --- Anti-Virus Scanning (25%) ---
+      # Most messages are clean; ~3% infected, ~1% disinfected, ~2% encrypted, ~0.5% error
+      - av_scan:
+          template: templates/scan-result.json.jinja
+          vars:
+            scan_type: av
+            event_class: LMS_EV_SCAN_LOGIC_AV_STATUS
+            outcomes:
+              - ["av_clean", 935]
+              - ["av_infected", 30]
+              - ["av_disinfected", 10]
+              - ["av_encrypted", 20]
+              - ["av_error", 5]
+          chance: 250
+
+      # --- Anti-Spam Scanning (25%) ---
+      # ~70% clean, ~18% spam, ~8% probable spam, ~3% mass mail, ~1% blacklisted
+      - as_scan:
+          template: templates/scan-result.json.jinja
+          vars:
+            scan_type: as
+            event_class: LMS_EV_SCAN_LOGIC_AS_STATUS
+            outcomes:
+              - ["as_clean", 700]
+              - ["as_spam", 180]
+              - ["as_probable_spam", 80]
+              - ["as_massmail", 30]
+              - ["as_blacklisted", 10]
+          chance: 250
+
+      # --- Anti-Phishing Scanning (15%) ---
+      # ~92% clean, ~5% phishing, ~3% malicious links
+      - ap_scan:
+          template: templates/scan-result.json.jinja
+          vars:
+            scan_type: ap
+            event_class: LMS_EV_SCAN_LOGIC_AP_STATUS
+            outcomes:
+              - ["ap_clean", 920]
+              - ["ap_phishing", 50]
+              - ["ap_malicious_link", 30]
+          chance: 150
+
+      # --- Mail Authentication (15%) ---
+      # ~85% pass, ~6% SPF fail, ~5% DKIM fail, ~4% DMARC fail
+      - ma_auth:
+          template: templates/scan-result.json.jinja
+          vars:
+            scan_type: ma
+            event_class: LMS_EV_SCAN_LOGIC_MA_STATUS
+            outcomes:
+              - ["ma_clean", 850]
+              - ["ma_spf_fail", 60]
+              - ["ma_dkim_fail", 50]
+              - ["ma_dmarc_fail", 40]
+          chance: 150
+
+      # --- Content Filtering (10%) ---
+      # ~90% clean, ~5% banned filename, ~3% banned format, ~2% size exceeded
+      - cf_filter:
+          template: templates/scan-result.json.jinja
+          vars:
+            scan_type: cf
+            event_class: LMS_EV_SCAN_LOGIC_CF_STATUS
+            outcomes:
+              - ["cf_clean", 900]
+              - ["cf_banned_name", 50]
+              - ["cf_banned_format", 30]
+              - ["cf_size_exceeded", 20]
+          chance: 100
+
+      # --- KATA Integration (4%) ---
+      # ~95% clean, ~5% detected (APT/zero-day)
+      - kt_kata:
+          template: templates/scan-result.json.jinja
+          vars:
+            scan_type: kt
+            event_class: LMS_EV_SCAN_LOGIC_KT_STATUS
+            outcomes:
+              - ["kt_clean", 950]
+              - ["kt_detected", 50]
+          chance: 40
+
+      # --- Message Backup (4%) ---
+      # Messages quarantined due to threat/policy detection
+      - message_backup:
+          template: templates/message-backup.json.jinja
+          chance: 40
+
+      # --- Not Processed (2%) ---
+      # Scan failures due to errors, timeouts, resource exhaustion
+      - not_processed:
+          template: templates/not-processed.json.jinja
+          chance: 20
+
+output:
+  - file:
+      path: output/events.json
+      write_mode: overwrite
+      formatter:
+        format: json

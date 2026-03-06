@@ -1,0 +1,140 @@
+{%- set record_id = shared.get('record_id', 1) -%}
+{%- set hostname = params.hostname -%}
+{%- set fqdn = hostname ~ '.' ~ params.domain -%}
+{%- set user_rec = samples.usernames | random -%}
+{%- set user = user_rec.username -%}
+{%- set client_ip = module.rand.network.ip_v4_public() -%}
+{%- set session_id = module.rand.number.integer(100000, 9999999) -%}
+{%- set ppe = module.rand.weighted_choice(["0-PPE-0", "1-PPE-1", "2-PPE-2"], [50, 30, 20]) -%}
+{#- Client type selection -#}
+{%- set client_type_weights = samples.client_types | map(attribute='weight') | list -%}
+{%- set client_type = module.rand.weighted_choice(samples.client_types, client_type_weights) -%}
+{%- set sslvpn_client_type = client_type.type -%}
+{%- set browser_type = client_type.client ~ " " ~ client_type.version -%}
+{#- Groups -#}
+{%- set group = module.rand.weighted_choice(
+  ["Domain Users", "VPN_Users", "VPN_Contractors", "VPN_Admins", "VPN_FullAccess"],
+  [35, 30, 15, 10, 10]
+) -%}
+{#- Build original syslog message -#}
+{%- set syslog_ts = timestamp.strftime('%m/%d/%Y:%H:%M:%S') ~ " GMT" -%}
+{%- set syslog_msg = syslog_ts ~ " " ~ hostname ~ " " ~ ppe ~ " : default SSLVPN LOGIN " ~ record_id ~ " 0 : Context " ~ user ~ "@" ~ client_ip ~ " - SessionId: " ~ session_id ~ " - User " ~ user ~ " - Client_ip " ~ client_ip ~ " - Nat_ip \\\"" ~ params.nat_ip ~ "\\\" - Vserver " ~ params.vserver_ip ~ ":" ~ params.vserver_port ~ " - Browser_type \\\"" ~ browser_type ~ "\\\" - SSLVPN_client_type " ~ sslvpn_client_type ~ " - Group(s) \\\"" ~ group ~ "\\\"" -%}
+{#- Push to active sessions pool for correlation with logout -#}
+{%- set sessions = shared.get('vpn_sessions', []) -%}
+{%- do sessions.append({
+  "user": user,
+  "client_ip": client_ip,
+  "session_id": session_id,
+  "group": group,
+  "sslvpn_client_type": sslvpn_client_type,
+  "browser_type": browser_type,
+  "start_time": timestamp.isoformat()
+}) -%}
+{%- if sessions | length > 200 -%}{%- do sessions.pop(0) -%}{%- endif -%}
+{%- do shared.set('vpn_sessions', sessions) -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ params.agent_id }}",
+        "name": "{{ fqdn }}",
+        "type": "filebeat",
+        "version": "{{ params.agent_version }}"
+    },
+    "citrix": {
+        "cef_format": false,
+        "device_product": "NetScaler",
+        "device_vendor": "Citrix",
+        "device_version": "NS14.1",
+        "facility": "local0",
+        "hostname": "{{ hostname }}",
+        "name": "SSLVPN LOGIN",
+        "ppe_id": "{{ ppe }}",
+        "priority": "info",
+        "session_id": "{{ session_id }}"
+    },
+    "citrix_adc": {
+        "log": {
+            "browser_type": "{{ browser_type }}",
+            "client_ip": "{{ client_ip }}",
+            "group": "{{ group }}",
+            "groups": "{{ group }}",
+            "nat": {
+                "ip": "{{ params.nat_ip }}"
+            },
+            "session_id": "{{ session_id }}",
+            "sslvpn_client_type": "{{ sslvpn_client_type }}",
+            "user": "{{ user }}",
+            "username": "{{ user }}",
+            "vserver": {
+                "ip": "{{ params.vserver_ip }}",
+                "port": {{ params.vserver_port }}
+            }
+        }
+    },
+    "client": {
+        "ip": "{{ client_ip }}"
+    },
+    "data_stream": {
+        "dataset": "citrix_adc.log",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "logged-in",
+        "category": ["authentication", "session"],
+        "dataset": "citrix_adc.log",
+        "kind": "event",
+        "module": "citrix_adc",
+        "original": "{{ syslog_msg }}",
+        "outcome": "success",
+        "severity": 6,
+        "type": ["start", "allowed"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}"
+    },
+    "log": {
+        "level": "informational",
+        "syslog": {
+            "facility": {
+                "code": 16
+            },
+            "priority": 134,
+            "severity": {
+                "code": 6
+            }
+        }
+    },
+    "observer": {
+        "hostname": "{{ hostname }}",
+        "name": "{{ fqdn }}",
+        "product": "Netscaler",
+        "type": "firewall",
+        "vendor": "Citrix"
+    },
+    "related": {
+        "hosts": ["{{ hostname }}"],
+        "ip": ["{{ client_ip }}", "{{ params.vserver_ip }}", "{{ params.nat_ip }}"],
+        "user": ["{{ user }}"]
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "user": {
+            "group": {
+                "name": "{{ group }}"
+            },
+            "name": "{{ user }}"
+        }
+    },
+    "user": {
+        "name": "{{ user }}",
+        "domain": "{{ params.domain }}"
+    },
+    "tags": ["citrix_adc.log", "forwarded"]
+}
+{%- do shared.set('record_id', (record_id + 1) % 2147483647) -%}

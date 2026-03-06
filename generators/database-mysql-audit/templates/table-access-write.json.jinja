@@ -1,0 +1,136 @@
+{%- set host = samples.hosts | random -%}
+{%- set hostname = host.name -%}
+{%- set event_id = shared.get('event_id:' ~ hostname, 1000) -%}
+{%- set sessions = shared.get('sessions:' ~ hostname, []) -%}
+{%- if sessions | length > 0 -%}
+  {%- set sess = sessions | random -%}
+  {%- set username = sess.user -%}
+  {%- set client_ip = sess.client_ip -%}
+  {%- set conn_id = sess.conn_id -%}
+  {%- set db_name = sess.db -%}
+  {%- set client_host = sess.client_host -%}
+{%- else -%}
+  {%- set user = samples.users.weighted_pick('weight') -%}
+  {%- set username = user.username -%}
+  {%- if user.host == 'localhost' -%}
+    {%- set client_ip = "127.0.0.1" -%}
+  {%- else -%}
+    {%- set client_ip = module.rand.network.ip_v4_private_c() -%}
+  {%- endif -%}
+  {%- set conn_id = module.rand.number.integer(50, 5000) -%}
+  {%- set db_name = (samples.databases | rejectattr('tables', 'equalto', []) | list | random).name -%}
+  {%- set client_host = module.rand.choice(["app-server-01", "web-01", hostname]) -%}
+{%- endif -%}
+{%- set db_entry = samples.databases | selectattr('name', 'equalto', db_name) | first | default(samples.databases | rejectattr('tables', 'equalto', []) | list | random) -%}
+{%- if db_entry.tables | length > 0 -%}
+  {%- set tbl = db_entry.tables | random -%}
+{%- else -%}
+  {%- set db_entry = samples.databases | rejectattr('tables', 'equalto', []) | list | random -%}
+  {%- set tbl = db_entry.tables | random -%}
+{%- endif -%}
+{%- set ta_event = module.rand.weighted_choice(["insert", "update", "delete"], [40, 45, 15]) -%}
+{%- set col1 = tbl.cols[1] if tbl.cols | length > 1 else "id" -%}
+{%- set col2 = tbl.cols[2] if tbl.cols | length > 2 else "id" -%}
+{%- if ta_event == "insert" -%}
+  {%- set query_stmt = "INSERT INTO `" ~ db_entry.name ~ "`.`" ~ tbl.name ~ "` (`" ~ col1 ~ "`, `" ~ col2 ~ "`) VALUES (?, ?)" -%}
+  {%- set event_type = "change" -%}
+{%- elif ta_event == "update" -%}
+  {%- set query_stmt = "UPDATE `" ~ db_entry.name ~ "`.`" ~ tbl.name ~ "` SET `" ~ col1 ~ "` = ? WHERE `id` = ?" -%}
+  {%- set event_type = "change" -%}
+{%- else -%}
+  {%- set query_stmt = "DELETE FROM `" ~ db_entry.name ~ "`.`" ~ tbl.name ~ "` WHERE `id` = ?" -%}
+  {%- set event_type = "deletion" -%}
+{%- endif -%}
+{
+    "@timestamp": "{{ timestamp.isoformat() }}",
+    "agent": {
+        "ephemeral_id": "{{ module.rand.crypto.uuid4() }}",
+        "id": "{{ host.agent_id }}",
+        "name": "{{ hostname }}",
+        "type": "filebeat",
+        "version": "{{ params.get('agent_version', '8.17.0') }}"
+    },
+    "client": {
+        "domain": "{{ client_host }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "data_stream": {
+        "dataset": "mysql_enterprise.audit",
+        "namespace": "default",
+        "type": "logs"
+    },
+    "ecs": {
+        "version": "8.17.0"
+    },
+    "event": {
+        "action": "mysql-table_access",
+        "category": ["database"],
+        "dataset": "mysql_enterprise.audit",
+        "kind": "event",
+        "module": "mysql_enterprise",
+        "outcome": "success",
+        "timezone": "+00:00",
+        "type": ["{{ event_type }}"]
+    },
+    "host": {
+        "hostname": "{{ hostname }}",
+        "ip": ["{{ host.ip }}"],
+        "mac": ["{{ host.mac }}"],
+        "name": "{{ hostname }}",
+        "os": {
+            "family": "linux",
+            "full": "x86_64-Linux",
+            "name": "{{ host.os_name }}",
+            "type": "linux",
+            "version": "{{ host.os_version }}"
+        }
+    },
+    "mysqlenterprise": {
+        "audit": {
+            "account": {
+                "host": "{{ client_host }}",
+                "user": "{{ username }}"
+            },
+            "class": "table_access",
+            "connection_id": "{{ conn_id }}",
+            "id": "{{ event_id }}",
+            "login": {
+                "ip": "{{ client_ip }}",
+                "os": "",
+                "proxy": "",
+                "user": "{{ username }}"
+            },
+            "table_access_data": {
+                "db": "{{ db_entry.name }}",
+                "query": {{ query_stmt | tojson }},
+                "sql_command": "{{ ta_event }}",
+                "table": "{{ tbl.name }}"
+            }
+        }
+    },
+    "related": {
+        "ip": ["{{ client_ip }}", "{{ host.ip }}"],
+        "user": ["{{ username }}"]
+    },
+    "server": {
+        "user": {
+            "name": "{{ username }}"
+        }
+    },
+    "service": {
+        "id": "{{ host.server_id }}",
+        "type": "mysql_enterprise",
+        "version": "{{ host.mysql_version }}"
+    },
+    "source": {
+        "address": "{{ client_ip }}",
+        "ip": "{{ client_ip }}",
+        "port": {{ module.rand.number.integer(32768, 65535) }}
+    },
+    "tags": ["mysql_enterprise-audit"],
+    "user": {
+        "name": "{{ username }}"
+    }
+}
+{%- do shared.set('event_id:' ~ hostname, event_id + 1) -%}
