@@ -8,12 +8,12 @@ InfoWatch Traffic Monitor is a Russian DLP system for data leak prevention that 
 
 | Template | Type | Chance | Description |
 |----------|------|--------|-------------|
-| `policy-violation` | Alert | 25% | DLP policy rule match -- blocks or alerts on confidential data |
+| `policy-violation` | Alert | 25% | DLP policy rule match - blocks or alerts on confidential data |
 | `content-capture` | Event | 35% | Routine traffic interception with no policy violation |
 | `device-control` | Event | 12% | USB/removable media/Bluetooth device detection |
 | `print-control` | Event | 8% | Print job monitoring and blocking |
 | `system-event` | Event | 10% | InfoWatch system operational messages |
-| `incident-update` | Event | 10% | Analyst workflow -- incident status changes |
+| `incident-update` | Event | 10% | Analyst workflow - incident status changes |
 
 ## Monitored Channels
 
@@ -144,6 +144,6 @@ eventum generate --path generators/dlp-infowatch/generator.yml --id iwtm --live-
 
 ## References
 
-- [InfoWatch Traffic Monitor](https://infowatch.com/products/data-loss-prevention-traffic-monitor) -- official product page
-- [Elastic CEF Integration](https://docs.elastic.co/en/integrations/cef) -- CEF log format ingestion into Elastic
-- [InfoWatch SIEM Integration](https://www.infowatch.ru/products/dlp-sistema-traffic-monitor/integratsii-dlp-sistemy) -- SIEM connector documentation
+- [InfoWatch Traffic Monitor](https://infowatch.com/products/data-loss-prevention-traffic-monitor) - official product page
+- [Elastic CEF Integration](https://docs.elastic.co/en/integrations/cef) - CEF log format ingestion into Elastic
+- [InfoWatch SIEM Integration](https://www.infowatch.ru/products/dlp-sistema-traffic-monitor/integratsii-dlp-sistemy) - SIEM connector documentation

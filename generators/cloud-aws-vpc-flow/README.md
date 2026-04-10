@@ -21,17 +21,17 @@ AWS VPC Flow Logs capture information about IP traffic going to and from network
 ## Realism Features
 
 - **Jinja2 macros** (`_base.json.jinja`) eliminate boilerplate across 9 templates with shared agent, ECS, cloud, and VPC flow block helpers
-- **Weighted port distributions** -- HTTPS (443) dominates at ~35%, followed by DNS (53), HTTP (80), SSH (22), MySQL (3306), PostgreSQL (5432), and 17 other services
-- **Lognormal traffic volumes** -- packets and bytes follow lognormal distributions matching real network traffic patterns; bulk transfers produce 10KB-500MB flows
-- **Network direction detection** -- automatically classifies flows as inbound, outbound, internal, or external based on RFC 1918 address analysis
-- **Realistic reject patterns** -- rejected TCP targets common attack surfaces (SSH, RDP, SMB, databases); rejected UDP targets DNS, SNMP, and discovery protocols
-- **ICMP type accuracy** -- uses actual ICMP type numbers (8=Echo Request, 0=Echo Reply, 3=Dest Unreachable, 11=Time Exceeded) in the port fields
-- **Flow duration realism** -- rejected flows last 0-10s (SYN-only), normal TCP 1-300s, bulk transfers 10-600s, UDP 1-60s
-- **NODATA/SKIPDATA events** -- simulates idle interfaces and internal capacity constraints at realistic 5%/1% rates
-- **Multi-account environment** -- 3 AWS accounts (production, staging, development) across 5 regions
+- **Weighted port distributions** - HTTPS (443) dominates at ~35%, followed by DNS (53), HTTP (80), SSH (22), MySQL (3306), PostgreSQL (5432), and 17 other services
+- **Lognormal traffic volumes** - packets and bytes follow lognormal distributions matching real network traffic patterns; bulk transfers produce 10KB-500MB flows
+- **Network direction detection** - automatically classifies flows as inbound, outbound, internal, or external based on RFC 1918 address analysis
+- **Realistic reject patterns** - rejected TCP targets common attack surfaces (SSH, RDP, SMB, databases); rejected UDP targets DNS, SNMP, and discovery protocols
+- **ICMP type accuracy** - uses actual ICMP type numbers (8=Echo Request, 0=Echo Reply, 3=Dest Unreachable, 11=Time Exceeded) in the port fields
+- **Flow duration realism** - rejected flows last 0-10s (SYN-only), normal TCP 1-300s, bulk transfers 10-600s, UDP 1-60s
+- **NODATA/SKIPDATA events** - simulates idle interfaces and internal capacity constraints at realistic 5%/1% rates
+- **Multi-account environment** - 3 AWS accounts (production, staging, development) across 5 regions
 - **15 network interfaces** spanning 3 VPCs with EC2, NAT gateway, ALB, Lambda, and ECS task ENI types
-- **Raw log preservation** -- `event.original` contains the v2 space-delimited format matching actual CloudWatch/S3 delivery
-- **ECS-compatible output** -- ready for Elasticsearch/OpenSearch ingestion via the Elastic AWS integration
+- **Raw log preservation** - `event.original` contains the v2 space-delimited format matching actual CloudWatch/S3 delivery
+- **ECS-compatible output** - ready for Elasticsearch/OpenSearch ingestion via the Elastic AWS integration
 
 ## Parameters
 
@@ -246,5 +246,5 @@ generators/cloud-aws-vpc-flow/
 - [VPC Flow Log Records](https://docs.aws.amazon.com/vpc/latest/userguide/flow-log-records.html)
 - [IANA Protocol Numbers](https://www.iana.org/assignments/protocol-numbers/protocol-numbers.xhtml)
 - [Elastic AWS VPC Flow Integration](https://docs.elastic.co/integrations/aws/vpcflow)
-- [Elastic Integrations -- aws](https://github.com/elastic/integrations/tree/main/packages/aws)
+- [Elastic Integrations - aws](https://github.com/elastic/integrations/tree/main/packages/aws)
 - [Elastic Common Schema (ECS)](https://www.elastic.co/guide/en/ecs/current/index.html)

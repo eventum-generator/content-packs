@@ -20,19 +20,19 @@ Produces realistic PAN-OS GlobalProtect VPN events in ECS-compatible JSON format
 
 ## Realism Features
 
-- **Weighted event distribution** -- 11 templates with realistic enterprise frequency (HIP checks most frequent, auth failures rare)
-- **Authentication methods** -- LDAP (~50%), SAML (~30%), Certificate (~15%), RADIUS (~5%)
-- **Connection methods** -- user-logon (~50%), pre-logon (~20%), on-demand (~20%), manual (~10%)
-- **Tunnel types** -- IPSec (~90%), SSL-VPN (~10%) for gateway config retrieval
-- **HIP check variation** -- "HIP report is not needed" (~70%) vs "HIP report processed successfully" (~30%)
-- **Latency metrics** -- Gaussian-distributed pre-tunnel (~100ms) and post-tunnel (~65ms) latency
-- **Session durations** -- Exponential distribution with ~4 hour mean for logout events
-- **Auth failure realism** -- Three error types: "Authentication failed", "Invalid credentials", "User not found"
-- **Multi-platform clients** -- Windows, macOS, Linux with matching GP client versions
-- **Machine/platform correlation** -- Each machine maps to a specific OS platform via os_index
-- **Geographic diversity** -- Source geo weighted toward US, UK, Germany, Canada, India
-- **Monotonic sequence numbers** -- Sequence counter increments across all events with no gaps
-- **Multiple gateways** -- 5 gateways across US-East, US-West, EU-West, EU-Central, APAC
+- **Weighted event distribution** - 11 templates with realistic enterprise frequency (HIP checks most frequent, auth failures rare)
+- **Authentication methods** - LDAP (~50%), SAML (~30%), Certificate (~15%), RADIUS (~5%)
+- **Connection methods** - user-logon (~50%), pre-logon (~20%), on-demand (~20%), manual (~10%)
+- **Tunnel types** - IPSec (~90%), SSL-VPN (~10%) for gateway config retrieval
+- **HIP check variation** - "HIP report is not needed" (~70%) vs "HIP report processed successfully" (~30%)
+- **Latency metrics** - Gaussian-distributed pre-tunnel (~100ms) and post-tunnel (~65ms) latency
+- **Session durations** - Exponential distribution with ~4 hour mean for logout events
+- **Auth failure realism** - Three error types: "Authentication failed", "Invalid credentials", "User not found"
+- **Multi-platform clients** - Windows, macOS, Linux with matching GP client versions
+- **Machine/platform correlation** - Each machine maps to a specific OS platform via os_index
+- **Geographic diversity** - Source geo weighted toward US, UK, Germany, Canada, India
+- **Monotonic sequence numbers** - Sequence counter increments across all events with no gaps
+- **Multiple gateways** - 5 gateways across US-East, US-West, EU-West, EU-Central, APAC
 
 ## Parameters
 

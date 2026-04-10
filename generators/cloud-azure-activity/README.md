@@ -22,20 +22,20 @@ Azure Activity Log provides insight into subscription-level events in Azure. It 
 
 - **Jinja2 macros** (`_base.json.jinja`) eliminate boilerplate across 9 templates
 - **All 7 activity log categories** with production-accurate distribution weights
-- **Weighted operation distributions** -- Administrative events use realistic operation weights matching real Azure environments
-- **Error injection** (~5%) -- Administrative operations produce failures (403 Forbidden, 409 Conflict, 400 BadRequest, 404 NotFound) with appropriate HTTP status codes
-- **Azure resource ID format** -- proper `/subscriptions/{sub}/resourceGroups/{rg}/providers/{provider}/{type}/{name}` structure
-- **Identity with claims** -- Azure AD identity block with JWT claims, UPN, object ID, tenant ID, and authorization scope
-- **Policy evaluation** -- compliance checks vs new resource deployments with policy definition IDs, effects (Audit/Deny/AuditIfNotExists/DeployIfNotExists), and assignment details
-- **Service health realism** -- 5 incident types (Incident, Maintenance, Informational, ActionRequired, Security) affecting 12 Azure services
-- **Autoscale events** -- scale-up/scale-down with instance count tracking and target resource references
-- **Resource health transitions** -- Available/Unavailable/Degraded states with PlatformInitiated/UserInitiated causes
-- **Alert rules** -- 6 metric types (CPU, Memory, HTTP Errors, DTU, Network, Disk) with thresholds and aggregation windows
-- **Multi-subscription environment** -- 3 Azure subscriptions (production, staging, development)
+- **Weighted operation distributions** - Administrative events use realistic operation weights matching real Azure environments
+- **Error injection** (~5%) - Administrative operations produce failures (403 Forbidden, 409 Conflict, 400 BadRequest, 404 NotFound) with appropriate HTTP status codes
+- **Azure resource ID format** - proper `/subscriptions/{sub}/resourceGroups/{rg}/providers/{provider}/{type}/{name}` structure
+- **Identity with claims** - Azure AD identity block with JWT claims, UPN, object ID, tenant ID, and authorization scope
+- **Policy evaluation** - compliance checks vs new resource deployments with policy definition IDs, effects (Audit/Deny/AuditIfNotExists/DeployIfNotExists), and assignment details
+- **Service health realism** - 5 incident types (Incident, Maintenance, Informational, ActionRequired, Security) affecting 12 Azure services
+- **Autoscale events** - scale-up/scale-down with instance count tracking and target resource references
+- **Resource health transitions** - Available/Unavailable/Degraded states with PlatformInitiated/UserInitiated causes
+- **Alert rules** - 6 metric types (CPU, Memory, HTTP Errors, DTU, Network, Disk) with thresholds and aggregation windows
+- **Multi-subscription environment** - 3 Azure subscriptions (production, staging, development)
 - **12 Azure AD users** across 8 departments including service accounts
 - **12 resource groups** with realistic naming conventions
-- **User agent diversity** -- Azure Portal, Azure CLI, PowerShell, Python/Go SDKs, and internal Azure service agents
-- **ECS-compatible output** -- ready for Elasticsearch/OpenSearch ingestion via the Elastic Azure integration
+- **User agent diversity** - Azure Portal, Azure CLI, PowerShell, Python/Go SDKs, and internal Azure service agents
+- **ECS-compatible output** - ready for Elasticsearch/OpenSearch ingestion via the Elastic Azure integration
 
 ## Parameters
 
@@ -223,7 +223,7 @@ generators/cloud-azure-activity/
 - [Azure Activity Log Event Schema](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/activity-log-schema)
 - [Azure Activity Log Categories](https://learn.microsoft.com/en-us/azure/azure-monitor/essentials/activity-log-schema#categories)
 - [Elastic Azure Integration](https://docs.elastic.co/integrations/azure)
-- [Elastic Integrations -- azure](https://github.com/elastic/integrations/tree/main/packages/azure)
+- [Elastic Integrations - azure](https://github.com/elastic/integrations/tree/main/packages/azure)
 - [Azure Resource Providers and Types](https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/resource-providers-and-types)
 - [Azure Policy Overview](https://learn.microsoft.com/en-us/azure/governance/policy/overview)
 - [Microsoft Defender for Cloud Alerts](https://learn.microsoft.com/en-us/azure/defender-for-cloud/alerts-overview)

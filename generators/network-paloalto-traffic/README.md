@@ -13,18 +13,18 @@ Produces realistic PAN-OS Traffic log events in ECS-compatible JSON format, matc
 
 ## Realism Features
 
-- **Zone-aware flow profiles** -- 4 traffic directions (trust->untrust 70%, untrust->dmz 15%, trust->trust 10%, dmz->trust 5%) with correct interfaces and NAT behavior
-- **Lognormal byte distributions** -- Realistic traffic volume using `lognormal()` for bytes_sent/bytes_received with proper clamping
-- **Protocol-aware session end reasons** -- TCP sessions end with tcp-fin (38%), aged-out (21%), tcp-rst-from-client (10%), etc.; UDP/ICMP always aged-out
-- **Session flags** -- 0x400053 for TCP, 0x400000 for UDP/ICMP, 0x0 for drops/denies
-- **30 PAN-OS App-IDs** -- Weighted application distribution (ssl 300, web-browsing 180, dns 90, etc.) with protocol, port, category, risk metadata
-- **Zone-matched security rules** -- 12 rules matched by source/destination zone pair
-- **Source NAT translation** -- Only for outbound (trust->untrust) flows
-- **Monotonic counters** -- sequence_number and flow_id increment via shared state
-- **Deny action distribution** -- deny 40%, reset-both 25%, reset-client 20%, reset-server 15%
-- **Drop application correlation** -- Dropped traffic uses incomplete/insufficient-data/not-applicable apps
-- **Geo-aware destinations** -- Allowed traffic skews US/EU; dropped/denied traffic skews higher-risk regions
-- **ECS-compliant output** -- Full Elastic panw integration field mapping including `panw.panos.*` vendor fields
+- **Zone-aware flow profiles** - 4 traffic directions (trust->untrust 70%, untrust->dmz 15%, trust->trust 10%, dmz->trust 5%) with correct interfaces and NAT behavior
+- **Lognormal byte distributions** - Realistic traffic volume using `lognormal()` for bytes_sent/bytes_received with proper clamping
+- **Protocol-aware session end reasons** - TCP sessions end with tcp-fin (38%), aged-out (21%), tcp-rst-from-client (10%), etc.; UDP/ICMP always aged-out
+- **Session flags** - 0x400053 for TCP, 0x400000 for UDP/ICMP, 0x0 for drops/denies
+- **30 PAN-OS App-IDs** - Weighted application distribution (ssl 300, web-browsing 180, dns 90, etc.) with protocol, port, category, risk metadata
+- **Zone-matched security rules** - 12 rules matched by source/destination zone pair
+- **Source NAT translation** - Only for outbound (trust->untrust) flows
+- **Monotonic counters** - sequence_number and flow_id increment via shared state
+- **Deny action distribution** - deny 40%, reset-both 25%, reset-client 20%, reset-server 15%
+- **Drop application correlation** - Dropped traffic uses incomplete/insufficient-data/not-applicable apps
+- **Geo-aware destinations** - Allowed traffic skews US/EU; dropped/denied traffic skews higher-risk regions
+- **ECS-compliant output** - Full Elastic panw integration field mapping including `panw.panos.*` vendor fields
 
 ## Parameters
 
