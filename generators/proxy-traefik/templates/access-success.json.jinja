@@ -1,0 +1,59 @@
+{%- from 'templates/_base.json.jinja' import render with context -%}
+{#- Successful and redirect responses (2xx / 3xx). Origin status mirrors the
+    downstream status, except http->https redirects, which Traefik generates
+    itself (origin never reached -> origin_status 0). Latency is drawn per
+    route latency class; the lognormal tail produces the "slow request"
+    outliers an SRE watches for. -#}
+{%- set route = samples.routes.weighted_pick('weight') -%}
+{%- set src_ip = module.rand.network.ip_v4_public() -%}
+{%- set src_port = module.rand.number.integer(1024, 65535) -%}
+{%- set http_version = module.rand.weighted_choice(["2.0", "1.1", "1.0"], [60, 38, 2]) -%}
+{#- Method: GET-dominated, weighted across what the route accepts -#}
+{%- set method_weights = [] -%}
+{%- for m in route.methods -%}
+  {%- do method_weights.append({"GET": 80, "HEAD": 6, "POST": 14, "PUT": 4, "DELETE": 3, "PATCH": 2, "OPTIONS": 2}.get(m, 5)) -%}
+{%- endfor -%}
+{%- set method = module.rand.weighted_choice(route.methods, method_weights) -%}
+{#- Status code distribution -#}
+{%- if route.scheme == "http" -%}
+  {%- set status = module.rand.weighted_choice([308, 200], [82, 18]) -%}
+{%- elif method in ["POST", "PUT", "PATCH"] -%}
+  {%- set status = module.rand.weighted_choice([200, 201, 204], [55, 35, 10]) -%}
+{%- elif method == "HEAD" -%}
+  {%- set status = 200 -%}
+{%- else -%}
+  {%- set status = module.rand.weighted_choice([200, 304, 302, 206], [88, 7, 3, 2]) -%}
+{%- endif -%}
+{#- Origin status and upstream latency -#}
+{%- if route.scheme == "http" and status == 308 -%}
+  {#- Traefik redirectScheme middleware answers without touching a backend -#}
+  {%- set origin_status = 0 -%}
+  {%- set origin_duration = module.rand.number.integer(30000, 200000) -%}
+{%- else -%}
+  {%- set origin_status = status -%}
+  {%- set lat_mu = {"fast": 15.2, "normal": 17.37, "slow": 19.21}[route.latency] -%}
+  {%- set lat_sigma = {"fast": 0.5, "normal": 0.7, "slow": 0.85}[route.latency] -%}
+  {%- set origin_duration = module.rand.number.clamp(module.rand.number.lognormal(lat_mu, lat_sigma), 100000, 60000000000) | int -%}
+{%- endif -%}
+{%- set overhead = module.rand.number.clamp(module.rand.number.lognormal(11.7, 0.4), 20000, 50000000) | int -%}
+{#- Response body size -#}
+{%- if status in [204, 304] or method == "HEAD" -%}
+  {%- set resp_bytes = 0 -%}
+{%- elif status in [301, 302, 307, 308] -%}
+  {%- set resp_bytes = module.rand.number.integer(120, 240) -%}
+{%- else -%}
+  {%- set resp_bytes = module.rand.number.clamp(module.rand.number.lognormal(7.6, 1.1), 0, 5000000) | int -%}
+{%- endif -%}
+{#- Request body size -#}
+{%- if method in ["POST", "PUT", "PATCH"] -%}
+  {%- set req_bytes = module.rand.number.clamp(module.rand.number.lognormal(6.5, 1.0), 0, 2000000) | int -%}
+{%- else -%}
+  {%- set req_bytes = 0 -%}
+{%- endif -%}
+{#- Request path, with a query string on search endpoints -#}
+{%- set full_path = module.rand.choice(route.paths) -%}
+{%- if "/search/v1/query" in full_path -%}
+  {%- set q = module.rand.choice(["widget", "laptop pro", "running shoes", "4k monitor", "coffee maker"]) -%}
+  {%- set full_path = full_path ~ "?q=" ~ (q | urlencode) -%}
+{%- endif -%}
+{{ render(route, src_ip, src_port, method, status, origin_status, resp_bytes, req_bytes, origin_duration, overhead, 0, http_version, full_path) }}
