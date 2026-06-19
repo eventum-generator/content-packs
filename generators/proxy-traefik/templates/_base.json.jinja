@@ -1,0 +1,126 @@
+{#-
+  Shared ECS event skeleton for Traefik access logs.
+  Mirrors the Elastic `traefik` integration (data stream `access`).
+  Import with:
+    {%- from 'templates/_base.json.jinja' import render with context -%}
+  Imported `with context` so it can read `timestamp`, `module`, `params`
+  and `shared` directly. Per-event values are passed as arguments.
+
+  Invariants preserved here:
+    - event.duration = origin.duration + overhead
+    - traefik.access.origin.content_size = 0 when the origin never replied
+      (origin_status == 0), i.e. a Traefik-generated 5xx
+    - traefik.access.request_count is a monotonic per-process counter
+-#}
+{%- macro render(route, src_ip, src_port, method, status, origin_status,
+                 resp_bytes, req_bytes, origin_duration, overhead,
+                 retries, http_version, full_path) -%}
+{%- set rc = shared.get('request_count', 0) + 1 -%}
+{%- do shared.set('request_count', rc) -%}
+{%- set duration = origin_duration + overhead -%}
+{%- set outcome = "success" if status < 400 else "failure" -%}
+{%- set provider = params.traefik_provider -%}
+{%- set service_addr = route.service_ip ~ ":" ~ route.service_port -%}
+{%- set community_id = "1:" ~ module.base64.b64encode(module.os.urandom(20)).decode() -%}
+{%- set ingested = (timestamp + module.datetime.timedelta(milliseconds=module.rand.number.integer(80, 400))).isoformat() -%}
+{
+    "@timestamp": {{ timestamp.isoformat() | tojson }},
+    "destination": {
+        "address": {{ service_addr | tojson }},
+        "ip": {{ route.service_ip | tojson }},
+        "port": {{ route.service_port }}
+    },
+    "ecs": {
+        "version": "8.11.0"
+    },
+    "event": {
+        "category": ["web"],
+        "created": {{ timestamp.isoformat() | tojson }},
+        "duration": {{ duration }},
+        "ingested": {{ ingested | tojson }},
+        "kind": "event",
+        "outcome": {{ outcome | tojson }},
+        "type": ["access"]
+    },
+    "http": {
+        "request": {
+            "body": {
+                "bytes": {{ req_bytes }}
+            },
+            "method": {{ method | tojson }}
+        },
+        "response": {
+            "body": {
+                "bytes": {{ resp_bytes }}
+            },
+            "status_code": {{ status }}
+        },
+        "version": {{ http_version | tojson }}
+    },
+    "log": {
+        "level": "info"
+    },
+    "network": {
+        "community_id": {{ community_id | tojson }},
+        "transport": "tcp"
+    },
+    "observer": {
+        "egress": {
+            "interface": {
+                "name": {{ (route.service ~ "@" ~ provider) | tojson }}
+            }
+        },
+        "ingress": {
+            "interface": {
+                "name": {{ route.entrypoint | tojson }}
+            }
+        },
+        "product": "traefik",
+        "type": "proxy",
+        "vendor": "traefik"
+    },
+    "related": {
+        "ip": [{{ src_ip | tojson }}, {{ route.service_ip | tojson }}]
+    },
+    "source": {
+        "address": {{ (src_ip ~ ":" ~ src_port) | tojson }},
+        "ip": {{ src_ip | tojson }},
+        "port": {{ src_port }}
+    },
+    "traefik": {
+        "access": {
+            "origin": {
+                "content_size": {{ resp_bytes if origin_status != 0 else 0 }},
+                "duration": {{ origin_duration }},
+                "status_code": {{ origin_status }}
+            },
+            "overhead": {{ overhead }},
+            "request_count": {{ rc }},
+            "retry_attempts": {{ retries }},
+            "router": {
+                "name": {{ (route.router ~ "@" ~ provider) | tojson }}
+            },
+            "service": {
+                "url": {
+                    "domain": {{ service_addr | tojson }},
+                    "force_query": false,
+                    "fragment": "",
+                    "opaque": "",
+                    "path": "",
+                    "raw_path": "",
+                    "raw_query": "",
+                    "user": null
+                }
+            }
+        }
+    },
+    "url": {
+        "domain": {{ route.host | tojson }},
+        "original": {{ full_path | tojson }},
+        "scheme": {{ route.scheme | tojson }}
+    },
+    "user": {
+        "name": "-"
+    }
+}
+{%- endmacro -%}
