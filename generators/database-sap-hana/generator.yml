@@ -1,0 +1,256 @@
+# SAP HANA Audit Trail Generator
+#
+# Produces SAP HANA audit trail events as ECS-compatible JSON. Every event
+# carries the audit trail line HANA itself writes, verbatim, in `message`,
+# with the same values parsed out into ECS fields and `sap.hana.audit.*`
+# alongside it - so a parser can be developed against the raw line while
+# dashboards and rules read the parsed one.
+#
+# The audited actions and the policies that report them follow the audit
+# policy set SAP recommends in the HANA Security Guide, plus the site
+# policies a production system adds for data access.
+#
+# Events are picked by state machine, not by chance: a credential check is
+# followed by the connection it authorises, statements run inside the
+# session that opened, and one intruder walks the whole trail from password
+# spraying to deleting audit entries, while routine traffic keeps flowing
+# around them.
+#
+# Usage:
+#   eventum generate --path generators/database-sap-hana/generator.yml --id hana --live-mode true
+
+input:
+  - cron:
+      expression: "* * * * * *"
+      count: 5
+
+event:
+  template:
+    mode: fsm
+
+    # Environment parameters - edit for your setup
+    params:
+      # The audited instance. `hana_port` is the port of the service that
+      # reports the action, and `tenant_db` the tenant it runs in.
+      hana_sid: HDB
+      hana_instance: "00"
+      hana_host: hana-prod-01.corp.local
+      hana_ip: 10.20.4.11
+      hana_port: 30040
+      hana_service: indexserver
+      tenant_db: HDB_PROD
+      hana_version: 2.00.077.00.1707118848
+      # Host facts that a collector attaches to every event it ships
+      hana_host_id: 4f2c9a17be3d4e8f9c05a1d76b3e8420
+      hana_mac: 00-50-56-A1-3F-2C
+      hana_os_version: 15 SP5
+      hana_os_kernel: 5.14.21-150500.55.83-default
+      # Where manual backups are written
+      backup_path: /hana/backup/HDB
+      # Range the intruder connects from - a subnet outside the managed
+      # client ranges, so their events stand out by source address alone
+      rogue_subnet: 10.99.0.0/16
+      ecs_version: "8.11.0"
+
+    samples:
+      # Who connects, and from which of their own client hosts
+      actors_app:
+        type: json
+        source: samples/actors_app.json
+      actors_admin:
+        type: json
+        source: samples/actors_admin.json
+      # Business users the ABAP stack passes through as application users
+      app_users:
+        type: csv
+        source: samples/app_users.csv
+        header: true
+      # What gets read and written. `weight` drives routine traffic;
+      # `kind` and `sensitivity` are filtered on to keep writes off the
+      # calculation views and to aim the harvest phase at the data that
+      # matters.
+      objects_data:
+        type: json
+        source: samples/objects_data.json
+      objects_procedures:
+        type: json
+        source: samples/objects_procedures.json
+      # Privileges and roles. `critical` marks the ones that hand over
+      # the database, which the escalation phase filters down to.
+      privileges_object:
+        type: json
+        source: samples/privileges_object.json
+      privileges_system:
+        type: json
+        source: samples/privileges_system.json
+      roles:
+        type: json
+        source: samples/roles.json
+      # Parameter changes, with the value each one replaces
+      config_parameters:
+        type: json
+        source: samples/config_parameters.json
+
+    # Each template is a state. The state that renders marks where the
+    # machine goes next by setting `to_<state>` in shared state, and the
+    # transition waiting on that mark fires. Every state reaches
+    # `data_read` and `auth_validate`, and `data_read` reaches all of
+    # them, so the distribution of event types is the steady state of this
+    # graph rather than a fixed set of weights.
+    templates:
+      # A trail opens the way a session does: with a credential check
+      - auth_validate:
+          template: templates/auth-validate.json.jinja
+          initial: true
+          transitions:
+            - to: session_connect
+              when:
+                defined: shared.to_session_connect
+            - to: session_denied
+              when:
+                defined: shared.to_session_denied
+
+      - session_connect:
+          template: templates/session-connect.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - session_denied:
+          template: templates/session-denied.json.jinja
+          transitions:
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+
+      # The busiest state, and the one that routes to every other
+      - data_read:
+          template: templates/data-read.json.jinja
+          transitions:
+            - to: data_change
+              when:
+                defined: shared.to_data_change
+            - to: procedure_execute
+              when:
+                defined: shared.to_procedure_execute
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+            - to: authorization_change
+              when:
+                defined: shared.to_authorization_change
+            - to: user_admin
+              when:
+                defined: shared.to_user_admin
+            - to: config_change
+              when:
+                defined: shared.to_config_change
+            - to: backup_recover
+              when:
+                defined: shared.to_backup_recover
+            - to: security_object_change
+              when:
+                defined: shared.to_security_object_change
+            - to: audit_policy_change
+              when:
+                defined: shared.to_audit_policy_change
+
+      - data_change:
+          template: templates/data-change.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - procedure_execute:
+          template: templates/procedure-execute.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - authorization_change:
+          template: templates/authorization-change.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: user_admin
+              when:
+                defined: shared.to_user_admin
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - user_admin:
+          template: templates/user-admin.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: authorization_change
+              when:
+                defined: shared.to_authorization_change
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - config_change:
+          template: templates/config-change.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - audit_policy_change:
+          template: templates/audit-policy-change.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - security_object_change:
+          template: templates/security-object-change.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+      - backup_recover:
+          template: templates/backup-recover.json.jinja
+          transitions:
+            - to: data_read
+              when:
+                defined: shared.to_data_read
+            - to: auth_validate
+              when:
+                defined: shared.to_auth_validate
+
+output:
+  - file:
+      path: output/events.json
+      write_mode: overwrite
+      formatter:
+        format: json

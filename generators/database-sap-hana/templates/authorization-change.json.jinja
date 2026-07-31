@@ -1,0 +1,103 @@
+{%- from 'templates/_base.json.jinja' import render, arc_tick, arc_step,
+    use_session, steer with context -%}
+{#- GRANT and REVOKE, of both privileges and roles, under the policy SAP
+    recommends for authorization changes. Privileges land either on a
+    schema object or on the system, and roles activated from the
+    repository carry the schema they live in.
+
+    The escalation phase draws from the same samples filtered down to
+    what is critical: the privileges and roles that hand over the database,
+    granted from the intruder's own session to the account they created
+    or, before that account exists, to themselves. -#}
+{%- do arc_tick() -%}
+{%- set is_arc = shared.get('arc', 'quiet') == 'escalate'
+                 and shared.get('arc_session')
+                 and module.rand.chance(0.8) -%}
+{%- if is_arc -%}
+  {%- set s = shared.get('arc_session') -%}
+  {%- set action = module.rand.weighted_choice(
+      ['GRANT PRIVILEGE', 'GRANT ROLE'], [45, 55]) -%}
+  {%- set grantee = shared.get('arc_backdoor') or shared.get('arc_user') -%}
+  {%- set grantee_schema = '' -%}
+{%- else -%}
+  {%- do use_session('admin') -%}
+  {%- set s = shared.get('picked') -%}
+  {%- set action = module.rand.weighted_choice(
+      ['GRANT PRIVILEGE', 'GRANT ROLE', 'REVOKE PRIVILEGE', 'REVOKE ROLE'],
+      [38, 32, 15, 15]) -%}
+  {#- Privileges are granted to users and, as often, to the roles that
+      carry them -#}
+  {%- set grantee_kind = module.rand.weighted_choice(
+      ['app', 'admin', 'role'], [55, 15, 30]) -%}
+  {%- if grantee_kind == 'role' -%}
+    {%- set grantee_row = samples.roles.weighted_pick('weight') -%}
+    {%- set grantee = grantee_row.role -%}
+    {%- set grantee_schema = grantee_row.schema -%}
+  {%- elif grantee_kind == 'admin' -%}
+    {%- set grantee = samples.actors_admin.weighted_pick('weight').user -%}
+    {%- set grantee_schema = '' -%}
+  {%- else -%}
+    {%- set grantee = samples.actors_app.weighted_pick('weight').user -%}
+    {%- set grantee_schema = '' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set granting = action.startswith('GRANT') -%}
+{%- set grantable = granting and module.rand.chance(0.18) -%}
+{%- set ev = {
+    'policy_name': '_SAP_authorizations',
+    'audit_level': 'INFO',
+    'action': action,
+    'action_status': 'SUCCESSFUL' if module.rand.chance(0.94)
+                     else 'UNSUCCESSFUL',
+    'category': ['iam'],
+    'target_principal': grantee,
+    'grantee_schema_name': grantee_schema
+} -%}
+{%- if grantable -%}
+  {%- do ev.update({'grantable': 'GRANTABLE'}) -%}
+{%- elif granting -%}
+  {%- do ev.update({'grantable': 'NON GRANTABLE'}) -%}
+{%- endif -%}
+{%- if action.endswith('ROLE') -%}
+  {%- set role = (samples.roles.where(critical=true) if is_arc
+                  else samples.roles).weighted_pick('weight') -%}
+  {%- do ev.update({
+      'type': ['group', 'change'],
+      'role_name': role.role,
+      'role_schema_name': role.schema,
+      'statement_string': ('GRANT' if granting else 'REVOKE') ~ ' "' ~ role.role
+          ~ '" ' ~ ('TO ' if granting else 'FROM ') ~ grantee
+          ~ (' WITH ADMIN OPTION' if grantable else '')
+  }) -%}
+{%- elif is_arc or module.rand.chance(0.45) -%}
+  {#- System privilege: no target object, and the escalation reaches for
+      the ones that administer users, data and the audit trail -#}
+  {%- set privilege = (samples.privileges_system.where(critical=true) if is_arc
+                       else samples.privileges_system
+                       ).weighted_pick('weight').name -%}
+  {%- do ev.update({
+      'type': ['admin', 'change'],
+      'privilege_name': privilege,
+      'statement_string': ('GRANT ' if granting else 'REVOKE ') ~ privilege
+          ~ (' TO ' if granting else ' FROM ') ~ grantee
+          ~ (' WITH ADMIN OPTION' if grantable else '')
+  }) -%}
+{%- else -%}
+  {%- set privilege = samples.privileges_object.weighted_pick('weight').name -%}
+  {%- set obj = samples.objects_data.weighted_pick('weight') -%}
+  {%- do ev.update({
+      'type': ['admin', 'change'],
+      'privilege_name': privilege,
+      'target_schema': obj.schema,
+      'target_object': obj.object,
+      'statement_string': ('GRANT ' if granting else 'REVOKE ') ~ privilege
+          ~ ' ON "' ~ obj.schema ~ '"."' ~ obj.object ~ '" '
+          ~ ('TO ' if granting else 'FROM ') ~ grantee
+          ~ (' WITH GRANT OPTION' if grantable else '')
+  }) -%}
+{%- endif -%}
+{%- if is_arc -%}
+  {%- do arc_step() -%}
+{%- endif -%}
+{%- do steer(['data_read', 'user_admin', 'auth_validate'], [82, 12, 6]) -%}
+{{ render(ev, s) }}

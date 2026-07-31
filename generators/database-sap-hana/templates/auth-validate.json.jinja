@@ -1,0 +1,77 @@
+{%- from 'templates/_base.json.jinja' import render, arc_tick, arc_step,
+    pick_actor, stage_session, route with context -%}
+{#- VALIDATE USER - the credential check HANA audits before a session
+    exists. It is followed by an accepted CONNECT or a refused one, and
+    the pair carries the same session ID, account and client, which is
+    what ties a logon together in the trail.
+
+    While the intruder sprays passwords, most of these attempts are
+    theirs: a different account each time, from a host outside the
+    managed ranges, until the credentials that finally work. -#}
+{%- do arc_tick() -%}
+{%- set arc = shared.get('arc', 'quiet') -%}
+{%- set is_arc = arc == 'probe' and shared.get('arc_user')
+                 and module.rand.chance(0.75) -%}
+{%- if is_arc -%}
+  {%- set last_try = shared.get('arc_left', 0) <= 1 -%}
+  {%- set actor_user = shared.get('arc_user') if last_try
+                       else samples.actors_app.weighted_pick('weight').user -%}
+  {%- do shared.set('actor', {
+      'user': actor_user,
+      'tier': 'app',
+      'pool': 'app',
+      'app_name': shared.get('arc_app'),
+      'app_user': '',
+      'client_host': shared.get('arc_host'),
+      'client_ip': shared.get('arc_ip')
+  }) -%}
+  {%- set ok = last_try -%}
+{%- else -%}
+  {%- do pick_actor(module.rand.weighted_choice(['app', 'admin'], [88, 12])) -%}
+  {%- set ok = module.rand.chance(0.96) -%}
+{%- endif -%}
+{%- set user = shared.get('actor').user -%}
+{#- Invalid attempts accumulate per account. HANA locks an account once
+    maximum_invalid_connect_attempts is reached, and a success clears
+    the counter. The map is bounded - it is reset once it outgrows the
+    set of accounts worth tracking. -#}
+{%- set failed = shared.get('failed') -%}
+{%- if failed is none -%}
+  {%- set failed = {} -%}
+  {%- do shared.set('failed', failed) -%}
+{%- endif -%}
+{%- if failed | length > 40 -%}
+  {%- do failed.clear() -%}
+{%- endif -%}
+{%- do failed.update({user: 0 if ok else failed.get(user, 0) + 1}) -%}
+{%- if failed[user] >= 6 -%}
+  {%- set reason = 'user is locked' -%}
+{%- elif is_arc -%}
+  {#- A guessed password is simply wrong; the reasons that report the
+      state of the account belong to people who own theirs. -#}
+  {%- set reason = 'authentication failed' -%}
+{%- else -%}
+  {%- set reason = module.rand.weighted_choice(
+      ['authentication failed', 'password has expired',
+       'password change required', 'user is deactivated'],
+      [82, 8, 7, 3]) -%}
+{%- endif -%}
+{%- do stage_session() -%}
+{%- set s = shared.get('picked') -%}
+{%- do shared.set('last_auth', {
+    's': s, 'ok': ok, 'reason': reason, 'is_arc': is_arc
+}) -%}
+{%- set ev = {
+    'policy_name': '_SAP_session validate',
+    'audit_level': 'ALERT',
+    'action': 'VALIDATE USER',
+    'action_status': 'SUCCESSFUL' if ok else 'UNSUCCESSFUL',
+    'category': ['authentication'],
+    'type': ['info'],
+    'comment': '' if ok else reason
+} -%}
+{%- if is_arc -%}
+  {%- do arc_step() -%}
+{%- endif -%}
+{%- do route('session_connect' if ok else 'session_denied') -%}
+{{ render(ev, s) }}

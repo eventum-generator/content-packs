@@ -1,0 +1,489 @@
+{#-
+  Shared skeleton and state helpers for the SAP HANA audit trail.
+
+  Import with:
+    {%- from 'templates/_base.json.jinja' import render, arc_tick, arc_step,
+        pick_actor, stage_session, register_session, use_session, steer,
+        steer_hub with context -%}
+
+  Imported `with context` so the macros can read `timestamp`, `params`,
+  `samples`, `module` and `shared` directly.
+
+  ---------------------------------------------------------------------
+  The raw trail line
+  ---------------------------------------------------------------------
+  `render` builds the semicolon-separated audit trail line that SAP HANA
+  itself writes, and puts it verbatim into `message`. The 38 positions
+  follow the layout documented for the syslog and CSV trail targets:
+
+     1 event timestamp         20 role name
+     2 service name            21 target principal
+     3 host name               22 action status
+     4 SID                     23 component
+     5 instance number         24 section
+     6 port number             25 parameter
+     7 database name           26 old value
+     8 client IP address       27 new value
+     9 client name             28 comment
+    10 client process ID       29 executed statement
+    11 client port number      30 session ID
+    12 policy name             31 application user name
+    13 audit level             32 role schema name
+    14 audit action            33 grantee schema name
+    15 session user            34 origin database name
+    16 target schema           35 origin user name
+    17 target object           36 XS application user name
+    18 privilege name          37 application name
+    19 grantable               38 statement user name
+
+  Position 7 is written by the syslog trail target only, which is the
+  target SAP recommends for production; the CSV text file target omits
+  it. Positions 36 and 39 onward carry XS Advanced payloads and stay
+  empty for database events, so the line stops after position 38.
+
+  A value must never contain a semicolon - HANA does not escape the
+  separator, so an embedded one would shift every following position.
+
+  ---------------------------------------------------------------------
+  The intrusion arc
+  ---------------------------------------------------------------------
+  `shared.arc` walks one intruder through six phases, so the trail
+  carries a story an analyst can reconstruct rather than independent
+  draws:
+
+    quiet     only routine traffic
+    probe     password spraying from an unmanaged host, one account at
+              a time, ending with the credentials that work
+    breach    the session that the guessed credentials open
+    escalate  a backdoor user and privileges granted from that session
+    harvest   bulk reads of the most sensitive objects
+    cover     audit policy changes and an audit log deletion
+
+  A phase advances only when an event that belongs to it is actually
+  emitted (`arc_step`), so no story step can be skipped. Routine events
+  keep flowing throughout, which is what makes the arc worth finding.
+-#}
+
+{#- Audit level -> syslog severity, as written by the syslog trail target -#}
+{%- set SEVERITY = {
+    'EMERGENCY': [0, 'emerg'],
+    'ALERT': [1, 'alert'],
+    'CRITICAL': [2, 'crit'],
+    'WARNING': [4, 'warning'],
+    'INFO': [6, 'info']
+} -%}
+
+{#- Fields that stay empty unless the audited action fills them.
+    Positions 34 and 35 are absent here: they carry the origin of a
+    query issued across tenant databases, which a single-tenant system
+    never produces. -#}
+{%- set OPTIONAL = [
+    'target_schema', 'target_object', 'privilege_name', 'grantable',
+    'role_name', 'target_principal', 'component', 'section', 'parameter',
+    'old_value', 'new_value', 'comment', 'statement_string',
+    'role_schema_name', 'grantee_schema_name'
+] -%}
+
+
+{#- ------------------------------------------------------------------ -#}
+{#- State helpers                                                      -#}
+{#- ------------------------------------------------------------------ -#}
+
+{%- macro arc_tick() -%}
+{#- Runs first in every template. Counts down the quiet stretch and
+    opens the next arc when it runs out. The first arc starts early so
+    that even a short run carries one. -#}
+{%- if shared.get('arc') is none -%}
+  {%- do shared.update({
+      'arc': 'quiet',
+      'arc_left': module.rand.number.integer(45, 90),
+      'arc_count': 0
+  }) -%}
+{%- elif shared.get('arc') == 'quiet' -%}
+  {%- set left = shared.get('arc_left', 0) - 1 -%}
+  {%- if left > 0 -%}
+    {%- do shared.set('arc_left', left) -%}
+  {%- else -%}
+    {#- The intruder holds one set of credentials and one source host
+        for the whole arc: right account, wrong place. -#}
+    {%- set victim = samples.actors_app.weighted_pick('weight') -%}
+    {%- do shared.update({
+        'arc': 'probe',
+        'arc_left': module.rand.number.integer(9, 18),
+        'arc_user': victim.user,
+        'arc_ip': module.rand.network.ip_v4_in_subnet(params.rogue_subnet),
+        'arc_host': module.rand.string.pattern('WKSTN-%d{3}'),
+        'arc_app': module.rand.choice(['hdbsql', 'HDBStudio', 'python-hdbcli'])
+    }) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{%- macro arc_step() -%}
+{#- Called by a template only when the event it just built belongs to
+    the current phase. -#}
+{%- set phase = shared.get('arc', 'quiet') -%}
+{%- set left = shared.get('arc_left', 0) - 1 -%}
+{%- if left > 0 -%}
+  {%- do shared.set('arc_left', left) -%}
+{%- elif phase == 'probe' -%}
+  {%- do shared.update({'arc': 'breach', 'arc_left': 1}) -%}
+{%- elif phase == 'breach' -%}
+  {%- do shared.update({
+      'arc': 'escalate', 'arc_left': module.rand.number.integer(3, 6)
+  }) -%}
+{%- elif phase == 'escalate' -%}
+  {%- do shared.update({
+      'arc': 'harvest', 'arc_left': module.rand.number.integer(12, 30)
+  }) -%}
+{%- elif phase == 'harvest' -%}
+  {%- do shared.update({
+      'arc': 'cover', 'arc_left': module.rand.number.integer(2, 4)
+  }) -%}
+{%- else -%}
+  {#- Arc closed: the intruder's session drops out of the pool, so no
+      later event runs inside it, and the identity is forgotten -#}
+  {%- set closing = shared.get('arc_session') -%}
+  {%- if closing -%}
+    {%- set sessions = shared.get('sessions_' ~ closing.pool) -%}
+    {%- if sessions and closing in sessions -%}
+      {%- do sessions.remove(closing) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- do shared.update({
+      'arc': 'quiet',
+      'arc_left': module.rand.number.integer(400, 900),
+      'arc_count': shared.get('arc_count', 0) + 1
+  }) -%}
+  {%- do shared.pop('arc_session') -%}
+  {%- do shared.pop('arc_user') -%}
+  {%- do shared.pop('arc_backdoor') -%}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{%- macro pick_actor(pool) -%}
+{#- Chooses who acts next and from which of their client hosts, and
+    leaves the result in `shared.actor`. `pool` is `app` for technical
+    and reporting accounts, `admin` for DBAs and support. -#}
+{%- set row = (samples.actors_admin if pool == 'admin'
+               else samples.actors_app).weighted_pick('weight') -%}
+{%- set client = module.rand.choice(row.clients) -%}
+{%- if row.app_user_kind == 'abap' -%}
+  {#- The ABAP stack connects as one technical account and passes the
+      business user through as the application user. -#}
+  {%- set app_user = samples.app_users.weighted_pick('weight').app_user -%}
+{%- elif row.app_user_kind == 'account' -%}
+  {%- set app_user = row.user -%}
+{%- else -%}
+  {%- set app_user = '' -%}
+{%- endif -%}
+{%- do shared.set('actor', {
+    'user': row.user,
+    'tier': row.tier,
+    'pool': pool,
+    'app_name': row.app_name,
+    'app_user': app_user,
+    'client_host': client.host,
+    'client_ip': client.ip
+}) -%}
+{%- endmacro -%}
+
+
+{%- macro stage_session() -%}
+{#- Turns `shared.actor` into a session and leaves it in
+    `shared.picked`, without opening it yet: authentication is audited
+    before the session exists, and it may still be refused. Session IDs
+    climb the way HANA numbers them. -#}
+{%- set actor = shared.get('actor') -%}
+{%- set seq = shared.get('session_seq', 400000)
+              + module.rand.number.integer(1, 25) -%}
+{%- do shared.set('session_seq', seq) -%}
+{%- do shared.set('picked', {
+    'id': seq,
+    'user': actor.user,
+    'tier': actor.tier,
+    'pool': actor.pool,
+    'app_name': actor.app_name,
+    'app_user': actor.app_user,
+    'client_host': actor.client_host,
+    'client_ip': actor.client_ip,
+    'client_pid': module.rand.number.integer(1200, 64000),
+    'client_port': module.rand.number.integer(32768, 60999),
+    'n': 0
+}) -%}
+{%- endmacro -%}
+
+
+{%- macro register_session() -%}
+{#- Adds the session in `shared.picked` to its pool, so that later
+    events can run inside it. -#}
+{%- set session = shared.get('picked') -%}
+{%- set key = 'sessions_' ~ session.pool -%}
+{%- set sessions = shared.get(key) -%}
+{%- if sessions is none -%}
+  {%- set sessions = [] -%}
+  {%- do shared.set(key, sessions) -%}
+{%- endif -%}
+{%- do sessions.append(session) -%}
+{#- Bounded pool: the oldest session drops out once it is full -#}
+{%- if sessions | length > (8 if session.pool == 'admin' else 40) -%}
+  {%- do sessions.pop(0) -%}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{%- macro use_session(pool) -%}
+{#- Leaves an open session in `shared.picked`. During the phases the
+    intruder drives, `arc` decides whether this event belongs to their
+    session; otherwise an open session is reused so that user, client
+    and session ID stay consistent across the events of one session. -#}
+{%- set sessions = shared.get('sessions_' ~ pool) -%}
+{%- if sessions -%}
+  {%- set session = module.rand.choice(sessions) -%}
+  {%- do session.update({'n': session.n + 1}) -%}
+  {#- A session that has run long enough closes out -#}
+  {%- if session.n > 150 -%}
+    {%- do sessions.remove(session) -%}
+  {%- endif -%}
+  {%- do shared.set('picked', session) -%}
+{%- else -%}
+  {#- Nothing open in this pool yet: the trail starts mid-flight, the
+      way it does when collection begins on a running system. -#}
+  {%- do pick_actor(pool) -%}
+  {%- do stage_session() -%}
+  {%- do register_session() -%}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{%- macro route(alias) -%}
+{#- Marks the state the machine moves to next. The mark is a state key
+    of its own, `to_<alias>`, and the transition fires on that key being
+    defined. Setting one drops the previous mark, so exactly one mark
+    exists at any time and the transitions of a state stay mutually
+    exclusive. -#}
+{%- do shared.pop(shared.get('route', ''), none) -%}
+{%- set mark = 'to_' ~ alias -%}
+{%- do shared.update({'route': mark, mark: true}) -%}
+{%- endmacro -%}
+
+
+{%- macro steer(options, weights) -%}
+{#- Routes a leaf state. Every state can reach `data_read` and
+    `auth_validate`, so a leaf hands control back to one of those while
+    an arc is running and lets `data_read` route to the phase that needs
+    to run. -#}
+{%- set arc = shared.get('arc', 'quiet') -%}
+{%- if arc == 'probe' and module.rand.chance(0.7) -%}
+  {%- do route('auth_validate') -%}
+{%- elif arc != 'quiet' and module.rand.chance(0.8) -%}
+  {%- do route('data_read') -%}
+{%- else -%}
+  {%- do route(module.rand.weighted_choice(options, weights)) -%}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{%- macro steer_hub(options, weights) -%}
+{#- The same for `data_read`, which reaches every other state and so
+    routes each arc phase to the state that carries it. -#}
+{%- set arc = shared.get('arc', 'quiet') -%}
+{%- if arc == 'probe' and module.rand.chance(0.7) -%}
+  {%- do route('auth_validate') -%}
+{%- elif arc == 'escalate' and module.rand.chance(0.8) -%}
+  {%- do route(module.rand.weighted_choice(
+      ['authorization_change', 'user_admin'], [62, 38])) -%}
+{%- elif arc == 'harvest' and module.rand.chance(0.75) -%}
+  {%- do route('data_read') -%}
+{%- elif arc == 'cover' and module.rand.chance(0.9) -%}
+  {%- do route('audit_policy_change') -%}
+{%- else -%}
+  {%- do route(module.rand.weighted_choice(options, weights)) -%}
+{%- endif -%}
+{%- endmacro -%}
+
+
+{#- ------------------------------------------------------------------ -#}
+{#- Event rendering                                                    -#}
+{#- ------------------------------------------------------------------ -#}
+
+{%- macro render(ev, s) -%}
+{#- `ev` carries the audited action, `s` the session it ran in. -#}
+{%- set stmt_user = ev.get('statement_user_name', s.user) -%}
+{#- HANA records the moment the action occurred, down to microseconds.
+    The events of one second are spread across it so that no two share
+    a timestamp, the way statements arriving within a second do not. -#}
+{%- set event_ts = timestamp + module.datetime.timedelta(
+    microseconds=module.rand.number.integer(0, 999999)) -%}
+{%- set trail_ts = event_ts.astimezone(module.datetime.timezone.utc)
+                   .strftime('%Y-%m-%dT%H:%M:%S.%f') ~ 'Z' -%}
+{%- set line = [
+    trail_ts,
+    params.hana_service,
+    params.hana_host,
+    params.hana_sid,
+    params.hana_instance,
+    params.hana_port | string,
+    params.tenant_db,
+    s.client_ip,
+    s.client_host,
+    s.client_pid | string,
+    s.client_port | string,
+    ev.policy_name,
+    ev.audit_level,
+    ev.action,
+    s.user,
+    ev.get('target_schema', ''),
+    ev.get('target_object', ''),
+    ev.get('privilege_name', ''),
+    ev.get('grantable', ''),
+    ev.get('role_name', ''),
+    ev.get('target_principal', ''),
+    ev.action_status,
+    ev.get('component', ''),
+    ev.get('section', ''),
+    ev.get('parameter', ''),
+    ev.get('old_value', ''),
+    ev.get('new_value', ''),
+    ev.get('comment', ''),
+    ev.get('statement_string', ''),
+    s.id | string,
+    s.app_user,
+    ev.get('role_schema_name', ''),
+    ev.get('grantee_schema_name', ''),
+    ev.get('origin_database_name', ''),
+    ev.get('origin_user_name', ''),
+    '',
+    s.app_name,
+    stmt_user
+] | join(';') -%}
+{#- Parsed view of the same line, minus the positions this action
+    leaves empty -#}
+{%- set audit = {
+    'action': ev.action,
+    'action_status': ev.action_status,
+    'application_name': s.app_name,
+    'audit_level': ev.audit_level,
+    'database_name': params.tenant_db,
+    'instance_number': params.hana_instance,
+    'policy_name': ev.policy_name,
+    'port': params.hana_port,
+    'service_name': params.hana_service,
+    'session_id': s.id,
+    'session_user': s.user,
+    'sid': params.hana_sid,
+    'statement_user_name': stmt_user
+} -%}
+{%- if s.app_user -%}
+  {%- do audit.update({'application_user_name': s.app_user}) -%}
+{%- endif -%}
+{%- for key in OPTIONAL -%}
+  {%- if ev.get(key) -%}
+    {%- do audit.update({key: ev[key]}) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set severity = SEVERITY[ev.audit_level] -%}
+{%- set outcome = 'success' if ev.action_status == 'SUCCESSFUL'
+                  else 'failure' -%}
+{%- set user_obj = {'name': s.user} -%}
+{%- if ev.get('target_principal') -%}
+  {%- do user_obj.update({'target': {'name': ev.target_principal}}) -%}
+{%- endif -%}
+{%- if ev.get('role_name') -%}
+  {%- do user_obj.update({'roles': [ev.role_name]}) -%}
+{%- endif -%}
+{#- Every principal, address and host the event touches, deduplicated -#}
+{%- set related_hosts = [params.hana_host, s.client_host]
+    | select | unique | list -%}
+{%- set related_ip = [s.client_ip, params.hana_ip] | select | unique | list -%}
+{%- set related_user = [s.user, ev.get('target_principal', ''), s.app_user,
+    stmt_user] | select | unique | list -%}
+{%- set ingested = (event_ts + module.datetime.timedelta(
+    milliseconds=module.rand.number.integer(120, 900))).isoformat() -%}
+{
+    "@timestamp": {{ event_ts.isoformat() | tojson }},
+{%- if s.app_user %}
+    "client": {"user": {"name": {{ s.app_user | tojson }}}},
+{%- endif %}
+    "ecs": {
+        "version": {{ params.ecs_version | tojson }}
+    },
+    "event": {
+        "action": {{ (ev.action | lower | replace(' ', '_')) | tojson }},
+        "category": {{ ev.category | tojson }},
+        "created": {{ event_ts.isoformat() | tojson }},
+        "dataset": "sap_hana.audit",
+        "ingested": {{ ingested | tojson }},
+        "kind": "event",
+        "module": "sap_hana",
+        "outcome": {{ outcome | tojson }},
+        "severity": {{ severity[0] }},
+        "timezone": {{ event_ts.isoformat()[-6:] | tojson }},
+        "type": {{ ev.type | tojson }}
+    },
+    "host": {
+        "architecture": "x86_64",
+        "containerized": false,
+        "hostname": {{ params.hana_host.split('.')[0] | tojson }},
+        "id": {{ params.hana_host_id | tojson }},
+        "ip": [{{ params.hana_ip | tojson }}],
+        "mac": [{{ params.hana_mac | tojson }}],
+        "name": {{ params.hana_host | tojson }},
+        "os": {
+            "family": "suse",
+            "kernel": {{ params.hana_os_kernel | tojson }},
+            "name": "SLES",
+            "platform": "sles",
+            "type": "linux",
+            "version": {{ params.hana_os_version | tojson }}
+        }
+    },
+    "log": {
+        "level": {{ ev.audit_level | lower | tojson }},
+        "syslog": {
+            "severity": {
+                "code": {{ severity[0] }},
+                "name": {{ severity[1] | tojson }}
+            }
+        }
+    },
+    "message": {{ line | tojson }},
+    "process": {
+        "name": {{ s.app_name | tojson }},
+        "pid": {{ s.client_pid }}
+    },
+    "related": {
+        "hosts": {{ related_hosts | tojson }},
+        "ip": {{ related_ip | tojson }},
+        "user": {{ related_user | tojson }}
+    },
+    "rule": {
+        "name": {{ ev.policy_name | tojson }},
+        "ruleset": "SAP HANA audit policies"
+    },
+    "sap": {
+        "hana": {
+            "audit": {{ audit | tojson }}
+        }
+    },
+    "server": {
+        "address": {{ params.hana_host | tojson }},
+        "domain": {{ params.hana_host.split('.', 1)[1] | tojson }},
+        "port": {{ params.hana_port }},
+        "user": {"name": {{ s.user | tojson }}}
+    },
+    "service": {
+        "name": {{ params.hana_service | tojson }},
+        "type": "hana",
+        "version": {{ params.hana_version | tojson }}
+    },
+    "source": {
+        "domain": {{ s.client_host | tojson }},
+        "ip": {{ s.client_ip | tojson }},
+        "port": {{ s.client_port }}
+    },
+    "user": {{ user_obj | tojson }}
+}
+{%- endmacro -%}

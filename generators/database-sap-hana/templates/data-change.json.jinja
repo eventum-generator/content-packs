@@ -1,0 +1,47 @@
+{%- from 'templates/_base.json.jinja' import render, arc_tick, use_session,
+    steer with context -%}
+{#- INSERT, UPDATE and DELETE on the application tables. Only the
+    application and loader accounts hold write privileges, so a write
+    from a reporting or monitoring session is audited and refused - the
+    kind of event that shows a report being run against a production
+    table. Calculation views are filtered out - a write never reaches
+    one. -#}
+{%- do arc_tick() -%}
+{%- do use_session('app') -%}
+{%- set s = shared.get('picked') -%}
+{%- set action = module.rand.weighted_choice(
+    ['INSERT', 'UPDATE', 'DELETE'], [46, 39, 15]) -%}
+{%- set obj = samples.objects_data.where(kind='TABLE').weighted_pick('weight') -%}
+{%- set qualified = '"' ~ obj.schema ~ '"."' ~ obj.object ~ '"' -%}
+{%- set allowed = s.tier in ['app', 'etl'] -%}
+{%- if action == 'INSERT' -%}
+  {%- set cols = [] -%}
+  {%- set marks = [] -%}
+  {%- for column in obj.columns -%}
+    {%- do cols.append('"' ~ column ~ '"') -%}
+    {%- do marks.append('?') -%}
+  {%- endfor -%}
+  {%- set statement = 'INSERT INTO ' ~ qualified ~ ' (' ~ cols | join(', ')
+      ~ ') VALUES (' ~ marks | join(', ') ~ ')' -%}
+{%- elif action == 'UPDATE' -%}
+  {%- set statement = 'UPDATE ' ~ qualified ~ ' SET "'
+      ~ obj.columns[-1] ~ '" = ? WHERE "' ~ obj.columns[0]
+      ~ '" = ? AND "' ~ obj.columns[1] ~ '" = ?' -%}
+{%- else -%}
+  {%- set statement = 'DELETE FROM ' ~ qualified ~ ' WHERE "'
+      ~ obj.columns[0] ~ '" = ? AND "' ~ obj.columns[1] ~ '" = ?' -%}
+{%- endif -%}
+{%- set critical = obj.sensitivity == 'critical' -%}
+{%- set ev = {
+    'policy_name': 'Z_pii access' if critical else 'Z_sensitive data access',
+    'audit_level': 'WARNING' if critical else 'INFO',
+    'action': action,
+    'action_status': 'SUCCESSFUL' if allowed else 'UNSUCCESSFUL',
+    'category': ['database'],
+    'type': ['change'],
+    'target_schema': obj.schema,
+    'target_object': obj.object,
+    'statement_string': statement
+} -%}
+{%- do steer(['data_read', 'auth_validate'], [88, 12]) -%}
+{{ render(ev, s) }}

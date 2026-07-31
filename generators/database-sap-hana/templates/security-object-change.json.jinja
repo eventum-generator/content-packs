@@ -1,0 +1,112 @@
+{%- from 'templates/_base.json.jinja' import render, arc_tick, use_session,
+    steer with context -%}
+{#- The three families of security object SAP asks to be audited
+    separately: certificate collections and certificates, the
+    authentication providers behind LDAP, SAML and JWT logon, and the
+    keys behind client-side encryption. Providers and encryption keys
+    are audited at critical level, certificates at info - the levels the
+    recommended policies assign. -#}
+{%- do arc_tick() -%}
+{%- do use_session('admin') -%}
+{%- set s = shared.get('picked') -%}
+{%- set family = module.rand.weighted_choice(
+    ['certificate', 'provider', 'encryption'], [50, 32, 18]) -%}
+{%- if family == 'certificate' -%}
+  {%- set action = module.rand.weighted_choice(
+      ['ALTER PSE', 'CREATE CERTIFICATE', 'DROP CERTIFICATE', 'CREATE PSE',
+       'DROP PSE'], [34, 28, 18, 14, 6]) -%}
+  {%- set pse = module.rand.choice(
+      ['SAPHANA', 'SAML_PSE', 'LDAP_TRUST', 'JWT_TRUST', 'BACKINT_PSE']) -%}
+  {%- if action == 'ALTER PSE' -%}
+    {%- set statement = 'ALTER PSE ' ~ pse ~ ' ' ~ module.rand.choice([
+        'ADD CERTIFICATE 47', 'SET OWN CERTIFICATE \'XXXXXXXXXXXXX\'',
+        'DROP CERTIFICATE 31', 'UNSET OWN CERTIFICATE']) -%}
+  {%- elif action == 'CREATE CERTIFICATE' -%}
+    {%- set statement = 'CREATE CERTIFICATE FROM \'XXXXXXXXXXXXX\' COMMENT \''
+        ~ module.rand.choice(['corp-ldap-ca', 'corp-idp-signing',
+                              'backint-tls', 'sso-issuer']) ~ '\'' -%}
+  {%- elif action == 'DROP CERTIFICATE' -%}
+    {%- set statement = 'DROP CERTIFICATE '
+        ~ module.rand.number.integer(11, 99) -%}
+  {%- elif action == 'CREATE PSE' -%}
+    {%- set statement = 'CREATE PSE ' ~ pse -%}
+  {%- else -%}
+    {%- set statement = 'DROP PSE ' ~ pse -%}
+  {%- endif -%}
+  {%- set policy = '_SAP_certificates' -%}
+  {%- set level = 'INFO' -%}
+  {%- set category = ['configuration'] -%}
+{%- elif family == 'provider' -%}
+  {%- set kind = module.rand.weighted_choice(
+      ['LDAP', 'SAML', 'JWT'], [50, 32, 18]) -%}
+  {%- set verb = module.rand.weighted_choice(
+      ['ALTER', 'VALIDATE', 'CREATE', 'DROP'], [40, 30, 22, 8]) -%}
+  {%- if verb == 'VALIDATE' -%}
+    {#- Only LDAP providers can be validated -#}
+    {%- set kind = 'LDAP' -%}
+  {%- endif -%}
+  {%- set action = verb ~ ' ' ~ kind ~ ' PROVIDER' -%}
+  {%- set provider = module.rand.choice(
+      ['CORP_LDAP', 'CORP_LDAP_DR', 'CORP_IDP', 'XSUAA']) -%}
+  {%- if verb == 'CREATE' and kind == 'LDAP' -%}
+    {%- set statement = 'CREATE LDAP PROVIDER ' ~ provider
+        ~ ' CREDENTIAL TYPE \'PASSWORD\' USING \'user=XXXXXXXXXXXXX\''
+        ~ ' USER LOOKUP URL \'ldaps://ldap.corp.local:636/ou=users,dc=corp\''
+        ~ ' ATTRIBUTE DN \'distinguishedName\' ENABLE' -%}
+  {%- elif verb == 'CREATE' -%}
+    {%- set statement = 'CREATE ' ~ kind ~ ' PROVIDER ' ~ provider
+        ~ ' WITH ISSUER \'CN=' ~ provider ~ ',O=Corp\'' -%}
+  {%- elif verb == 'ALTER' -%}
+    {%- set statement = 'ALTER ' ~ kind ~ ' PROVIDER ' ~ provider ~ ' '
+        ~ module.rand.choice([
+            'ENABLE', 'DISABLE',
+            'CREDENTIAL TYPE \'PASSWORD\' USING \'user=XXXXXXXXXXXXX\'']) -%}
+  {%- elif verb == 'VALIDATE' -%}
+    {%- set statement = 'VALIDATE LDAP PROVIDER ' ~ provider -%}
+  {%- else -%}
+    {%- set statement = 'DROP ' ~ kind ~ ' PROVIDER ' ~ provider -%}
+  {%- endif -%}
+  {%- set policy = '_SAP_authentication provider' -%}
+  {%- set level = 'CRITICAL' -%}
+  {%- set category = ['configuration', 'iam'] -%}
+{%- else -%}
+  {%- set key_kind = module.rand.weighted_choice(
+      ['CLIENTSIDE ENCRYPTION COLUMN KEY', 'CLIENTSIDE ENCRYPTION KEYPAIR'],
+      [62, 38]) -%}
+  {%- set verb = module.rand.weighted_choice(
+      ['CREATE', 'ALTER', 'DROP'], [46, 40, 14]) -%}
+  {%- set action = verb ~ ' ' ~ key_kind -%}
+  {%- set key = module.rand.choice(['CEK_HR', 'CEK_FI', 'CEK_BANK', 'KP_HR',
+                                    'KP_FI']) -%}
+  {%- if verb == 'CREATE' and key_kind.endswith('KEYPAIR') -%}
+    {%- set statement = 'CREATE CLIENTSIDE ENCRYPTION KEYPAIR ' ~ key
+        ~ ' TYPE RSA2048' -%}
+  {%- elif verb == 'CREATE' -%}
+    {%- set statement = 'CREATE CLIENTSIDE ENCRYPTION COLUMN KEY ' ~ key
+        ~ ' ENCRYPTED WITH KEYPAIR KP_FI' -%}
+  {%- elif verb == 'ALTER' -%}
+    {%- set statement = 'ALTER ' ~ key_kind ~ ' ' ~ key ~ ' '
+        ~ module.rand.choice(['ADD KEYCOPY ENCRYPTED WITH KEYPAIR KP_HR',
+                              'DROP KEYCOPY ENCRYPTED WITH KEYPAIR KP_FI',
+                              'REKEY WITH KEYPAIR KP_FI']) -%}
+  {%- else -%}
+    {%- set statement = 'DROP ' ~ key_kind ~ ' ' ~ key -%}
+  {%- endif -%}
+  {%- set policy = '_SAP_clientside encryption' -%}
+  {%- set level = 'CRITICAL' -%}
+  {%- set category = ['configuration'] -%}
+{%- endif -%}
+{%- set verb_kind = {'CREATE': 'creation', 'ALTER': 'change',
+    'DROP': 'deletion', 'VALIDATE': 'info'}[action.split(' ')[0]] -%}
+{%- set ev = {
+    'policy_name': policy,
+    'audit_level': level,
+    'action': action,
+    'action_status': 'SUCCESSFUL' if module.rand.chance(0.95)
+                     else 'UNSUCCESSFUL',
+    'category': category,
+    'type': [verb_kind],
+    'statement_string': statement
+} -%}
+{%- do steer(['data_read', 'auth_validate'], [92, 8]) -%}
+{{ render(ev, s) }}

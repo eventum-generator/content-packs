@@ -1,0 +1,94 @@
+{%- from 'templates/_base.json.jinja' import render, arc_tick, arc_step,
+    use_session, steer_hub with context -%}
+{#- SELECT. The heaviest event type on a system that audits data access,
+    and the state the machine returns to between everything else, so it
+    also routes each phase of the intrusion to the events that carry it.
+
+    Three shapes of reader: the ABAP stack and the Fiori and BW servers
+    send prepared statements, the loaders read column ranges by delta
+    key, and a person at HDB Studio reads whole rows. Monitoring
+    accounts read the system views instead, under their own policy.
+
+    While the intruder harvests, their session pulls entire tables,
+    filtered by sensitivity rather than drawn by traffic weight. -#}
+{%- do arc_tick() -%}
+{%- set is_arc = shared.get('arc', 'quiet') == 'harvest'
+                 and shared.get('arc_session')
+                 and module.rand.chance(0.6) -%}
+{%- if is_arc -%}
+  {%- set s = shared.get('arc_session') -%}
+{%- else -%}
+  {%- do use_session('app') -%}
+  {%- set s = shared.get('picked') -%}
+{%- endif -%}
+{%- if not is_arc and s.tier == 'monitor' -%}
+  {%- set view = module.rand.choice([
+      'M_SERVICE_MEMORY', 'M_CS_TABLES', 'M_CONNECTIONS',
+      'M_ACTIVE_STATEMENTS', 'M_DISK_USAGE', 'M_LOAD_HISTORY_SERVICE',
+      'M_BACKUP_CATALOG', 'M_LICENSE', 'M_SYSTEM_OVERVIEW',
+      'M_TABLE_PERSISTENCE_STATISTICS']) -%}
+  {%- set ev = {
+      'policy_name': 'Z_catalog read',
+      'audit_level': 'INFO',
+      'action': 'SELECT',
+      'action_status': 'SUCCESSFUL',
+      'category': ['database'],
+      'type': ['access'],
+      'target_schema': 'SYS',
+      'target_object': view,
+      'statement_string': 'SELECT * FROM "SYS"."' ~ view ~ '"'
+  } -%}
+{%- else -%}
+  {%- if is_arc -%}
+    {#- Picked for how sensitive the object is, not how busy it is -#}
+    {%- set obj = samples.objects_data.where(
+        sensitivity=module.rand.weighted_choice(
+            ['critical', 'high'], [72, 28])).weighted_pick('weight') -%}
+  {%- else -%}
+    {%- set obj = samples.objects_data.weighted_pick('weight') -%}
+  {%- endif -%}
+  {%- set qualified = '"' ~ obj.schema ~ '"."' ~ obj.object ~ '"' -%}
+  {%- if is_arc -%}
+    {#- No predicate and no column list: the whole table -#}
+    {%- set statement = 'SELECT * FROM ' ~ qualified -%}
+  {%- elif s.app_name in ['SAPAppServer', 'SAPFioriLaunchpad', 'SAPBWServer'] -%}
+    {%- set cols = [] -%}
+    {%- for column in obj.columns[:4] -%}
+      {%- do cols.append('"' ~ column ~ '"') -%}
+    {%- endfor -%}
+    {%- set statement = 'SELECT ' ~ cols | join(', ') ~ ' FROM ' ~ qualified
+        ~ ' WHERE "' ~ obj.columns[0] ~ '" = ? AND "' ~ obj.columns[1]
+        ~ '" = ?' -%}
+  {%- elif s.tier == 'etl' -%}
+    {%- set cols = [] -%}
+    {%- for column in obj.columns -%}
+      {%- do cols.append('"' ~ column ~ '"') -%}
+    {%- endfor -%}
+    {%- set statement = 'SELECT ' ~ cols | join(', ') ~ ' FROM ' ~ qualified
+        ~ ' WHERE "' ~ obj.columns[0] ~ '" > ?' -%}
+  {%- else -%}
+    {%- set statement = 'SELECT TOP ' ~ module.rand.weighted_choice(
+        [100, 500, 1000, 5000], [30, 35, 25, 10]) ~ ' * FROM ' ~ qualified -%}
+  {%- endif -%}
+  {%- set critical = obj.sensitivity == 'critical' -%}
+  {%- set ev = {
+      'policy_name': 'Z_pii access' if critical else 'Z_sensitive data access',
+      'audit_level': 'WARNING' if critical else 'INFO',
+      'action': 'SELECT',
+      'action_status': 'SUCCESSFUL',
+      'category': ['database'],
+      'type': ['access'],
+      'target_schema': obj.schema,
+      'target_object': obj.object,
+      'statement_string': statement
+  } -%}
+{%- endif -%}
+{%- if is_arc -%}
+  {%- do arc_step() -%}
+{%- endif -%}
+{%- do steer_hub(
+    ['data_read', 'auth_validate', 'data_change', 'procedure_execute',
+     'authorization_change', 'user_admin', 'config_change',
+     'backup_recover', 'security_object_change', 'audit_policy_change'],
+    [430, 90, 150, 95, 55, 40, 30, 22, 16, 12]) -%}
+{{ render(ev, s) }}

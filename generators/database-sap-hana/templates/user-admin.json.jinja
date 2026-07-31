@@ -1,0 +1,109 @@
+{%- from 'templates/_base.json.jinja' import render, arc_tick, arc_step,
+    use_session, steer with context -%}
+{#- Users, roles and user groups created, changed and dropped. The
+    policy SAP recommends for user administration audits successful
+    execution only, so every event here reports a change that went
+    through. Passwords appear masked, the way HANA masks them in the
+    statement it audits.
+
+    The escalation phase adds the account the intruder creates for
+    themselves - named to pass for a support account, and the principal
+    that the grants which follow are made out to. -#}
+{%- do arc_tick() -%}
+{%- set is_arc = shared.get('arc', 'quiet') == 'escalate'
+                 and shared.get('arc_session')
+                 and module.rand.chance(0.8) -%}
+{%- if is_arc -%}
+  {%- set s = shared.get('arc_session') -%}
+  {%- if shared.get('arc_backdoor') is none -%}
+    {%- do shared.set('arc_backdoor', module.rand.choice(
+        ['Z_SUPPORT_TMP', 'HDB_SVC2', 'SAPSUPPORT2', 'DBMAINT'])) -%}
+    {%- set action = 'CREATE USER' -%}
+  {%- else -%}
+    {#- The account already exists; what follows keeps it usable -#}
+    {%- set action = 'ALTER USER' -%}
+    {%- set alter_variant = module.rand.choice(
+        ['DISABLE PASSWORD LIFETIME', 'RESET CONNECT ATTEMPTS',
+         'SET PARAMETER PRIORITY = \'8\'']) -%}
+  {%- endif -%}
+  {%- set principal = shared.get('arc_backdoor') -%}
+{%- else -%}
+  {%- do use_session('admin') -%}
+  {%- set s = shared.get('picked') -%}
+  {%- set action = module.rand.weighted_choice(
+      ['ALTER USER', 'CREATE USER', 'CREATE ROLE', 'DROP USER',
+       'ALTER USERGROUP', 'ALTER ROLE', 'CREATE USERGROUP', 'DROP ROLE',
+       'DROP USERGROUP'],
+      [40, 18, 10, 8, 6, 6, 5, 4, 3]) -%}
+{%- endif -%}
+{%- if not is_arc -%}
+  {%- if action.endswith('USERGROUP') -%}
+    {%- set principal = module.rand.choice(
+        ['UG_APP', 'UG_DBA', 'UG_ETL', 'UG_REPORTING', 'DEFAULT']) -%}
+  {%- elif action == 'CREATE ROLE' -%}
+    {%- set principal = 'Z_S4_' ~ module.rand.choice(
+        ['CO', 'PS', 'QM', 'PM', 'WM']) ~ '_DISPLAY' -%}
+  {%- elif action.endswith('ROLE') -%}
+    {%- set principal = samples.roles.weighted_pick('weight').role -%}
+  {%- elif action == 'CREATE USER' -%}
+    {%- set principal = module.rand.choice(
+        ['Z_SVC_', 'SVC_INTEG_', 'ANALYST_', 'REPORT_'])
+        ~ module.rand.number.integer(10, 99) -%}
+  {%- else -%}
+    {%- set principal = module.rand.weighted_choice(
+        [samples.actors_app.weighted_pick('weight').user,
+         samples.actors_admin.weighted_pick('weight').user], [80, 20]) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if action == 'CREATE USER' -%}
+  {%- set statement = 'CREATE USER ' ~ principal
+      ~ ' PASSWORD XXXXXXXXXXXXX NO FORCE_FIRST_PASSWORD_CHANGE' -%}
+{%- elif action == 'ALTER USER' -%}
+  {%- set statement = 'ALTER USER ' ~ principal ~ ' '
+      ~ (alter_variant if alter_variant is defined
+         else module.rand.weighted_choice(
+             ['RESET CONNECT ATTEMPTS', 'PASSWORD XXXXXXXXXXXXX', 'ACTIVATE',
+              'DEACTIVATE', 'DISABLE PASSWORD LIFETIME',
+              'SET PARAMETER PRIORITY = \'5\''],
+             [34, 26, 12, 10, 10, 8])) -%}
+{%- elif action == 'DROP USER' -%}
+  {%- set statement = 'DROP USER ' ~ principal ~ ' CASCADE' -%}
+{%- elif action == 'CREATE ROLE' -%}
+  {%- set statement = 'CREATE ROLE "' ~ principal ~ '"' -%}
+{%- elif action == 'ALTER ROLE' -%}
+  {%- set statement = 'ALTER ROLE "' ~ principal ~ '" '
+      ~ module.rand.choice(['ENABLE', 'DISABLE']) ~ ' LDAP AUTHORIZATION' -%}
+{%- elif action == 'DROP ROLE' -%}
+  {%- set statement = 'DROP ROLE "' ~ principal ~ '"' -%}
+{%- elif action == 'CREATE USERGROUP' -%}
+  {%- set statement = 'CREATE USERGROUP ' ~ principal ~ ' DISABLE USER ADMIN' -%}
+{%- elif action == 'ALTER USERGROUP' -%}
+  {%- set statement = 'ALTER USERGROUP ' ~ principal
+      ~ ' SET PARAMETER \'minimal_password_length\' = \''
+      ~ module.rand.choice([10, 12, 14]) ~ '\'' -%}
+{%- else -%}
+  {%- set statement = 'DROP USERGROUP ' ~ principal -%}
+{%- endif -%}
+{%- if 'USER' in action and 'USERGROUP' not in action -%}
+  {%- set scope = 'user' -%}
+{%- else -%}
+  {%- set scope = 'group' -%}
+{%- endif -%}
+{%- set verb = {'CREATE': 'creation', 'ALTER': 'change', 'DROP': 'deletion'
+    }[action.split(' ')[0]] -%}
+{%- set ev = {
+    'policy_name': '_SAP_user administration',
+    'audit_level': 'INFO',
+    'action': action,
+    'action_status': 'SUCCESSFUL',
+    'category': ['iam'],
+    'type': [scope, verb],
+    'target_principal': principal,
+    'statement_string': statement
+} -%}
+{%- if is_arc -%}
+  {%- do arc_step() -%}
+{%- endif -%}
+{%- do steer(['data_read', 'authorization_change', 'auth_validate'],
+    [78, 16, 6]) -%}
+{{ render(ev, s) }}

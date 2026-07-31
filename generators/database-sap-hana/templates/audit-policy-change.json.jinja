@@ -1,0 +1,74 @@
+{%- from 'templates/_base.json.jinja' import render, arc_tick, arc_step,
+    use_session, steer with context -%}
+{#- Audit policies created, changed and dropped, and audit entries
+    deleted. HANA audits these itself under the internal policy that
+    cannot be switched off, always at critical level - which is why the
+    last phase of the intrusion is visible at all.
+
+    That phase disables the policies which recorded the grants and the
+    reads, then deletes what is already in the trail. Only part of it
+    succeeds: the account was never granted audit administration. -#}
+{%- do arc_tick() -%}
+{%- set is_arc = shared.get('arc', 'quiet') == 'cover'
+                 and shared.get('arc_session')
+                 and module.rand.chance(0.9) -%}
+{%- if is_arc -%}
+  {%- set s = shared.get('arc_session') -%}
+  {%- set action = module.rand.weighted_choice(
+      ['ALTER AUDIT POLICY', 'ALTER SYSTEM CLEAR AUDIT LOG',
+       'DROP AUDIT POLICY'], [55, 30, 15]) -%}
+  {%- set policy = module.rand.choice(
+      ['_SAP_authorizations', 'Z_pii access', 'Z_sensitive data access',
+       '_SAP_user administration']) -%}
+  {%- set ok = module.rand.chance(0.6) -%}
+{%- else -%}
+  {%- do use_session('admin') -%}
+  {%- set s = shared.get('picked') -%}
+  {%- set action = module.rand.weighted_choice(
+      ['ALTER AUDIT POLICY', 'CREATE AUDIT POLICY',
+       'ALTER SYSTEM CLEAR AUDIT LOG', 'DROP AUDIT POLICY'],
+      [46, 26, 16, 12]) -%}
+  {%- set policy = module.rand.choice(
+      ['_SAP_session validate', '_SAP_authorizations',
+       '_SAP_user administration', '_SAP_configuration changes',
+       '_SAP_recover database', '_SAP_certificates',
+       'Z_sensitive data access', 'Z_pii access', 'Z_session connect',
+       'Z_catalog read', 'Z_procedure execution']) -%}
+  {%- set ok = module.rand.chance(0.97) -%}
+{%- endif -%}
+{%- if action == 'CREATE AUDIT POLICY' -%}
+  {%- set obj = samples.objects_data.where(
+      sensitivity='critical').weighted_pick('weight') -%}
+  {%- set statement = 'CREATE AUDIT POLICY "' ~ policy
+      ~ '" AUDITING ALL SELECT ON "' ~ obj.schema ~ '"."' ~ obj.object
+      ~ '" LEVEL WARNING TRAIL TYPE TABLE RETENTION 180' -%}
+  {%- set kind = 'creation' -%}
+{%- elif action == 'ALTER AUDIT POLICY' -%}
+  {%- set statement = 'ALTER AUDIT POLICY "' ~ policy ~ '" '
+      ~ ('DISABLE' if is_arc
+         else module.rand.weighted_choice(['ENABLE', 'DISABLE'], [72, 28])) -%}
+  {%- set kind = 'change' -%}
+{%- elif action == 'DROP AUDIT POLICY' -%}
+  {%- set statement = 'DROP AUDIT POLICY "' ~ policy ~ '"' -%}
+  {%- set kind = 'deletion' -%}
+{%- else -%}
+  {%- set until = (timestamp - module.datetime.timedelta(
+      days=1 if is_arc else module.rand.number.integer(30, 180))
+      ).strftime('%Y-%m-%d %H:%M:%S') -%}
+  {%- set statement = 'ALTER SYSTEM CLEAR AUDIT LOG UNTIL \'' ~ until ~ '\'' -%}
+  {%- set kind = 'deletion' -%}
+{%- endif -%}
+{%- set ev = {
+    'policy_name': 'MandatoryAuditPolicy',
+    'audit_level': 'CRITICAL',
+    'action': action,
+    'action_status': 'SUCCESSFUL' if ok else 'UNSUCCESSFUL',
+    'category': ['configuration'],
+    'type': [kind],
+    'statement_string': statement
+} -%}
+{%- if is_arc -%}
+  {%- do arc_step() -%}
+{%- endif -%}
+{%- do steer(['data_read', 'auth_validate'], [92, 8]) -%}
+{{ render(ev, s) }}
