@@ -1,0 +1,52 @@
+{%- for flag in ['to_denied_1', 'to_denied_2', 'to_denied_3', 'to_alternate_fetch', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 48 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_denied_1', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['miss', 'hit', 'denied'], [80, 15, 5]) -%}
+  {%- set ip = module.rand.choice(['10.20.40.11', '10.20.40.12', '10.20.40.13']) -%}
+  {%- set domain = module.rand.choice(['portal.example.test', 'updates.example.test', 'docs.example.test']) -%}
+  {%- set path = module.rand.choice(['/index.html', '/release-notes.html', '/status']) -%}
+{%- else -%}
+  {%- set ip = params.suspect_ip -%}
+  {%- set path = params.target_path -%}
+  {%- if stage.startswith('denied_') -%}
+    {%- set kind = 'denied' -%}
+    {%- set domain = params.blocked_domain -%}
+    {%- set step = stage[-1] | int -%}
+    {%- do shared.set('to_denied_' ~ (step + 1), true) if step < 3 else shared.set('to_alternate_fetch', true) -%}
+  {%- else -%}
+    {%- set kind = 'miss' -%}
+    {%- set domain = params.alternate_domain -%}
+    {%- do shared.set('to_routine', true) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if kind == 'denied' -%}
+  {%- set code = 'TCP_DENIED' -%}
+  {%- set status = 403 -%}
+  {%- set size = 3146 -%}
+  {%- set hierarchy = 'NONE/-' -%}
+  {%- set mime = '-' -%}
+  {%- set acl = 'BLOCK_WEBCAT-DefaultGroup-DefaultGroup-NONE-NONE-DefaultRouting' -%}
+  {%- set verdict = '<IW_sprt,-,-,-,-,-,-,-,-,-,-,-,-,-,-,IW_sprt,->' -%}
+  {%- set event_type = ['denied'] -%}
+{%- else -%}
+  {%- set code = 'TCP_HIT' if kind == 'hit' else 'TCP_MISS' -%}
+  {%- set status = 200 -%}
+  {%- set size = module.rand.number.integer(2500, 9500) -%}
+  {%- set hierarchy = 'NONE/-' if kind == 'hit' else 'DIRECT/' ~ domain -%}
+  {%- set mime = 'application/octet-stream' if stage == 'alternate_fetch' else 'text/html' -%}
+  {%- set acl = 'DEFAULT_CASE_11-DefaultGroup-DefaultGroup-NONE-NONE-DefaultRouting-NONE' -%}
+  {%- set verdict = '<IW_comp,6.9,-,"-",-,-,-,-,"-",-,-,-,"-",-,-,"-","-",-,-,IW_comp,-,"-","-","Unknown","Unknown","-","-",198.34,0,-,[Local],"-",37,"-",33,0,"-","-">' -%}
+  {%- set event_type = ['access'] -%}
+{%- endif -%}
+{%- set url = 'http://' ~ domain ~ path -%}
+{%- set elapsed = module.rand.number.integer(10, 300) -%}
+{%- set epoch = '%.3f' | format(timestamp.timestamp()) -%}
+{%- set request = 'GET ' ~ url ~ (' HTTP/1.1' if kind == 'denied' else '') -%}
+{%- set original = epoch ~ ' ' ~ elapsed ~ ' ' ~ ip ~ ' ' ~ code ~ '/' ~ status ~ ' ' ~ size ~ ' ' ~ request ~ ' - ' ~ hierarchy ~ ' ' ~ mime ~ ' ' ~ acl ~ ' ' ~ verdict ~ ' -' -%}
+{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['web'], 'type': event_type, 'action': 'proxy-' ~ kind, 'outcome': 'failure' if kind == 'denied' else 'success', 'original': original}, 'host': {'name': params.host_name}, 'source': {'ip': ip}, 'url': {'full': url, 'domain': domain, 'path': path, 'scheme': 'http'}, 'http': {'request': {'method': 'GET'}, 'response': {'status_code': status, 'body': {'bytes': size}}}, 'network': {'protocol': 'http'}, 'related': {'ip': [ip]}, 'cisco': {'swa': {'result_code': code, 'elapsed_ms': elapsed, 'hierarchy': hierarchy, 'mime_type': mime, 'acl_decision_tag': acl, 'scan_verdict': verdict}}} -%}
+{{- payload | tojson -}}
