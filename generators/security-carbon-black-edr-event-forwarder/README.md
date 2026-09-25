@@ -6,19 +6,19 @@ Synthetic Carbon Black EDR (formerly CB Response) endpoint events for SIEM proce
 
 | Native type | Behavior | Approximate frequency with anomaly mode | ECS category/type |
 | --- | --- | --- | --- |
-| `ingress.event.procstart` (`event_type: proc`) | Process creation | 41% | `process` / `start` |
-| `ingress.event.netconn` | Outbound TCP connection | 41% | `network` / `connection` |
-| `ingress.event.childproc` | Child process creation | <1% | `process` / `start` |
-| `ingress.event.regmod` | Registry value written | 6% | `registry` / `change` |
-| `ingress.event.filemod` | File last-write change | 12% | `file` / `change` |
+| `ingress.event.procstart` (`event_type: proc`) | Process creation | about 40% | `process` / `start` |
+| `ingress.event.netconn` | Outbound TCP connection | about 40% | `network` / `connection` |
+| `ingress.event.childproc` | Child process creation | about 4% | `process` / `start` |
+| `ingress.event.regmod` | Registry value written | about 6% | `registry` / `change` |
+| `ingress.event.filemod` | File last-write change | about 11% | `file` / `change` |
 
-The generator models one EDR server and four routine endpoint sensors. The anomaly uses a fifth sensor. Each source event is JSON under `carbon_black.edr`; its raw JSON record is retained in `event.original`. The outer document adds ECS fields for SIEM use.
+The generator models one EDR server and five routine endpoint sensors. The same fifth sensor and user also participate in the anomaly; background PowerShell starts have a distinct parent and command line. Each source event is JSON under `carbon_black.edr`; its raw JSON record is retained in `event.original`. The outer document adds ECS fields for SIEM use.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), a Word process on `WS-FIN-01` creates PowerShell. That process starts with a hidden script, writes a `Run` registry value, modifies an AppData file and opens an outbound TCP connection. These are five distinct vendor-documented endpoint event types. The `childproc.child_process_guid` equals the later events' `process_guid`; the `childproc.process_guid` equals `procstart.parent_process_guid`. All five retain the same `sensor_id`, host and process MD5. A rule can correlate those keys over a short window and distinguish the sequence from ordinary process starts and network traffic. Sort by `@timestamp` when inspecting a batch, since output line order can differ from event time.
+With `anomaly_mode: true` (the default), a Word process on `WS-FIN-01` creates PowerShell. That process starts with a hidden script, writes a `Run` registry value, modifies an AppData file and opens an outbound TCP connection. These are five distinct vendor-documented endpoint event types. The `childproc.child_process_guid` equals the later events' `process_guid`; the `childproc.process_guid` equals `procstart.parent_process_guid`. All five retain the same `sensor_id`, host and process MD5. A rule can correlate those keys within 10 seconds and distinguish the sequence from ordinary endpoint activity. In the validated one-second cadence, the five steps span exactly 4 seconds. Sort by `@timestamp` when inspecting a batch, since output line order can differ from event time.
 
-With `anomaly_mode: false`, the fifth sensor and the linked `childproc` series disappear. The four routine sensors continue producing process starts, connections, independent registry setting writes and temporary-file updates. A rule therefore needs the shared process and sensor identifiers plus the sequence, not the presence of a single event type.
+With `anomaly_mode: false`, only the linked five-step series disappears. All five event types remain in the background, including child creation followed by its own process-start record and PowerShell activity on the same sensor and user. Routine children do not continue through the full `procstart` → `regmod` → `filemod` → `netconn` sequence on one child `process_guid`; the shared identifiers and order are the detection signal.
 
 ## Parameters
 
@@ -58,7 +58,7 @@ This registry event was copied from an anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T14:38:32+00:00",
+  "@timestamp": "2026-09-25T14:53:12+00:00",
   "carbon_black": {
     "edr": {
       "action": "writeval",
@@ -66,14 +66,14 @@ This registry event was copied from an anomaly-mode run:
       "cb_server": "cb-01.example.test",
       "computer_name": "WS-FIN-01",
       "event_type": "regmod",
-      "link_process": "https://cb-01.example.test/#analyze/00000007-0000-3830-a545-1e222047f361/1",
+      "link_process": "https://cb-01.example.test/#analyze/00000007-0000-7470-7708-38e8b8dc068b/1",
       "link_sensor": "https://cb-01.example.test/#/host/7",
       "md5": "E3F7D643F0133A6BCB598EAD3B4F1C76",
       "path": "\\registry\\user\\s-1-5-21-1000-1000-1000-1001\\software\\microsoft\\windows\\currentversion\\run\\updater",
-      "pid": 5442,
-      "process_guid": "00000007-0000-3830-a545-1e222047f361",
+      "pid": 2003,
+      "process_guid": "00000007-0000-7470-7708-38e8b8dc068b",
       "sensor_id": 7,
-      "timestamp": 1790347112,
+      "timestamp": 1790347992,
       "type": "ingress.event.regmod"
     }
   },
@@ -87,7 +87,7 @@ This registry event was copied from an anomaly-mode run:
     ],
     "dataset": "carbon_black_edr.event_forwarder",
     "kind": "event",
-    "original": "{\"action\": \"writeval\", \"actiontype\": 2, \"cb_server\": \"cb-01.example.test\", \"computer_name\": \"WS-FIN-01\", \"event_type\": \"regmod\", \"link_process\": \"https://cb-01.example.test/#analyze/00000007-0000-3830-a545-1e222047f361/1\", \"link_sensor\": \"https://cb-01.example.test/#/host/7\", \"md5\": \"E3F7D643F0133A6BCB598EAD3B4F1C76\", \"path\": \"\\\\registry\\\\user\\\\s-1-5-21-1000-1000-1000-1001\\\\software\\\\microsoft\\\\windows\\\\currentversion\\\\run\\\\updater\", \"pid\": 5442, \"process_guid\": \"00000007-0000-3830-a545-1e222047f361\", \"sensor_id\": 7, \"timestamp\": 1790347112, \"type\": \"ingress.event.regmod\"}",
+    "original": "{\"action\": \"writeval\", \"actiontype\": 2, \"cb_server\": \"cb-01.example.test\", \"computer_name\": \"WS-FIN-01\", \"event_type\": \"regmod\", \"link_process\": \"https://cb-01.example.test/#analyze/00000007-0000-7470-7708-38e8b8dc068b/1\", \"link_sensor\": \"https://cb-01.example.test/#/host/7\", \"md5\": \"E3F7D643F0133A6BCB598EAD3B4F1C76\", \"path\": \"\\\\registry\\\\user\\\\s-1-5-21-1000-1000-1000-1001\\\\software\\\\microsoft\\\\windows\\\\currentversion\\\\run\\\\updater\", \"pid\": 2003, \"process_guid\": \"00000007-0000-7470-7708-38e8b8dc068b\", \"sensor_id\": 7, \"timestamp\": 1790347992, \"type\": \"ingress.event.regmod\"}",
     "type": [
       "change"
     ]
@@ -101,9 +101,9 @@ This registry event was copied from an anomaly-mode run:
     "vendor": "Carbon Black"
   },
   "process": {
-    "entity_id": "00000007-0000-3830-a545-1e222047f361",
+    "entity_id": "00000007-0000-7470-7708-38e8b8dc068b",
     "executable": "c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe",
-    "pid": 5442
+    "pid": 2003
   },
   "registry": {
     "path": "\\registry\\user\\s-1-5-21-1000-1000-1000-1001\\software\\microsoft\\windows\\currentversion\\run\\updater"
