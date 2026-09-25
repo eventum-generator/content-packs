@@ -1,0 +1,28 @@
+{%- set step = vars.step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set n = shared.get('routine_count', 0) + 1 -%}
+  {%- if n >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', n) -%}{%- endif -%}
+{%- endif -%}
+{%- set attack = step != 'routine' -%}
+{%- set variant = (module.rand.weighted_choice(['firewall_log','firewall_deny','ips'],[85,12,3]) if not attack else ('ips' if step.startswith('ips') else 'firewall_deny')) -%}
+{%- set host_id = params.attack_host_id if attack else module.rand.number.integer(1, 50) -%}
+{%- set host_name = params.attack_target_name if attack else 'app-%02d.corp.example' % host_id -%}
+{%- set target_ip = params.attack_target_ip if attack else '10.50.20.' ~ (host_id + 20) -%}
+{%- set source_ip = params.attack_source_ip if attack else '10.50.1.' ~ module.rand.number.integer(10, 150) -%}
+{%- set dest_port = (445 if step == 'probe_1' else 3389) if step.startswith('probe') else (80 if variant == 'ips' or variant == 'firewall_log' else module.rand.choice([445, 3389])) -%}
+{%- set source_port = module.rand.number.integer(40000, 60000) -%}
+{%- set signature = '1001111' if variant == 'ips' else ('21' if variant == 'firewall_deny' else '20') -%}
+{%- set name = 'Test Intrusion Prevention Rule' if variant == 'ips' else ('Deny Inbound Management' if variant == 'firewall_deny' else 'Log for TCP Port 80') -%}
+{%- set act = 'IDS:Reset' if variant == 'ips' else ('Deny' if variant == 'firewall_deny' else 'Log') -%}
+{%- set severity = 3 if variant == 'ips' else (5 if variant == 'firewall_deny' else 0) -%}
+{%- set fields = {'cn1':host_id,'cn1Label':'Host ID','dvchost':host_name,'act':act,'dmac':'00:50:56:F5:7F:%02X' % host_id,'smac':'00:0C:29:EB:35:DE','TrendMicroDsFrameType':'IP','src':source_ip,'dst':target_ip,'in':60 if variant == 'firewall_deny' else 1093,'cs3':'DF','cs3Label':'Fragmentation Bits','proto':'TCP','spt':source_port,'dpt':dest_port,'cs2':'0x02 SYN' if variant == 'firewall_deny' else '0x18 ACK PSH','cs2Label':'TCP Flags','cnt':1} -%}
+{%- if variant != 'firewall_deny' -%}{%- do fields.update({'TrendMicroDsPacketData':'R0VUIC8gSFRUUC8xLjE='}) -%}{%- endif -%}
+{%- if variant == 'ips' -%}{%- do fields.update({'cn3':10,'cn3Label':'Intrusion Prevention Packet Position','cs5':10,'cs5Label':'Intrusion Prevention Stream Position','cs6':8,'cs6Label':'Intrusion Prevention Flags'}) -%}{%- endif -%}
+{%- set parts = [] -%}{%- for key,value in fields.items() -%}{%- do parts.append(key ~ '=' ~ value|string) -%}{%- endfor -%}
+{%- set raw = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.manager_name ~ ' CEF:0|Trend Micro|Deep Security Agent|' ~ params.agent_version ~ '|' ~ signature ~ '|' ~ name ~ '|' ~ severity ~ '|' ~ parts|join(' ') -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'intrusion-reset' if variant == 'ips' else ('firewall-deny' if variant == 'firewall_deny' else 'firewall-log'),'category':['network','intrusion_detection'] if variant == 'ips' else ['network'],'code':signature,'dataset':'trendmicro.deep_security','kind':'alert' if variant == 'ips' else 'event','original':raw,'type':['denied'] if variant != 'firewall_log' else ['info']},'host':{'name':host_name,'ip':[target_ip]},'source':{'ip':source_ip,'port':source_port},'destination':{'ip':target_ip,'port':dest_port},'network':{'transport':'tcp'},'related':{'ip':[source_ip,target_ip],'hosts':[host_name]},'trendmicro':{'deep_security':{'host_id':host_id,'rule_id':signature,'rule_name':name,'action':act,'manager_name':params.manager_name}}} -%}
+{{- out | tojson -}}
