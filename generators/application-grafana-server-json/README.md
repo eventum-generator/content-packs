@@ -6,19 +6,19 @@ Synthetic Grafana OSS 9.5.1 server-log JSON messages based on real 9.5.0/9.5.1 l
 
 | Native message | Approximate share with anomaly mode | ECS category | Meaning |
 | --- | ---: | --- | --- |
-| `Request Completed`, status 200 | 91.4% | `web` | Routine HTTP request using the observed request-log field set |
-| `Parsing JSON Web Token` | 2.1% | `authentication` | JWT parser diagnostic |
-| `Failed to verify JWT` | 2.1% | `authentication` | JWT verification diagnostic |
-| `Invalid JWT` | 2.1% | `authentication` | JWT rejection diagnostic |
-| `Request Completed`, status 401 | 2.1% | `web`, `authentication` | Rejected HTTP request |
+| `Request Completed`, status 200 | 84.2% | `web` | Routine HTTP request using the observed request-log field set |
+| `Parsing JSON Web Token` | 3.9% | `authentication` | JWT parser diagnostic |
+| `Failed to verify JWT` | 3.9% | `authentication` | JWT verification diagnostic |
+| `Invalid JWT` | 3.9% | `authentication` | JWT rejection diagnostic |
+| `Request Completed`, status 401 | 3.9% | `web`, `authentication` | Rejected HTTP request |
 
-The template uses FSM mode. It emits 128 routine requests, then three four-message JWT diagnostic/request groups when anomaly mode is enabled. Frequencies, identities, addresses, and timing are synthetic, not measured Grafana production rates. The 200 line varies values within the 401 request-log field set; it is not copied from a captured 200 line.
+The template uses FSM mode. It emits 128 routine requests with one isolated JWT failure after each 32-request block; anomaly mode replaces the fourth isolated failure with three closely spaced JWT failure groups. Frequencies, identities, addresses, and timing are synthetic, not measured Grafana production rates. The 200 line varies values within the 401 request-log field set; it is not copied from a captured 200 line.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), three `Request Completed` 401 events from `198.51.100.24` occur within eight simulated seconds. Each 401 is preceded by nearby `Parsing JSON Web Token`, `Failed to verify JWT`, and `Invalid JWT` messages. A detection rule can group the 401 events by `host.name` and `source.ip`, sort by `@timestamp`, and alert on at least three within a short window. Do not use file row order as the event clock.
+With `anomaly_mode: true` (the default), three `Request Completed` 401 events from `198.51.100.24` occur within eight simulated seconds. Ordinary isolated 401 events also occur in both modes, including occasional events from this same IP; the useful signal is the short-window cluster, not the status or IP alone. Each 401 is preceded by nearby `Parsing JSON Web Token`, `Failed to verify JWT`, and `Invalid JWT` messages. A detection rule can group the 401 events by `host.name` and `source.ip`, sort by `@timestamp`, and alert on at least three within a short window. Do not use file row order as the event clock.
 
-The JWT diagnostics have no client IP or request ID in the source example. Their proximity provides context only; it cannot prove they belong to a particular 401 when requests overlap. This sequence also does not prove an attack. With `anomaly_mode: false`, only routine 200 requests appear: no JWT diagnostics or 401 events.
+The JWT diagnostics have no client IP or request ID in the source example. Their proximity provides context only; it cannot prove they belong to a particular 401 when requests overlap. This sequence also does not prove an attack. With `anomaly_mode: false`, routine 200 requests and isolated JWT diagnostics/401 events continue, but no client has three 401 events within a 10-second window.
 
 ## Parameters
 
@@ -28,7 +28,7 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Include the repeated JWT rejection sequence; `false` produces background only |
+| `anomaly_mode` | `true` | Include a dense three-401 cluster; `false` keeps routine 200s and isolated 401s |
 | `grafana_host` | `grafana-01` | ECS host name |
 | `routine_requests_before_chain` | `128` | Routine requests between anomaly sequences |
 | `suspect_remote_addr` | `198.51.100.24` | Client IP shared by the three anomalous 401 events |
@@ -54,7 +54,7 @@ This complete JSON event was copied from an anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T14:44:58.003000+00:00",
+  "@timestamp": "2026-09-25T14:50:59.003000+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -68,7 +68,7 @@ This complete JSON event was copied from an anomaly-mode run:
     "duration": 2213017,
     "kind": "event",
     "module": "grafana",
-    "original": "{\"duration\": \"2.213017ms\", \"level\": \"info\", \"logger\": \"context\", \"method\": \"GET\", \"msg\": \"Request Completed\", \"orgId\": 0, \"path\": \"/\", \"referer\": \"\", \"remote_addr\": \"198.51.100.24\", \"size\": 39, \"status\": 401, \"t\": \"2026-09-25T14:44:58.003000000Z\", \"time_ms\": 2, \"uname\": \"\", \"userId\": 0}",
+    "original": "{\"duration\": \"2.213017ms\", \"level\": \"info\", \"logger\": \"context\", \"method\": \"GET\", \"msg\": \"Request Completed\", \"orgId\": 0, \"path\": \"/\", \"referer\": \"\", \"remote_addr\": \"198.51.100.24\", \"size\": 39, \"status\": 401, \"t\": \"2026-09-25T14:50:59.003000000Z\", \"time_ms\": 2, \"uname\": \"\", \"userId\": 0}",
     "outcome": "failure",
     "type": [
       "denied"
@@ -87,7 +87,7 @@ This complete JSON event was copied from an anomaly-mode run:
       "remote_addr": "198.51.100.24",
       "size": 39,
       "status": 401,
-      "t": "2026-09-25T14:44:58.003000000Z",
+      "t": "2026-09-25T14:50:59.003000000Z",
       "time_ms": 2,
       "uname": "",
       "userId": 0
