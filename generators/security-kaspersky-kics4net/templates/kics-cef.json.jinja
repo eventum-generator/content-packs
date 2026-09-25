@@ -1,0 +1,55 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 3) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- if chain -%}
+  {%- set code = ['4000005003', '4000005005', '4000004001'][step] -%}
+  {%- set ip = params.target_ip -%}
+  {%- set owner_mac = params.owner_mac -%}
+  {%- set challenger_mac = params.challenger_mac -%}
+{%- else -%}
+  {%- set code = module.rand.weighted_choice(['4000005003', '4000005007', '4000005005'], [60, 30, 10]) -%}
+  {%- set ip = module.rand.choice(['10.20.30.20', '10.20.30.21', '10.20.30.22']) -%}
+  {%- set owner_mac = module.rand.choice(['02:42:ac:11:00:20', '02:42:ac:11:00:21', '02:42:ac:11:00:22']) -%}
+  {%- set challenger_mac = '02:42:ac:11:00:77' -%}
+{%- endif -%}
+{%- set title = {'4000005003': 'New device detected on network', '4000005007': 'New device IP address detected', '4000005005': 'IP address conflict detected', '4000004001': 'Symptoms of ARP spoofing detected in ARP replies'}[code] -%}
+{%- set score = 8.7 if code == '4000004001' else (5.5 if code == '4000005005' else 2.1) -%}
+{%- set severity = 9 if score >= 8 else (6 if score >= 4 else 3) -%}
+{%- set event_id = 30000 + (shared.get('event_id', -1) + 1) % 999999999 -%}
+{%- do shared.set('event_id', event_id - 30000) -%}
+{%- set common = ' dateTime=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
+  ~ ' hostname=' ~ params.server_host ~ ' messageType=Event'
+  ~ ' score=' ~ score ~ ' eventIdentifier=' ~ event_id
+  ~ ' src=' ~ ip ~ ' dst=10.20.30.1' -%}
+{%- if code == '4000004001' -%}
+  {%- set fields = ' substitutedIpAddress=' ~ ip ~ ' targetIpAddress=10.20.30.1'
+    ~ ' attackStartTimestamp=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%S.000Z') -%}
+{%- elif code == '4000005005' -%}
+  {%- set fields = ' ownerIp=' ~ ip ~ ' ownerMac=' ~ owner_mac
+    ~ ' challengerMac=' ~ challenger_mac -%}
+{%- elif code == '4000005007' -%}
+  {%- set fields = ' ownerMac=' ~ owner_mac ~ ' newIpAddress=' ~ ip
+    ~ ' oldIpAddress=10.20.30.99' -%}
+{%- else -%}
+  {%- set fields = ' ownerIp=' ~ ip ~ ' ownerMac=' ~ owner_mac
+    ~ ' assetName=example-device-' ~ tick -%}
+{%- endif -%}
+{%- set raw = 'CEF:0|Kaspersky Lab|Kaspersky Industrial CyberSecurity for Networks|4.2.0.335|'
+  ~ code ~ '|' ~ title ~ '|' ~ severity ~ '|' ~ (common ~ fields).strip() -%}
+{%- set category = 'intrusion_detection' if code == '4000004001' else ('network' if code == '4000005005' else 'host') -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'alert' if code in ['4000005005', '4000004001'] else 'event',
+    'dataset': 'kaspersky.kics_networks', 'category': [category],
+    'type': ['info'], 'code': code, 'action': title, 'original': raw},
+  'host': {'name': params.server_host},
+  'source': {'ip': ip}, 'destination': {'ip': '10.20.30.1'},
+  'related': {'ip': [ip, '10.20.30.1']},
+  'kaspersky': {'kics_networks': {'event_identifier': event_id,
+    'score': score, 'owner_mac': owner_mac,
+    'challenger_mac': challenger_mac if code == '4000005005' else none}}} -%}
+{{ record | tojson }}
