@@ -1,0 +1,55 @@
+{%- from 'templates/_base.json.jinja' import render with context -%}
+{%- set flow_no = shared.get('flow_no', 0) + 1 -%}
+{%- do shared.set('flow_no', flow_no) -%}
+{%- set stage = flow_no % 120 -%}
+{%- set attack = params.anomaly_mode and stage >= 1 and stage <= 11 -%}
+{%- if attack -%}
+  {%- set actor = params.suspicious_actor -%}
+  {%- set ip = params.suspicious_ip -%}
+  {%- if stage <= 10 -%}
+    {%- set operation = 'read' -%}
+    {%- set path = params.secret_mount ~ '/data/payroll/employee-' ~ stage -%}
+  {%- else -%}
+    {%- set operation = 'delete' -%}
+    {%- set path = 'sys/audit/file' -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set actor = module.rand.choice(['svc-api', 'svc-billing', 'alice']) -%}
+  {%- set ip = module.rand.choice(['10.20.8.12', '10.20.8.31', '10.20.9.18']) -%}
+  {%- set operation = module.rand.weighted_choice(['read', 'list', 'update'], [78, 15, 7]) -%}
+  {%- if operation == 'read' -%}
+    {%- set path = module.rand.choice([params.secret_mount ~ '/data/app/api-key', params.secret_mount ~ '/data/billing/db', 'auth/token/lookup-self']) -%}
+  {%- elif operation == 'list' -%}
+    {%- set path = params.secret_mount ~ '/metadata/app' -%}
+  {%- else -%}
+    {%- set path = 'auth/token/renew-self' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set id = module.rand.crypto.uuid4() -%}
+{%- set entity_id = '96fa6c68-63af-43dc-a9ea-f59556f4b5ea' if attack else {'svc-api':'49263c43-35ab-4df6-a747-1715203590ba','svc-billing':'09ae6e74-f30a-4713-83a5-c8be3496bdbe','alice':'e60a5c72-a56d-4ff4-b16a-45c3bceea453'}[actor] -%}
+{%- set digest = module.hashlib.sha256(actor.encode()).hexdigest() -%}
+{%- set accessor = 'hmac-sha256:' ~ digest -%}
+{%- set token = 'hmac-sha256:' ~ module.hashlib.sha256((actor ~ ':token').encode()).hexdigest() -%}
+{%- set auth = {
+    'accessor': accessor, 'client_token': token,
+    'display_name': 'userpass-' ~ actor, 'entity_id': entity_id,
+    'metadata': {'username': actor},
+    'policies': ['default', 'payroll-reader'] if attack else ['default'],
+    'token_policies': ['default', 'payroll-reader'] if attack else ['default'],
+    'token_type': 'service'
+} -%}
+{%- set mount_type = 'system' if path.startswith('sys/') else ('token' if path.startswith('auth/') else 'kv') -%}
+{%- set request = {
+    'id': id, 'operation': operation, 'namespace': {'id': 'root'},
+    'client_token': token, 'client_token_accessor': accessor,
+    'path': path, 'remote_address': ip,
+    'remote_port': module.rand.number.integer(49152, 65535),
+    'mount_type': mount_type,
+    'mount_point': 'sys/' if mount_type == 'system' else ('auth/token/' if mount_type == 'token' else params.secret_mount ~ '/')
+} -%}
+{%- set native = {'time': timestamp.isoformat(), 'type': 'request',
+                  'auth': auth, 'request': request} -%}
+{%- do shared.set('current', {'auth': auth, 'request': request,
+                               'actor': actor, 'ip': ip,
+                               'denied': attack and stage == 11}) -%}
+{{- render(native, actor, ip) -}}
