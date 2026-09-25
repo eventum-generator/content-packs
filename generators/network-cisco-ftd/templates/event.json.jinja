@@ -1,0 +1,37 @@
+{%- set step = vars.step -%}
+{%- set attack = step.startswith('attack') or step.startswith('intrusion') -%}
+{%- if step == 'routine_start' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set n = shared.get('routine_count', 0) + 1 -%}
+  {%- if n >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', n) -%}{%- endif -%}
+{%- endif -%}
+{%- if step == 'routine_start' or step == 'attack_start' -%}
+  {%- set cid = (shared.get('connection_id', 1000) % 2147483647) + 1 -%}
+  {%- do shared.set('connection_id', cid) -%}
+  {%- set src = params.attack_source_ip if attack else '10.40.1.' ~ module.rand.number.integer(10, 80) -%}
+  {%- set dst = params.attack_destination_ip if attack else '10.40.20.' ~ module.rand.number.integer(10, 80) -%}
+  {%- set dpt = 443 if attack else module.rand.choice([53, 80, 443]) -%}
+  {%- set flow = {'src':src,'dst':dst,'spt':module.rand.number.integer(40000, 60000),'dpt':dpt,'id':cid,'first':timestamp.strftime('%Y-%m-%dT%H:%M:%SZ')} -%}
+  {%- do shared.set('flow', flow) -%}
+{%- else -%}{%- set flow = shared.get('flow') -%}{%- endif -%}
+{%- set intrusion = step.startswith('intrusion') -%}
+{%- set code = '430001' if intrusion else ('430002' if step.endswith('start') else '430003') -%}
+{%- set action = 'intrusion-detected' if intrusion else ('connection-start' if code == '430002' else 'connection-end') -%}
+{%- set fields = {'EventPriority':'High' if intrusion else 'Low','DeviceUUID':params.device_uuid,'InstanceID':2,'FirstPacketSecond':flow.first,'ConnectionID':flow.id,'SrcIP':flow.src,'DstIP':flow.dst,'SrcPort':flow.spt,'DstPort':flow.dpt,'Protocol':'tcp','IngressInterface':'inside','EgressInterface':'dmz','IngressZone':'Inside','EgressZone':'DMZ','ACPolicy':'Corporate Access Policy','AccessControlRuleName':'Allow to DMZ','Client':'SSL client' if flow.dpt == 443 else ('DNS' if flow.dpt == 53 else 'HTTP client'),'ApplicationProtocol':'HTTPS' if flow.dpt == 443 else ('DNS' if flow.dpt == 53 else 'HTTP')} -%}
+{%- if intrusion -%}
+  {%- do fields.update({'Priority':2,'GID':1,'SID':36330 if step == 'intrusion_1' else 37732,'Revision':2,'Message':'WEB-MISC suspicious URI' if step == 'intrusion_1' else 'POLICY-OTHER malicious content','Classification':'Web Application Attack','IntrusionPolicy':'Balanced Security and Connectivity','NAPPolicy':'Balanced Security and Connectivity','InlineResult':'Dropped'}) -%}
+{%- else -%}
+  {%- do fields.update({'AccessControlRuleAction':'Allow','InitiatorPackets':1 if code == '430002' else 5,'ResponderPackets':0 if code == '430002' else 1,'InitiatorBytes':74 if code == '430002' else 450,'ResponderBytes':0 if code == '430002' else 180,'NAPPolicy':'Balanced Security and Connectivity'}) -%}
+  {%- if code == '430003' -%}{%- do fields.update({'ConnectionDuration':1}) -%}{%- endif -%}
+{%- endif -%}
+{%- set pieces = [] -%}
+{%- for key,value in fields.items() -%}{%- do pieces.append(key ~ ': ' ~ value|string) -%}{%- endfor -%}
+{%- set raw = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.device_name ~ ' %FTD-6-' ~ code ~ ': ' ~ pieces|join(', ') -%}
+{%- set specific = {'message_id':code,'security_event':{'device_uuid':params.device_uuid,'instance_id':2,'first_packet_second':flow.first,'connection_id':flow.id,'src_ip':flow.src,'dst_ip':flow.dst,'src_port':flow.spt,'dst_port':flow.dpt,'protocol':'tcp','access_control_rule_name':'Allow to DMZ'}} -%}
+{%- if intrusion -%}{%- do specific.security_event.update({'gid':1,'sid':fields.SID,'revision':2,'inline_result':'Dropped','intrusion_policy':'Balanced Security and Connectivity'}) -%}{%- endif -%}
+{%- if code == '430003' -%}{%- do specific.security_event.update({'connection_duration':1,'initiator_bytes':450,'responder_bytes':180}) -%}{%- endif -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':['intrusion_detection','network'] if intrusion else ['network'],'code':code,'dataset':'cisco_ftd.log','kind':'alert' if intrusion else 'event','original':raw,'type':['denied'] if intrusion else (['start'] if code == '430002' else ['end'])},'host':{'name':params.device_name},'source':{'ip':flow.src,'port':flow.spt},'destination':{'ip':flow.dst,'port':flow.dpt},'network':{'transport':'tcp'},'related':{'ip':[flow.src,flow.dst]},'cisco':{'ftd':specific}} -%}
+{{- out | tojson -}}
