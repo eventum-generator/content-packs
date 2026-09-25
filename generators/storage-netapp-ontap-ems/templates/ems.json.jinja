@@ -1,0 +1,59 @@
+{%- for flag in ['to_failure_1', 'to_failure_2', 'to_failure_3', 'to_lockout', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 36 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_failure_1', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- if count % 12 == 0 -%}
+    {%- set event_name = 'security.invalid.login' -%}
+    {%- set severity = 'alert' -%}
+    {%- set priority = 9 -%}
+    {%- set message = 'Failed to authenticate login attempt to Vserver: ' ~ params.vserver ~ ', username: ' ~ params.incidental_user ~ ', application: ssh.' -%}
+    {%- set user_name = params.incidental_user -%}
+    {%- set category = 'authentication' -%}
+    {%- set event_type = 'start' -%}
+    {%- set outcome = 'failure' -%}
+  {%- else -%}
+    {%- set event_name = 'zapi.snapshot.success' -%}
+    {%- set severity = 'notice' -%}
+    {%- set priority = 13 -%}
+    {%- set snapshot_name = 'auto.' ~ timestamp.strftime('%Y%m%d_%H%M%S') -%}
+    {%- set message = 'Asynchronous creation of Snapshot copy named ' ~ snapshot_name ~ ' in volume ' ~ params.snapshot_volume ~ ' was successful. The Snapshot copy was created 125 milliseconds after the request was received by ZAPI.' -%}
+    {%- set user_name = none -%}
+    {%- set category = 'file' -%}
+    {%- set event_type = 'creation' -%}
+    {%- set outcome = 'success' -%}
+  {%- endif -%}
+{%- elif stage == 'lockout' -%}
+  {%- set event_name = 'useradmin.lockedout.user' -%}
+  {%- set severity = 'error' -%}
+  {%- set priority = 11 -%}
+  {%- set message = "User '" ~ params.target_user ~ "' is locked out of the appliance for failing authentication '" ~ params.lockout_attempts ~ "' times." -%}
+  {%- set user_name = params.target_user -%}
+  {%- set category = 'authentication' -%}
+  {%- set event_type = 'denied' -%}
+  {%- set outcome = 'failure' -%}
+  {%- do shared.set('to_routine', true) -%}
+{%- else -%}
+  {%- set event_name = 'security.invalid.login' -%}
+  {%- set severity = 'alert' -%}
+  {%- set priority = 9 -%}
+  {%- set message = 'Failed to authenticate login attempt to Vserver: ' ~ params.vserver ~ ', username: ' ~ params.target_user ~ ', application: ssh.' -%}
+  {%- set user_name = params.target_user -%}
+  {%- set category = 'authentication' -%}
+  {%- set event_type = 'start' -%}
+  {%- set outcome = 'failure' -%}
+  {%- if stage == 'failure_1' -%}{%- do shared.set('to_failure_2', true) -%}
+  {%- elif stage == 'failure_2' -%}{%- do shared.set('to_failure_3', true) -%}
+  {%- else -%}{%- do shared.set('to_lockout', true) -%}{%- endif -%}
+{%- endif -%}
+{%- set day = (' ' if timestamp.day < 10 else '') ~ timestamp.day -%}
+{%- set syslog_time = timestamp.strftime('%b ') ~ day ~ timestamp.strftime(' %H:%M:%S') -%}
+{%- set original = '<' ~ priority ~ '>' ~ syslog_time ~ ' [' ~ params.node_name ~ ':' ~ event_name ~ ':' ~ severity ~ ']: ' ~ message -%}
+{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': [category], 'type': [event_type], 'action': event_name, 'outcome': outcome, 'original': original}, 'host': {'name': params.node_name}, 'log': {'syslog': {'priority': priority, 'facility': {'code': 1, 'name': 'user'}, 'severity': {'code': priority % 8, 'name': severity}}}, 'netapp': {'ems': {'name': event_name, 'severity': severity, 'message': message}}} -%}
+{%- if event_name == 'zapi.snapshot.success' -%}{%- do payload['netapp']['ems'].update({'snapshot': snapshot_name, 'volume': params.snapshot_volume, 'duration_ms': 125}) -%}{%- endif -%}
+{%- if event_name == 'security.invalid.login' -%}{%- do payload['netapp']['ems'].update({'vserver': params.vserver}) -%}{%- endif -%}
+{%- if user_name -%}{%- do payload.update({'user': {'name': user_name}, 'related': {'user': [user_name]}}) -%}{%- endif -%}
+{{- payload | tojson -}}
