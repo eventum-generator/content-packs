@@ -1,0 +1,71 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 5) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set kind = 'vpn_deny' if chain else module.rand.weighted_choice(['web_allow', 'ping_deny'], [85, 15]) -%}
+{%- set stamp = event_time.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- if kind == 'web_allow' -%}
+  {%- set source_ip = module.rand.choice(['10.0.1.2', '10.0.1.3', '10.0.1.4']) -%}
+  {%- set dest_ip = module.rand.choice(['203.0.113.11', '203.0.113.12']) -%}
+  {%- set source_port = module.rand.number.integer(40000, 60000) -%}
+  {%- set dest_port = 80 -%}
+  {%- set action = 'Allow' -%}
+  {%- set code = '3000-0176' -%}
+  {%- set transport = 'tcp' -%}
+  {%- set policy = 'HTTP-proxy.1-00' -%}
+  {%- set raw = stamp ~ ' Allow ' ~ source_ip ~ ' ' ~ dest_ip
+    ~ ' http/tcp ' ~ source_port ~ ' 80 Trusted External Allowed (' ~ policy ~ ')'
+    ~ ' proc_id="firewall" rc="406" msg_id="3000-0176"'
+    ~ ' src_ip_nat="198.51.100.10" flags="SDdF" duration="14"'
+    ~ ' sent_pkts="10" rcvd_pkts="5" sent_bytes="564" rcvd_bytes="785"' -%}
+{%- elif kind == 'ping_deny' -%}
+  {%- set source_ip = module.rand.choice(['10.0.1.131', '10.0.1.132']) -%}
+  {%- set dest_ip = '10.0.1.1' -%}
+  {%- set source_port = none -%}
+  {%- set dest_port = none -%}
+  {%- set action = 'Deny' -%}
+  {%- set code = '3000-0148' -%}
+  {%- set transport = 'icmp' -%}
+  {%- set policy = 'Ping-00' -%}
+  {%- set raw = stamp ~ ' Deny ' ~ source_ip ~ ' ' ~ dest_ip
+    ~ ' echo-request/icmp Trusted Firebox Denied 84 64 (' ~ policy ~ ')'
+    ~ ' proc_id="firewall" rc="101" msg_id="3000-0148"'
+    ~ ' type="8" duration="0" sent_pkts="1" rcvd_pkts="0"'
+    ~ ' sent_bytes="84" rcvd_bytes="0"' -%}
+{%- else -%}
+  {%- set source_ip = params.vpn_source_ip -%}
+  {%- set dest_ip = params.vpn_firebox_ip -%}
+  {%- set source_port = 31069 + (tick - params.anomaly_interval_events) -%}
+  {%- set dest_port = params.vpn_port -%}
+  {%- set action = 'Deny' -%}
+  {%- set code = '3000-0148' -%}
+  {%- set transport = 'tcp' -%}
+  {%- set policy = 'Unhandled External Packet-00' -%}
+  {%- set raw = stamp ~ ' Deny ' ~ source_ip ~ ' ' ~ dest_ip
+    ~ ' ' ~ dest_port ~ '/tcp ' ~ source_port ~ ' ' ~ dest_port
+    ~ ' External1 Firebox Denied 52 51 (' ~ policy ~ ')'
+    ~ ' proc_id="firewall" rc="101" msg_id="3000-0148"'
+    ~ ' tcp_info="offset 8 S 2192251295 win 65535"' -%}
+{%- endif -%}
+{%- set source_obj = {'ip': source_ip} -%}
+{%- set destination_obj = {'ip': dest_ip} -%}
+{%- if source_port is not none -%}
+  {%- do source_obj.update({'port': source_port}) -%}
+{%- endif -%}
+{%- if dest_port is not none -%}
+  {%- do destination_obj.update({'port': dest_port}) -%}
+{%- endif -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'watchguard.firebox.traffic',
+    'category': ['network'], 'type': ['allowed' if action == 'Allow' else 'denied'],
+    'action': 'traffic_' ~ action.lower(), 'code': code, 'original': raw},
+  'observer': {'name': params.device_name, 'vendor': 'WatchGuard', 'product': 'Firebox'},
+  'source': source_obj, 'destination': destination_obj,
+  'network': {'transport': transport},
+  'rule': {'name': policy},
+  'related': {'ip': [source_ip, dest_ip]},
+  'watchguard': {'firebox': {'reason': policy, 'return_code': '406' if action == 'Allow' else '101'}}} -%}
+{{ record | tojson }}
