@@ -1,0 +1,45 @@
+{%- for key in ['to_failed_login', 'to_success_login', 'to_pop3_login', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- set protocol = 'imap' -%}
+{%- set user = module.rand.choice(['alice@corp.example', 'bob@corp.example', 'support@corp.example']) -%}
+{%- set client = module.rand.choice(['10.20.10.11', '10.20.10.12', '10.20.10.13']) -%}
+{%- set result = module.rand.weighted_choice(['success', 'failure'], [96, 4]) -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 45 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('failed_count', 0) -%}{%- do shared.set('to_failed_login', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{%- elif stage == 'failed_login' -%}
+  {%- set user = params.target_user -%}{%- set client = params.suspicious_client_ip -%}{%- set result = 'failure' -%}
+  {%- set count = shared.get('failed_count', 0) + 1 -%}
+  {%- if count >= 4 -%}{%- do shared.set('failed_count', 0) -%}{%- do shared.set('to_success_login', true) -%}{%- else -%}{%- do shared.set('failed_count', count) -%}{%- endif -%}
+{%- elif stage == 'success_login' -%}
+  {%- set user = params.target_user -%}{%- set client = params.suspicious_client_ip -%}{%- set result = 'success' -%}
+  {%- do shared.set('to_pop3_login', true) -%}
+{%- else -%}
+  {%- set user = params.target_user -%}{%- set client = params.suspicious_client_ip -%}{%- set result = 'success' -%}{%- set protocol = 'pop3' -%}
+  {%- do shared.set('to_routine', true) -%}
+{%- endif -%}
+{%- set session_id = module.rand.string.hex(16) -%}
+{%- if result == 'success' -%}
+  {%- set mpid = module.rand.number.integer(10000, 60000) -%}
+  {%- set body = protocol ~ '-login: Login: user=<' ~ user ~ '>, method=PLAIN, rip=' ~ client ~ ', lip=' ~ params.local_ip ~ ', mpid=' ~ mpid ~ ', TLS, session=<' ~ session_id ~ '>' -%}
+{%- else -%}
+  {%- set body = protocol ~ '-login: Disconnected (auth failed, 1 attempts in 2 secs): user=<' ~ user ~ '>, method=PLAIN, rip=' ~ client ~ ', lip=' ~ params.local_ip ~ ', TLS, session=<' ~ session_id ~ '>' -%}
+{%- endif -%}
+{%- set original = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.host_name ~ ' dovecot: ' ~ body -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['authentication'], 'type': ['start'] if result == 'success' else ['denied'], 'action': 'login-' ~ result, 'outcome': result, 'original': original},
+  'host': {'name': params.host_name, 'ip': [params.local_ip]},
+  'service': {'name': 'dovecot', 'type': protocol},
+  'user': {'name': user},
+  'source': {'ip': client},
+  'destination': {'ip': params.local_ip, 'port': 995 if protocol == 'pop3' else 993},
+  'related': {'ip': [client, params.local_ip], 'user': [user]},
+  'dovecot': {'protocol': protocol, 'login_result': result, 'method': 'PLAIN', 'session': session_id, 'tls': true}
+} -%}
+{%- if result == 'success' -%}{%- do event.dovecot.update({'mpid': mpid}) -%}{%- endif -%}
+{{- event | tojson -}}
