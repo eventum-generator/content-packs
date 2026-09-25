@@ -1,0 +1,54 @@
+{%- set previous_time = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous_time is none or timestamp > previous_time else previous_time + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set interval = params.anomaly_interval_events | int -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (interval + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= interval -%}
+{%- set step = tick - interval if chain else -1 -%}
+{%- if chain -%}
+  {%- set host_name = params.target_host -%}
+  {%- set device_id = params.target_device_id -%}
+  {%- set device_ip = params.target_ip -%}
+  {%- set file_path = params.target_path -%}
+  {%- set user_name = params.target_user -%}
+  {%- set kind = 'threat' if step == 3 else 'hips' -%}
+{%- else -%}
+  {%- set device = module.rand.choice([['ws-ops-01','a2e114a8-9070-4868-8ee2-1e87b7b85ee1','10.20.1.31'],['ws-sales-02','a2e114a8-9070-4868-8ee2-1e87b7b85ee2','10.20.1.32'],['ws-hr-03','a2e114a8-9070-4868-8ee2-1e87b7b85ee3','10.20.1.33'],['ws-dev-04','a2e114a8-9070-4868-8ee2-1e87b7b85ee4','10.20.1.34']]) -%}
+  {%- set host_name = device[0] -%}
+  {%- set device_id = device[1] -%}
+  {%- set device_ip = device[2] -%}
+  {%- set file_path = 'C:\\Users\\Public\\' ~ module.rand.choice(['tool.exe', 'installer.exe', 'archive.exe']) -%}
+  {%- set user_name = 'EXAMPLE\\employee' -%}
+  {%- set roll = module.rand.number.integer(1, 100) -%}
+  {%- set kind = 'firewall' if roll <= 45 else ('threat' if roll <= 75 else 'hips') -%}
+{%- endif -%}
+{%- set rt = event_time.strftime('%b %d %Y %H:%M:%S') -%}
+{%- set common = 'dvc=' ~ device_ip ~ ' dvchost=' ~ host_name ~ ' deviceExternalId=' ~ device_id ~ ' ESETProtectDeviceGroupName=All/Workstations ESETProtectDeviceOsName=Microsoft Windows 11 Pro ESETProtectDeviceGroupDescription=Workstations rt=' ~ rt ~ ' ' -%}
+{%- set cef_path = file_path | replace('\\', '\\\\') -%}
+{%- set uri_path = file_path | replace('\\', '/') -%}
+{%- set hash_value = 'ab151235dcf905cb5fc2e3b8a6fe731d31878cc1' if chain else module.rand.choice(['c692a53f4fd6c7a374ff884a60c9c2aa775a3a2c', '25b101fd1d72dd7e5e918679c04fd3ad604b7c67', '858a097c3ac2c04f8a321077608fec25940f78d6']) -%}
+{%- if kind == 'hips' -%}
+  {%- set class_id = '303' -%}
+  {%- set event_name = 'Attempt to run a suspicious object Blocked' -%}
+  {%- set ext = 'cat=ESET HIPS Event cs3=C:\\\\Windows\\\\explorer.exe cs3Label=Application cs4=Attempt to run a suspicious object cs4Label=Operation cs5=' ~ cef_path ~ ' cs5Label=Target act=Blocked cn1=1 cn1Label=Handled cs1=Suspicious attempt to launch an application cs1Label=Rule ID cs2=Block suspicious application cs2Label=Rule Name cnt=1' -%}
+  {%- set category = 'intrusion_detection' -%}
+  {%- set event_type = 'denied' -%}
+  {%- set action = 'Blocked' -%}
+{%- elif kind == 'threat' -%}
+  {%- set class_id = '183' -%}
+  {%- set event_name = 'File scanner cleaned a virus' -%}
+  {%- set ext = 'cat=ESET Threat Event cs1=Win32/Agent.ABC cs1Label=Threat Name cs2=29000 (20260925) cs2Label=Engine Version cs3=Virus cs3Label=Threat Type cs4=Real-time file system protection cs4Label=Scanner ID cs5=scan001 cs5Label=Scan ID act=Cleaned by deleting fileType=File filePath=file:///' ~ uri_path ~ ' cn1=1 cn1Label=Handled suser=' ~ (user_name | replace('\\', '\\\\')) ~ ' sprod=C:\\\\Windows\\\\explorer.exe cs7=Event occurred on a newly created file cs7Label=Circumstances deviceCustomDate1=' ~ rt ~ ' deviceCustomDate1Label=FirstSeen cs8=' ~ hash_value ~ ' cs8Label=Hash' -%}
+  {%- set category = 'malware' -%}
+  {%- set event_type = 'info' -%}
+  {%- set action = 'Cleaned by deleting' -%}
+{%- else -%}
+  {%- set class_id = '209' -%}
+  {%- set event_name = 'Detected port scanning attack' -%}
+  {%- set ext = 'cat=ESET Firewall Event msg=TCP Port Scanning attack src=198.51.100.90 spt=36324 dst=' ~ device_ip ~ ' dpt=445 proto=tcp act=Blocked cn1=1 cn1Label=Handled cnt=1 deviceProcessName=System deviceDirection=0 suser=EXAMPLE\\employee cs2=Block port scan cs2Label=Rule Name cs3=Win32/Botnet.generic cs3Label=Threat Name' -%}
+  {%- set category = 'network' -%}
+  {%- set event_type = 'denied' -%}
+  {%- set action = 'Blocked' -%}
+{%- endif -%}
+{%- set raw = 'CEF:0|ESET|Protect|' ~ params.protect_version ~ '|' ~ class_id ~ '|' ~ event_name ~ '|5|' ~ common ~ ext -%}
+{"@timestamp":{{ event_time.isoformat() | tojson }},"ecs":{"version":"8.17.0"},"event":{"kind":"alert","module":"eset","dataset":"eset.protect","code":{{ class_id | tojson }},"action":{{ action | tojson }},"category":[{{ category | tojson }}],"type":[{{ event_type | tojson }}],"original":{{ raw | tojson }}},"host":{"name":{{ host_name | tojson }},"id":{{ device_id | tojson }},"ip":[{{ device_ip | tojson }}]},"observer":{"name":{{ params.protect_host | tojson }},"product":"Protect","vendor":"ESET","version":{{ params.protect_version | tojson }}},"eset":{"protect":{"category":{{ kind | tojson }},"class_id":{{ class_id | tojson }},"action":{{ action | tojson }}}}{% if kind != 'firewall' %},"file":{"path":{{ file_path | tojson }}{% if kind == 'threat' %},"hash":{"sha1":{{ hash_value | tojson }}}{% endif %}}{% endif %}{% if kind == 'threat' %},"user":{"name":{{ user_name | tojson }}}{% endif %}}
