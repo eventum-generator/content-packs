@@ -1,0 +1,57 @@
+{%- for key in ['to_pveam_start', 'to_pveam_download', 'to_pveam_finished', 'to_pveam_download_data', 'to_pveam_finished_data', 'to_pveam_signature', 'to_pveam_success', 'to_ticket_denied', 'to_ticket_success', 'to_vm_stop', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 70 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('denied_count', 0) -%}{%- do shared.set('to_ticket_denied', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- if count % 23 == 0 -%}{%- do shared.set('to_pveam_start', true) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['status', 'ticket_ok', 'config'], [80, 12, 8]) -%}
+{%- elif stage == 'ticket_denied' -%}
+  {%- set kind = 'ticket_denied' -%}
+  {%- set denied_count = shared.get('denied_count', 0) + 1 -%}
+  {%- if denied_count >= 3 -%}{%- do shared.set('denied_count', 0) -%}{%- do shared.set('to_ticket_success', true) -%}{%- else -%}{%- do shared.set('denied_count', denied_count) -%}{%- endif -%}
+{%- elif stage == 'ticket_success' -%}
+  {%- set kind = 'ticket_success' -%}{%- do shared.set('to_vm_stop', true) -%}
+{%- elif stage == 'vm_stop' -%}
+  {%- set kind = 'vm_stop' -%}{%- do shared.set('to_routine', true) -%}
+{%- else -%}
+  {%- set kind = stage -%}
+  {%- if stage == 'pveam_start' -%}{%- do shared.set('to_pveam_download', true) -%}
+  {%- elif stage == 'pveam_download' -%}{%- do shared.set('to_pveam_finished', true) -%}
+  {%- elif stage == 'pveam_finished' -%}{%- do shared.set('to_pveam_download_data', true) -%}
+  {%- elif stage == 'pveam_download_data' -%}{%- do shared.set('to_pveam_finished_data', true) -%}
+  {%- elif stage == 'pveam_finished_data' -%}{%- do shared.set('to_pveam_signature', true) -%}
+  {%- elif stage == 'pveam_signature' -%}{%- do shared.set('to_pveam_success', true) -%}
+  {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{%- endif -%}
+{%- set is_pveam = kind.startswith('pveam_') -%}
+{%- set ip = params.suspect_ip if kind in ['ticket_denied', 'ticket_success', 'vm_stop'] else module.rand.choice(['10.20.1.11', '10.20.1.12', '10.20.1.13']) -%}
+{%- set user_name = params.suspect_user if kind == 'vm_stop' else module.rand.choice(['admin@pam', 'monitor@pve']) -%}
+{%- if kind == 'pveam_start' -%}{%- set message = 'starting update' -%}
+{%- elif kind == 'pveam_download' -%}{%- set message = 'start download https://releases.turnkeylinux.org/pve/aplinfo.dat.asc' -%}
+{%- elif kind == 'pveam_finished' -%}{%- set message = 'download finished: 200 OK' -%}
+{%- elif kind == 'pveam_download_data' -%}{%- set message = 'start download https://releases.turnkeylinux.org/pve/aplinfo.dat.gz' -%}
+{%- elif kind == 'pveam_finished_data' -%}{%- set message = 'download finished: 200 OK' -%}
+{%- elif kind == 'pveam_signature' -%}{%- set message = 'signature verification: gpgv: Good signature from "Turnkey Linux Release Key <release@turnkeylinux.com>"' -%}
+{%- elif kind == 'pveam_success' -%}{%- set message = 'update successful' -%}
+{%- elif kind == 'status' -%}{%- set message = 'GET /api2/json/nodes/' ~ params.node_name ~ '/qemu/101/status/current HTTP/1.1' -%}
+{%- elif kind == 'config' -%}{%- set message = 'GET /api2/json/nodes/' ~ params.node_name ~ '/qemu/101/config HTTP/1.1' -%}
+{%- elif kind == 'vm_stop' -%}{%- set message = 'POST /api2/json/nodes/' ~ params.node_name ~ '/qemu/' ~ params.target_vmid ~ '/status/stop HTTP/1.1' -%}
+{%- else -%}{%- set message = 'POST /api2/json/access/ticket HTTP/1.1' -%}{%- endif -%}
+{%- if is_pveam -%}
+  {%- set original = timestamp.strftime('%Y-%m-%d %H:%M:%S') ~ ' ' ~ message -%}
+  {%- set event_meta = {'kind': 'event', 'category': ['package'], 'type': ['start'] if kind in ['pveam_start', 'pveam_download', 'pveam_download_data'] else ['info'] if kind in ['pveam_finished', 'pveam_finished_data', 'pveam_signature'] else ['end'], 'action': kind.replace('_', '-'), 'original': original} -%}
+  {%- set event = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': event_meta, 'host': {'name': params.node_name}, 'log': {'file': {'path': '/var/log/pveam.log'}}, 'proxmox': {'pveam': {'message': message}}} -%}
+{%- else -%}
+  {%- set code = 401 if kind == 'ticket_denied' else 200 -%}
+  {%- set size = 13 if kind == 'ticket_denied' else 740 if kind in ['ticket_ok', 'ticket_success'] else 121 if kind == 'vm_stop' else 442 -%}
+  {%- set log_user = '-' if kind in ['ticket_denied', 'ticket_ok', 'ticket_success'] else user_name -%}
+  {%- set original = '::ffff:' ~ ip ~ ' - ' ~ log_user ~ ' [' ~ timestamp.strftime('%d/%b/%Y:%H:%M:%S %z') ~ '] "' ~ message ~ '" ' ~ code ~ ' ' ~ size -%}
+  {%- set action = 'ticket-denied' if kind == 'ticket_denied' else 'ticket-issued' if kind in ['ticket_ok', 'ticket_success'] else 'vm-stop-request' if kind == 'vm_stop' else 'api-read' -%}
+  {%- set event_meta = {'kind': 'event', 'category': ['authentication'] if kind in ['ticket_denied', 'ticket_ok', 'ticket_success'] else ['host'] if kind == 'vm_stop' else ['web'], 'type': ['denied'] if kind == 'ticket_denied' else ['start'] if kind in ['ticket_ok', 'ticket_success'] else ['change'] if kind == 'vm_stop' else ['access'], 'action': action, 'outcome': 'failure' if kind == 'ticket_denied' else 'success', 'original': original} -%}
+  {%- set event = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': event_meta, 'host': {'name': params.node_name}, 'source': {'ip': ip}, 'related': {'ip': [ip]}, 'http': {'request': {'method': 'POST' if message.startswith('POST') else 'GET'}, 'response': {'status_code': code, 'body': {'bytes': size}}}, 'url': {'path': message.split(' ')[1]}, 'log': {'file': {'path': '/var/log/pveproxy/access.log'}}, 'proxmox': {'access': {'username': log_user}}} -%}
+  {%- if log_user != '-' -%}{%- do event.update({'user': {'name': log_user}}) -%}{%- do event.related.update({'user': [log_user]}) -%}{%- endif -%}
+{%- endif -%}
+{{- event | tojson -}}
