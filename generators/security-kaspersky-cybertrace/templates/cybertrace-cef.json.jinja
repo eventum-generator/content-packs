@@ -1,41 +1,83 @@
 {%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- set clock = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set event_time = clock if previous is none or clock > previous else previous + module.datetime.timedelta(minutes=5) -%}
 {%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 3) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- set stage = shared.get('anomaly_stage', -1) -%}
+{%- set routine_count = shared.get('routine_count', 0) -%}
+{%- if params.anomaly_mode and stage == -1 and routine_count >= params.anomaly_delay_events -%}
+  {%- set stage = 0 -%}
+{%- endif -%}
+{%- set chain = 0 <= stage < 3 -%}
 {%- if chain -%}
-  {%- set kind = ['KL_Malicious_URL', 'KL_Malicious_Hash_MD5', 'KL_Malicious_URL'][step] -%}
+  {%- set kind = 'KL_Malicious_Hash_MD5' if stage == 1 else 'KL_Malicious_URL' -%}
   {%- set endpoint_ip = params.target_endpoint_ip -%}
   {%- set user_name = params.target_user -%}
-  {%- set url = params.target_url if step != 1 else '-' -%}
-  {%- set hash = params.target_md5 if step == 1 else '-' -%}
+  {%- set dst_ip = params.target_destination_ip -%}
+  {%- set url = params.target_url if stage != 1 else '-' -%}
+  {%- set hash = params.target_md5 if stage == 1 else '-' -%}
+  {%- do shared.set('anomaly_stage', stage + 1) -%}
 {%- else -%}
-  {%- set kind = module.rand.weighted_choice(['KL_Malicious_URL', 'KL_Phishing_URL', 'KL_Malicious_Hash_MD5'], [65, 25, 10]) -%}
-  {%- set endpoint_ip = module.rand.choice(['192.0.2.20', '192.0.2.21', '192.0.2.22']) -%}
-  {%- set user_name = module.rand.choice(['analyst', 'developer', 'operator']) -%}
-  {%- set url = module.rand.choice(['https://ioc.example.test/a', 'https://phish.example.test/login']) if kind != 'KL_Malicious_Hash_MD5' else '-' -%}
-  {%- set hash = '44D88612FEA8A8F36DE82E1278ABB02F' if kind == 'KL_Malicious_Hash_MD5' else '-' -%}
+  {%- set routine_index = (shared.get('routine_index', -1) + 1) % 288 -%}
+  {%- do shared.set('routine_index', routine_index) -%}
+  {%- do shared.set('routine_count', [routine_count + 1, params.anomaly_delay_events] | min) -%}
+  {%- if routine_index in [4, 148] -%}
+    {%- set kind = 'KL_Malicious_URL' if routine_index == 4 else 'KL_Malicious_Hash_MD5' -%}
+    {%- set endpoint_ip = params.target_endpoint_ip -%}
+    {%- set user_name = params.target_user -%}
+    {%- set dst_ip = params.target_destination_ip -%}
+    {%- set url = params.target_url if routine_index == 4 else '-' -%}
+    {%- set hash = params.target_md5 if routine_index == 148 else '-' -%}
+  {%- else -%}
+    {%- set kind = module.rand.weighted_choice(
+      ['KL_Malicious_URL', 'KL_Phishing_URL', 'KL_Malicious_Hash_MD5'], [65, 25, 10]) -%}
+    {%- set octet = module.rand.choice(
+      [module.rand.number.integer(20, 42), module.rand.number.integer(50, 69)]) -%}
+    {%- set endpoint_ip = '10.20.1.' ~ octet -%}
+    {%- set user_name = ['analyst', 'developer', 'operator', 'svc-web'][octet % 4] -%}
+    {%- set dst_ip = module.rand.choice(['198.51.100.11', '198.51.100.12', '198.51.100.13']) -%}
+    {%- if kind == 'KL_Malicious_URL' -%}
+      {%- set url = module.rand.choice(
+        ['https://ioc.example.test/a', 'https://ioc.example.test/b', 'https://bad.example.test/update']) -%}
+      {%- set hash = '-' -%}
+    {%- elif kind == 'KL_Phishing_URL' -%}
+      {%- set url = module.rand.choice(
+        ['https://phish.example.test/login', 'https://phish.example.test/verify']) -%}
+      {%- set hash = '-' -%}
+    {%- else -%}
+      {%- set url = '-' -%}
+      {%- set hash = module.rand.choice(
+        ['FEAF2058298C1E174C2B79AFFC7CF4DF', '44D88612FEA8A8F36DE82E1278ABB02F']) -%}
+    {%- endif -%}
+  {%- endif -%}
 {%- endif -%}
 {%- set indicator = hash if hash != '-' else url -%}
-{%- set event_id = 10000 + (shared.get('event_id', -1) + 1) % 999999999 -%}
-{%- do shared.set('event_id', event_id - 10000) -%}
-{%- set raw = 'CEF:0|Kaspersky Lab|Kaspersky CyberTrace for ArcSight|2.0|2|CyberTrace Detection Event|8|'
-  ~ ' reason=' ~ kind ~ ' dst=198.51.100.10 src=' ~ endpoint_ip
+{%- set context = 'MD5:' ~ hash if hash != '-' else 'mask:' ~ url -%}
+{%- set event_id = shared.get('next_external_id') -%}
+{%- if event_id is none -%}
+  {%- set event_id = module.rand.number.integer(100000, 900000) -%}
+{%- endif -%}
+{%- do shared.set('next_external_id', (event_id + 1) % 1000000000) -%}
+{%- set raw = 'CEF:0|Kaspersky|Kaspersky CyberTrace for ArcSight|2.0|2|CyberTrace Detection Event|8|'
+  ~ ' reason=' ~ kind ~ ' dst=' ~ dst_ip ~ ' src=' ~ endpoint_ip
   ~ ' fileHash=' ~ hash ~ ' request=' ~ url
   ~ ' sourceServiceName=ExampleVendor sproc=EndpointSecurity suser=' ~ user_name
   ~ ' msg=CyberTrace detected ' ~ kind ~ ' externalId=' ~ event_id
   ~ ' cs5Label=MatchedIndicator cs5=' ~ indicator
-  ~ ' cs6Label=Context cs6=feed=Example_Feed.json' -%}
+  ~ ' cn3Label=Confidence cn3=100 cs6Label=Context cs6=' ~ context -%}
 {%- set record = {'@timestamp': event_time.isoformat(),
   'ecs': {'version': '8.17.0'},
   'event': {'kind': 'alert', 'dataset': 'kaspersky.cybertrace',
-    'category': ['threat'], 'type': ['indicator'], 'code': kind,
+    'category': ['threat'], 'type': ['indicator'], 'code': kind, 'severity': 8,
     'action': 'indicator_match', 'original': raw},
-  'source': {'ip': endpoint_ip}, 'destination': {'ip': '198.51.100.10'},
+  'source': {'ip': endpoint_ip}, 'destination': {'ip': dst_ip},
+  'observer': {'vendor': 'Kaspersky', 'product': 'Kaspersky CyberTrace for ArcSight'},
   'user': {'name': user_name},
-  'related': {'ip': [endpoint_ip, '198.51.100.10'], 'user': [user_name]},
+  'related': {'ip': [endpoint_ip, dst_ip], 'user': [user_name]},
   'kaspersky': {'cybertrace': {'matched_indicator': indicator,
-    'external_id': event_id, 'feed': 'Example_Feed.json'}}} -%}
+    'external_id': event_id, 'confidence': 100, 'record_context': context}}} -%}
+{%- if url != '-' -%}
+  {%- do record.update({'url': {'original': url}}) -%}
+{%- else -%}
+  {%- do record.update({'file': {'hash': {'md5': hash | lower}}}) -%}
+{%- endif -%}
 {{ record | tojson }}

@@ -1,60 +1,67 @@
-# Kaspersky CyberTrace ArcSight CEF
+# Kaspersky CyberTrace ArcSight CEF detections
 
-Indicator-match events using the documented CyberTrace for ArcSight CEF pattern. Eventum writes ECS JSON and preserves the native CEF record in `event.original`.
+Synthetic detection events for Kaspersky CyberTrace 4.0 using its documented, configurable ArcSight CEF pattern. Eventum writes ECS JSON and places the CEF message in event.original. The 2.0 text in the CEF device-version segment is part of Kaspersky's ArcSight pattern; it is not a claim that the modeled CyberTrace product version is 2.0.
 
 ## Event types
 
-| Detection category | Meaning | Approximate background frequency |
+| Category in CEF reason | Matched indicator | Approximate share |
 | --- | --- | --- |
-| `KL_Malicious_URL` | Malicious URL match | 65% |
-| `KL_Phishing_URL` | Phishing URL match | 25% |
-| `KL_Malicious_Hash_MD5` | Malicious MD5 match | 10% |
+| KL_Malicious_URL | Malicious URL | 65% |
+| KL_Phishing_URL | Phishing URL | 25% |
+| KL_Malicious_Hash_MD5 | Malicious file MD5 | 10% |
 
-These are synthetic scenario weights, not production measurements. The CEF signature `2` is the documented CyberTrace Detection Event for all three categories; the category is in `reason`.
+One event is generated every five synthetic minutes, about 288 detections per day across more than 40 modeled endpoint addresses. Shares and rate are scenario assumptions, not Kaspersky production measurements. Category names and indicator types follow Kaspersky's documented verification examples.
 
 ## Anomaly Chain
 
-After 60 routine records, one endpoint and user produce a malicious URL match, a malicious MD5 match, and a repeat of the same URL match. Correlate by CEF `src` and `suser`, then compare `cs5` and `reason` over the time window. This supports a rule for multiple indicator categories followed by renewed contact with the first URL.
+With anomaly_mode: true, one sequence begins after 12 routine events, about one synthetic hour:
 
-`anomaly_mode: true` is the default and mixes the sequence with background. Set it to `false` for background only. Sort by `@timestamp` when checking the sequence; concurrent output may reorder lines.
+1. An endpoint at 10.20.1.44 under user operator matches a malicious URL.
+2. Five minutes later, the same endpoint and user match a malicious MD5.
+3. Five minutes later, the endpoint and user match the original URL again.
+
+Correlate CEF src and suser, then compare reason and cs5 (MatchedIndicator) within ten minutes. The sequence suggests repeated contact after a file-hash detection. It assumes the incoming endpoint telemetry carries a stable device IP, user, URL and file hash. CyberTrace detections alone do not prove that the URL delivered that file or identify a process relationship.
+
+Background mode contains each exact individual target indicator signature, including endpoint, user, destination and record context. The URL and MD5 matches are spaced about 12 hours apart; no individual event exposes the mode. anomaly_mode defaults to true and inserts the sequence once per run. Set it to false for background only. Sort on @timestamp when inspecting output because concurrent writes can reorder lines.
 
 ## Parameters
 
 ### Event Parameters
 
-Edit `event.template.params` in `generator.yml`.
+Edit event.template.params in generator.yml.
 
 | Name | Default | Purpose |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Enable the multi-indicator chain. |
-| `anomaly_interval_events` | `60` | Routine records between chains. |
-| `target_endpoint_ip` | `192.0.2.44` | Endpoint for all chain matches. |
-| `target_user` | `operator` | User for all chain matches. |
-| `target_url` | `https://malware.example.test/dropper` | Repeated URL indicator. |
-| `target_md5` | `C912705B4BBB14EC7E78FA8B370532C9` | MD5 indicator. |
+| anomaly_mode | true | Include the one-time URL → MD5 → URL sequence. |
+| anomaly_delay_events | 12 | Routine detections before the sequence. |
+| target_endpoint_ip | 10.20.1.44 | Endpoint in occasional individual matches and the sequence. |
+| target_destination_ip | 198.51.100.10 | Destination extracted from those incoming events. |
+| target_user | operator | User in those incoming events. |
+| target_url | https://malware.example.test/dropper | Repeated URL indicator. |
+| target_md5 | C912705B4BBB14EC7E78FA8B370532C9 | MD5 indicator. |
 
 ### Output Parameters
 
-The shipped file output needs no overrides. Replace `output.file` with another output plugin and use top-level `${params.*}` or `${secrets.*}` substitutions for destination settings when needed.
+File output works as shipped and needs no top-level params or secrets. To send events elsewhere, replace output.file with another output plugin and declare top-level params/secrets for that destination.
 
 ## Usage
 
-From the content-packs repository:
+Run from the content-packs repository:
 
-```bash
+~~~bash
 eventum generate --path generators/security-kaspersky-cybertrace/generator.yml --id cybertrace --live-mode false
 eventum generate --path generators/security-kaspersky-cybertrace/generator.yml --id cybertrace --live-mode true
-```
+~~~
 
-Output: `generators/security-kaspersky-cybertrace/output/events.json`. Extract `event.original` for a collector that expects raw CEF.
+Events are written to generators/security-kaspersky-cybertrace/output/events.json. A CEF collector needs event.original, rather than the surrounding ECS JSON.
 
 ## Sample output
 
-Copied from an actual anomaly-mode run:
+This complete MD5 detection is from an anomaly-mode Eventum run:
 
-```json
+~~~json
 {
-  "@timestamp": "2026-09-25T13:21:05+00:00",
+  "@timestamp": "2026-09-25T18:55:00+00:00",
   "destination": {
     "ip": "198.51.100.10"
   },
@@ -66,24 +73,35 @@ Copied from an actual anomaly-mode run:
     "category": [
       "threat"
     ],
-    "code": "KL_Malicious_URL",
+    "code": "KL_Malicious_Hash_MD5",
     "dataset": "kaspersky.cybertrace",
     "kind": "alert",
-    "original": "CEF:0|Kaspersky Lab|Kaspersky CyberTrace for ArcSight|2.0|2|CyberTrace Detection Event|8| reason=KL_Malicious_URL dst=198.51.100.10 src=192.0.2.44 fileHash=- request=https://malware.example.test/dropper sourceServiceName=ExampleVendor sproc=EndpointSecurity suser=operator msg=CyberTrace detected KL_Malicious_URL externalId=10060 cs5Label=MatchedIndicator cs5=https://malware.example.test/dropper cs6Label=Context cs6=feed=Example_Feed.json",
+    "original": "CEF:0|Kaspersky|Kaspersky CyberTrace for ArcSight|2.0|2|CyberTrace Detection Event|8| reason=KL_Malicious_Hash_MD5 dst=198.51.100.10 src=10.20.1.44 fileHash=C912705B4BBB14EC7E78FA8B370532C9 request=- sourceServiceName=ExampleVendor sproc=EndpointSecurity suser=operator msg=CyberTrace detected KL_Malicious_Hash_MD5 externalId=675033 cs5Label=MatchedIndicator cs5=C912705B4BBB14EC7E78FA8B370532C9 cn3Label=Confidence cn3=100 cs6Label=Context cs6=MD5:C912705B4BBB14EC7E78FA8B370532C9",
+    "severity": 8,
     "type": [
       "indicator"
     ]
   },
+  "file": {
+    "hash": {
+      "md5": "c912705b4bbb14ec7e78fa8b370532c9"
+    }
+  },
   "kaspersky": {
     "cybertrace": {
-      "external_id": 10060,
-      "feed": "Example_Feed.json",
-      "matched_indicator": "https://malware.example.test/dropper"
+      "confidence": 100,
+      "external_id": 675033,
+      "matched_indicator": "C912705B4BBB14EC7E78FA8B370532C9",
+      "record_context": "MD5:C912705B4BBB14EC7E78FA8B370532C9"
     }
+  },
+  "observer": {
+    "product": "Kaspersky CyberTrace for ArcSight",
+    "vendor": "Kaspersky"
   },
   "related": {
     "ip": [
-      "192.0.2.44",
+      "10.20.1.44",
       "198.51.100.10"
     ],
     "user": [
@@ -91,22 +109,30 @@ Copied from an actual anomaly-mode run:
     ]
   },
   "source": {
-    "ip": "192.0.2.44"
+    "ip": "10.20.1.44"
   },
   "user": {
     "name": "operator"
   }
 }
-```
+~~~
 
-## Scope and validation
+## Scope and evidence
 
-The selected CEF pattern fields are covered 21/21, including the seven header segments and fourteen populated extension keys. Configurable actionable fields are omitted. Both modes were parsed and checked for the complete chain or its absence.
+This is the Kaspersky:CyberTrace:ArcSight CEF Detection Event stream, distinct from Kaspersky NGFW Firewall, KATA, Security Center, mail and proxy streams. The CyberTrace 4.0 ArcSight integration guide supplies the chosen Kaspersky CEF header, order of 16 populated extension keys, and cs5/cn3/cs6 label literals. This configured variant clears the optional actionable fields as the guide permits. The selected output values are synthetic substitutions for the documented patterns, not a replay of device output. The externalId seed varies between runs and increments within a run.
 
-KUMA 4.2 lists a CyberTrace regexp normalizer. This pack uses Kaspersky's ArcSight CEF pattern; compatibility with that regexp normalizer is not established. Use a suitable CEF parser or adapt the CyberTrace event pattern to the target SIEM.
+The ArcSight CEF pattern does not contain a timestamp field. @timestamp is therefore the synthetic Eventum event time, not a timestamp parsed from event.original. CEF src is the incoming event's endpoint IP (%DeviceIp%), not the CyberTrace server address. CEF cs6 contains the documented-style record context: mask for URL matches or MD5 for hash matches. ECS url.original or file.hash.md5 is populated according to the matched indicator.
+
+Kaspersky publishes a complete plain-text CyberTrace 4.0 MD5 detection and a complete ArcSight CEF record for CyberTrace 5.3. The 5.3 record corroborates the Kaspersky header, confidence pair and colon-separated context, but cannot establish byte-exact 4.0 output. The exact live substitutions, escaping and target-collector compatibility remain unverified without a 4.0 capture. KUMA 4.2 lists a regexp CyberTrace normalizer, not a documented parser for this custom ArcSight CEF pattern. Kaspersky's ArcSight connector guide specifies Raw TCP; the shipped file output does not reproduce that transport. Use a matching CEF parser or configure CyberTrace's event format for the target SIEM.
+
+Both modes were run and checked for all categories, exact CEF-pattern structure, raw/ECS field consistency, UTC five-minute cadence, unique externalId values, and the sequence distinction. The README sample was copied from the generated anomaly run.
 
 ## References
 
-- [Kaspersky CyberTrace event format patterns](https://support.kaspersky.com/cybertrace/2020/en-us/197106.htm)
-- [Kaspersky CyberTrace detection categories](https://support.kaspersky.com/cybertrace/2020/en-us/171634.htm)
-- [KUMA 4.2 supported sources](https://support.kaspersky.ru/kuma/4.2/255782)
+- [CyberTrace 4.0 ArcSight integration CEF pattern and actionable fields](https://support.kaspersky.com/cybertrace/2020/en-us/174019.htm)
+- [CyberTrace 4.0 configurable event formats and plain-text sample](https://support.kaspersky.com/cybertrace/2020/en-us/197106.htm)
+- [CyberTrace 5.3 complete CEF detection example](https://support.kaspersky.ru/cyber-trace/5.3/313250)
+- [CyberTrace 4.0 release features](https://support.kaspersky.com/cybertrace/2020/en-us/192225.htm)
+- [Kaspersky verification feed categories and indicator examples](https://support.kaspersky.com/cybertrace/2020/en-us/171415.htm)
+- [KUMA 4.2 supported source normalizers](https://support.kaspersky.ru/kuma/4.2/255782)
+- [Kaspersky ArcSight Forwarding Connector setup (Raw TCP)](https://support.kaspersky.com/cybertrace/2020/en-us/167564.htm)
