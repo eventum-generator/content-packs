@@ -14,9 +14,9 @@ The template uses FSM mode and emits one record per simulated second from a sing
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), one workflow instance passes through `ahk8y → b6p4 → tzkv` three times after 32 ordinary workflow passes. The nine records share `sharepoint.workflow.instance_id` and the site, web, item, and list IDs. Each pass has its own `sharepoint.uls.correlation_id`, joining its three records within 20 ms of event time. A rule can group by workflow instance, sort by `@timestamp`, and find three starts with association lookups across distinct correlation IDs in a short window. Sort by `@timestamp`; output row order is not a reliable clock.
+With `anomaly_mode: true` (the default), one workflow instance passes through `ahk8y → b6p4 → tzkv` three times after 32 ordinary workflow passes. One of those ordinary passes already uses the same workflow and object IDs, so the ID alone does not identify the anomaly. The nine records share `sharepoint.workflow.instance_id` and the site, web, item, and list IDs. Each pass has its own `sharepoint.uls.correlation_id`, joining its three records within 20 ms of event time. A rule can group by workflow instance, sort by `@timestamp`, and find three starts with association lookups across distinct correlation IDs in a short window. Sort by `@timestamp`; output row order is not a reliable clock.
 
-Microsoft's troubleshooting guide uses these EventIDs and the correlation ID to investigate a workflow timer job stuck at “Pausing.” Repeated processing here is a synthetic investigation lead, not a documented failure signature or proof that the job is stuck. Diagnosing a stuck timer job also requires checking for absent new timer-job entries and the job's state. With `anomaly_mode: false`, the stream contains independent ordinary workflow passes and never emits the linked workflow instance.
+Microsoft's troubleshooting guide uses these EventIDs and the correlation ID to investigate a workflow timer job stuck at “Pausing.” Repeated processing here is a synthetic investigation lead, not a documented failure signature or proof that the job is stuck. Diagnosing a stuck timer job also requires checking for absent new timer-job entries and the job's state. With `anomaly_mode: false`, the stream includes one isolated ordinary pass for that workflow instance per 32 routine passes, but never a three-pass burst for it.
 
 ## Parameters
 
@@ -28,7 +28,7 @@ Edit `event.template.params` in `generator.yml`:
 | --- | --- | --- |
 | `anomaly_mode` | `true` | Include three linked workflow passes; `false` produces background only |
 | `farm_host` | `sp-app-01` | SharePoint server name |
-| `suspect_workflow_id` | `11111111-2222-4333-8444-555555555555` | Clearly synthetic workflow instance in the anomaly chain |
+| `suspect_workflow_id` | `11111111-2222-4333-8444-555555555555` | Clearly synthetic workflow instance used in one benign pass and the anomaly chain |
 | `routine_workflows_before_chain` | `32` | Ordinary three-record passes between anomaly chains |
 
 ### Output Parameters
@@ -51,7 +51,7 @@ This JSON event was copied from an anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T14:50:45.010000+00:00",
+  "@timestamp": "2026-09-25T14:52:13.010000+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -64,7 +64,7 @@ This JSON event was copied from an anomaly-mode run:
     "dataset": "sharepoint.uls",
     "kind": "event",
     "module": "sharepoint",
-    "original": "09/25/2026 14:50:45.01\tOWSTIMER.EXE (0x9318)\t0x6DF0\tSharePoint Foundation\tDatabase\tb6p4\tVerboseEx\tSqlCommand: ; EXEC proc_getworkflowassociations '08fed616-659d-4b02-81c4-235a3108575d', '586727fc-d194-4c88-b7d8-634f34ba6b54', '0a4da7b6-256e-4482-9ea1-271cf212fdf1', '0b3a7c76-1acc-4270-89ca-216c9648d4d0', @contenttypeid, @RequestGuid OUTPUT\tfe3ce123-d4df-42ce-80b6-fbecd22c43fe",
+    "original": "09/25/2026 14:52:13.01\tOWSTIMER.EXE (0x9318)\t0x6DF0\tSharePoint Foundation\tDatabase\tb6p4\tVerboseEx\tSqlCommand: ; EXEC proc_getworkflowassociations '285c2d48-d9c9-45d9-a726-8bc5033790b8', 'acff57c3-ea68-4eda-8f1d-3c641959299f', '6077cc34-5f9c-4bdd-8beb-c2aafe0a5b9e', '39fae561-5463-4dc7-8a8a-65ab28c8cb9b', @contenttypeid, @RequestGuid OUTPUT\t04bf54d9-3c8e-4034-ba8d-2d5749d91f44",
     "type": [
       "info"
     ]
@@ -75,7 +75,7 @@ This JSON event was copied from an anomaly-mode run:
   "log": {
     "level": "verboseex"
   },
-  "message": "SqlCommand: ; EXEC proc_getworkflowassociations '08fed616-659d-4b02-81c4-235a3108575d', '586727fc-d194-4c88-b7d8-634f34ba6b54', '0a4da7b6-256e-4482-9ea1-271cf212fdf1', '0b3a7c76-1acc-4270-89ca-216c9648d4d0', @contenttypeid, @RequestGuid OUTPUT",
+  "message": "SqlCommand: ; EXEC proc_getworkflowassociations '285c2d48-d9c9-45d9-a726-8bc5033790b8', 'acff57c3-ea68-4eda-8f1d-3c641959299f', '6077cc34-5f9c-4bdd-8beb-c2aafe0a5b9e', '39fae561-5463-4dc7-8a8a-65ab28c8cb9b', @contenttypeid, @RequestGuid OUTPUT",
   "process": {
     "name": "OWSTIMER.EXE",
     "pid": 37656,
@@ -96,20 +96,20 @@ This JSON event was copied from an anomaly-mode run:
     "uls": {
       "area": "SharePoint Foundation",
       "category": "Database",
-      "correlation_id": "fe3ce123-d4df-42ce-80b6-fbecd22c43fe",
+      "correlation_id": "04bf54d9-3c8e-4034-ba8d-2d5749d91f44",
       "event_id": "b6p4",
       "level": "VerboseEx",
-      "message": "SqlCommand: ; EXEC proc_getworkflowassociations '08fed616-659d-4b02-81c4-235a3108575d', '586727fc-d194-4c88-b7d8-634f34ba6b54', '0a4da7b6-256e-4482-9ea1-271cf212fdf1', '0b3a7c76-1acc-4270-89ca-216c9648d4d0', @contenttypeid, @RequestGuid OUTPUT",
+      "message": "SqlCommand: ; EXEC proc_getworkflowassociations '285c2d48-d9c9-45d9-a726-8bc5033790b8', 'acff57c3-ea68-4eda-8f1d-3c641959299f', '6077cc34-5f9c-4bdd-8beb-c2aafe0a5b9e', '39fae561-5463-4dc7-8a8a-65ab28c8cb9b', @contenttypeid, @RequestGuid OUTPUT",
       "process": "OWSTIMER.EXE (0x9318)",
       "thread_id": "0x6DF0",
-      "timestamp_local": "09/25/2026 14:50:45.01"
+      "timestamp_local": "09/25/2026 14:52:13.01"
     },
     "workflow": {
       "instance_id": "11111111-2222-4333-8444-555555555555",
-      "item_id": "0a4da7b6-256e-4482-9ea1-271cf212fdf1",
-      "list_id": "0b3a7c76-1acc-4270-89ca-216c9648d4d0",
-      "site_id": "08fed616-659d-4b02-81c4-235a3108575d",
-      "web_id": "586727fc-d194-4c88-b7d8-634f34ba6b54"
+      "item_id": "6077cc34-5f9c-4bdd-8beb-c2aafe0a5b9e",
+      "list_id": "39fae561-5463-4dc7-8a8a-65ab28c8cb9b",
+      "site_id": "285c2d48-d9c9-45d9-a726-8bc5033790b8",
+      "web_id": "acff57c3-ea68-4eda-8f1d-3c641959299f"
     }
   }
 }
