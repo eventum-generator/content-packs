@@ -1,0 +1,65 @@
+{%- for key in ['to_routine_request', 'to_routine_disposition', 'to_audit_change', 'to_attack_request', 'to_attack_issue'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- set code = 4886 -%}
+{%- set seq = shared.get('record_id', 310000) + 1 -%}{%- do shared.set('record_id', seq) -%}
+{%- set user = shared.get('requester', 'anna') -%}
+{%- set req_id = shared.get('request_id', 3000) -%}
+{%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template -%}
+{%- set data = {} -%}
+{%- if stage == 'routine_request' -%}
+  {%- set code = 4886 -%}
+  {%- set user = module.rand.choice(['anna', 'boris', 'irina', 'pavel', 'marina']) -%}
+  {%- set req_id = req_id + 1 -%}
+  {%- do shared.set('request_id', req_id) -%}
+  {%- do shared.set('requester', user) -%}
+  {%- do shared.set('to_routine_disposition', true) -%}
+{%- elif stage == 'routine_disposition' -%}
+  {%- set code = module.rand.weighted_choice([4887, 4888], [94, 6]) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 50 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_audit_change', true) -%}{%- else -%}{%- do shared.set('to_routine_request', true) -%}{%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', count) -%}
+    {%- do shared.set('to_routine_request', true) -%}
+  {%- endif -%}
+{%- elif stage == 'audit_change' -%}
+  {%- set code = 4885 -%}
+  {%- do shared.set('to_attack_request', true) -%}
+{%- elif stage == 'attack_request' -%}
+  {%- set code = 4886 -%}
+  {%- set user = params.suspicious_requester -%}
+  {%- set req_id = req_id + 1 -%}
+  {%- do shared.set('request_id', req_id) -%}
+  {%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template ~ '\nSAN:upn=' ~ params.privileged_upn -%}
+  {%- do shared.set('to_attack_issue', true) -%}
+{%- else -%}
+  {%- set code = 4887 -%}
+  {%- set user = params.suspicious_requester -%}
+  {%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template ~ '\nSAN:upn=' ~ params.privileged_upn -%}
+  {%- do shared.set('to_routine_request', true) -%}
+{%- endif -%}
+{%- if code == 4885 -%}
+  {%- set data = {'AuditFilter': '127', 'SubjectUserSid': 'S-1-5-21-1000000000-2000000000-3000000000-1105', 'SubjectUserName': params.suspicious_requester, 'SubjectDomainName': params.domain, 'SubjectLogonId': '0x48b320'} -%}
+{%- else -%}
+  {%- set data = {'RequestId': req_id|string, 'Requester': params.domain ~ '\\' ~ user, 'Attributes': attributes} -%}
+  {%- if code == 4887 -%}
+    {%- do data.update({'Disposition': '3', 'SubjectKeyIdentifier': module.rand.string.hex(40), 'Subject': 'CN=' ~ (params.privileged_upn if stage == 'attack_issue' else user ~ '.' ~ params.domain|lower)}) -%}
+  {%- elif code == 4888 -%}
+    {%- do data.update({'Disposition': '-2146875375', 'SubjectKeyIdentifier': module.rand.string.hex(40), 'Subject': ''}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set ns = namespace(xml='<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-A5BA-3E3B0328C30D}"/><EventID>' ~ code ~ '</EventID><Version>0</Version><Level>0</Level><Task>12805</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime="' ~ timestamp.isoformat() ~ '"/><EventRecordID>' ~ seq ~ '</EventRecordID><Correlation/><Execution ProcessID="652" ThreadID="368"/><Channel>Security</Channel><Computer>' ~ params.ca_host ~ '</Computer><Security/></System><EventData>') -%}
+{%- for key, value in data.items() -%}{%- set ns.xml = ns.xml ~ '<Data Name="' ~ key ~ '">' ~ (value|e) ~ '</Data>' -%}{%- endfor -%}
+{%- set ns.xml = ns.xml ~ '</EventData></Event>' -%}
+{%- set names = {4885: 'ca-audit-filter-changed', 4886: 'certificate-requested', 4887: 'certificate-issued', 4888: 'certificate-denied'} -%}
+{%- set category = ['configuration'] if code == 4885 else ['configuration'] -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'code': code|string, 'kind': 'event', 'category': category, 'type': ['change'] if code == 4885 else (['denied'] if code == 4888 else ['info']), 'outcome': 'failure' if code == 4888 else 'success', 'action': names[code], 'provider': 'Microsoft-Windows-Security-Auditing', 'original': ns.xml},
+  'host': {'name': params.ca_host},
+  'observer': {'name': params.ca_name, 'type': 'certificate-authority'},
+  'winlog': {'channel': 'Security', 'provider_name': 'Microsoft-Windows-Security-Auditing', 'event_id': code, 'record_id': seq, 'computer_name': params.ca_host, 'task': 'Certification Services', 'event_data': data}
+} -%}
+{{- event | tojson -}}
