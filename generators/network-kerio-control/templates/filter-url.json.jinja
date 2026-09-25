@@ -1,0 +1,34 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- if chain -%}
+  {%- set action = 'DENY' -%}
+  {%- set rule = 'Restricted Sites' -%}
+  {%- set client_ip = params.target_client_ip -%}
+  {%- set user_name = params.target_user -%}
+  {%- set url = 'http://' ~ params.target_domain ~ ['/', '/admin', '/config', '/backup'][step] -%}
+{%- else -%}
+  {%- set action = module.rand.weighted_choice(['ALLOW', 'DENY'], [85, 15]) -%}
+  {%- set rule = 'Web Access' if action == 'ALLOW' else 'Blocked Categories' -%}
+  {%- set client_ip = module.rand.choice(['192.0.2.20', '192.0.2.21', '192.0.2.22']) -%}
+  {%- set user_name = module.rand.choice(['user-one', 'user-two', 'visitor']) -%}
+  {%- set url = module.rand.choice(['http://updates.example.test/packages/index', 'http://intranet.example.test/home']) if action == 'ALLOW' else 'http://games.example.test/play' -%}
+{%- endif -%}
+{%- set raw = '[' ~ event_time.strftime('%d/%b/%Y %H:%M:%S') ~ '] '
+  ~ action ~ ' URL ' ~ "'" ~ rule ~ "'" ~ ' ' ~ client_ip ~ ' '
+  ~ user_name ~ ' HTTP GET ' ~ url -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'kerio.control_filter',
+    'category': ['web'], 'type': ['access'], 'action': action,
+    'original': raw},
+  'host': {'name': params.firewall_host},
+  'source': {'ip': client_ip}, 'user': {'name': user_name},
+  'http': {'request': {'method': 'GET'}}, 'url': {'full': url},
+  'related': {'ip': [client_ip], 'user': [user_name]},
+  'kerio': {'control': {'filter_rule': rule, 'filter_action': action}}} -%}
+{{ record | tojson }}
