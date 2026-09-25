@@ -45,10 +45,10 @@ The shipped configuration writes `output/events.json` and has no `${params.*}` o
 From the content-packs repository root:
 
 ```bash
-eventum generate --path generators/email-postfix/generator.yml --id email-postfix --live-mode true
+uv run --project ../eventum eventum generate --path generators/email-postfix/generator.yml --id email-postfix --live-mode true
 ```
 
-For a finite sample, add `input.cron.start` and `input.cron.end`, then run with `--live-mode false`.
+For a finite sample, add `input[0].cron.start` and `input[0].cron.end`, then run with `--live-mode false`.
 
 ## Sample Output
 
