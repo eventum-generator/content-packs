@@ -1,0 +1,61 @@
+{%- set step = vars.step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('start_anomaly', none) -%}
+  {%- set n = shared.get('routine_count', 0) + 1 -%}
+  {%- if n >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('start_anomaly', true) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', n) -%}
+  {%- endif -%}
+  {%- set name = module.rand.weighted_choice(
+      ['SCALL', 'CALL', 'TLOCK'], [80, 18, 2]) -%}
+  {%- set user = params.routine_user -%}
+  {%- set client_id = params.routine_client_id -%}
+  {%- set duration = module.rand.number.integer(100, 90000) -%}
+{%- else -%}
+  {%- set name = {'long_call': 'CALL', 'lock_wait': 'TLOCK',
+      'lock_timeout': 'TTIMEOUT', 'exception': 'EXCP'}[step] -%}
+  {%- set user = params.unusual_user -%}
+  {%- set client_id = params.unusual_client_id -%}
+  {%- set duration = {'long_call': 500000, 'lock_wait': 800000,
+      'lock_timeout': 900000, 'exception': 0}[step] -%}
+{%- endif -%}
+{%- set raw = {
+    'ts': timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f'),
+    'duration': duration | string,
+    'name': name, 'depth': '0',
+    'level': 'ERROR' if name in ['EXCP', 'TTIMEOUT'] else 'INFO',
+    'process': params.process_name,
+    'OSThread': '15968' if step != 'routine' else '15432',
+    'ClientID': client_id, 'SessionID': '421' if step != 'routine' else '103',
+    'Usr': user, 'p:processName': params.infobase
+} -%}
+{%- if name in ['SCALL', 'CALL'] -%}
+  {%- set call_id = (shared.get('call_id', 28283) % 999999) + 1 -%}
+  {%- do shared.set('call_id', call_id) -%}
+  {%- do raw.update({'Interface': 'bc15bd01-10bf-413c-a856-ddc907fcd123',
+      'IName': 'IVResourceRemoteConnection', 'Method': '0',
+      'CallID': call_id | string, 'MName': 'send', 'DstClientID': '122'}) -%}
+{%- elif name in ['TLOCK', 'TTIMEOUT'] -%}
+  {%- do raw.update({'Regions': 'Document.SalesOrder',
+      'WaitConnections': 'ClientID=88'}) -%}
+{%- else -%}
+  {%- do raw.update({'Descr': 'Transaction lock timeout',
+      'Database': params.infobase, 'Dbms': 'DBPOSTGRS'}) -%}
+{%- endif -%}
+{{ {'@timestamp': timestamp.isoformat(),
+    'ecs': {'version': '8.17.0'},
+    'event': {'dataset': '1c.techjournal', 'kind': 'event',
+        'category': ['database'] if name in ['TLOCK', 'TTIMEOUT', 'EXCP']
+            else ['process'],
+        'type': ['error'] if name in ['TTIMEOUT', 'EXCP']
+            else ['info'], 'action': name,
+        'original': raw | tojson},
+    'host': {'name': params.host_name},
+    'process': {'name': params.process_name},
+    'user': {'name': user},
+    'one_c': {'techjournal': raw}
+} | tojson }}
