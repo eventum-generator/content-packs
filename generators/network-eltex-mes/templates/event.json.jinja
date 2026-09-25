@@ -1,0 +1,210 @@
+{# MES log reference documents the message body, not a transport envelope. #}
+{%- set step = vars.step -%}
+{%- set extra = {} -%}
+{%- set category = ['network'] -%}
+{%- set event_type = ['info'] -%}
+{%- set outcome = 'success' -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- do shared.pop('to_normal', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('to_attack', true) -%}
+    {%- endif -%}
+    {%- do shared.set('routine_count', 0) -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', count) -%}
+  {%- endif -%}
+  {%- set kind = module.rand.weighted_choice(
+      ['mac_learned', 'mac_removed', 'link', 'reject', 'normal'],
+      [780, 180, 20, 5, 15]) -%}
+  {%- if kind == 'mac_learned' or kind == 'mac_removed' -%}
+    {%- set endpoint = samples.endpoints | random -%}
+    {%- set state = 'Learnt' if kind == 'mac_learned' else 'Removed' -%}
+    {%- set component = 'BRG_MACNTFY' -%}
+    {%- set severity_code = 'I' -%}
+    {%- set mnemonic = 'MAC_CHANGED' -%}
+    {%- set body = state ~ ' Mac ' ~ endpoint.mac ~ ' on VLAN '
+        ~ endpoint.vlan ~ ' Port ' ~ endpoint.port -%}
+    {%- set action = 'mac_' ~ ('learned' if kind == 'mac_learned' else 'removed') -%}
+    {%- do extra.update({'interface': {'name': endpoint.port},
+        'source': {'mac': endpoint.mac},
+        'eltex': {'mes': {'mac_state': state.lower(),
+            'vlan': {'id': endpoint.vlan}}}}) -%}
+  {%- elif kind == 'link' -%}
+    {%- set down = shared.get('routine_down', false) -%}
+    {%- do shared.set('routine_down', not down) -%}
+    {%- set component = 'LINK' -%}
+    {%- set severity_code = 'W' -%}
+    {%- set mnemonic = 'Up' if down else 'Down' -%}
+    {%- set body = 'gi1/0/6' -%}
+    {%- set action = 'interface_up' if down else 'interface_down' -%}
+    {%- set event_type = ['change'] -%}
+    {%- do extra.update({'interface': {'name': body},
+        'eltex': {'mes': {'interface': {'state':
+            'up' if down else 'down'}}}}) -%}
+  {%- elif kind == 'reject' -%}
+    {%- set component = 'AAA' -%}
+    {%- set severity_code = 'W' -%}
+    {%- set mnemonic = 'REJECT' -%}
+    {%- set body = 'New https connection for user ' ~ params.normal_user
+        ~ ', source ' ~ params.normal_source_ip ~ ' destination '
+        ~ params.switch_ip ~ ', local user table REJECTED.' -%}
+    {%- set action = 'login_rejected' -%}
+    {%- set category = ['authentication'] -%}
+    {%- set event_type = ['start', 'denied'] -%}
+    {%- set outcome = 'failure' -%}
+    {%- do extra.update({'source': {'ip': params.normal_source_ip},
+        'destination': {'ip': params.switch_ip},
+        'user': {'name': params.normal_user},
+        'eltex': {'mes': {'connection': {'type': 'https',
+            'auth_method': 'local user table'}}}}) -%}
+  {%- else -%}
+    {%- do shared.set('to_normal', true) -%}
+    {%- set component = 'BRG_MACNTFY' -%}
+    {%- set severity_code = 'I' -%}
+    {%- set mnemonic = 'MAC_CHANGED' -%}
+    {%- set endpoint = samples.endpoints | random -%}
+    {%- set body = 'Learnt Mac ' ~ endpoint.mac ~ ' on VLAN '
+        ~ endpoint.vlan ~ ' Port ' ~ endpoint.port -%}
+    {%- set action = 'mac_learned' -%}
+    {%- do extra.update({'interface': {'name': endpoint.port},
+        'source': {'mac': endpoint.mac},
+        'eltex': {'mes': {'mac_state': 'learnt',
+            'vlan': {'id': endpoint.vlan}}}}) -%}
+  {%- endif -%}
+{%- elif step == 'normal_connect' or step == 'unusual_connect' -%}
+  {%- set unusual = step == 'unusual_connect' -%}
+  {%- set actor = params.unusual_user if unusual else params.normal_user -%}
+  {%- set src = params.unusual_source_ip if unusual
+      else params.normal_source_ip -%}
+  {%- set component = 'AAA' -%}
+  {%- set severity_code = 'I' -%}
+  {%- set mnemonic = 'CONNECT' -%}
+  {%- set body = 'New https connection for user ' ~ actor ~ ', source '
+      ~ src ~ ' destination ' ~ params.switch_ip
+      ~ ', local user table ACCEPTED.' -%}
+  {%- set action = 'login_accepted' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start', 'allowed'] -%}
+  {%- do extra.update({'source': {'ip': src},
+      'destination': {'ip': params.switch_ip}, 'user': {'name': actor},
+      'eltex': {'mes': {'connection': {'type': 'https',
+          'auth_method': 'local user table'}}}}) -%}
+{%- elif step == 'normal_disconnect' -%}
+  {%- set component = 'AAA' -%}
+  {%- set severity_code = 'I' -%}
+  {%- set mnemonic = 'DISCONNECT' -%}
+  {%- set body = 'https connection for user ' ~ params.normal_user
+      ~ ', source ' ~ params.normal_source_ip ~ ' destination '
+      ~ params.switch_ip ~ ' TERMINATED' -%}
+  {%- set action = 'session_terminated' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['end'] -%}
+  {%- do extra.update({'source': {'ip': params.normal_source_ip},
+      'destination': {'ip': params.switch_ip},
+      'user': {'name': params.normal_user},
+      'eltex': {'mes': {'connection': {'type': 'https'}}}}) -%}
+{%- elif step in ['reject_1', 'reject_2', 'reject_3'] -%}
+  {%- set component = 'AAA' -%}
+  {%- set severity_code = 'W' -%}
+  {%- set mnemonic = 'REJECT' -%}
+  {%- set body = 'New https connection for user ' ~ params.unusual_user
+      ~ ', source ' ~ params.unusual_source_ip ~ ' destination '
+      ~ params.switch_ip ~ ', local user table REJECTED.' -%}
+  {%- set action = 'login_rejected' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start', 'denied'] -%}
+  {%- set outcome = 'failure' -%}
+  {%- do extra.update({'source': {'ip': params.unusual_source_ip},
+      'destination': {'ip': params.switch_ip},
+      'user': {'name': params.unusual_user},
+      'eltex': {'mes': {'connection': {'type': 'https',
+          'auth_method': 'local user table'}}}}) -%}
+{%- elif step == 'port_change' -%}
+  {%- set component = 'LINK' -%}
+  {%- set severity_code = 'N' -%}
+  {%- set mnemonic = 'PortConfRecover' -%}
+  {%- set body = 'Port ' ~ params.target_port ~ ' configured to speed 1G' -%}
+  {%- set action = 'interface_speed_changed' -%}
+  {%- set category = ['configuration', 'network'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- do extra.update({'interface': {'name': params.target_port},
+      'eltex': {'mes': {'interface': {'speed': '1G'}}}}) -%}
+{%- elif step == 'target_link_down' -%}
+  {%- set component = 'LINK' -%}
+  {%- set severity_code = 'W' -%}
+  {%- set mnemonic = 'Down' -%}
+  {%- set body = params.target_port -%}
+  {%- set action = 'interface_down' -%}
+  {%- set event_type = ['change'] -%}
+  {%- do extra.update({'interface': {'name': params.target_port},
+      'eltex': {'mes': {'interface': {'state': 'down'}}}}) -%}
+{%- elif step == 'target_mac_removed' -%}
+  {%- set component = 'BRG_MACNTFY' -%}
+  {%- set severity_code = 'I' -%}
+  {%- set mnemonic = 'MAC_CHANGED' -%}
+  {%- set body = 'Removed Mac ' ~ params.target_mac ~ ' on VLAN '
+      ~ params.target_vlan ~ ' Port ' ~ params.target_port -%}
+  {%- set action = 'mac_removed' -%}
+  {%- do extra.update({'interface': {'name': params.target_port},
+      'source': {'mac': params.target_mac},
+      'eltex': {'mes': {'mac_state': 'removed',
+          'vlan': {'id': params.target_vlan}}}}) -%}
+{%- elif step == 'delete_syslog_server' -%}
+  {%- set component = 'SYSLOG' -%}
+  {%- set severity_code = 'N' -%}
+  {%- set mnemonic = 'NOSYSLOGSERVER' -%}
+  {%- set body = 'delete syslog server ' ~ params.syslog_server_ip -%}
+  {%- set action = 'syslog_server_deleted' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['deletion'] -%}
+  {%- do extra.update({'eltex': {'mes': {'syslog_server':
+      {'ip': params.syslog_server_ip}}}}) -%}
+{%- else -%}
+  {%- set component = 'SYSLOG' -%}
+  {%- set severity_code = 'N' -%}
+  {%- set mnemonic = 'CLEARLOGGINGFILE' -%}
+  {%- set body = 'clear messages from the logging file.' -%}
+  {%- set action = 'logging_file_cleared' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['deletion'] -%}
+{%- endif -%}
+{%- set raw = component ~ '-' ~ severity_code ~ '-'
+    ~ mnemonic ~ ': ' ~ body -%}
+{
+  "@timestamp": {{ timestamp.isoformat() | tojson }},
+  "ecs": {"version": "8.17.0"},
+  "event": {
+    "action": {{ action | tojson }},
+    "category": {{ category | tojson }},
+    "dataset": "eltex.mes.syslog",
+    "kind": "event",
+    "module": "eltex",
+    "original": {{ raw | tojson }},
+    "outcome": {{ outcome | tojson }},
+    "type": {{ event_type | tojson }}
+  },
+  "message": {{ raw | tojson }},
+  "log": {"level": {{ {'W': 'warning', 'I': 'info',
+      'N': 'notice'}[severity_code] | tojson }}},
+  "observer": {
+    "hostname": {{ params.switch_name | tojson }},
+    "ip": {{ params.switch_ip | tojson }},
+    "name": {{ params.switch_name | tojson }},
+    "product": "MES",
+    "type": "switch",
+    "vendor": "Eltex"
+  },
+  "eltex": {"mes": {
+    "component": {{ component | tojson }},
+    "mnemonic": {{ mnemonic | tojson }},
+    "severity_code": {{ severity_code | tojson }},
+    "details": {{ extra.get('eltex', {}).get('mes', {}) | tojson }}
+  }}{% if extra.get('interface') %},
+  "interface": {{ extra.interface | tojson }}{% endif %}{% if extra.get('source') %},
+  "source": {{ extra.source | tojson }}{% endif %}{% if extra.get('destination') %},
+  "destination": {{ extra.destination | tojson }}{% endif %}{% if extra.get('user') %},
+  "user": {{ extra.user | tojson }}{% endif %}
+}
