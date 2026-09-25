@@ -54,7 +54,7 @@ This complete JSON event was copied from an anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T15:00:08.003000+00:00",
+  "@timestamp": "2026-09-25T14:44:58.003000+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -68,7 +68,7 @@ This complete JSON event was copied from an anomaly-mode run:
     "duration": 2213017,
     "kind": "event",
     "module": "grafana",
-    "original": "{\"duration\": \"2.213017ms\", \"level\": \"info\", \"logger\": \"context\", \"method\": \"GET\", \"msg\": \"Request Completed\", \"orgId\": 0, \"path\": \"/\", \"referer\": \"\", \"remote_addr\": \"198.51.100.24\", \"size\": 39, \"status\": 401, \"t\": \"2026-09-25T15:00:08.003000000Z\", \"time_ms\": 2, \"uname\": \"\", \"userId\": 0}",
+    "original": "{\"duration\": \"2.213017ms\", \"level\": \"info\", \"logger\": \"context\", \"method\": \"GET\", \"msg\": \"Request Completed\", \"orgId\": 0, \"path\": \"/\", \"referer\": \"\", \"remote_addr\": \"198.51.100.24\", \"size\": 39, \"status\": 401, \"t\": \"2026-09-25T14:44:58.003000000Z\", \"time_ms\": 2, \"uname\": \"\", \"userId\": 0}",
     "outcome": "failure",
     "type": [
       "denied"
@@ -87,7 +87,7 @@ This complete JSON event was copied from an anomaly-mode run:
       "remote_addr": "198.51.100.24",
       "size": 39,
       "status": 401,
-      "t": "2026-09-25T15:00:08.003000000Z",
+      "t": "2026-09-25T14:44:58.003000000Z",
       "time_ms": 2,
       "uname": "",
       "userId": 0
