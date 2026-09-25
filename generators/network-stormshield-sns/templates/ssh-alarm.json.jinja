@@ -1,0 +1,38 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- if chain -%}
+  {%- set step = tick - params.anomaly_interval_events -%}
+  {%- set source_ip = params.scanner_ip -%}
+  {%- set destination_ip = ['10.20.0.11', '10.20.0.12', '10.20.0.13', '10.20.0.14'][step] -%}
+  {%- set destination_name = ['app-01', 'db-01', 'files-01', 'backup-01'][step] -%}
+  {%- set source_port = 54000 + step -%}
+{%- else -%}
+  {%- set source_ip = module.rand.choice(['10.10.1.10', '10.10.1.11', '10.10.1.12']) -%}
+  {%- set destination_ip = '10.20.0.10' -%}
+  {%- set destination_name = 'bastion-01' -%}
+  {%- set source_port = module.rand.number.integer(40000, 60000) -%}
+{%- endif -%}
+{%- set local_time = event_time.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set raw = 'id=firewall time="' ~ local_time ~ '" fw="' ~ params.firewall_name
+  ~ '" tz=+0000 startime="' ~ local_time ~ '" pri=4 srcif="Ethernet0"'
+  ~ ' srcifname="out" ipproto=tcp proto=ssh src=' ~ source_ip
+  ~ ' srcport=' ~ source_port ~ ' srcportname=ephemeral_fw dst=' ~ destination_ip
+  ~ ' dstport=22 dstportname=ssh dstname=' ~ destination_name
+  ~ ' action=pass msg="Interactive connection detected" class=protocol'
+  ~ ' classification=0 alarmid=85' -%}
+{%- set record = {
+  '@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'alert', 'dataset': 'stormshield.sns', 'category': ['network', 'intrusion_detection'], 'type': ['info'], 'action': 'interactive_connection_detected', 'code': '85', 'original': raw},
+  'observer': {'name': params.firewall_name, 'vendor': 'Stormshield', 'product': 'SNS'},
+  'source': {'ip': source_ip, 'port': source_port},
+  'destination': {'ip': destination_ip, 'port': 22, 'domain': destination_name},
+  'network': {'transport': 'tcp', 'protocol': 'ssh'},
+  'related': {'ip': [source_ip, destination_ip]},
+  'stormshield': {'sns': {'priority': 4, 'source_interface': 'Ethernet0', 'source_interface_name': 'out', 'action': 'pass', 'alarm_id': 85, 'classification': 0}}
+} -%}
+{{ record | tojson }}
