@@ -1,0 +1,80 @@
+{%- set step = vars.step -%}
+{%- set chain = step.startswith('chain_') -%}
+{%- set install = step == 'routine_install' or step.startswith('chain_install') -%}
+{%- set status = step == 'routine_status' or step.startswith('chain_status') -%}
+{%- set routine_services = [
+  {'host':'WS-ENG-01.corp.example.test','name':'ContosoAgent','path':'C:\\Program Files\\Contoso\\agent.exe'},
+  {'host':'WS-HR-02.corp.example.test','name':'FabrikamUpdater','path':'C:\\Program Files\\Fabrikam\\updater.exe'},
+  {'host':'WS-SALES-03.corp.example.test','name':'NorthwindBackup','path':'C:\\Program Files\\Northwind\\backup.exe'},
+  {'host':'WS-OPS-04.corp.example.test','name':'ContosoMonitor','path':'C:\\Program Files\\Contoso\\monitor.exe'}
+] -%}
+{%- set status_services = [
+  {'host':'WS-ENG-01.corp.example.test','name':'ContosoSync','path':''},
+  {'host':'WS-HR-02.corp.example.test','name':'FabrikamMessenger','path':''},
+  {'host':'WS-SALES-03.corp.example.test','name':'NorthwindSearch','path':''},
+  {'host':'WS-OPS-04.corp.example.test','name':'ContosoWatchdog','path':''}
+] -%}
+{%- if step == 'routine_status' -%}
+  {%- do shared.pop('to_install', none) -%}
+  {%- set status_count = shared.get('status_count', 0) + 1 -%}
+  {%- if status_count >= 50 -%}
+    {%- do shared.set('status_count', 0) -%}
+    {%- do shared.set('to_install', true) -%}
+  {%- else -%}{%- do shared.set('status_count', status_count) -%}{%- endif -%}
+  {%- set routine = module.rand.choice(status_services) -%}
+{%- elif step == 'routine_install' -%}
+  {%- do shared.pop('to_chain', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_chain', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set routine = module.rand.choice(routine_services) -%}
+  {%- do shared.set('routine_service', routine) -%}
+{%- elif not chain -%}
+  {%- set routine = shared.get('routine_service') -%}
+{%- endif -%}
+{%- if chain -%}
+  {%- set host = params.chain_host_a if step.endswith('_a') else params.chain_host_b -%}
+  {%- set service_name = params.chain_service_name -%}
+  {%- set image_path = params.chain_image_path -%}
+{%- else -%}
+  {%- set host = routine.host -%}
+  {%- set service_name = routine.name -%}
+  {%- set image_path = routine.path -%}
+{%- endif -%}
+{%- set record_key = 'record:' ~ host -%}
+{%- set record = shared.get(record_key, 1000) -%}
+{%- do shared.set(record_key, record + 1) -%}
+{%- set utc_time = timestamp.isoformat().replace('+00:00', 'Z') -%}
+{%- if install -%}
+  {%- set event_id = 7045 -%}
+  {%- set data = {'ServiceName':service_name,'ImagePath':image_path,'ServiceType':'user mode service','StartType':'demand start','AccountName':'LocalSystem'} -%}
+  {%- set action = 'service-installed' -%}
+  {%- set types = ['change'] -%}
+{%- elif status -%}
+  {%- set event_id = 7036 -%}
+  {%- set status_key = 'running:' ~ host ~ ':' ~ service_name -%}
+  {%- set running = true if chain else not shared.get(status_key, false) -%}
+  {%- if not chain -%}{%- do shared.set(status_key, running) -%}{%- endif -%}
+  {%- set state = 'running' if running else 'stopped' -%}
+  {%- set binary = ((service_name ~ ('/4' if running else '/1')).encode('utf-16-le')).hex().upper() ~ '0000' -%}
+  {%- set data = {'param1':service_name,'param2':state} -%}
+  {%- set action = 'service-state-changed' -%}
+  {%- set types = ['start'] if running else ['end'] -%}
+{%- else -%}
+  {%- set event_id = 7040 -%}
+  {%- set data = {'param1':service_name,'param2':'demand start','param3':'auto start','param4':service_name} -%}
+  {%- set action = 'service-start-type-changed' -%}
+  {%- set types = ['change'] -%}
+{%- endif -%}
+{%- set xml -%}
+<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Service Control Manager" Guid="{555908d1-a6d7-4695-8e1e-26931d2012f4}" EventSourceName="Service Control Manager" /><EventID Qualifiers="16384">{{ event_id }}</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8080000000000000</Keywords><TimeCreated SystemTime="{{ utc_time }}" /><EventRecordID>{{ record }}</EventRecordID><Correlation /><Execution ProcessID="{{ 700 + (record % 100) }}" ThreadID="{{ 1000 + (record % 300) }}" /><Channel>System</Channel><Computer>{{ host }}</Computer><Security{% if not status %} UserID="S-1-5-18"{% endif %} /></System><EventData>{% if install %}<Data Name="ServiceName">{{ service_name|e }}</Data><Data Name="ImagePath">{{ image_path|e }}</Data><Data Name="ServiceType">user mode service</Data><Data Name="StartType">demand start</Data><Data Name="AccountName">LocalSystem</Data>{% elif status %}<Data Name="param1">{{ service_name|e }}</Data><Data Name="param2">{{ state }}</Data><Binary>{{ binary }}</Binary>{% else %}<Data Name="param1">{{ service_name|e }}</Data><Data Name="param2">demand start</Data><Data Name="param3">auto start</Data><Data Name="param4">{{ service_name|e }}</Data>{% endif %}</EventData></Event>
+{%- endset -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':['configuration'],'code':event_id|string,'dataset':'windows.service_control_manager','kind':'event','original':xml,'provider':'Service Control Manager','type':types},'host':{'name':host,'os':{'family':'windows','type':'windows'}},'log':{'level':'information'},'related':{'hosts':[host]},'service':{'name':service_name},'winlog':{'channel':'System','computer_name':host,'event_data':data,'event_id':event_id,'keywords':['Classic'],'level':'information','provider_guid':'{555908d1-a6d7-4695-8e1e-26931d2012f4}','provider_name':'Service Control Manager','record_id':record,'time_created':timestamp.isoformat()}} -%}
+{%- if install -%}{%- do out.update({'file':{'path':image_path}}) -%}{%- endif -%}
+{%- if not status -%}{%- do out.update({'user':{'id':'S-1-5-18'}}) -%}{%- endif -%}
+{%- if status -%}{%- do out.update({'windows':{'service_control_manager':{'state':state,'binary':binary}}}) -%}
+{%- elif not install -%}{%- do out.update({'windows':{'service_control_manager':{'start_type':'auto start'}}}) -%}
+{%- else -%}{%- do out.update({'windows':{'service_control_manager':{'start_type':'demand start'}}}) -%}{%- endif -%}
+{{- out | tojson -}}
