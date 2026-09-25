@@ -1,0 +1,41 @@
+{%- set step = vars.step -%}
+{%- set attack = step.startswith('attack_') -%}
+{%- set action_event = step.endswith('action') or 'action' in step -%}
+{%- if step == 'routine_action' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set n = shared.get('routine_runs',0) + 1 -%}
+  {%- if n >= params.anomaly_interval_runs -%}
+    {%- do shared.set('routine_runs',0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack',true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_runs',n) -%}{%- endif -%}
+{%- endif -%}
+{%- if action_event -%}
+  {%- set instance = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}{%- do shared.set('instance',instance) -%}
+  {%- if attack -%}
+    {%- do shared.set('task',params.anomaly_task) -%}{%- do shared.set('action',params.anomaly_action) -%}{%- do shared.set('user',params.anomaly_user) -%}
+  {%- else -%}
+    {%- set sample = samples.tasks.pick() -%}
+    {%- do shared.set('task',sample.task) -%}{%- do shared.set('action',sample.action) -%}{%- do shared.set('user',sample.user) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set instance = shared.get('instance') -%}
+{%- set task = shared.get('task') -%}{%- set command = shared.get('action') -%}{%- set actor = shared.get('user') -%}
+{%- set record = (shared.get('record_counter',30000) % 2147483647) + 1 -%}{%- do shared.set('record_counter',record) -%}
+{%- set failure = attack and action_event and step != 'attack_action_4' -%}
+{%- if action_event -%}
+  {%- set event_id = 201 -%}{%- set version = 2 -%}{%- set task_code = 201 -%}{%- set event_data_name = 'ActionSuccess' -%}
+  {%- set data = {'TaskName':task,'TaskInstanceId':instance,'ActionName':command,'ResultCode':5 if failure else 0,'EnginePID':1060} -%}
+  {%- set action_name = 'action-completed' -%}{%- set event_type = ['error'] if failure else ['end'] -%}
+{%- else -%}
+  {%- set event_id = 102 -%}{%- set version = 0 -%}{%- set task_code = 102 -%}{%- set event_data_name = 'TaskSuccessEvent' -%}
+  {%- set data = {'TaskName':task,'UserContext':actor,'InstanceId':instance} -%}
+  {%- set action_name = 'task-finished' -%}{%- set event_type = ['end'] -%}
+{%- endif -%}
+{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-TaskScheduler" Guid="{DE7B24EA-73C8-4A09-985D-5BDADCFA9017}"/><EventID>' ~ event_id ~ '</EventID><Version>' ~ version ~ '</Version><Level>4</Level><Task>' ~ task_code ~ '</Task><Opcode>2</Opcode><Keywords>' ~ ('0x8000000000000000' if action_event else '0x8000000000000001') ~ '</Keywords><TimeCreated SystemTime="' ~ timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '0Z"/><EventRecordID>' ~ record ~ '</EventRecordID><Correlation ActivityID="' ~ instance ~ '"/><Execution ProcessID="884" ThreadID="5524"/><Channel>Microsoft-Windows-TaskScheduler/Operational</Channel><Computer>' ~ params.host_name ~ '</Computer><Security UserID="S-1-5-18"/></System><EventData Name="' ~ event_data_name ~ '">' -%}
+{%- set ns = namespace(xml=xml) -%}
+{%- for key,value in data.items() -%}{%- set ns.xml = ns.xml ~ '<Data Name="' ~ key ~ '">' ~ (value|string|e) ~ '</Data>' -%}{%- endfor -%}
+{%- set xml = ns.xml ~ '</EventData></Event>' -%}
+{%- set evt = {'action':action_name,'category':['process'],'code':event_id|string,'dataset':'windows.task_scheduler_operational','kind':'event','original':xml,'type':event_type} -%}
+{%- if action_event -%}{%- do evt.update({'outcome':'failure' if failure else 'success'}) -%}{%- endif -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':evt,'host':{'name':params.host_name,'ip':[params.host_ip]},'message':task ~ ': ' ~ action_name,'process':{'executable':command} if action_event else {},'related':{'user':[actor]},'tags':['task-scheduler-operational','preserve_original_event'],'user':{'name':actor},'windows':{'task_scheduler':{'task_name':task,'task_instance_id':instance,'event_data':data}},'winlog':{'activity_id':instance,'channel':'Microsoft-Windows-TaskScheduler/Operational','event_id':event_id,'provider_name':'Microsoft-Windows-TaskScheduler','record_id':record}} -%}
+{{- out | tojson -}}
