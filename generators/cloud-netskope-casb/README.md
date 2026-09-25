@@ -54,7 +54,7 @@ This JSON event was copied from an anomaly-mode run, not handwritten:
 
 ```json
 {
-  "@timestamp": "2026-09-25T13:48:16+00:00",
+  "@timestamp": "2026-09-25T13:48:50+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -64,7 +64,7 @@ This JSON event was copied from an anomaly-mode run, not handwritten:
       "configuration"
     ],
     "kind": "event",
-    "original": "<14>Sep 25 13:48:16 netskopece CEF:0|Netskope|Example Tenant|NULL|audit|NULL|High|auditLogEvent=Deleted Inline Policy auditType=admin_audit_logs suser=policy.admin@example.test timestamp=1790344096",
+    "original": "<14>Sep 25 13:48:50 netskopece CEF:0|Netskope|Example Tenant|NULL|audit|NULL|High|auditLogEvent=Deleted Inline Policy auditType=admin_audit_logs suser=rpatel@example.test timestamp=1790344130",
     "outcome": "success",
     "type": [
       "deletion"
@@ -80,11 +80,11 @@ This JSON event was copied from an anomaly-mode run, not handwritten:
   },
   "related": {
     "user": [
-      "policy.admin@example.test"
+      "rpatel@example.test"
     ]
   },
   "user": {
-    "email": "policy.admin@example.test"
+    "email": "rpatel@example.test"
   }
 }
 ```
