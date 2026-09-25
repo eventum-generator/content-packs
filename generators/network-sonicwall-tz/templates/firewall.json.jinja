@@ -1,0 +1,93 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 5) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set log_number = (shared.get('log_number', 0) + 1) % 10000000 -%}
+{%- do shared.set('log_number', log_number) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- if chain -%}
+  {%- set kind = 'denied' if step < 3 else ('website' if step == 3 else 'closed') -%}
+  {%- set source_ip = params.target_source_ip -%}
+  {%- set dest_ip = params.blocked_ip if kind == 'denied' else params.alternate_ip -%}
+  {%- set dest_name = params.blocked_domain if kind == 'denied' else params.alternate_domain -%}
+  {%- set source_port = 51000 + step if kind == 'denied' else 51010 -%}
+  {%- set path = '/offers' -%}
+{%- else -%}
+  {%- set kind = module.rand.weighted_choice(['website', 'closed', 'denied'], [75, 20, 5]) -%}
+  {%- set source_ip = module.rand.choice(['10.20.30.11', '10.20.30.12', '10.20.30.13']) -%}
+  {%- set dest_ip = '203.0.113.42' if kind == 'denied' else module.rand.choice(['203.0.113.20', '203.0.113.21']) -%}
+  {%- set dest_name = 'games.example' if kind == 'denied' else 'updates.example' -%}
+  {%- set source_port = module.rand.number.integer(40000, 60000) -%}
+  {%- set path = module.rand.choice(['/', '/news', '/static/app.js']) -%}
+{%- endif -%}
+{%- set source_mac = '02:00:00:00:00:77' if chain else {
+  '10.20.30.11': '02:00:00:00:00:11',
+  '10.20.30.12': '02:00:00:00:00:12',
+  '10.20.30.13': '02:00:00:00:00:13'}[source_ip] -%}
+{%- set sent_bytes = module.rand.number.integer(300, 5000) -%}
+{%- set received_bytes = module.rand.number.integer(800, 200000) -%}
+{%- if chain and step == 3 -%}
+  {%- do shared.set('chain_sent_bytes', sent_bytes) -%}
+{%- elif chain and step == 4 -%}
+  {%- set sent_bytes = shared.get('chain_sent_bytes', sent_bytes) + module.rand.number.integer(0, 200) -%}
+{%- endif -%}
+{%- set stamp = event_time.strftime('%b %d %H:%M:%S') -%}
+{%- set iso_stamp = event_time.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set prefix = stamp ~ ' ' ~ params.firewall_ip ~ ' id=firewall sn='
+  ~ params.firewall_serial ~ ' time="' ~ iso_stamp ~ '" fw=' ~ params.firewall_ip -%}
+{%- set flow = ' src=' ~ source_ip ~ ':' ~ source_port ~ ':X0 dst='
+  ~ dest_ip ~ ':80:X1' -%}
+{%- if kind == 'denied' -%}
+  {%- set event_id = 14 -%}
+  {%- set action = 'website_denied' -%}
+  {%- set fw_action = 'drop' -%}
+  {%- set category = 'Gambling' -%}
+  {%- set raw = prefix ~ ' pri=3 c=4 m=14 msg="Web site access denied"'
+    ~ ' app=9 n=' ~ log_number ~ flow
+    ~ ' srcMac=' ~ source_mac ~ ' dstMac=02:00:00:00:01:01'
+    ~ ' proto=tcp/http dstname=' ~ dest_name ~ ' arg=' ~ path
+    ~ ' code=11 Category="Gambling" rule="9 (LAN->WAN)" fw_action="drop"' -%}
+{%- elif kind == 'website' -%}
+  {%- set event_id = 97 -%}
+  {%- set action = 'website_accessed' -%}
+  {%- set fw_action = 'NA' -%}
+  {%- set category = 'Not Rated' -%}
+  {%- set raw = prefix ~ ' pri=6 c=1024 m=97 app=48 n=' ~ log_number ~ flow
+    ~ ' srcMac=' ~ source_mac ~ ' dstMac=02:00:00:00:01:01'
+    ~ ' proto=tcp/http op=1 sent=' ~ sent_bytes ~ ' rcvd=' ~ received_bytes ~ ' dpi=0'
+    ~ ' dstname=' ~ dest_name ~ ' arg=' ~ path
+    ~ ' code=64 Category="Not Rated"'
+    ~ ' note="Policy: CFS Default Policy, Info: 6148 "'
+    ~ ' rule="9 (LAN->WAN)" fw_action="NA"' -%}
+{%- else -%}
+  {%- set event_id = 537 -%}
+  {%- set action = 'connection_closed' -%}
+  {%- set fw_action = 'NA' -%}
+  {%- set category = none -%}
+  {%- set raw = prefix ~ ' pri=6 c=1024 m=537 msg="Connection Closed"'
+    ~ ' app=9 n=' ~ log_number ~ flow
+    ~ ' dstMac=02:00:00:00:01:01 proto=tcp/http'
+    ~ ' sent=' ~ sent_bytes ~ ' spkt=3 dpi=0 cdur=40183'
+    ~ ' rule="9 (LAN->WAN)" fw_action="NA"' -%}
+{%- endif -%}
+{%- set source_obj = {'ip': source_ip, 'port': source_port} -%}
+{%- set destination_obj = {'ip': dest_ip, 'port': 80} -%}
+{%- set sonic_data = {'serial': params.firewall_serial, 'log_number': log_number,
+  'firewall_action': fw_action, 'category': category} -%}
+{%- set event_obj = {'kind': 'event', 'dataset': 'sonicwall.sonicos',
+  'category': ['network', 'web'], 'type': ['denied'] if kind == 'denied' else ['info'],
+  'action': action, 'code': event_id | string, 'original': raw} -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'}, 'event': event_obj,
+  'observer': {'ip': params.firewall_ip, 'vendor': 'SonicWall', 'product': 'SonicOS'},
+  'source': source_obj, 'destination': destination_obj,
+  'network': {'transport': 'tcp'},
+  'related': {'ip': [source_ip, dest_ip]},
+  'rule': {'name': '9 (LAN->WAN)'},
+  'sonicwall': {'sonicos': sonic_data}} -%}
+{%- if kind != 'closed' -%}
+  {%- do record.update({'url': {'domain': dest_name, 'path': path}}) -%}
+{%- endif -%}
+{{ record | tojson }}
