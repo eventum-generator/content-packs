@@ -1,0 +1,42 @@
+{%- set step = vars.step -%}
+{%- if step == 'normal_connect' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set count = shared.get('routine_sessions', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_sessions -%}
+    {%- do shared.set('routine_sessions', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_sessions', count) -%}{%- endif -%}
+{%- endif -%}
+{%- if step in ['normal_connect','attack_connect'] -%}
+  {%- set conn = (shared.get('connection_counter', 100) % 2147483647) + 1 -%}
+  {%- do shared.set('connection_counter', conn) -%}{%- do shared.set('active_connection', conn) -%}
+  {%- set port = module.rand.number.integer(40000, 62000) -%}{%- do shared.set('active_port', port) -%}
+{%- endif -%}
+{%- set conn = shared.get('active_connection', 101) -%}
+{%- set port = shared.get('active_port', 42000) -%}
+{%- set attack = step.startswith('attack_') -%}
+{%- set src = params.anomaly_ip if attack else params.normal_ip -%}
+{%- set remote = src ~ ':' ~ port -%}
+{%- set ctx = 'conn' ~ conn -%}
+{%- set component = 'NETWORK' -%}{%- set log_id = 51800 -%}{%- set msg = 'client metadata' -%}
+{%- set action = 'client-metadata' -%}{%- set event_category = ['network'] -%}{%- set event_type = ['connection'] -%}
+{%- set attr = {'remote':remote,'client':ctx,'doc':{'application':{'name':'MongoDB Shell'},'driver':{'name':'MongoDB Internal Client','version':'7.0.0'},'os':{'type':'Linux','name':'Ubuntu','architecture':'x86_64','version':'6.6'}}} -%}
+{%- if step in ['normal_slow','attack_slow_1','attack_slow_2','attack_slow_3'] -%}
+  {%- set component = 'COMMAND' -%}{%- set log_id = 51803 -%}{%- set msg = 'Slow query' -%}
+  {%- set action = 'slow-query' -%}{%- set event_category = ['database'] -%}{%- set event_type = ['info'] -%}
+  {%- set coll = samples.collections.pick() -%}
+  {%- set ns = params.anomaly_namespace if attack else coll.namespace -%}
+  {%- set collection = ns.split('.')[1] -%}
+  {%- set docs = (50000 if step == 'attack_slow_1' else (100000 if step == 'attack_slow_2' else 150000)) if attack else coll.docs_examined -%}
+  {%- set returned = (5000 if step == 'attack_slow_1' else (10000 if step == 'attack_slow_2' else 15000)) if attack else coll.nreturned -%}
+  {%- set duration = (350 if step == 'attack_slow_1' else (600 if step == 'attack_slow_2' else 850)) if attack else 120 -%}
+  {%- set command = {'find':collection,'filter':{},'batchSize':10000 if attack else 100,'$db':ns.split('.')[0]} -%}
+  {%- set attr = {'type':'command','ns':ns,'appName':'MongoDB Shell','command':command,'planSummary':'COLLSCAN','keysExamined':0,'docsExamined':docs,'nreturned':returned,'numYields':12 if attack else 1,'reslen':returned * 150,'remote':remote,'protocol':'op_msg','durationMillis':duration} -%}
+{%- elif step in ['normal_disconnect','attack_disconnect'] -%}
+  {%- set log_id = 22944 -%}{%- set msg = 'end connection {remote} ({connectionCount}{word} now open)' -%}
+  {%- set action = 'disconnect' -%}{%- set event_type = ['end'] -%}
+  {%- set attr = {'remote':remote,'connectionCount':4,'word':' connections'} -%}
+{%- endif -%}
+{%- set native = {'t':{'$date':timestamp.isoformat(timespec='milliseconds')},'s':'I','c':component,'id':log_id,'ctx':ctx,'svc':'R','msg':msg,'attr':attr} -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':event_category,'dataset':'mongodb.log','kind':'event','original':native|tojson,'type':event_type},'host':{'name':params.db_host,'ip':[params.db_ip]},'log':{'level':'info'},'message':msg,'mongodb':{'log':native},'observer':{'hostname':params.db_host,'ip':params.db_ip,'product':'MongoDB','type':'database','vendor':'MongoDB'},'related':{'ip':[src]},'source':{'ip':src,'port':port},'tags':['mongodb-structured-log','preserve_original_event']} -%}
+{{- out | tojson -}}
