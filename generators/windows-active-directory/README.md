@@ -1,27 +1,31 @@
 # Active Directory domain controller audit
 
-Generates Windows Security events from one Active Directory domain controller as ECS JSON. The stream covers Kerberos, NTLM, privileged group membership, and directory changes. It complements `windows-security`, which models host audit events rather than this domain-controller sequence. Six event IDs share one emitting template across seven FSM states. Security record IDs increase on this one controller.
+Generates Windows Security events from one Active Directory domain controller as ECS JSON. The stream covers Kerberos, NTLM, privileged group membership, and directory changes. It complements `windows-security`, which models host audit events rather than this domain-controller sequence. Six event IDs share one emitting template across nine FSM states. The controller's Security record IDs increase with event time; the file output can arrive slightly out of order under concurrent rendering.
 
 ## Event types
 
-With `anomaly_mode: true`, the FSM emits 250 routine events, then one 11-event intrusion chain. The overall shares below assume that mode. Routine event weights are illustrative, not a measured production distribution. Microsoft documents Kerberos ticket events as high volume on domain controllers; the exact mix depends on audit policy and workload.
+The default is a small synthetic controller emitting one event per second. The authentication weights are illustrative, not a measured production distribution; real ratios depend on workload and audit policy. The background also contains one legitimate administrative maintenance sequence, so neither event 4728 nor 5136 alone identifies the attack. The incident sequence occurs once in anomaly mode.
 
-| Event ID | Action | Routine weight | Overall share | ECS category |
-|---|---|---:|---:|---|
-| 4768 | Kerberos TGT issued | 48% | ~46.4% | `authentication` |
-| 4769 | Kerberos service ticket issued | 44% | ~43.3% | `authentication` |
-| 4776 | NTLM credential validated | 6% | ~5.7% | `authentication` |
-| 4771 | Kerberos pre-authentication failed | 2% | ~3.4% | `authentication` |
-| 4728 | Member added to Domain Admins | chain | ~0.4% | `iam` |
-| 5136 | Directory attribute value deleted or added | chain | ~0.8% | `iam`, `configuration` |
+| Event ID | Action | Ordinary authentication weight | Additional use | ECS category |
+|---|---|---:|---|---|
+| 4768 | Kerberos TGT issued | 48% | One compromised-account TGT | `authentication` |
+| 4769 | Kerberos service ticket issued | 44% | Three RC4 service-account tickets | `authentication` |
+| 4776 | NTLM credential validated | 6% | Background only | `authentication` |
+| 4771 | Kerberos pre-authentication failed | 2% | Four-account password spray | `authentication` |
+| 4728 | Member added to Domain Admins | one maintenance event | One attacker-controlled member added | `iam` |
+| 5136 | Directory attribute modified | one maintenance pair | One attack delete/add pair | `iam`, `configuration` |
 
 ## Anomaly Chain
 
-The linked chain starts with four 4771 failures for four accounts from `10.99.4.22`. The last targeted account, `helpdesk.admin`, then gets a successful 4768. It requests three RC4 service tickets for distinct service accounts, adds `svc_sync` to Domain Admins, and changes that account's `msDS-AllowedToDelegateTo` value. The 5136 delete/add pair shares `OpCorrelationID`; the administrative events share `SubjectLogonId`. Detection ideas: password spraying across accounts from one IP followed by a successful TGT; three RC4 service tickets for distinct service accounts from the compromised principal; a Domain Admins group addition followed by a delegation attribute change. Join 4771, 4768, and 4769 on source IP and principal, then link administrative events by `SubjectLogonId`. Match the 5136 delete/add pair by `OpCorrelationID`. Set `anomaly_mode: false` for only routine 4768, 4769, 4776, and 4771 events; no chain step is emitted.
+After 250 ordinary events, four 4771 failures target distinct accounts from `10.99.4.22` at one-second intervals. The last account, `helpdesk.admin`, then obtains a 4768 TGT. After 30 seconds of background traffic it requests three RC4 service tickets for distinct service accounts. Another 90 seconds of background traffic precedes a 4728 addition of `svc_sync` to Domain Admins and a 5136 delete/add pair changing that account's `msDS-AllowedToDelegateTo` list from `cifs/filesrv01.contoso.local` to `ldap/dc01.contoso.local`. The first failure and last change are about 130 seconds apart. The chain runs once; normal traffic continues afterward.
 
-Validation covered 258 of 263 field paths in six Elastic expected-event fixtures (98.1%). The five omitted paths are `log.file.path`, which identifies the fixture XML file rather than a live Windows Event Log source.
+Correlate 4771 failures by source IP and distinct user, then join the successful 4768 and subsequent 4769 events by source IP, account, and a bounded time window. Join 4728 and 5136 by `SubjectUserSid` and `SubjectLogonId`; join the 5136 value pair by `OpCorrelationID` and object GUID. Event 4768 does not contain a logon ID, so its connection to the later directory changes is temporal and account-based, not an ID equality. The source IP also occurs in benign authentication traffic. A one-off approved Domain Admins addition and delegation edit appear in both modes, on different objects; alerting on event ID, actor, or IP alone is insufficient.
 
-The generator uses the updated 4768/4769 event fields introduced on patched Windows Server 2016 and later, including encryption capabilities and ticket hashes. Events are normalized ECS JSON, not Windows XML. The 5136 pair requires Directory Service Changes auditing and a matching SACL on the modified object in a real domain.
+Set `anomaly_mode: false` to emit only the ordinary traffic and the one-off approved maintenance. It never emits the four-account spray, the RC4 sweep, or the `svc_sync` privilege/delegation changes.
+
+Validation covers 258 of 263 field paths in six Elastic System Security expected-event fixtures (98.1%). The five omitted paths are `log.file.path`, which points to Elastic's local XML fixture files rather than a live Windows Event Log source. Microsoft Security event XML is the source for the native `winlog.event_data` values; this generator emits normalized ECS JSON, not raw XML.
+
+The 4768/4769 version-2 fields model Windows Server 2016, 2019, or 2022 with the January 14, 2025 or later security update. Successful Kerberos ticket events require the relevant Kerberos audit subcategories; 4728 requires Security Group Management auditing. The 5136 pair requires Directory Service Changes auditing and a matching SACL on the modified object. RC4 tickets in this scenario require service accounts and policy that still permit RC4; this is not a recommended security setting.
 
 ## Parameters
 
@@ -39,7 +43,7 @@ Edit `event.template.params` in `generator.yml` to change the synthetic domain.
 | `dc_agent_id` | `a51465f9-72f4-4761-89bb-55de00ec6701` | Stable collector ID |
 | `dc_ephemeral_id` | `943942bd-09ec-48aa-957d-2f12ecb83866` | Collector session ID |
 | `agent_version` | `8.17.0` | Filebeat version |
-| `attack_ip` | `10.99.4.22` | Source address of the linked chain |
+| `attack_ip` | `10.99.4.22` | Shared bastion address used by the chain and some ordinary authentications |
 | `attack_member` | `svc_sync` | Account added to Domain Admins and modified |
 | `attack_member_rid` | `2108` | RID of that account |
 | `attack_object_guid` | `{62ae5b92-0fab-4f0d-9393-1cfab99c9742}` | Stable directory object GUID |
@@ -70,7 +74,7 @@ output:
 
 ## Usage
 
-Run from the `content-packs` root. Live mode emits ten events per second. Sample mode advances simulated ticks as fast as the process can render, so bound its run time.
+Run from the `content-packs` root. Live mode emits one event per second. Sample mode advances simulated ticks as fast as the process can render, so bound its run time.
 
 ```bash
 # Bounded batch sample
@@ -82,11 +86,11 @@ eventum generate --path generators/windows-active-directory/generator.yml --id a
 
 ## Sample output
 
-This complete 4728 event was copied from a validation run:
+This complete 4728 event was copied from the post-review anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T10:24:12+00:00",
+  "@timestamp": "2026-09-25T16:38:19+00:00",
   "agent": {
     "ephemeral_id": "943942bd-09ec-48aa-957d-2f12ecb83866",
     "id": "a51465f9-72f4-4761-89bb-55de00ec6701",
@@ -106,7 +110,7 @@ This complete 4728 event was copied from a validation run:
     "kind": "event",
     "outcome": "success",
     "provider": "Microsoft-Windows-Security-Auditing",
-    "sequence": 900259,
+    "sequence": 900379,
     "type": [
       "group",
       "change"
@@ -155,7 +159,7 @@ This complete 4728 event was copied from a validation run:
       "MemberName": "CN=svc_sync,CN=Users,DC=contoso,DC=local",
       "MemberSid": "S-1-5-21-3457937927-2839227994-823803824-2108",
       "SubjectDomainName": "CONTOSO",
-      "SubjectLogonId": "0xb085d1",
+      "SubjectLogonId": "0x9648a9",
       "SubjectUserName": "helpdesk.admin",
       "SubjectUserSid": "S-1-5-21-3457937927-2839227994-823803824-1114",
       "TargetDomainName": "CONTOSO",
@@ -168,21 +172,21 @@ This complete 4728 event was copied from a validation run:
     ],
     "level": "information",
     "logon": {
-      "id": "0xb085d1"
+      "id": "0x9648a9"
     },
     "opcode": "Info",
     "outcome": "success",
     "process": {
       "pid": 516,
       "thread": {
-        "id": 6448
+        "id": 8007
       }
     },
     "provider_guid": "{54849625-5478-4994-a5ba-3e3b0328c30d}",
     "provider_name": "Microsoft-Windows-Security-Auditing",
-    "record_id": "900259",
+    "record_id": "900379",
     "task": "Security Group Management",
-    "time_created": "2026-09-25T10:24:12+00:00",
+    "time_created": "2026-09-25T16:38:19+00:00",
     "version": 0
   }
 }
@@ -195,6 +199,8 @@ This complete 4728 event was copied from a validation run:
 - [Microsoft: 4769 Kerberos service ticket](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4769)
 - [Microsoft: 4771 pre-authentication failure](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4771)
 - [Microsoft: 4776 NTLM credential validation](https://learn.microsoft.com/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4776)
+- [Microsoft: msDS-AllowedToDelegateTo attribute schema](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-ada2/86261ca1-154c-41fb-8e5f-c6446e77daaa)
+- [Microsoft: RC4 Kerberos audit and remediation](https://learn.microsoft.com/en-us/windows-server/security/kerberos/detect-remediate-rc4-kerberos)
 - [Microsoft: Audit Security Group Management](https://learn.microsoft.com/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/audit-security-group-management)
 - [Microsoft: 5136 directory service object changed](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-5136)
 - [Elastic: System Security data stream fixtures and fields](https://github.com/elastic/integrations/tree/main/packages/system/data_stream/security)
