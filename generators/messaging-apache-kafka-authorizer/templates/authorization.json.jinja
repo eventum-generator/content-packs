@@ -1,0 +1,36 @@
+{%- for key in ['to_probe', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set principal = module.rand.choice(['User:svc-metrics', 'User:svc-web', 'User:analyst']) -%}
+  {%- set client = module.rand.choice(['10.40.3.11', '10.40.3.12', '10.40.3.13']) -%}
+  {%- set resource = module.rand.choice(['orders-archive', 'metrics-internal', 'unknown-topic']) -%}
+  {%- set operation = module.rand.weighted_choice(['READ', 'WRITE'], [85, 15]) -%}
+  {%- set request = 'Fetch' if operation == 'READ' else 'Produce' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 45 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('probe_count', 0) -%}{%- do shared.set('to_probe', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{%- else -%}
+  {%- set count = shared.get('probe_count', 0) + 1 -%}
+  {%- set principal = params.suspicious_principal -%}
+  {%- set client = params.suspicious_client_ip -%}
+  {%- set resource = params.sensitive_topic -%}
+  {%- set operation = ['READ', 'WRITE', 'ALTER_CONFIGS', 'DELETE'][count - 1] -%}
+  {%- set request = ['Fetch', 'Produce', 'AlterConfigs', 'DeleteTopics'][count - 1] -%}
+  {%- if count >= 4 -%}{%- do shared.set('probe_count', 0) -%}{%- do shared.set('to_routine', true) -%}{%- else -%}{%- do shared.set('probe_count', count) -%}{%- endif -%}
+{%- endif -%}
+{%- set message = 'Principal = ' ~ principal ~ ' is Denied operation = ' ~ operation ~ ' from host = ' ~ client ~ ' on resource = Topic:LITERAL:' ~ resource ~ ' for request = ' ~ request ~ ' with resourceRefCount = 1 based on rule DefaultDeny' -%}
+{%- set original = '[' ~ timestamp.strftime('%Y-%m-%d %H:%M:%S,') ~ ('%03d'|format(timestamp.microsecond // 1000)) ~ '] INFO ' ~ message ~ ' (kafka.authorizer.logger)' -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['iam'], 'type': ['denied'], 'action': 'authorization-denied', 'outcome': 'failure', 'original': original},
+  'host': {'name': params.broker_host},
+  'log': {'level': 'INFO', 'logger': 'kafka.authorizer.logger'},
+  'user': {'name': principal[5:]},
+  'source': {'ip': client},
+  'related': {'ip': [client], 'user': [principal[5:]]},
+  'kafka': {'principal': principal, 'operation': operation, 'resource': {'type': 'Topic', 'pattern_type': 'LITERAL', 'name': resource}, 'request': request, 'resource_ref_count': 1, 'rule': 'DefaultDeny', 'authorization_result': 'Denied'}
+} -%}
+{{- event | tojson -}}
