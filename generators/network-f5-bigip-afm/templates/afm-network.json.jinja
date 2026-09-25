@@ -1,0 +1,97 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set sequence = (shared.get('sequence', 0) + 1) % 1000000 -%}
+{%- do shared.set('sequence', sequence) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 5) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set background_dos = tick < params.anomaly_interval_events and tick in [8, 20, 32, 44] -%}
+{%- set dos_event = chain or background_dos -%}
+{%- set rt = event_time.strftime('%b %d %Y %H:%M:%S') -%}
+{%- if dos_event -%}
+  {%- if chain -%}
+    {%- set step = tick - params.anomaly_interval_events -%}
+    {%- if step == 0 -%}
+      {%- do shared.set('attack_cycle', (shared.get('attack_cycle', 0) + 1) % 1000000) -%}
+    {%- endif -%}
+    {%- set attack_id = 3083822789 + shared.get('attack_cycle', 1) -%}
+    {%- set attack_status = ['Attack Started', 'Attack Sampled', 'Attack Sampled', 'Attack Sampled', 'Attack Stopped'][step] -%}
+  {%- else -%}
+    {%- set background_attack_seq = (shared.get('background_attack_seq', 0) + 1) % 1000000 -%}
+    {%- do shared.set('background_attack_seq', background_attack_seq) -%}
+    {%- set attack_id = 4000000000 + background_attack_seq -%}
+    {%- set attack_status = 'Attack Started' if tick == 8 else ('Attack Stopped' if tick == 32 else 'Attack Sampled') -%}
+  {%- endif -%}
+  {%- set action = 'Drop' if attack_status == 'Attack Sampled' else 'None' -%}
+  {%- set src_ip = params.attack_source_ipv6 if chain or tick in [8, 44] else '2001:db8:10::54' -%}
+  {%- set dst_ip = params.attack_destination_ipv6 if chain or tick in [8, 44] else '2001:db8:20::7' -%}
+  {%- set src_port = 52123 -%}
+  {%- set dst_port = 80 -%}
+  {%- set raw = 'CEF:0|F5|Advanced Firewall Module|' ~ params.product_version
+    ~ '|Bad TCP checksum|' ~ action ~ '|8|'
+    ~ 'dvchost=' ~ params.bigip_host
+    ~ ' dvc=' ~ params.bigip_management_ip
+    ~ ' rt=' ~ rt
+    ~ ' act=' ~ action
+    ~ ' cn1=' ~ attack_id ~ ' cn1Label=attack_id'
+    ~ ' cs1=' ~ attack_status ~ ' cs1Label=attack_status'
+    ~ ' src= spt=' ~ src_port ~ ' dst= dpt=' ~ dst_port
+    ~ ' cs2=' ~ params.vlan ~ ' cs2Label=vlan'
+    ~ ' cs3=' ~ params.virtual_server ~ ' cs3Label=virtual_name'
+    ~ ' cn4=0 cn4Label=route_domain'
+    ~ ' c6a2=' ~ src_ip ~ ' c6a2Label=source_address'
+    ~ ' c6a3=' ~ dst_ip ~ ' c6a3Label=destination_address' -%}
+  {%- set event_type = ['start'] if attack_status == 'Attack Started' else (['end'] if attack_status == 'Attack Stopped' else ['denied']) -%}
+  {%- set event_action = 'dos_' ~ ('started' if attack_status == 'Attack Started' else ('stopped' if attack_status == 'Attack Stopped' else 'sampled')) -%}
+  {%- set f5 = {'afm': {'attack_id': attack_id, 'attack_status': attack_status,
+    'attack_name': 'Bad TCP checksum', 'action': action,
+    'vlan': params.vlan, 'virtual_server': params.virtual_server}} -%}
+{%- else -%}
+  {%- set phase = tick % 4 -%}
+  {%- set action = 'Open' if phase == 2 else ('Closed' if phase == 3 else 'Accept') -%}
+  {%- if phase == 2 -%}
+    {%- do shared.set('flow_port', 40000 + (sequence % 20000)) -%}
+    {%- do shared.set('flow_source', module.rand.choice(['10.0.10.10', '10.0.10.11'])) -%}
+  {%- endif -%}
+  {%- set src_ip = shared.get('flow_source', '10.0.10.10') if phase == 3 or phase == 2 else module.rand.choice(['10.0.10.10', '10.0.10.11']) -%}
+  {%- set src_port = shared.get('flow_port', 40000) if phase == 3 or phase == 2 else 40000 + (sequence % 20000) -%}
+  {%- set dst_ip = '10.0.20.10' -%}
+  {%- set dst_port = 443 -%}
+  {%- set rule = 'allow_https' if action == 'Accept' else '' -%}
+  {%- set raw = 'CEF:0|F5|Advanced Firewall Module|' ~ params.product_version
+    ~ '|23003137|Network Event|8|'
+    ~ 'rt=' ~ rt
+    ~ ' dvchost=' ~ params.bigip_host
+    ~ ' dvc=' ~ params.bigip_management_ip
+    ~ ' src=' ~ src_ip ~ ' spt=' ~ src_port
+    ~ ' dst=' ~ dst_ip ~ ' dpt=' ~ dst_port
+    ~ ' proto=TCP'
+    ~ ' cs1=' ~ params.virtual_server ~ ' cs1Label=virtual_name'
+    ~ ' cs2=' ~ params.vlan ~ ' cs2Label=vlan'
+    ~ ' act=' ~ action
+    ~ ' c6a2= c6a2Label=source_address'
+    ~ ' c6a3= c6a3Label=destination_address'
+    ~ ' cs3= cs3Label=drop_reason'
+    ~ ' cn4=0 cn4Label=route_domain'
+    ~ ' cs5=' ~ rule ~ ' cs5Label=acl_rule_name' -%}
+  {%- set event_type = ['start'] if action == 'Open' else (['end'] if action == 'Closed' else ['allowed']) -%}
+  {%- set event_action = 'network_' ~ (action | lower) -%}
+  {%- set f5 = {'afm': {'action': action, 'vlan': params.vlan,
+    'virtual_server': params.virtual_server, 'acl_rule_name': rule}} -%}
+{%- endif -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'f5.afm',
+    'category': ['network', 'intrusion_detection'] if dos_event else ['network'],
+    'type': event_type, 'action': event_action,
+    'code': 'Bad TCP checksum' if dos_event else '23003137',
+    'original': raw},
+  'observer': {'name': params.bigip_host, 'ip': [params.bigip_management_ip],
+    'vendor': 'F5', 'product': 'Advanced Firewall Module', 'version': params.product_version},
+  'source': {'ip': src_ip, 'port': src_port},
+  'destination': {'ip': dst_ip, 'port': dst_port},
+  'network': {'transport': 'tcp'},
+  'related': {'ip': [src_ip, dst_ip, params.bigip_management_ip]},
+  'f5': f5} -%}
+{{ record | tojson }}
