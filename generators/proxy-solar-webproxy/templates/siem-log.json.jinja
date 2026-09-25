@@ -1,0 +1,75 @@
+{%- for flag in ['to_denied_1', 'to_denied_2', 'to_upload', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 40 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_denied_1', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set blocked = count % 8 == 0 -%}
+  {%- set is_upload = false -%}
+  {%- set user_name = params.ordinary_user -%}
+  {%- set source_ip = params.ordinary_ip -%}
+  {%- set target_host = 'social.example.test' if blocked else 'portal.example.test' -%}
+  {%- set target_ip = params.blocked_destination_ip if blocked else params.ordinary_destination_ip -%}
+  {%- set path = '/news' if blocked else '/home' -%}
+  {%- set bytes_out = 0 if blocked else 412 -%}
+  {%- set bytes_in = 0 if blocked else 8241 -%}
+{%- else -%}
+  {%- set blocked = stage != 'upload' -%}
+  {%- set is_upload = stage == 'upload' -%}
+  {%- set user_name = params.suspect_user -%}
+  {%- set source_ip = params.suspect_ip -%}
+  {%- set target_host = 'fileshare.example.test' if blocked else 'uploads.example.test' -%}
+  {%- set target_ip = params.blocked_destination_ip if blocked else params.upload_destination_ip -%}
+  {%- set path = '/restricted' if blocked else '/ingest' -%}
+  {%- set bytes_out = 0 if blocked else 12582912 -%}
+  {%- set bytes_in = 0 if blocked else 2048 -%}
+  {%- if stage == 'denied_1' -%}{%- do shared.set('to_denied_2', true) -%}
+  {%- elif stage == 'denied_2' -%}{%- do shared.set('to_upload', true) -%}
+  {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{%- endif -%}
+{%- set method = 'POST' if is_upload else 'GET' -%}
+{%- set status = 403 if blocked else 200 -%}
+{%- set reason = 'URL(' ~ target_host ~ ')' if blocked else '' -%}
+{%- set policy = 'Web category block' if blocked else 'Standard web access' -%}
+{%- set filter_codes = '11,0,0,2' if blocked else '11,0,0,0' -%}
+{%- set mime = 'text/html' if blocked or not is_upload else 'application/json' -%}
+{%- set request_time = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] ~ 'Z' -%}
+{%- set agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36' -%}
+{%- set fields = [
+  'acc-domain:' ~ params.account_domain,
+  'acc-groups:Employees',
+  'acc-ip:' ~ source_ip,
+  'acc-name:' ~ user_name,
+  'acc-port:54721',
+  'bytes-in:' ~ bytes_in,
+  'bytes-out:' ~ bytes_out,
+  'flt-categories:0',
+  'flt-codes:' ~ filter_codes,
+  'flt-policy:' ~ policy,
+  'flt-rules:https,web-filter',
+  'flt-status:' ~ status,
+  'flt-time:8',
+  'req-hostname:' ~ target_host,
+  'req-method:' ~ method,
+  'req-pathname:' ~ path,
+  'req-protocol:https',
+  'req-query:',
+  'req-referer:',
+  'req-time:' ~ request_time,
+  'req-user-agent:' ~ agent,
+  'res-datatype:' ~ mime,
+  'res-ip:' ~ target_ip,
+  'traf-mode:forward',
+  'req-port:443',
+  'flt-reason:' ~ reason
+] -%}
+{%- set syslog_time = timestamp.strftime('%b ') ~ timestamp.day ~ timestamp.strftime(' %H:%M:%S') -%}
+{%- set original = syslog_time ~ ' ' ~ params.proxy_host ~ ' java: [' ~ fields | join('] [') ~ ']' -%}
+{%- set action = 'http-denied' if blocked else 'http-allowed' -%}
+{%- set event_type = 'denied' if blocked else 'access' -%}
+{%- set outcome = 'failure' if blocked else 'success' -%}
+{%- set full_url = 'https://' ~ target_host ~ path -%}
+{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['web'], 'type': [event_type], 'action': action, 'outcome': outcome, 'original': original}, 'host': {'name': params.proxy_host}, 'source': {'ip': source_ip, 'port': 54721, 'bytes': bytes_out}, 'destination': {'ip': target_ip, 'port': 443, 'bytes': bytes_in}, 'user': {'name': user_name, 'domain': params.account_domain}, 'related': {'user': [user_name], 'ip': [source_ip, target_ip]}, 'url': {'full': full_url, 'scheme': 'https', 'domain': target_host, 'path': path}, 'http': {'request': {'method': method}, 'response': {'status_code': status}}, 'user_agent': {'original': agent}, 'solar_webproxy': {'account_groups': 'Employees', 'filter_codes': filter_codes, 'filter_policy': policy, 'filter_rules': 'https,web-filter', 'filter_time_ms': 8, 'filter_reason': reason, 'traffic_mode': 'forward', 'request_time': request_time, 'response_mime_type': mime}} -%}
+{{- payload | tojson -}}
