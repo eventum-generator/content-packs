@@ -1,0 +1,69 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- if chain -%}
+  {%- set step = tick - params.anomaly_interval_events -%}
+  {%- set kind = ['nat_view', 'object_create', 'policy_save', 'task_complete'][step] -%}
+  {%- set actor_ip = params.unusual_admin_ip -%}
+{%- else -%}
+  {%- set kind = module.rand.weighted_choice(['nat_view', 'object_view', 'login'], [65, 25, 10]) -%}
+  {%- set actor_ip = module.rand.choice(['10.1.1.10', '10.26.166.110']) -%}
+{%- endif -%}
+{%- if kind == 'nat_view' -%}
+  {%- set component = 'sfdccsm' -%}
+  {%- set detail = 'Devices > NAT > NGFW NAT Policy Editor, Page View' -%}
+  {%- set action = 'nat_policy_page_view' -%}
+  {%- set category = ['web'] -%}
+  {%- set event_type = ['access'] -%}
+{%- elif kind == 'object_view' -%}
+  {%- set component = 'sfdccsm' -%}
+  {%- set detail = 'Devices > NAT, Page View' -%}
+  {%- set action = 'nat_page_view' -%}
+  {%- set category = ['web'] -%}
+  {%- set event_type = ['access'] -%}
+{%- elif kind == 'login' -%}
+  {%- set component = 'ActionQueueScrape.pl' -%}
+  {%- set detail = 'Login, Login Success' -%}
+  {%- set action = 'login_success' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start'] -%}
+{%- elif kind == 'object_create' -%}
+  {%- set component = 'sfdccsm' -%}
+  {%- set detail = 'Objects > Object Management > NetworkObject, create ' ~ params.network_object -%}
+  {%- set action = 'network_object_create' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['creation'] -%}
+{%- elif kind == 'policy_save' -%}
+  {%- set component = 'sfdccsm' -%}
+  {%- set detail = 'Devices > NAT > NAT Policy Editor, Save Policy ' ~ params.nat_policy -%}
+  {%- set action = 'nat_policy_save' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['change'] -%}
+{%- else -%}
+  {%- set component = 'ActionQueueScrape.pl' -%}
+  {%- set detail = 'Task Queue, Successful task completion : Pre-deploy Global Configuration Generation' -%}
+  {%- set action = 'predeploy_config_generation_complete' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['end'] -%}
+{%- endif -%}
+{%- set actor = 'admin@localhost' if kind == 'task_complete' else ('csm_processes@Default User IP' if kind == 'login' else 'admin@' ~ actor_ip) -%}
+{%- set raw = event_time.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.management_center
+  ~ ': [FMC-AUDIT] ' ~ component ~ ': ' ~ actor ~ ', ' ~ detail -%}
+{%- set event_obj = {'kind': 'event', 'dataset': 'cisco.fmc.audit',
+  'category': category, 'type': event_type, 'action': action,
+  'code': 'FMC-AUDIT', 'original': raw} -%}
+{%- if kind == 'login' -%}
+  {%- do event_obj.update({'outcome': 'success'}) -%}
+{%- endif -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'}, 'event': event_obj,
+  'observer': {'name': params.management_center, 'vendor': 'Cisco', 'product': 'Secure Firewall Management Center'},
+  'user': {'name': 'csm_processes' if kind == 'login' else 'admin'},
+  'cisco': {'fmc': {'audit': {'component': component, 'detail': detail}}}} -%}
+{%- if kind not in ['task_complete', 'login'] -%}
+  {%- do record.update({'source': {'ip': actor_ip}, 'related': {'ip': [actor_ip]}}) -%}
+{%- endif -%}
+{{ record | tojson }}
