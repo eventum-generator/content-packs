@@ -1,0 +1,49 @@
+{%- for key in ['to_task_created', 'to_maintenance_begin', 'to_maintenance_started', 'to_maintenance_entered', 'to_task_completed', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 55 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('chain_task_id', 'haTask-ha-host-vim.HostSystem.enterMaintenanceMode-' ~ module.rand.number.integer(17000000, 17999999)) -%}{%- do shared.set('chain_operation_id', module.rand.string.hex(8) ~ '-3b41-42eb-a394-22ac9e452c6f-6a-a-615a') -%}{%- do shared.set('chain_session_id', module.rand.string.hex(8)) -%}{%- do shared.set('to_task_created', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['login', 'logout'], [55, 45]) -%}
+{%- else -%}
+  {%- set kind = stage -%}
+  {%- if stage == 'task_created' -%}{%- do shared.set('to_maintenance_begin', true) -%}
+  {%- elif stage == 'maintenance_begin' -%}{%- do shared.set('to_maintenance_started', true) -%}
+  {%- elif stage == 'maintenance_started' -%}{%- do shared.set('to_maintenance_entered', true) -%}
+  {%- elif stage == 'maintenance_entered' -%}{%- do shared.set('to_task_completed', true) -%}
+  {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{%- endif -%}
+{%- set iso_time = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] ~ 'Z' -%}
+{%- set task_id = shared.get('chain_task_id', '') -%}
+{%- set operation_id = shared.get('chain_operation_id', '') -%}
+{%- set session_id = shared.get('chain_session_id', '') -%}
+{%- if kind in ['login', 'logout'] -%}
+  {%- set sub = 'Vimsvc.ha-eventmgr' -%}
+  {%- set event_key = shared.get('event_key', 1000) + 1 -%}
+  {%- do shared.set('event_key', 1000 if event_key >= 999999 else event_key) -%}
+  {%- if kind == 'login' -%}{%- set detail = 'User nsx-user@127.0.0.1 logged in as pyvmomi Python/3.8.18 (VMkernel; 8.0.2; x86_64)' -%}
+  {%- else -%}{%- set detail = 'User nsx-user@127.0.0.1 logged out (login time: Tuesday, 05 Feb, 2026 12:00:00 PM, number of API invocations: 9, user agent: pyvmomi Python/3.8.18 (VMkernel; 8.0.2; x86_64))' -%}{%- endif -%}
+  {%- set payload = '[Originator@6876 sub=' ~ sub ~ ' opID=' ~ module.rand.string.hex(8) ~ ' sid=' ~ module.rand.string.hex(8) ~ '] Event ' ~ event_key ~ ' : ' ~ detail -%}
+{%- elif kind in ['task_created', 'task_completed'] -%}
+  {%- set sub = 'Vimsvc.TaskManager' -%}
+  {%- set detail = 'Task Created : ' ~ task_id if kind == 'task_created' else 'Task Completed : ' ~ task_id ~ ' Status success' -%}
+  {%- set payload = '[Originator@6876 sub=' ~ sub ~ ' opID=' ~ operation_id ~ ' sid=' ~ session_id ~ ' user=' ~ params.maintenance_actor ~ '] ' ~ detail -%}
+{%- else -%}
+  {%- set sub = 'Vimsvc.ha-eventmgr' -%}
+  {%- set event_key = shared.get('event_key', 1000) + 1 -%}
+  {%- do shared.set('event_key', 1000 if event_key >= 999999 else event_key) -%}
+  {%- if kind == 'maintenance_begin' -%}{%- set detail = 'The host has begun entering maintenance mode.' -%}
+  {%- elif kind == 'maintenance_started' -%}{%- set detail = 'Host ' ~ params.host_name ~ ' in ' ~ params.datacenter_name ~ ' has started to enter maintenance mode' -%}
+  {%- else -%}{%- set detail = 'The host has entered maintenance mode.' -%}{%- endif -%}
+  {%- set context = ' opID=' ~ operation_id ~ ' sid=' ~ session_id ~ ' user=' ~ params.maintenance_actor if kind == 'maintenance_started' else '' -%}
+  {%- set payload = '[Originator@6876 sub=' ~ sub ~ context ~ '] Event ' ~ event_key ~ ' : ' ~ detail -%}
+{%- endif -%}
+{%- set original = iso_time ~ ' In(166) Hostd[2101270]: ' ~ payload -%}
+{%- set event_meta = {'kind': 'event', 'category': ['authentication'] if kind in ['login', 'logout'] else ['configuration'], 'type': ['start'] if kind == 'login' else ['end'] if kind == 'logout' else ['change'], 'action': kind.replace('_', '-'), 'original': original} -%}
+{%- set event = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': event_meta, 'host': {'name': params.host_name}, 'log': {'file': {'path': '/var/run/log/hostd.log'}, 'level': 'info'}, 'process': {'name': 'Hostd', 'pid': 2101270}, 'vmware': {'esxi': {'subsystem': sub, 'message': detail}}} -%}
+{%- if kind in ['login', 'logout'] -%}{%- do event.update({'user': {'name': 'nsx-user'}, 'related': {'user': ['nsx-user'], 'ip': ['127.0.0.1']}, 'source': {'ip': '127.0.0.1'}}) -%}
+{%- elif kind in ['task_created', 'task_completed', 'maintenance_started'] -%}{%- do event.vmware.esxi.update({'operation_id': operation_id, 'session_id': session_id, 'actor': params.maintenance_actor}) -%}{%- do event.update({'related': {'user': [params.maintenance_actor]}}) -%}{%- if kind in ['task_created', 'task_completed'] -%}{%- do event.vmware.esxi.update({'task_id': task_id}) -%}{%- endif -%}{%- endif -%}
+{%- if kind == 'task_completed' -%}{%- do shared.pop('chain_task_id', none) -%}{%- do shared.pop('chain_operation_id', none) -%}{%- do shared.pop('chain_session_id', none) -%}{%- endif -%}
+{{- event | tojson -}}
