@@ -1,61 +1,66 @@
-# Kaspersky NGFW 1.0 CEF sessions
+# Kaspersky NGFW 1.0 Firewall CEF sessions
 
-Kaspersky NGFW Firewall CEF session records with paired start and end events and transfer volumes. The generator writes ECS JSON with the native CEF record in `event.original`.
+Synthetic Kaspersky NGFW 1.0 Firewall session-start and session-end messages. The generator writes ECS JSON; each event's event.original contains a CEF message body for the Firewall stream. It does not prepend a syslog transport header.
 
 ## Event types
 
-| Event code | Meaning | Approximate frequency | ECS category |
-| --- | --- | --- | --- |
-| `Session start` | Session opened | ~2.5% in anomaly mode | network |
-| `Firewall` | Session ended | ~97.5% in anomaly mode | network |
+| CEF name | Meaning | Share |
+| --- | --- | --- |
+| Session start | TCP session created | 50% |
+| Firewall | TCP session ended, with directional counters | 50% |
 
-Frequencies are synthetic scenario weights, not measured production rates.
+The configured cadence is one event every 30 seconds, about 2,880 events or 1,440 complete sessions per synthetic day. Routine sessions mix HTTPS (about 84%), HTTP (5%), TCP DNS (5%), SMB (about 6%), and occasional large SMB transfers. These proportions are scenario assumptions, not published NGFW production measurements. Each start/end pair preserves its session ID, addresses, ports, rule, and start time. End events report the elapsed duration and counters; in/out are bytes received from the client/server, respectively.
 
 ## Anomaly Chain
 
-After about 80 routine session-end records, two start/end pairs target TCP/445 from 10.20.1.87 to 10.20.2.14. Match each pair on `kaspersky.ngfw.session_id`, then correlate the pairs on source and destination. Each end record reports more than 70 MB sent by the server. A rule can detect repeated large SMB transfers to one client.
+With anomaly_mode: true, one additional sequence starts after 60 routine sessions, about one synthetic hour:
 
-`anomaly_mode: true` is the default and mixes this chain into ordinary traffic. Set it to `false` for background records only. Correlate by `@timestamp` because output-line order can differ under concurrent generation.
+1. A client at 10.20.1.87 opens an SMB session to 10.20.2.14:445, then its end record reports 75 MB from the server.
+2. Thirty seconds later, the same client opens a second SMB session to that server; its end record reports 82 MB from the server.
+
+Join starts and ends by kaspersky.ngfw.session_id, then correlate the two completed sessions by source/destination and their one-minute separation. A rule can alert on two large server-to-client SMB transfers in a short window. Background mode also emits the same individual large-transfer signatures but spaces them roughly two hours apart. No individual record identifies the mode or proves data theft.
+
+anomaly_mode defaults to true. Set it to false for routine traffic without the adjacent two-session sequence. The anomaly occurs once per generator run. Compare @timestamp when analyzing samples, because concurrently written output lines can be out of order.
 
 ## Parameters
 
 ### Event Parameters
 
-Edit `event.template.params` in `generator.yml`.
+Edit event.template.params in generator.yml.
 
 | Name | Default | Purpose |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Enable the SMB transfer chain. |
-| `anomaly_interval_events` | `80` | Routine records between chains. |
-| `device_host` | `ngfw-01.example.test` | NGFW hostname. |
-| `device_version` | `1.0.0.0` | CEF device version. |
-| `unusual_source_ip` | `10.20.1.87` | Chain client. |
-| `sensitive_destination_ip` | `10.20.2.14` | Chain server. |
+| anomaly_mode | true | Include the one-time SMB sequence. |
+| anomaly_delay_sessions | 60 | Routine sessions before that sequence. |
+| device_host | ngfw-01.example.test | Device host name in CEF and ECS. |
+| device_version | 1.0.0.0 | NGFW 1.0 CEF device version. |
+| large_smb_source_ip | 10.20.1.87 | Client for occasional and adjacent large SMB sessions. |
+| large_smb_destination_ip | 10.20.2.14 | Server for those sessions. |
 
 ### Output Parameters
 
-The shipped file output works without overrides. To send records elsewhere, replace `output.file` with the desired output plugin and use top-level `params`/`secrets` substitutions for destination and credentials. No top-level placeholders are required by this pack.
+File output works as shipped and needs no top-level params or secrets. To send events elsewhere, replace output.file with an output plugin and declare top-level params/secrets for that destination.
 
 ## Usage
 
-From the content-packs repository:
+Run from the content-packs repository:
 
-```bash
+~~~bash
 eventum generate --path generators/network-kaspersky-ngfw/generator.yml --id kaspersky-ngfw --live-mode false
 eventum generate --path generators/network-kaspersky-ngfw/generator.yml --id kaspersky-ngfw --live-mode true
-```
+~~~
 
-The file output is `generators/network-kaspersky-ngfw/output/events.json`. Extract `event.original` when a collector requires raw CEF rather than ECS JSON.
+Events are written to generators/network-kaspersky-ngfw/output/events.json. A CEF collector needs the event.original value, rather than the surrounding ECS JSON.
 
 ## Sample output
 
-Copied from an actual Eventum anomaly-mode run:
+This complete event is from an anomaly-mode Eventum run:
 
-```json
+~~~json
 {
-  "@timestamp": "2026-09-25T13:04:04+00:00",
+  "@timestamp": "2026-09-25T18:27:30+00:00",
   "destination": {
-    "bytes": 0,
+    "bytes": 75000000,
     "ip": "10.20.2.14",
     "port": 445
   },
@@ -63,25 +68,30 @@ Copied from an actual Eventum anomaly-mode run:
     "version": "8.17.0"
   },
   "event": {
-    "action": "Session start",
+    "action": "Firewall",
     "category": [
       "network"
     ],
     "dataset": "kaspersky.ngfw",
+    "duration": 30000000000,
+    "end": "2026-09-25T18:27:30+00:00",
     "kind": "event",
-    "original": "CEF:0|Kaspersky|NGFW|1.0.0.0|Firewall|Session start|Unknown|rt=2026-09-25T13:04:04Z dtz=UTC+00:00 cs4=Low cs4Label=Priority devicePayloadId=911 cs1=Internal SMB inspection cs1Label=SecurityRule act=Inspect FullMatch=yes start=2026-09-25T13:04:04Z cn1=0 cn1Label=Duration cn2=1 cn2Label=ClientPackets cn3=0 cn3Label=ServerPackets in=64 out=0 dvchost=ngfw-01.example.test src=10.20.1.87 dst=10.20.2.14 proto=TCP spt=49220 dpt=445 KasperskyNGFWTCPRedir=no app=Unknown",
+    "original": "CEF:0|Kaspersky|NGFW|1.0.0.0|Firewall|Firewall|Unknown|rt=2026-09-25T18:27:30Z dtz=UTC+00:00 cs4=Low cs4Label=Priority devicePayloadId=900061 cs1=Internal SMB inspection cs1Label=SecurityRule act=Inspect FullMatch=yes start=2026-09-25T18:27:00Z end=2026-09-25T18:27:30Z cn1=30 cn1Label=Duration cn2=40000 cn2Label=ClientPackets cn3=53572 cn3Label=ServerPackets in=2800000 out=75000000 dvchost=ngfw-01.example.test src=10.20.1.87 dst=10.20.2.14 proto=TCP spt=54295 dpt=445 KasperskyNGFWTCPRedir=no app=Unknown",
+    "start": "2026-09-25T18:27:00+00:00",
     "type": [
-      "start"
+      "end"
     ]
   },
   "kaspersky": {
     "ngfw": {
       "action": "Inspect",
       "rule": "Internal SMB inspection",
-      "session_id": "911"
+      "session_id": "900061"
     }
   },
   "network": {
+    "bytes": 77800000,
+    "packets": 93572,
     "protocol": "smb",
     "transport": "tcp"
   },
@@ -92,21 +102,24 @@ Copied from an actual Eventum anomaly-mode run:
     "version": "1.0.0.0"
   },
   "source": {
-    "bytes": 64,
+    "bytes": 2800000,
     "ip": "10.20.1.87",
-    "port": 49220
+    "port": 54295
   }
 }
-```
+~~~
 
-## Scope and validation
+## Scope and evidence
 
-27/27 selected documented CEF keys are represented across start and end records. Optional protocol-specific and security-profile fields are outside this focused session stream. Both modes were generated and parsed; a time-sorted complete chain was found in anomaly mode and no chain records appeared in background mode.
+This pack models the Kaspersky:NGFW:CEF Firewall session stream. Kaspersky Security Center, KATA, KWTS, and KSMG are distinct products and streams, not duplicate generators. KUMA 4.2 lists a CEF normalizer for NGFW 1.0 and 1.2; this pack specifically models 1.0.
 
-The schema follows NGFW 1.0. KUMA also lists NGFW 1.2, but this pack does not claim byte-for-byte 1.2 compatibility. Routine traffic is modeled as session-end records; start records occur in the anomaly chain.
+Kaspersky documents the CEF header, the Firewall event names, and a field-by-field Firewall extension table. The generated fields follow those documented keys and meanings. A complete real NGFW 1.0 Firewall CEF extension was not available in the cited sources, so exact device field ordering, label values, and optional-field omission cannot be proven byte-for-byte. The CEF body is synthetic and does not claim to be a packet capture or a complete syslog message. Application protocol names in ECS are inferred from destination ports; app=Unknown reflects an unclassified application in the CEF message.
+
+Both modes were run in Eventum sample mode. The verifier checked JSON parsing, CEF key/value correspondence with ECS, UTC event times, start/end identifiers and endpoints, elapsed duration, directional byte/packet counters, branch coverage, and the sequence distinction between modes. The large SMB byte and packet volumes are compatible with a 30-second, roughly 20–22 Mbps transfer, but represent a synthetic scenario rather than vendor-published traffic.
 
 ## References
 
-- [Kaspersky NGFW 1.0 CEF header](https://support.kaspersky.com/ngfw/1.0/274361)
-- [Kaspersky NGFW 1.0 Firewall fields](https://support.kaspersky.com/ngfw/1.0/274840)
+- [Kaspersky NGFW 1.0 CEF format and event names](https://support.kaspersky.com/ngfw/1.0/274361)
+- [Kaspersky NGFW 1.0 Firewall field table](https://support.kaspersky.com/ngfw/1.0/274840)
+- [Kaspersky NGFW SIEM export](https://support.kaspersky.com/ngfw/1.0/269371)
 - [KUMA 4.2 supported sources](https://support.kaspersky.ru/kuma/4.2/255782)
