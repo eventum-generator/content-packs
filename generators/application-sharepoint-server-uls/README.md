@@ -10,11 +10,11 @@ Synthetic SharePoint Server 2016 Unified Logging Service (ULS) diagnostic record
 | `b6p4` | 33.3% | `process` | Workflow-association SQL command |
 | `tzkv` | 33.3% | `process` | SQL command parameters for that lookup |
 
-The template uses FSM mode and emits one event per simulated minute from a single farm node. These proportions are synthetic: one `ahk8y`, `b6p4`, and `tzkv` record per modeled workflow pass. Microsoft does not publish a production distribution for these EventIDs.
+The template uses FSM mode and emits one record per simulated second from a single farm node. Within each workflow pass, native event timestamps are 10 ms apart; records can reach the output file up to two seconds after their event time. These proportions are synthetic: one `ahk8y`, `b6p4`, and `tzkv` record per modeled workflow pass. Microsoft does not publish a production distribution for these EventIDs.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), one workflow instance passes through `ahk8y → b6p4 → tzkv` three times after 32 ordinary workflow passes. The nine records share `sharepoint.workflow.instance_id` and the site, web, item, and list IDs. Each pass has its own `sharepoint.uls.correlation_id`, joining its three records. A rule can group by workflow instance, sort by `@timestamp`, and find three starts with association lookups across distinct correlation IDs in a short window. Sort by `@timestamp`; output row order is not a reliable clock.
+With `anomaly_mode: true` (the default), one workflow instance passes through `ahk8y → b6p4 → tzkv` three times after 32 ordinary workflow passes. The nine records share `sharepoint.workflow.instance_id` and the site, web, item, and list IDs. Each pass has its own `sharepoint.uls.correlation_id`, joining its three records within 20 ms of event time. A rule can group by workflow instance, sort by `@timestamp`, and find three starts with association lookups across distinct correlation IDs in a short window. Sort by `@timestamp`; output row order is not a reliable clock.
 
 Microsoft's troubleshooting guide uses these EventIDs and the correlation ID to investigate a workflow timer job stuck at “Pausing.” Repeated processing here is a synthetic investigation lead, not a documented failure signature or proof that the job is stuck. Diagnosing a stuck timer job also requires checking for absent new timer-job entries and the job's state. With `anomaly_mode: false`, the stream contains independent ordinary workflow passes and never emits the linked workflow instance.
 
@@ -51,7 +51,7 @@ This JSON event was copied from an anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T16:04:00+00:00",
+  "@timestamp": "2026-09-25T14:50:45.010000+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -64,7 +64,7 @@ This JSON event was copied from an anomaly-mode run:
     "dataset": "sharepoint.uls",
     "kind": "event",
     "module": "sharepoint",
-    "original": "09/25/2026 16:04:00.00\tOWSTIMER.EXE (0x9318)\t0x6DF0\tSharePoint Foundation\tDatabase\tb6p4\tVerboseEx\tSqlCommand: ; EXEC proc_getworkflowassociations '89731438-aba4-4f6c-a763-af07abc5c7e0', '16dd7828-193f-4e28-bfe9-1a3aa346df89', '0a4d8bdd-e7d3-47f2-95b9-209659d05e9c', 'ead1e62d-fdd2-4eb2-a52d-38bdb8f47960', @contenttypeid, @RequestGuid OUTPUT\tc997636f-eb02-4e6c-aa4f-d62630a183f2",
+    "original": "09/25/2026 14:50:45.01\tOWSTIMER.EXE (0x9318)\t0x6DF0\tSharePoint Foundation\tDatabase\tb6p4\tVerboseEx\tSqlCommand: ; EXEC proc_getworkflowassociations '08fed616-659d-4b02-81c4-235a3108575d', '586727fc-d194-4c88-b7d8-634f34ba6b54', '0a4da7b6-256e-4482-9ea1-271cf212fdf1', '0b3a7c76-1acc-4270-89ca-216c9648d4d0', @contenttypeid, @RequestGuid OUTPUT\tfe3ce123-d4df-42ce-80b6-fbecd22c43fe",
     "type": [
       "info"
     ]
@@ -75,7 +75,7 @@ This JSON event was copied from an anomaly-mode run:
   "log": {
     "level": "verboseex"
   },
-  "message": "SqlCommand: ; EXEC proc_getworkflowassociations '89731438-aba4-4f6c-a763-af07abc5c7e0', '16dd7828-193f-4e28-bfe9-1a3aa346df89', '0a4d8bdd-e7d3-47f2-95b9-209659d05e9c', 'ead1e62d-fdd2-4eb2-a52d-38bdb8f47960', @contenttypeid, @RequestGuid OUTPUT",
+  "message": "SqlCommand: ; EXEC proc_getworkflowassociations '08fed616-659d-4b02-81c4-235a3108575d', '586727fc-d194-4c88-b7d8-634f34ba6b54', '0a4da7b6-256e-4482-9ea1-271cf212fdf1', '0b3a7c76-1acc-4270-89ca-216c9648d4d0', @contenttypeid, @RequestGuid OUTPUT",
   "process": {
     "name": "OWSTIMER.EXE",
     "pid": 37656,
@@ -96,20 +96,20 @@ This JSON event was copied from an anomaly-mode run:
     "uls": {
       "area": "SharePoint Foundation",
       "category": "Database",
-      "correlation_id": "c997636f-eb02-4e6c-aa4f-d62630a183f2",
+      "correlation_id": "fe3ce123-d4df-42ce-80b6-fbecd22c43fe",
       "event_id": "b6p4",
       "level": "VerboseEx",
-      "message": "SqlCommand: ; EXEC proc_getworkflowassociations '89731438-aba4-4f6c-a763-af07abc5c7e0', '16dd7828-193f-4e28-bfe9-1a3aa346df89', '0a4d8bdd-e7d3-47f2-95b9-209659d05e9c', 'ead1e62d-fdd2-4eb2-a52d-38bdb8f47960', @contenttypeid, @RequestGuid OUTPUT",
+      "message": "SqlCommand: ; EXEC proc_getworkflowassociations '08fed616-659d-4b02-81c4-235a3108575d', '586727fc-d194-4c88-b7d8-634f34ba6b54', '0a4da7b6-256e-4482-9ea1-271cf212fdf1', '0b3a7c76-1acc-4270-89ca-216c9648d4d0', @contenttypeid, @RequestGuid OUTPUT",
       "process": "OWSTIMER.EXE (0x9318)",
       "thread_id": "0x6DF0",
-      "timestamp_local": "09/25/2026 16:04:00.00"
+      "timestamp_local": "09/25/2026 14:50:45.01"
     },
     "workflow": {
       "instance_id": "11111111-2222-4333-8444-555555555555",
-      "item_id": "0a4d8bdd-e7d3-47f2-95b9-209659d05e9c",
-      "list_id": "ead1e62d-fdd2-4eb2-a52d-38bdb8f47960",
-      "site_id": "89731438-aba4-4f6c-a763-af07abc5c7e0",
-      "web_id": "16dd7828-193f-4e28-bfe9-1a3aa346df89"
+      "item_id": "0a4da7b6-256e-4482-9ea1-271cf212fdf1",
+      "list_id": "0b3a7c76-1acc-4270-89ca-216c9648d4d0",
+      "site_id": "08fed616-659d-4b02-81c4-235a3108575d",
+      "web_id": "586727fc-d194-4c88-b7d8-634f34ba6b54"
     }
   }
 }
