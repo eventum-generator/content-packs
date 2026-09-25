@@ -1,0 +1,70 @@
+{%- set step = vars.step -%}
+{%- if step == 'normal_connect' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set count = shared.get('routine_sessions', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_sessions -%}
+    {%- do shared.set('routine_sessions', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_sessions', count) -%}{%- endif -%}
+{%- endif -%}
+{%- set conn = shared.get('active_connection', 0) -%}
+{%- if step in ['normal_connect','fail_1','fail_2','fail_3','attack_connect','delegated_connect'] -%}
+  {%- set conn = (shared.get('connection_counter', 1000) % 2147483647) + 1 -%}
+  {%- do shared.set('connection_counter', conn) -%}
+  {%- if step in ['normal_connect','attack_connect','delegated_connect'] -%}{%- do shared.set('active_connection', conn) -%}{%- endif -%}
+{%- endif -%}
+{%- set actor = params.normal_user -%}{%- set src = params.normal_ip -%}
+{%- set operation = 'CONNECT' -%}{%- set retcode = 0 -%}
+{%- set database = '' -%}{%- set object = '' -%}{%- set query_id = 0 -%}
+{%- set event_category = ['authentication'] -%}{%- set event_type = ['start'] -%}
+{%- set action = 'connect' -%}
+{%- if step == 'normal_query' -%}
+  {%- set table = samples.tables.pick() -%}
+  {%- do shared.set('normal_database', table.database) -%}
+  {%- do shared.set('normal_table', table.table) -%}
+  {%- set query_id = (shared.get('query_counter', 2000) % 2147483647) + 1 -%}
+  {%- do shared.set('query_counter', query_id) -%}{%- do shared.set('active_query', query_id) -%}
+  {%- set operation = 'QUERY' -%}{%- set database = table.database -%}
+  {%- set object = "'" ~ table.query ~ "'" -%}
+  {%- set event_category = ['database'] -%}{%- set event_type = ['info'] -%}{%- set action = 'query' -%}
+{%- elif step == 'normal_table' -%}
+  {%- set operation = 'READ' -%}{%- set database = shared.get('normal_database') -%}
+  {%- set object = shared.get('normal_table') -%}{%- set query_id = shared.get('active_query') -%}
+  {%- set event_category = ['database'] -%}{%- set event_type = ['access'] -%}{%- set action = 'table-read' -%}
+{%- elif step == 'normal_disconnect' -%}
+  {%- set operation = 'DISCONNECT' -%}{%- set event_type = ['end'] -%}{%- set action = 'disconnect' -%}
+{%- elif step in ['fail_1','fail_2','fail_3'] -%}
+  {%- set actor = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
+  {%- set operation = 'FAILED_CONNECT' -%}{%- set retcode = 1045 -%}
+  {%- set event_type = ['denied'] -%}{%- set action = 'failed-connect' -%}
+{%- elif step == 'attack_connect' -%}
+  {%- set actor = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
+{%- elif step == 'delegated_connect' -%}
+  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
+{%- elif step == 'grant_query' -%}
+  {%- set actor = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
+  {%- set query_id = (shared.get('query_counter', 2000) % 2147483647) + 1 -%}{%- do shared.set('query_counter', query_id) -%}
+  {%- set operation = 'QUERY' -%}{%- set database = 'payroll' -%}
+  {%- set object = "'GRANT SELECT ON payroll.* TO \'" ~ params.delegated_user ~ "\'@\'%\''" -%}
+  {%- set event_category = ['iam','database'] -%}{%- set event_type = ['change'] -%}{%- set action = 'grant-query' -%}
+{%- elif step == 'sensitive_query' -%}
+  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
+  {%- set query_id = (shared.get('query_counter', 2000) % 2147483647) + 1 -%}
+  {%- do shared.set('query_counter', query_id) -%}{%- do shared.set('active_query', query_id) -%}
+  {%- set operation = 'QUERY' -%}{%- set database = 'payroll' -%}
+  {%- set object = "'SELECT * FROM salaries'" -%}
+  {%- set event_category = ['database'] -%}{%- set event_type = ['info'] -%}{%- set action = 'query' -%}
+{%- elif step == 'sensitive_table' -%}
+  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
+  {%- set operation = 'READ' -%}{%- set database = 'payroll' -%}
+  {%- set object = 'salaries' -%}{%- set query_id = shared.get('active_query') -%}
+  {%- set event_category = ['database'] -%}{%- set event_type = ['access'] -%}{%- set action = 'table-read' -%}
+{%- elif step == 'attack_disconnect' -%}
+  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
+  {%- set operation = 'DISCONNECT' -%}{%- set event_type = ['end'] -%}{%- set action = 'disconnect' -%}
+{%- endif -%}
+{%- set record = timestamp.strftime('%Y%m%d %H:%M:%S') ~ ',' ~ params.db_host ~ ',' ~ actor ~ ',' ~ src ~ ',' ~ conn ~ ',' ~ query_id ~ ',' ~ operation ~ ',' ~ database ~ ',' ~ object ~ ',' ~ retcode -%}
+{%- set original = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.db_host ~ ' mysql-server_auditing: ' ~ record -%}
+{%- set audit = {'serverhost':params.db_host,'username':actor,'host':src,'connectionid':conn,'queryid':query_id,'operation':operation,'database':database,'object':object,'retcode':retcode} -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':event_category,'dataset':'mariadb.audit','kind':'event','original':original,'outcome':'failure' if retcode else 'success','type':event_type},'host':{'name':params.db_host,'ip':[params.db_ip]},'log':{'syslog':{'appname':'mysql-server_auditing'}},'mariadb':{'audit':audit},'message':record,'observer':{'hostname':params.db_host,'ip':params.db_ip,'product':'MariaDB','type':'database','vendor':'MariaDB'},'related':{'ip':[src],'user':[actor]},'source':{'ip':src},'tags':['mariadb-audit','preserve_original_event'],'user':{'name':actor}} -%}
+{{- out | tojson -}}
