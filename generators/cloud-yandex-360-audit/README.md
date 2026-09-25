@@ -1,25 +1,32 @@
-# Yandex 360 Audit Log Generator
+# Yandex 360 Organization Audit Generator
 
-Produces one native enriched event object per line from the Yandex 360 organization audit-log API. It models identity and Disk activity; it does not model a paginated API response or Mail audit logs.
+Produces one `enrichedEvent` item per line from the [Yandex 360 organization audit-log API](https://yandex.ru/dev/api360/doc/ru/audit-logs/get-logs) (`cloud-api.yandex.net/v1/auditlog/organizations/{org_id}/events`). It covers browser sign-ins and selected Disk actions. The API's `items`/`iteration_key` pagination wrapper and the separate Mail audit method are outside this SIEM-oriented event stream.
 
 ## Event Types
 
-| Native `event.type` | Baseline weight | Category |
+| Native `event.type` | Routine sampling weight | Meaning |
 |---|---:|---|
-| `disk_fs-view` | 36% | File access |
-| `id_cookie.set` | 32% | Authentication |
-| `disk_fs-get-download-url` | 18% | Download |
-| `disk_fs-store` | 10% | File write |
-| `disk_fs-set-private` | 4% | Sharing change |
-| `disk_fs-set-public` | Chain only | Sharing change |
+| `id_cookie.set` | 25 | Browser or mobile sign-in |
+| `disk_fs-view` | 37 | File view |
+| `disk_fs-get-download-url` | 18 | File download |
+| `disk_fs-store` | 12 | File upload or edit |
+| `disk_fs-set-public` | 5 | Create a shared link |
+| `disk_fs-set-private` | 3 | Remove a shared link |
 
-These are synthetic weights, not measured production rates. The FSM emits one four-event chain after every 80 routine events when `anomaly_mode` is enabled.
+Weights are relative generator choices. The routine scheduler also inserts a few spaced admin actions, and an unavailable public-link state can redirect a choice to a file view. Yandex does not publish production frequencies for these types. A bounded per-file state ensures `disk_fs-set-private` only follows `disk_fs-set-public` for that file. Its `meta` contains only `unixtime`, `tgt_rawaddress`, and `resource_name`, as specified by Yandex; public-link creation adds `public_rights.macros` and `public_rights.rights`.
 
 ## Anomaly Chain
 
-A successful `id_cookie.set` for `admin@corp.example` arrives from `198.51.100.42`, outside the ordinary internal address pool. The same `event.uid` and `event.ip` then view `disk:/finance/payroll-2026.xlsx`, create a public link with `public_rights.macros: all`, and request a download URL for that file. The order and fixed file path make it possible to detect unusual login followed by external sharing and download in a short window. Join on `event.org_id`, `event.uid`, `event.ip`, and `event.meta.tgt_rawaddress`; independent `request_id` and `idempotency_id` values identify individual API events, not the whole session.
+`anomaly_mode: true` is the default. After 120 routine events, it inserts one four-event sequence on adjacent minute ticks:
 
-Set `anomaly_mode: false` for background only. This removes the unusual login and the correlated file-access and sharing sequence. It does not suppress ordinary downloads or ordinary private-link changes.
+1. `id_cookie.set`: `admin@corp.example` signs in from `203.0.113.42`, an alternate address to the account's usual address.
+2. `disk_fs-view`: the same `event.uid` and `event.ip` view `disk:/finance/payroll-2026.xlsx`.
+3. `disk_fs-set-public`: the account creates an `all`/`read` public link for that file.
+4. `disk_fs-get-download-url`: the account downloads the same file.
+
+A rule can match this ordered sequence within four minutes using `event.org_id`, `event.uid`, `event.ip`, and `event.meta.tgt_rawaddress`. `event.request_id` and `event.idempotency_id` identify individual operations, not a session. Background traffic in **both** modes contains each of these same actor/address/file actions separately, at least 20 minutes apart in the scheduled baseline. No individual event identifies the injected chain. `anomaly_mode: false` produces the background stream without this short sequence.
+
+The documentation defines `disk_fs-get-download-url` as a file download. The event does not include a download URL or prove where the content was subsequently sent.
 
 ## Parameters
 
@@ -29,58 +36,60 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `anomaly_mode` | `true` | Include the correlated chain; `false` emits only background |
+| `anomaly_mode` | `true` | Insert one short admin sequence; `false` produces background only |
 | `org_id` | `1234567` | Synthetic organization ID |
-| `organization_domain` | `corp.example` | Synthetic login domain |
-| `suspicious_ip` | `198.51.100.42` | Unusual login and file-action address |
-| `compromised_login` | `admin@corp.example` | Chain actor |
-| `compromised_uid` | `1130000000123456` | Stable chain actor ID |
-| `sensitive_path` | `disk:/finance/payroll-2026.xlsx` | File used in the chain |
+| `organization_domain` | `corp.example` | Domain for synthetic employee logins |
+| `alternate_ip` | `203.0.113.42` | Alternate admin address used in the chain and spaced background actions |
+| `compromised_login` | `admin@corp.example` | Admin login used in both modes |
+| `compromised_uid` | `1130000000123456` | Stable admin user ID |
+| `sensitive_path` | `disk:/finance/payroll-2026.xlsx` | File path used in both modes |
+
+Five employee profiles and three ordinary files are inline `items` samples in `generator.yml`. Their IDs, display names, addresses, file names, and MIME types remain stable throughout a run.
 
 ### Output Parameters
 
-The shipped configuration writes to `output/events.json` and needs no output parameters or secrets. To send events to a SIEM, replace the `file` output with the required output plugin and configure its endpoint and credentials there.
+The shipped configuration writes to `output/events.json` and needs no output parameters or secrets. Replace the `file` output with a SIEM output plugin and configure its endpoint and credentials to send events elsewhere.
 
 ## Usage
 
 Run from the content-packs repository root:
 
 ```bash
-eventum generate --path generators/cloud-yandex-360-audit/generator.yml --id yandex-360 --live-mode false
-eventum generate --path generators/cloud-yandex-360-audit/generator.yml --id yandex-360 --live-mode true
+eventum generate --path generators/cloud-yandex-360-audit/generator.yml --id yandex-360 --live-mode false --keep-order true
+eventum generate --path generators/cloud-yandex-360-audit/generator.yml --id yandex-360 --live-mode true --keep-order true
 ```
 
-The first command generates as fast as possible until interrupted. Live mode emits one event per second.
+Batch mode generates continuously until interrupted. Live mode emits one event per minute; the sixth cron field is seconds. `--keep-order true` keeps the file in timestamp order. Set `event.template.params.anomaly_mode: false` in `generator.yml` to exercise background mode.
 
 ## Sample Output
 
-This complete event was copied from the generated `output/events.json`:
+This complete `id_cookie.set` item is copied from an actual generator run:
 
 ```json
 {
   "event": {
-    "idempotency_id": "d5ca0c5b-8567-4ca3-9494-f58b15d67bf5",
-    "ip": "10.20.7.32",
+    "idempotency_id": "5c744503-57f2-49ab-b732-b5ed6c9c1c09",
+    "ip": "198.51.100.90",
     "is_system": false,
     "meta": {
-      "device_id": null,
+      "device_id": "",
       "revision": "1"
     },
-    "occurred_at": "2026-09-25T11:59:58+00:00",
+    "occurred_at": "2026-09-25T17:37:00+00:00",
     "org_id": 1234567,
-    "request_id": "693e6f3a-a302-441f-95c3-3d55e563e3a0",
+    "request_id": "@309862,1790357820.0795600,9400041844236835,42f382873483621f9b081932b946ee40,1130000000123456,admin@corp.example",
     "service": "ID",
     "status": "Success",
     "type": "id_cookie.set",
-    "uid": 1130000000100005
+    "uid": 1130000000123456
   },
-  "user_login": "marina@corp.example",
-  "user_name": "marina"
+  "user_login": "admin@corp.example",
+  "user_name": "Администратор системы"
 }
 ```
 
 ## Source and Scope
 
-The [Yandex 360 audit API](https://yandex.ru/dev/api360/doc/ru/audit-logs/get-logs) defines the `enrichedEvent`/`auditlogEvent` fields and each included event type. Disk `meta` keys follow its documented per-type parameter list. The endpoint requires an audit-capable tariff and `ya360_security:read_auditlog`. Its `items` and `iteration_key` pagination envelope is omitted because each generated line represents one item ready for SIEM ingestion. Mail audit logs use a separate method and are outside this generator.
+[Yandex's current organization audit-log method](https://yandex.ru/dev/api360/doc/ru/audit-logs/get-logs) defines the `enrichedEvent`/`auditlogEvent` object, accepted `service` values, sign-in type, Disk event names, and per-type Disk `meta` keys. The generated item includes all 13 required key paths in those two objects plus the optional `event.uid`. The published complete response examples cover `id_cookie.set` only. They show a human-readable `user_name`, UUID-shaped `idempotency_id`, a compound `@...` request ID, and an ISO 8601 string for `occurred_at` (despite the table labeling that field `integer`). The generator follows the concrete example for sign-ins.
 
-Coverage: 13/13 selected required envelope fields from the vendor's `enrichedEvent` and `auditlogEvent` schema, plus the documented Disk metadata for supported types. This is not coverage of every Yandex 360 audit event. The API does not document a production type distribution, so the baseline weights are illustrative.
+For Disk events, the current API page supplies field lists but no complete raw `enrichedEvent` example. Disk `request_id` values here are synthetic UUID strings; the exact format, and the lexical form of `tgt_rawaddress`, remain unverified. The [older Disk audit method](https://yandex.ru/dev/api360/doc/ru/ref/AuditLogService/AuditLogService_Disk) has a different endpoint, schema, and OAuth permission and is not used as a reference for this generator. Full raw fidelity of the current Disk event objects requires a captured response from the current organization audit API.
