@@ -8,13 +8,13 @@ Synthetic Secret Server 11.3 secret-view audit events for SIEM ingestion and cor
 | --- | --- | --- | --- |
 | `SECRET - VIEW` | `10004` | 100%; ordinary views dominate, five linked views recur when anomaly mode is enabled | `iam` / `access` |
 
-The generator models one Secret Server instance. Background events use four fixed actors and four ordinary secret records; actor IDs and source IPs, as well as secret IDs, names and folders, remain consistent.
+The generator models one Secret Server instance. Background events use four ordinary actors and periodic isolated views by the privileged auditor. That auditor and the high-value secret IDs also appear in both modes; actor IDs, source IPs, secret IDs, names and folders remain consistent.
 
 ## Anomaly Chain
 
 When `anomaly_mode: true` (the default), a single actor views five distinct high-value secrets in the same folder over five event timestamps: Domain Controller Admin, Backup Vault Root, Firewall Breakglass, Database Admin and Cloud Tenant Root. Each view is native CEF event `10004`. Correlate `suser` or `suid`, `src`, and five distinct `fileId` values within a short window; `cs3` gives the folder. The generator also emits normal views before and after each chain. Output lines can be interleaved by Eventum; sort by `@timestamp` for sequence analysis.
 
-Set `anomaly_mode: false` for background only. This removes the linked high-value views and does not assign the chain actor or source IP to ordinary events. The pattern indicates unusual secret access, not proof that credentials were disclosed or used.
+Set `anomaly_mode: false` for background only. This removes the five-view burst but retains isolated high-value views by the same actor and source IP. The pattern indicates unusual secret access, not proof that credentials were disclosed or used.
 
 ## Parameters
 
