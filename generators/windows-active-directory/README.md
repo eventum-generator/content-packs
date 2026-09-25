@@ -204,3 +204,4 @@ This complete 4728 event was copied from the post-review anomaly-mode run:
 - [Microsoft: Audit Security Group Management](https://learn.microsoft.com/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/audit-security-group-management)
 - [Microsoft: 5136 directory service object changed](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-5136)
 - [Elastic: System Security data stream fixtures and fields](https://github.com/elastic/integrations/tree/main/packages/system/data_stream/security)
+- [Elastic: real 5136 normalized field example](https://github.com/elastic/integrations/issues/16965)
