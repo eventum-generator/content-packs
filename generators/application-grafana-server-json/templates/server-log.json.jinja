@@ -1,0 +1,81 @@
+{%- for flag in ['next_request_ok', 'next_jwt_parse', 'next_jwt_verify', 'next_jwt_invalid', 'next_request_401'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
+{%- set kind = vars.kind -%}
+{%- if kind == 'request_ok' -%}
+  {%- set request_count = shared.get('request_count', 0) + 1 -%}
+  {%- set index = ((request_count - 1) % 6) + 1 -%}
+  {%- set remote_addr = '10.24.8.' ~ (20 + index) -%}
+  {%- set uname = 'viewer' ~ index -%}
+  {%- set user_id = 100 + index -%}
+  {%- set path = module.rand.choice(['/api/search', '/api/dashboards/home', '/api/user']) -%}
+  {%- set native = {'level': 'info', 'logger': 'context', 'msg': 'Request Completed', 't': timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '000Z', 'duration': '12.345678ms', 'method': 'GET', 'orgId': 1, 'path': path, 'referer': 'http://grafana.example.test/', 'remote_addr': remote_addr, 'size': 1240, 'status': 200, 'time_ms': 12, 'uname': uname, 'userId': user_id} -%}
+  {%- if request_count >= params.routine_requests_before_chain -%}
+    {%- do shared.set('request_count', 0) -%}
+    {%- do shared.set('fail_kind', 'anomaly' if params.anomaly_mode else 'background') -%}
+    {%- do shared.set('attempt', 0) -%}
+    {%- do shared.set('next_jwt_parse', true) -%}
+  {%- elif request_count % 32 == 0 -%}
+    {%- do shared.set('request_count', request_count) -%}
+    {%- do shared.set('fail_kind', 'background') -%}
+    {%- do shared.set('next_jwt_parse', true) -%}
+  {%- else -%}
+    {%- do shared.set('request_count', request_count) -%}
+    {%- do shared.set('next_request_ok', true) -%}
+  {%- endif -%}
+  {%- set event_time = timestamp -%}
+  {%- set action = 'request_completed' -%}
+  {%- set ecs_category = ['web'] -%}
+  {%- set ecs_type = ['access'] -%}
+{%- elif kind == 'jwt_parse' -%}
+  {%- set event_time = timestamp -%}
+  {%- do shared.set('anchor_time', event_time) -%}
+  {%- if shared.get('fail_kind') == 'anomaly' -%}{%- do shared.set('attempt', shared.get('attempt', 0) + 1) -%}{%- endif -%}
+  {%- do shared.set('next_jwt_verify', true) -%}
+  {%- set native = {'level': 'debug', 'logger': 'auth.jwt', 'msg': 'Parsing JSON Web Token', 't': event_time.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '000Z'} -%}
+  {%- set action = 'jwt_parse' -%}
+  {%- set ecs_category = ['authentication'] -%}
+  {%- set ecs_type = ['info'] -%}
+{%- elif kind == 'jwt_verify' -%}
+  {%- set event_time = shared.get('anchor_time') + module.datetime.timedelta(milliseconds=1) -%}
+  {%- do shared.set('next_jwt_invalid', true) -%}
+  {%- set native = {'error': params.jwt_error, 'level': 'debug', 'logger': 'context', 'msg': 'Failed to verify JWT', 't': event_time.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '000Z'} -%}
+  {%- set action = 'jwt_verify_failed' -%}
+  {%- set ecs_category = ['authentication'] -%}
+  {%- set ecs_type = ['denied'] -%}
+{%- elif kind == 'jwt_invalid' -%}
+  {%- set event_time = shared.get('anchor_time') + module.datetime.timedelta(milliseconds=2) -%}
+  {%- do shared.set('next_request_401', true) -%}
+  {%- set native = {'error': params.jwt_error, 'level': 'warn', 'logger': 'context', 'msg': 'Invalid JWT', 't': event_time.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '000Z', 'traceID': ''} -%}
+  {%- set action = 'jwt_invalid' -%}
+  {%- set ecs_category = ['authentication'] -%}
+  {%- set ecs_type = ['denied'] -%}
+{%- else -%}
+  {%- set event_time = shared.get('anchor_time') + module.datetime.timedelta(milliseconds=3) -%}
+  {%- if shared.get('fail_kind') == 'anomaly' -%}
+    {%- set failed_ip = params.suspect_remote_addr -%}
+  {%- else -%}
+    {%- set failure_index = shared.get('background_failure_count', 0) -%}
+    {%- set failed_ip = params.suspect_remote_addr if failure_index == 6 else '10.24.9.' ~ (30 + failure_index) -%}
+    {%- do shared.set('background_failure_count', (failure_index + 1) % 7) -%}
+  {%- endif -%}
+  {%- set native = {'duration': '2.213017ms', 'level': 'info', 'logger': 'context', 'method': 'GET', 'msg': 'Request Completed', 'orgId': 0, 'path': '/', 'referer': '', 'remote_addr': failed_ip, 'size': 39, 'status': 401, 't': event_time.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '000Z', 'time_ms': 2, 'uname': '', 'userId': 0} -%}
+  {%- if shared.get('fail_kind') == 'anomaly' and shared.get('attempt', 0) < 3 -%}
+    {%- do shared.set('next_jwt_parse', true) -%}
+  {%- else -%}
+    {%- do shared.set('attempt', 0) -%}
+    {%- do shared.pop('fail_kind', none) -%}
+    {%- do shared.set('next_request_ok', true) -%}
+  {%- endif -%}
+  {%- set action = 'request_completed' -%}
+  {%- set ecs_category = ['web', 'authentication'] -%}
+  {%- set ecs_type = ['denied'] -%}
+{%- endif -%}
+{%- set original = native | tojson -%}
+{%- set payload = {'@timestamp': event_time.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ecs_category, 'type': ecs_type, 'dataset': 'grafana.server', 'module': 'grafana', 'action': action, 'original': original}, 'host': {'name': params.grafana_host}, 'service': {'name': 'Grafana OSS', 'version': '9.5.1'}, 'message': native.msg, 'log': {'level': native.level}, 'grafana': {'log': native}} -%}
+{%- if kind in ['request_ok', 'request_401'] -%}
+  {%- do payload.update({'source': {'ip': native.remote_addr}, 'http': {'request': {'method': native.method}, 'response': {'status_code': native.status}}, 'url': {'path': native.path}, 'related': {'ip': [native.remote_addr], 'hosts': [params.grafana_host]}}) -%}
+  {%- do payload.event.update({'outcome': 'success' if native.status < 400 else 'failure', 'duration': 12345678 if kind == 'request_ok' else 2213017}) -%}
+  {%- if native.uname -%}{%- do payload.update({'user': {'name': native.uname, 'id': native.userId ~ ''}}) -%}{%- endif -%}
+{%- else -%}
+  {%- do payload.update({'related': {'hosts': [params.grafana_host]}}) -%}
+{%- endif -%}
+{{- payload | tojson -}}
