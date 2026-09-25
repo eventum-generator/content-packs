@@ -1,0 +1,77 @@
+{%- for flag in ['next_routine_login', 'next_routine_update', 'next_routine_logout', 'next_anomaly_login', 'next_anomaly_add', 'next_anomaly_update', 'next_anomaly_logout'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine_login' -%}
+  {%- set session_count = shared.get('session_count', 0) + 1 -%}
+  {%- do shared.set('session_count', session_count) -%}
+  {%- set index = ((session_count - 1) % 6) + 1 -%}
+  {%- set user_name = 'admin' ~ ('0' ~ index if index < 10 else index) -%}
+  {%- set client_ip = '10.20.30.' ~ (10 + index) -%}
+  {%- set processnode_name = 'cimp-node-0' ~ (((session_count - 1) % 4) + 1) ~ '.example.test' -%}
+  {%- do shared.update({'user_name': user_name, 'client_ip': client_ip, 'processnode_name': processnode_name}) -%}
+  {%- do shared.set('next_routine_update' if session_count % 4 == 0 else 'next_routine_logout', true) -%}
+{%- elif stage == 'anomaly_login' -%}
+  {%- set anomaly_index = (shared.get('anomaly_index', 0) % 9999) + 1 -%}
+  {%- set user_name = params.suspect_user -%}
+  {%- set client_ip = params.suspect_client_ip -%}
+  {%- set processnode_name = params.suspect_node_prefix ~ '-' ~ anomaly_index ~ '.example.test' -%}
+  {%- do shared.update({'anomaly_index': anomaly_index, 'user_name': user_name, 'client_ip': client_ip, 'processnode_name': processnode_name}) -%}
+  {%- do shared.set('next_anomaly_add', true) -%}
+{%- else -%}
+  {%- set user_name = shared.get('user_name') -%}
+  {%- set client_ip = shared.get('client_ip') -%}
+  {%- set processnode_name = shared.get('processnode_name') -%}
+  {%- if stage == 'routine_update' -%}
+    {%- do shared.set('next_routine_logout', true) -%}
+  {%- elif stage == 'routine_logout' -%}
+    {%- if shared.get('session_count', 0) >= params.routine_sessions_before_chain -%}
+      {%- do shared.set('session_count', 0) -%}
+      {%- do shared.set('next_anomaly_login' if params.anomaly_mode else 'next_routine_login', true) -%}
+    {%- else -%}
+      {%- do shared.set('next_routine_login', true) -%}
+    {%- endif -%}
+  {%- elif stage == 'anomaly_add' -%}
+    {%- do shared.set('next_anomaly_update', true) -%}
+  {%- elif stage == 'anomaly_update' -%}
+    {%- do shared.set('next_anomaly_logout', true) -%}
+  {%- else -%}
+    {%- do shared.set('next_routine_login', true) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if stage.endswith('login') -%}
+  {%- set severity = 6 -%}
+  {%- set event_type = 'UserLogging' -%}
+  {%- set resource_accessed = 'Cisco CallManager Administration' -%}
+  {%- set audit_category = 'AdministrativeEvent' -%}
+  {%- set component_id = 'Cisco CallManager Administration' -%}
+  {%- set audit_details = 'Successfully Logged into Cisco Unified CM Admin Webpages' -%}
+  {%- set action = 'user_login' -%}
+  {%- set ecs_category = 'authentication' -%}
+  {%- set ecs_type = 'start' -%}
+{%- elif stage.endswith('logout') -%}
+  {%- set severity = 6 -%}
+  {%- set event_type = 'UserLogging' -%}
+  {%- set resource_accessed = 'CUCMAdmin' -%}
+  {%- set audit_category = 'CriticalEvent' -%}
+  {%- set component_id = 'Cisco CUCM Administration' -%}
+  {%- set audit_details = 'Successfully Logged out Cisco Unified Administration Web Pages' -%}
+  {%- set action = 'user_logout' -%}
+  {%- set ecs_category = 'authentication' -%}
+  {%- set ecs_type = 'end' -%}
+{%- else -%}
+  {%- set severity = 5 -%}
+  {%- set event_type = 'GeneralConfigurationUpdate' -%}
+  {%- set resource_accessed = 'CUCMAdmin' -%}
+  {%- set audit_category = 'AdministrativeEvent' -%}
+  {%- set component_id = 'Cisco CUCM Administration' -%}
+  {%- set operation = 'added' if stage == 'anomaly_add' else 'updated' -%}
+  {%- set audit_details = 'record in table processnode with key field name = ' ~ processnode_name ~ ' ' ~ operation -%}
+  {%- set action = 'processnode_' ~ operation -%}
+  {%- set ecs_category = 'configuration' -%}
+  {%- set ecs_type = 'creation' if stage == 'anomaly_add' else 'change' -%}
+{%- endif -%}
+{%- set native_time = timestamp.strftime('%H:%M:%S.%f')[:-3] -%}
+{%- set original = native_time ~ ' |LogMessage   UserID : ' ~ user_name ~ '  ClientAddress : ' ~ client_ip ~ '  Severity : ' ~ severity ~ '  EventType : ' ~ event_type ~ '  ResourceAccessed: ' ~ resource_accessed ~ '  EventStatus : Success  CompulsoryEvent : No  AuditCategory : ' ~ audit_category ~ '  ComponentID : ' ~ component_id ~ '  CorrelationID :   AuditDetails : ' ~ audit_details ~ ' App ID: Cisco Tomcat Cluster ID:  Node ID: ' ~ params.cucm_node -%}
+{%- set audit = {'timestamp_local': native_time, 'user_id': user_name, 'client_address': client_ip, 'severity': severity, 'event_type': event_type, 'resource_accessed': resource_accessed, 'event_status': 'Success', 'compulsory_event': 'No', 'audit_category': audit_category, 'component_id': component_id, 'correlation_id': '', 'audit_details': audit_details, 'app_id': 'Cisco Tomcat', 'cluster_id': '', 'node_id': params.cucm_node} -%}
+{%- if event_type == 'GeneralConfigurationUpdate' -%}{%- do audit.update({'processnode_name': processnode_name}) -%}{%- endif -%}
+{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': [ecs_category], 'type': [ecs_type], 'outcome': 'success', 'dataset': 'cucm.audit', 'module': 'cucm', 'action': action, 'code': event_type, 'original': original}, 'host': {'name': params.cucm_node}, 'service': {'name': 'Cisco Unified Communications Manager', 'version': '14.0.1.10000-20'}, 'user': {'name': user_name}, 'source': {'ip': client_ip}, 'related': {'user': [user_name], 'ip': [client_ip], 'hosts': [params.cucm_node]}, 'message': audit_details, 'cucm': {'audit': audit}} -%}
+{{- payload | tojson -}}
