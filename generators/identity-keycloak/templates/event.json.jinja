@@ -1,0 +1,176 @@
+{%- for key in ['to_spray', 'to_breach', 'to_role_grant', 'to_audit_change', 'to_routine'] -%}
+  {%- do shared.pop(key, none) -%}
+{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- set login_names = ['alice', 'bob', 'carol', 'dmitry', 'irina', 'ops-admin'] -%}
+{%- set user_ids = {
+    'alice': '364ba1fb-f8c5-45ac-a57c-a39f3bd4b3a0',
+    'bob': '08558a58-3690-4ee3-bdcc-4df76d84c23b',
+    'carol': '81515fb3-c87c-4768-9607-d0d4543a5d33',
+    'dmitry': '06d6371d-36ad-4c74-ad71-92c418d6b6ca',
+    'irina': 'e32ea9c9-eef4-4472-8d1c-431cbf9f065b',
+    'ops-admin': 'bf511ad7-52ec-47ac-8cb0-41d097eea006'
+} -%}
+{%- set client = 'security-admin-console' if stage != 'routine' else module.rand.choice(['portal', 'hr-app', 'mail-ui']) -%}
+{%- set user_name = module.rand.choice(login_names) -%}
+{%- set user_id = user_ids[user_name] -%}
+{%- set ip = module.rand.choice(['10.20.8.12', '10.20.8.31', '10.20.9.18']) -%}
+{%- set event_type = 'LOGIN' -%}
+{%- set error = none -%}
+{%- set resource_type = none -%}
+{%- set resource_path = none -%}
+{%- set operation_type = none -%}
+{%- set representation = none -%}
+{%- if stage == 'routine' -%}
+  {%- set event_type = module.rand.weighted_choice(['LOGIN', 'CODE_TO_TOKEN', 'LOGOUT', 'LOGIN_ERROR'], [55, 20, 15, 10]) -%}
+  {%- if event_type == 'CODE_TO_TOKEN' or event_type == 'LOGOUT' -%}
+    {%- set session = shared.get('active_session') -%}
+    {%- if session is none -%}
+      {%- set event_type = 'LOGIN' -%}
+    {%- else -%}
+      {%- set user_name = session.user_name -%}
+      {%- set user_id = session.user_id -%}
+      {%- set ip = session.ip -%}
+      {%- set client = session.client -%}
+      {%- if event_type == 'LOGOUT' -%}
+        {%- do shared.pop('active_session') -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if event_type == 'LOGIN' -%}
+    {%- do shared.set('active_session', {
+        'user_name': user_name, 'user_id': user_id,
+        'ip': ip, 'client': client
+    }) -%}
+  {%- endif -%}
+  {%- if event_type == 'LOGIN_ERROR' -%}
+    {%- set error = 'invalid_user_credentials' -%}
+  {%- endif -%}
+  {%- set routine_count = shared.get('routine_count', 0) + 1 -%}
+  {%- if routine_count >= 80 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('spray_count', 0) -%}
+      {%- do shared.set('to_spray', true) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', routine_count) -%}
+  {%- endif -%}
+{%- elif stage == 'spray' -%}
+  {%- set n = shared.get('spray_count', 0) + 1 -%}
+  {%- do shared.set('spray_count', n) -%}
+  {%- set event_type = 'LOGIN_ERROR' -%}
+  {%- set error = 'invalid_user_credentials' -%}
+  {%- set user_name = ['alice', 'bob', 'carol', 'dmitry', params.compromised_user][n - 1] -%}
+  {%- set user_id = params.compromised_user_id if n == 5 else user_ids[user_name] -%}
+  {%- set ip = params.suspicious_ip -%}
+  {%- if n == 5 -%}
+    {%- do shared.set('to_breach', true) -%}
+  {%- endif -%}
+{%- elif stage == 'breach' -%}
+  {%- set event_type = 'LOGIN' -%}
+  {%- set user_name = params.compromised_user -%}
+  {%- set user_id = params.compromised_user_id -%}
+  {%- set ip = params.suspicious_ip -%}
+  {%- do shared.set('to_role_grant', true) -%}
+{%- elif stage == 'role_grant' -%}
+  {%- set event_type = 'ADMIN_EVENT' -%}
+  {%- set operation_type = 'CREATE' -%}
+  {%- set resource_type = 'REALM_ROLE_MAPPING' -%}
+  {%- set resource_path = 'users/' ~ params.target_user_id ~ '/role-mappings/realm' -%}
+  {%- set representation = ([{'id': params.privileged_role_id,
+                              'name': params.privileged_role_name}]|tojson) -%}
+  {%- set user_name = params.compromised_user -%}
+  {%- set user_id = params.compromised_user_id -%}
+  {%- set ip = params.suspicious_ip -%}
+  {%- do shared.set('to_audit_change', true) -%}
+{%- else -%}
+  {%- set event_type = 'ADMIN_EVENT' -%}
+  {%- set operation_type = 'UPDATE' -%}
+  {%- set resource_type = 'REALM' -%}
+  {%- set resource_path = 'events/config' -%}
+  {%- set user_name = params.compromised_user -%}
+  {%- set user_id = params.compromised_user_id -%}
+  {%- set ip = params.suspicious_ip -%}
+  {%- do shared.set('to_routine', true) -%}
+{%- endif -%}
+{%- set level = 'WARN' if error else 'INFO' -%}
+{%- if event_type == 'ADMIN_EVENT' -%}
+  {%- set message = 'operationType=' ~ (operation_type|tojson)
+      ~ ', realmId=' ~ (params.realm_id|tojson)
+      ~ ', realmName=' ~ (params.realm|tojson)
+      ~ ', clientId=' ~ (client|tojson)
+      ~ ', userId=' ~ (user_id|tojson)
+      ~ ', ipAddress=' ~ (ip|tojson)
+      ~ ', resourceType=' ~ (resource_type|tojson)
+      ~ ', resourcePath=' ~ (resource_path|tojson) -%}
+  {%- if representation is not none -%}
+    {%- set message = message ~ ', representation=' ~ (representation|tojson) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set message = 'type=' ~ (event_type|tojson)
+      ~ ', realmId=' ~ (params.realm_id|tojson)
+      ~ ', realmName=' ~ (params.realm|tojson)
+      ~ ', clientId=' ~ (client|tojson)
+      ~ ', userId=' ~ (user_id|tojson)
+      ~ ', ipAddress=' ~ (ip|tojson) -%}
+  {%- if error is not none -%}
+    {%- set message = message ~ ', error=' ~ (error|tojson) -%}
+  {%- endif -%}
+  {%- set message = message
+      ~ ', auth_method=' ~ ('openid-connect'|tojson)
+      ~ ', auth_type=' ~ ('code'|tojson)
+      ~ ', redirect_uri=' ~ ('https://sso.corp.example/callback'|tojson)
+      ~ ', code_id=' ~ (module.rand.crypto.uuid4()|tojson)
+      ~ ', username=' ~ (user_name|tojson) -%}
+{%- endif -%}
+{%- set full_line = timestamp.strftime('%Y-%m-%d %H:%M:%S,%f')[:23] ~ ' ' ~ level ~ '  [org.keycloak.events] (executor-thread-1) ' ~ message -%}
+{%- set log_offset = shared.get('log_offset', 0) -%}
+{%- do shared.set('log_offset', log_offset + (full_line|length) + 1) -%}
+{%- set event = {
+    'agent_id_status': 'verified', 'dataset': 'keycloak.log',
+    'ingested': timestamp.isoformat(), 'original': full_line,
+    'timezone': '+00:00', 'kind': 'event',
+    'action': operation_type if operation_type else event_type,
+    'outcome': 'failure' if error else 'success',
+    'category': ['iam', 'configuration'] if operation_type else ['authentication'],
+    'type': ['change'] if operation_type else (['start'] if event_type == 'LOGIN' else ['info'])
+} -%}
+{%- set doc = {
+    '@timestamp': timestamp.isoformat(),
+    'agent': {'ephemeral_id': params.collector_ephemeral_id, 'id': params.collector_id,
+              'name': params.hostname, 'type': 'filebeat', 'version': params.collector_version},
+    'data_stream': {'dataset': 'keycloak.log', 'namespace': 'default', 'type': 'logs'},
+    'ecs': {'version': '8.17.0'},
+    'elastic_agent': {'id': params.collector_id, 'snapshot': false, 'version': params.collector_version},
+    'event': event,
+    'host': {'architecture': 'x86_64', 'containerized': true,
+             'hostname': params.hostname, 'id': '5082ec46978249e68488c21de3f64030',
+             'ip': [params.host_ip], 'mac': ['02-42-0A-14-01-0F'],
+             'name': params.hostname,
+             'os': {'codename': 'bookworm', 'family': 'debian',
+                    'kernel': '6.1.0', 'name': 'Debian', 'platform': 'debian',
+                    'type': 'linux', 'version': '12'}},
+    'input': {'type': 'filestream'},
+    'log': {'file': {'device_id': '2049', 'inode': '537921',
+                      'path': '/opt/keycloak/data/log/keycloak.log'},
+            'level': level, 'logger': 'org.keycloak.events', 'offset': log_offset},
+    'message': message,
+    'process': {'thread': {'name': 'executor-thread-1'}},
+    'tags': ['keycloak-log'],
+    'source': {'ip': ip}, 'related': {'ip': [ip], 'user': [user_name]},
+    'user': {'id': user_id, 'name': user_name},
+    'keycloak': {'realm': params.realm, 'realm_id': params.realm_id,
+                 'client_id': client,
+                 'user_id': user_id, 'ip_address': ip, 'event_type': event_type}
+} -%}
+{%- if operation_type -%}
+  {%- do doc.keycloak.update({'operation_type': operation_type,
+                               'resource_type': resource_type,
+                               'resource_path': resource_path}) -%}
+  {%- if representation is not none -%}
+    {%- do doc.keycloak.update({'representation': representation,
+                                 'role_name': params.privileged_role_name}) -%}
+  {%- endif -%}
+{%- endif -%}
+{{- doc|tojson -}}
