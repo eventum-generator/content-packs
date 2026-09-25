@@ -1,0 +1,56 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- set started = chain and step % 2 == 0 -%}
+{%- if chain and step == 0 -%}
+  {%- do shared.set('episode', (shared.get('episode', 0) + 1) % 1000000) -%}
+{%- endif -%}
+{%- if chain -%}
+  {%- set src = params.unusual_source_ip -%}
+  {%- set dst = params.sensitive_destination_ip -%}
+  {%- set dpt = 445 -%}
+  {%- set session_id = '9' ~ shared.get('episode', 1) ~ (step // 2 + 1) -%}
+  {%- set spt = 49220 + step // 2 -%}
+  {%- set rule = 'Internal SMB inspection' -%}
+  {%- set bytes_out = 75000000 + step * 5000000 -%}
+{%- else -%}
+  {%- set src = module.rand.choice(['10.20.1.21','10.20.1.22','10.20.1.23','10.20.1.24']) -%}
+  {%- set dst = module.rand.choice(['198.51.100.12','198.51.100.13','10.20.2.8']) -%}
+  {%- set dpt = module.rand.choice([53,80,443]) -%}
+  {%- set session_id = module.rand.string.digits(7) -%}
+  {%- set spt = module.rand.number.integer(49152, 61000) -%}
+  {%- set rule = 'Office internet access' -%}
+  {%- set bytes_out = module.rand.number.integer(500, 80000) -%}
+{%- endif -%}
+{%- set name = 'Session start' if started else 'Firewall' -%}
+{%- set start_time = event_time if started else event_time - module.datetime.timedelta(seconds=8) -%}
+{%- set duration = 0 if started else 8 -%}
+{%- set ext = 'rt=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%SZ') ~ ' dtz=UTC+00:00'
+  ~ ' cs4=Low cs4Label=Priority devicePayloadId=' ~ session_id
+  ~ ' cs1=' ~ rule ~ ' cs1Label=SecurityRule act=Inspect FullMatch=yes'
+  ~ ' start=' ~ start_time.strftime('%Y-%m-%dT%H:%M:%SZ')
+  ~ (' end=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%SZ') if not started else '')
+  ~ ' cn1=' ~ duration ~ ' cn1Label=Duration'
+  ~ ' cn2=' ~ (1 if started else 32) ~ ' cn2Label=ClientPackets'
+  ~ ' cn3=' ~ (0 if started else 65) ~ ' cn3Label=ServerPackets'
+  ~ ' in=' ~ (64 if started else 12000)
+  ~ ' out=' ~ (0 if started else bytes_out)
+  ~ ' dvchost=' ~ params.device_host ~ ' src=' ~ src ~ ' dst=' ~ dst
+  ~ ' proto=TCP spt=' ~ spt ~ ' dpt=' ~ dpt
+  ~ ' KasperskyNGFWTCPRedir=no app=Unknown' -%}
+{%- set raw = 'CEF:0|Kaspersky|NGFW|' ~ params.device_version ~ '|Firewall|' ~ name ~ '|Unknown|' ~ ext -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'kaspersky.ngfw', 'category': ['network'],
+    'type': ['start'] if started else ['end'], 'action': name,
+    'original': raw},
+  'observer': {'hostname': params.device_host, 'vendor': 'Kaspersky', 'product': 'NGFW', 'version': params.device_version},
+  'source': {'ip': src, 'port': spt, 'bytes': 64 if started else 12000},
+  'destination': {'ip': dst, 'port': dpt, 'bytes': 0 if started else bytes_out},
+  'network': {'transport': 'tcp', 'protocol': 'smb'} if chain else {'transport': 'tcp'},
+  'kaspersky': {'ngfw': {'session_id': session_id, 'rule': rule, 'action': 'Inspect'}}} -%}
+{{ record | tojson }}
