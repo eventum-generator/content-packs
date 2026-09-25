@@ -1,0 +1,47 @@
+{%- set step = vars.step -%}
+{%- set attack = step.startswith('attack_') -%}
+{%- set starting = step.endswith('start') or step.startswith('attack_start_') -%}
+{%- if step == 'routine_start' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set n = shared.get('routine_cycles', 0) + 1 -%}
+  {%- if n >= params.anomaly_interval_cycles -%}
+    {%- do shared.set('routine_cycles', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_cycles', n) -%}{%- endif -%}
+{%- endif -%}
+{%- if starting -%}
+  {%- set activity = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
+  {%- do shared.set('activity',activity) -%}
+  {%- if attack -%}
+    {%- do shared.set('extension_name','Security') -%}
+    {%- do shared.set('extension_id','{827D319E-6EAC-11D2-A4EA-00C04F79F83A}') -%}
+    {%- do shared.set('gpo_name','Corp Security Baseline') -%}
+  {%- else -%}
+    {%- do shared.set('extension_name','Group Policy Folders') -%}
+    {%- do shared.set('extension_id','{6232C319-91AC-4931-9385-E70C2B099F0E}') -%}
+    {%- do shared.set('gpo_name',samples.gpos.pick().name) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set activity = shared.get('activity') -%}
+{%- set ext = shared.get('extension_name') -%}{%- set extid = shared.get('extension_id') -%}
+{%- set gpo = shared.get('gpo_name') -%}
+{%- set record = (shared.get('record_counter',20000) % 2147483647) + 1 -%}{%- do shared.set('record_counter',record) -%}
+{%- set failed = not starting -%}
+{%- if starting -%}
+  {%- set event_id = 4016 -%}{%- set level = 4 -%}{%- set opcode = 1 -%}
+  {%- set gpo_xml = '<GPO ID="{6C77B631-1580-41B1-B63A-D3D593EB84AC}"><Name>' ~ (gpo|e) ~ '</Name></GPO>' -%}
+  {%- set data = {'CSEExtensionId':extid,'CSEExtensionName':ext,'IsExtensionAsyncProcessing':'false','IsGPOListChanged':'false','GPOListStatusString':'%%4101','DescriptionString':gpo,'ApplicableGPOList':gpo_xml} -%}
+  {%- set action = 'cse-processing-started' -%}{%- set event_type = ['start'] -%}
+{%- else -%}
+  {%- set event_id = 7016 -%}{%- set level = 2 -%}{%- set opcode = 2 -%}
+  {%- set data = {'CSEElaspedTimeInMilliSeconds':20984,'ErrorCode':1252,'CSEExtensionName':ext,'CSEExtensionId':extid} -%}
+  {%- set action = 'cse-processing-failed' -%}{%- set event_type = ['error'] -%}
+{%- endif -%}
+{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-GroupPolicy" Guid="{AEA1B4FA-97D1-45F2-A64C-4D69FFFD92C9}"/><EventID>' ~ event_id ~ '</EventID><Version>0</Version><Level>' ~ level ~ '</Level><Task>0</Task><Opcode>' ~ opcode ~ '</Opcode><Keywords>0x4000000000000000</Keywords><TimeCreated SystemTime="' ~ timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '0Z"/><EventRecordID>' ~ record ~ '</EventRecordID><Correlation ActivityID="' ~ activity ~ '"/><Execution ProcessID="1260" ThreadID="1404"/><Channel>Microsoft-Windows-GroupPolicy/Operational</Channel><Computer>' ~ params.host_name ~ '</Computer><Security UserID="S-1-5-18"/></System><EventData>' -%}
+{%- set ns = namespace(xml=xml) -%}
+{%- for key,value in data.items() -%}{%- set ns.xml = ns.xml ~ '<Data Name="' ~ key ~ '">' ~ (value|string|e) ~ '</Data>' -%}{%- endfor -%}
+{%- set xml = ns.xml ~ '</EventData></Event>' -%}
+{%- set evt = {'action':action,'category':['configuration'],'code':event_id|string,'dataset':'windows.group_policy_operational','kind':'event','original':xml,'type':event_type} -%}
+{%- if failed -%}{%- do evt.update({'outcome':'failure'}) -%}{%- endif -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':evt,'group_policy':{'cse':data,'gpo_name':gpo},'host':{'name':params.host_name,'ip':[params.host_ip]},'message':ext ~ ' extension processing ' ~ ('started' if starting else 'failed'),'tags':['group-policy-operational','preserve_original_event'],'winlog':{'activity_id':activity,'channel':'Microsoft-Windows-GroupPolicy/Operational','event_id':event_id,'provider_name':'Microsoft-Windows-GroupPolicy','record_id':record}} -%}
+{{- out | tojson -}}
