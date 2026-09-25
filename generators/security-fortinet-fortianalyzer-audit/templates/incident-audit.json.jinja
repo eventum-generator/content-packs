@@ -1,7 +1,7 @@
 {%- set previous = shared.get('previous_time') -%}
 {%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
 {%- do shared.set('previous_time', event_time) -%}
-{%- set sequence = (shared.get('sequence', 0) + 1) % 1000000 -%}
+{%- set sequence = (shared.get('sequence', 0) + 1) % 1000000000 -%}
 {%- do shared.set('sequence', sequence) -%}
 {%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
 {%- do shared.set('tick', tick) -%}
@@ -10,19 +10,58 @@
   {%- set step = tick - params.anomaly_interval_events -%}
   {%- set kind = ['create', 'attachment_add', 'attachment_delete', 'delete'][step] -%}
   {%- if step == 0 -%}
-    {%- do shared.set('anomaly_cycle', (shared.get('anomaly_cycle', 0) + 1) % 1000000) -%}
+    {%- do shared.set('incident_serial', (shared.get('incident_serial', 0) + 1) % 1000000) -%}
+    {%- do shared.set('chain_incident_id', params.incident_prefix ~ '-' ~ event_time.strftime('%Y') ~ '-' ~ (1000 + shared.get('incident_serial'))) -%}
   {%- endif -%}
-  {%- set incident_id = params.incident_prefix ~ '-' ~ (9000000 + shared.get('anomaly_cycle', 1)) -%}
-  {%- set actor = 'system' if step < 2 else params.suspicious_analyst -%}
+  {%- set incident_id = shared.get('chain_incident_id') -%}
+  {%- set actor = 'soc_analyst' if step < 2 else params.suspicious_analyst -%}
   {%- set severity = 'high' -%}
 {%- else -%}
-  {%- set kind = module.rand.weighted_choice(['create', 'update', 'attachment_add'], [35, 50, 15]) -%}
-  {%- if kind == 'create' -%}
-    {%- do shared.set('normal_incident_id', params.incident_prefix ~ '-' ~ (1000 + sequence)) -%}
+  {%- set incidents = shared.get('open_incidents', []) -%}
+  {%- set with_attachment = [] -%}
+  {%- set without_attachment = [] -%}
+  {%- set old_incidents = [] -%}
+  {%- for candidate in incidents -%}
+    {%- if candidate.has_attachment -%}
+      {%- do with_attachment.append(candidate) -%}
+    {%- else -%}
+      {%- do without_attachment.append(candidate) -%}
+    {%- endif -%}
+    {%- if event_time.timestamp() - candidate.created_epoch >= 1800 -%}
+      {%- do old_incidents.append(candidate) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set desired = module.rand.weighted_choice(
+    ['create', 'update', 'attachment_add', 'attachment_delete', 'delete'],
+    [8, 54, 24, 9, 5]) -%}
+  {%- if not incidents or (desired == 'create' and incidents | length < 80) -%}
+    {%- set kind = 'create' -%}
+    {%- do shared.set('incident_serial', (shared.get('incident_serial', 0) + 1) % 1000000) -%}
+    {%- set incident = {
+      'id': params.incident_prefix ~ '-' ~ event_time.strftime('%Y') ~ '-' ~ (1000 + shared.get('incident_serial')),
+      'severity': module.rand.choice(['low', 'medium', 'high']),
+      'created_epoch': event_time.timestamp(), 'has_attachment': false} -%}
+    {%- do incidents.append(incident) -%}
+  {%- elif desired == 'attachment_add' and without_attachment -%}
+    {%- set kind = 'attachment_add' -%}
+    {%- set incident = module.rand.choice(without_attachment) -%}
+    {%- do incident.update({'has_attachment': true}) -%}
+  {%- elif desired == 'attachment_delete' and with_attachment -%}
+    {%- set kind = 'attachment_delete' -%}
+    {%- set incident = module.rand.choice(with_attachment) -%}
+    {%- do incident.update({'has_attachment': false}) -%}
+  {%- elif desired == 'delete' and old_incidents -%}
+    {%- set kind = 'delete' -%}
+    {%- set incident = module.rand.choice(old_incidents) -%}
+    {%- do incidents.remove(incident) -%}
+  {%- else -%}
+    {%- set kind = 'update' -%}
+    {%- set incident = module.rand.choice(incidents) -%}
   {%- endif -%}
-  {%- set incident_id = shared.get('normal_incident_id', params.incident_prefix ~ '-1000') -%}
-  {%- set actor = module.rand.choice(['soc_analyst', 'ir_analyst']) -%}
-  {%- set severity = module.rand.choice(['low', 'medium']) -%}
+  {%- do shared.set('open_incidents', incidents) -%}
+  {%- set incident_id = incident.id -%}
+  {%- set actor = module.rand.choice(['soc_analyst', 'ir_analyst', params.suspicious_analyst]) -%}
+  {%- set severity = incident.severity -%}
 {%- endif -%}
 {%- if kind == 'create' -%}
   {%- set logid = '100001' -%}
