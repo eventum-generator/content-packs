@@ -1,0 +1,25 @@
+{%- set step = vars.step -%}
+{%- set chain = step.startswith('chain_') -%}
+{%- if step == 'routine_a' -%}
+  {%- do shared.pop('to_chain', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_chain', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{%- endif -%}
+{%- set alert_type = 'signature' if step == 'chain_signature' else ('protocol' if step == 'chain_protocol' else ('correlation' if step == 'chain_correlation' else module.rand.weighted_choice(['signature','protocol','profile'],[70,20,10]))) -%}
+{%- set name = 'Signature violation' if alert_type == 'signature' else ('Protocol violation' if alert_type == 'protocol' else ('Correlated violation' if alert_type == 'correlation' else 'Profile violation')) -%}
+{%- set severity = 'High' if step == 'chain_correlation' else ('Medium' if step == 'chain_protocol' else 'Low') -%}
+{%- set blocked = step == 'chain_correlation' or (not chain and module.rand.chance(0.04)) -%}
+{%- set src = params.chain_source_ip if chain else '10.43.1.' ~ module.rand.number.integer(10, 180) -%}
+{%- set spt = module.rand.number.integer(40000, 60000) -%}
+{%- set description = 'MultipleViolations' if alert_type == 'correlation' else ('MalformedRequest' if alert_type == 'protocol' else ('SignatureMatch' if alert_type == 'signature' else 'ProfileDeviation')) -%}
+{%- set policy = 'AttackCorrelation' if alert_type == 'correlation' else ('ProtocolPolicy' if alert_type == 'protocol' else ('SignaturePolicy' if alert_type == 'signature' else 'ProfilePolicy')) -%}
+{%- set extension = {'act':'Block' if blocked else 'None','dst':params.protected_server_ip,'dpt':443,'duser':'anonymous','src':src,'spt':spt,'proto':'TCP','rt':timestamp.strftime('%b %d %Y %H:%M:%S'),'cat':'Alert','cs1':policy,'cs1Label':'Policy','cs2':'PortalGroup','cs2Label':'ServerGroup','cs3':'HTTPS','cs3Label':'ServiceName','cs4':'CustomerPortal','cs4Label':'ApplicationName','cs5':description,'cs5Label':'Description'} -%}
+{%- set pieces = [] -%}
+{%- for key,value in extension.items() -%}{%- do pieces.append(key ~ '=' ~ value|string) -%}{%- endfor -%}
+{%- set raw = 'CEF:0|Imperva Inc.|SecureSphere|' ~ params.device_version ~ '|' ~ alert_type ~ '|' ~ name ~ '|' ~ severity ~ '|' ~ pieces|join(' ') -%}
+{%- set cef = {'version':0,'vendor':'Imperva Inc.','product':'SecureSphere','device_version':params.device_version,'class_id':alert_type,'name':name,'severity':severity,'extension':extension} -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'block' if blocked else 'no-action','category':['intrusion_detection','web'],'code':alert_type,'dataset':'imperva_securesphere.cef','kind':'alert','original':raw,'type':['denied'] if blocked else ['info']},'host':{'name':params.device_name},'source':{'ip':src,'port':spt},'destination':{'ip':params.protected_server_ip,'port':443},'network':{'transport':'tcp'},'related':{'ip':[src,params.protected_server_ip]},'imperva':{'securesphere':cef}} -%}
+{{- out | tojson -}}
