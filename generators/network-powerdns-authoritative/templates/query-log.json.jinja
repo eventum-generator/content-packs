@@ -1,0 +1,39 @@
+{%- for key in ['to_reconnaissance', 'to_enumeration', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- set client = module.rand.choice(['10.20.30.11', '10.20.30.12', '10.20.30.13', '10.20.30.14']) -%}
+{%- set label = module.rand.choice(['www', 'mail', 'vpn', 'api', 'ns1']) -%}
+{%- set qname = label ~ '.' ~ params.zone_name -%}
+{%- set qtype = module.rand.weighted_choice(['A', 'AAAA', 'SOA', 'MX'], [75, 12, 8, 5]) -%}
+{%- if qtype in ['SOA', 'MX'] -%}{%- set qname = params.zone_name -%}{%- endif -%}
+{%- set cache = module.rand.weighted_choice(['HIT', 'MISS'], [72, 28]) -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 65 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('recon_count', 0) -%}{%- do shared.set('to_reconnaissance', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{%- elif stage == 'reconnaissance' -%}
+  {%- set client = params.suspicious_client_ip -%}{%- set qname = params.zone_name -%}{%- set cache = 'MISS' -%}
+  {%- set count = shared.get('recon_count', 0) + 1 -%}{%- do shared.set('recon_count', count) -%}
+  {%- set qtype = ['SOA', 'NS', 'TXT'][count - 1] -%}
+  {%- if count >= 3 -%}{%- do shared.set('enumeration_count', 0) -%}{%- do shared.set('to_enumeration', true) -%}{%- endif -%}
+{%- else -%}
+  {%- set client = params.suspicious_client_ip -%}{%- set qtype = 'A' -%}{%- set cache = 'MISS' -%}
+  {%- set count = shared.get('enumeration_count', 0) + 1 -%}{%- do shared.set('enumeration_count', count) -%}
+  {%- set qname = ('%02d'|format(count)) ~ module.rand.string.hex(20) ~ '.' ~ params.zone_name -%}
+  {%- if count >= 12 -%}{%- do shared.set('enumeration_count', 0) -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{%- endif -%}
+{%- set message = "Remote " ~ client ~ " wants '" ~ qname ~ "|" ~ qtype ~ "', do = 0, bufsize = 512: packetcache " ~ cache -%}
+{%- set original = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.host_name ~ ' pdns_server[2367]: ' ~ message -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['network'], 'type': ['info'], 'action': 'dns-query', 'original': original},
+  'host': {'name': params.host_name},
+  'process': {'name': 'pdns_server', 'pid': 2367},
+  'source': {'ip': client},
+  'related': {'ip': [client]},
+  'dns': {'type': 'query', 'question': {'name': qname, 'type': qtype}},
+  'powerdns': {'server_type': 'authoritative', 'dnssec_ok': false, 'edns_buffer_size': 512, 'packet_cache': cache}
+} -%}
+{{- event | tojson -}}
