@@ -67,17 +67,34 @@ The shipped generator writes `output/events.json` without external credentials. 
 
 ## Usage
 
-From the content-packs repository:
+From the content-packs repository, make a finite copy of the config for a batch run:
 
 ```bash
-# Bounded fast sample. Live mode follows the one-minute schedule.
-timeout 3 eventum generate --path generators/identity-keycloak/generator.yml --id keycloak --live-mode false
-eventum generate --path generators/identity-keycloak/generator.yml --id keycloak --live-mode true
+uv run --project ../eventum python - <<'PY'
+from pathlib import Path
+p = Path("generators/identity-keycloak")
+source = (p / "generator.yml").read_text()
+finite = source.replace(
+    "      count: 1\n",
+    '      count: 1\n      start: "2026-09-25T00:00:00+00:00"\n'
+    '      end: "2026-09-25T06:00:00+00:00"\n',
+    1,
+)
+(p / "generator.batch.yml").write_text(finite)
+PY
+flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/identity-keycloak/generator.batch.yml --id keycloak --live-mode false --keep-order true
+rm generators/identity-keycloak/generator.batch.yml
+```
+
+For continuous generation at the configured one-minute rate:
+
+```bash
+uv run --project ../eventum eventum generate --path generators/identity-keycloak/generator.yml --id keycloak --live-mode true
 ```
 
 ## Sample Output
 
-This complete `CREATE-REALM_ROLE_MAPPING` event was copied from the validated anomaly-mode output:
+This complete synthetic `CREATE-REALM_ROLE_MAPPING` event was copied from the validated anomaly-mode output. Exact equivalence to a raw Keycloak 26.7.4 capture remains unverified for representation-bearing admin lines:
 
 ```json
 {
