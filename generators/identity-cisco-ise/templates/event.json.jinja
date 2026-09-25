@@ -2,77 +2,126 @@
 {%- set kind = step -%}
 {%- if step == 'routine' -%}
   {%- do shared.pop('to_attack', none) -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
+  {%- set count = [shared.get('routine_count', 0) + 1, params.anomaly_after_events] | min -%}
+  {%- do shared.set('routine_count', count) -%}
+  {%- if shared.get('session_active', false) -%}
+    {%- set actor = shared.get('session_actor') -%}
+    {%- set src = shared.get('session_ip') -%}
+    {%- if actor == params.anomaly_admin -%}
+      {%- set kind = module.rand.weighted_choice(['normal_logout', 'normal_config', 'normal_target'], [90, 4, 6]) -%}
+    {%- else -%}
+      {%- set kind = module.rand.weighted_choice(['normal_logout', 'normal_config'], [96, 4]) -%}
+    {%- endif -%}
+    {%- if kind == 'normal_logout' -%}{%- do shared.set('session_active', false) -%}{%- endif -%}
   {%- else -%}
-    {%- do shared.set('routine_count', count) -%}
+    {%- set actor = module.rand.weighted_choice([params.normal_admin, params.anomaly_admin], [80, 20]) -%}
+    {%- set src = params.anomaly_admin_ip if actor == params.anomaly_admin else params.normal_admin_ip -%}
+    {%- set kind = module.rand.weighted_choice(['normal_login', 'normal_fail'], [95, 5]) -%}
+    {%- if kind == 'normal_login' -%}
+      {%- do shared.set('session_active', true) -%}
+      {%- do shared.set('session_actor', actor) -%}
+      {%- do shared.set('session_ip', src) -%}
+    {%- endif -%}
   {%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['normal_login','normal_logout','normal_fail','normal_config'],[65,20,10,5]) -%}
+  {%- if count >= params.anomaly_after_events and kind == 'normal_logout' and params.anomaly_mode and shared.get('remote_enabled', true) and shared.get('auth_logging_enabled', true) and not shared.get('anomaly_done', false) -%}
+    {%- do shared.set('anomaly_done', true) -%}
+    {%- do shared.set('to_attack', true) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set actor = params.anomaly_admin -%}
+  {%- set src = params.anomaly_admin_ip -%}
 {%- endif -%}
-{%- set seq = (shared.get('sequence', 100000) % 99999999) + 1 -%}
+{%- set msg_number = shared.get('message_number', 27384) + 1 -%}
+{%- set seq = shared.get('sequence', 188270) + 1 -%}
+{%- do shared.set('message_number', msg_number) -%}
 {%- do shared.set('sequence', seq) -%}
-{%- set version = shared.get('config_version', 2700) -%}
-{%- set actor = params.anomaly_admin if kind in ['login_fail_1','login_fail_2','login_fail_3','login_success','disable_auth_logging','delete_collector'] else params.normal_admin -%}
-{%- set src = params.anomaly_admin_ip if actor == params.anomaly_admin else params.normal_admin_ip -%}
+{%- set mid = '%010d' % msg_number -%}
+{%- set seq_text = '%010d' % seq -%}
+{%- set version = shared.get('config_version', 2732) -%}
 {%- set code = '51001' -%}
 {%- set desc = 'Administrator-Login: Administrator authentication succeeded' -%}
-{%- set outcome = 'success' -%}
-{%- set event_type = ['admin','info'] -%}
-{%- set category = ['iam','authentication'] -%}
 {%- set action = 'administrator-login' -%}
 {%- set operation = 'Administrator authentication successful.' -%}
+{%- set category = ['iam', 'authentication'] -%}
+{%- set event_type = ['admin', 'info'] -%}
+{%- set outcome = 'success' -%}
 {%- set detail = {} -%}
-{%- if kind in ['login_fail_1','login_fail_2','login_fail_3','normal_fail'] -%}
+{%- set config_fields = '' -%}
+{%- if kind in ['normal_fail', 'login_fail_1', 'login_fail_2', 'login_fail_3'] -%}
   {%- set code = '51000' -%}
   {%- set desc = 'Administrator-Login: Administrator authentication failed' -%}
-  {%- set operation = 'Authentication failed due to invalid user or password' -%}
+  {%- set operation = 'Authentication failed due to invalid user or password\\, or account is disabled/locked' -%}
+  {%- set category = none -%}
+  {%- set event_type = none -%}
   {%- set outcome = 'failure' -%}
-  {%- set event_type = ['admin','denied'] -%}
-{%- elif kind == 'normal_logout' -%}
+{%- elif kind in ['normal_logout', 'attack_logout'] -%}
   {%- set code = '51002' -%}
   {%- set desc = 'Administrator-Login: Administrator logged off' -%}
   {%- set operation = 'User logged out' -%}
-  {%- set event_type = ['admin','end'] -%}
-{%- elif kind in ['normal_config','disable_auth_logging'] -%}
+{%- elif kind in ['normal_config', 'disable_auth_logging'] -%}
   {%- set code = '52001' -%}
   {%- set desc = 'Configuration-Changes: Changed configuration' -%}
-  {%- set operation = 'LoggingCategories "Passed Authentications" has been edited successfully.' if kind == 'disable_auth_logging' else 'LoggingCategories "System Statistics" has been edited successfully.' -%}
-  {%- set target = 'Passed Authentications' if kind == 'disable_auth_logging' else 'System Statistics' -%}
-  {%- set local = 'disable' if kind == 'disable_auth_logging' else 'enable' -%}
-  {%- set assigned = '{}' if kind == 'disable_auth_logging' else '{LogCollector}' -%}
-  {%- set change = 'Object modified: Local Logging = ' ~ local ~ '; Assigned Targets = ' ~ assigned -%}
   {%- set action = 'configuration-changes' -%}
-  {%- set category = ['iam','configuration'] -%}
-  {%- set event_type = ['change','info'] -%}
-  {%- do detail.update({'config_change':{'data':change,'attributes':[{'name':'Local Logging','value':local},{'name':'Assigned Targets','value':[] if kind == 'disable_auth_logging' else ['LogCollector']}]},'component':'Administration','object':{'type':'UPSCategory','name':target},'local_logging':local,'assigned_targets':[] if kind == 'disable_auth_logging' else ['LogCollector'],'failure':{'flag':false},'request_response':{'type':'initial'}}) -%}
-  {%- set version = version + 1 -%}{%- do shared.set('config_version', version) -%}
-{%- elif kind == 'delete_collector' -%}
-  {%- set code = '52002' -%}
-  {%- set desc = 'Configuration-Changes: Deleted configuration' -%}
-  {%- set change = 'Object deleted: Name=RemoteCollector; IP Address=10.40.0.20' -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_type = ['change', 'info'] -%}
+  {%- set outcome = none -%}
+  {%- set name = 'Passed Authentications' if kind == 'disable_auth_logging' or module.rand.number.integer(1, 10) <= 3 else 'System Statistics' -%}
+  {%- if kind == 'disable_auth_logging' -%}
+    {%- set local = 'disable' -%}
+  {%- elif name == 'Passed Authentications' -%}
+    {%- set local = 'disable' if shared.get('auth_logging_enabled', true) else 'enable' -%}
+  {%- else -%}
+    {%- set local = 'disable' if shared.get('stats_logging', true) else 'enable' -%}
+  {%- endif -%}
+  {%- do shared.set('auth_logging_enabled' if name == 'Passed Authentications' else 'stats_logging', local == 'enable') -%}
+  {%- set targets = [] if local == 'disable' else ['LogCollector'] -%}
+  {%- set target_text = '{}' if not targets else '{LogCollector}' -%}
+  {%- set change = 'Object modified:\\, Log Severity Level = INFO\\,Local Logging = ' ~ local ~ '\\,Assigned Targets = ' ~ target_text -%}
+  {%- set operation = 'LoggingCategories "' ~ name ~ '" has been edited successfully.' -%}
+  {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSCategory, ObjectName=' ~ name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSCategory', 'name': name}, 'local_logging': local, 'assigned_targets': targets, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
+  {%- set version = version + 1 -%}
+  {%- do shared.set('config_version', version) -%}
+{%- elif kind in ['normal_target', 'disable_collector'] -%}
+  {%- set code = '52001' -%}
+  {%- set desc = 'Configuration-Changes: Changed configuration' -%}
   {%- set action = 'configuration-changes' -%}
-  {%- set category = ['iam','configuration'] -%}
-  {%- set event_type = ['deletion','info'] -%}
-  {%- set operation = '' -%}
-  {%- do detail.update({'config_change':{'data':change},'object':{'type':'UPSLogTarget','name':'RemoteCollector','internal':{'id':'38bcf4bf-f61a-4028-8b69-ef94eceb2a8d'}},'component':'Administration'}) -%}
-  {%- set version = version + 1 -%}{%- do shared.set('config_version', version) -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_type = ['change', 'info'] -%}
+  {%- set outcome = none -%}
+  {%- set name = 'RemoteCollector' if kind == 'disable_collector' or module.rand.number.integer(1, 10) <= 3 else 'BackupCollector' -%}
+  {%- set old_status = 'ENABLED' if kind == 'disable_collector' or shared.get('remote_enabled' if name == 'RemoteCollector' else 'backup_enabled', true) else 'DISABLED' -%}
+  {%- set new_status = 'DISABLED' if old_status == 'ENABLED' else 'ENABLED' -%}
+  {%- do shared.set('remote_enabled' if name == 'RemoteCollector' else 'backup_enabled', new_status == 'ENABLED') -%}
+  {%- set target_ip = '10.40.0.20' if name == 'RemoteCollector' else '10.40.0.21' -%}
+  {%- set target_description = 'Remote UDP Collector' if name == 'RemoteCollector' else 'Backup UDP Collector' -%}
+  {%- set change = 'Object modified:\\,Port = 514\\,IP Address = ' ~ target_ip ~ '\\,Facility Code = LOCAL6\\,Length = 1024\\,Description = ' ~ target_description ~ '\\,Include Alarms = FALSE\\,Old status = ' ~ old_status ~ ' New status = ' ~ new_status ~ '\\,' -%}
+  {%- set operation = 'LoggingTargets "' ~ name ~ '" has been edited successfully.' -%}
+  {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSLogTarget, ObjectName=' ~ name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSLogTarget', 'name': name}, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
+  {%- set version = version + 1 -%}
+  {%- do shared.set('config_version', version) -%}
 {%- endif -%}
-{%- set mid = '%010d' % seq -%}
-{%- set pre = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] ~ ' +00:00 ' ~ mid ~ ' ' ~ code ~ ' NOTICE ' ~ desc ~ ', ConfigVersionId=' ~ version ~ ', AdminInterface=GUI, AdminIPAddress=' ~ src ~ ', ' -%}
-{%- set pre = pre ~ ('AdminSession=AdminGUI_Session, ' if code in ['51001','51002'] else '') ~ 'AdminName=' ~ actor ~ ', ' -%}
-{%- if code in ['51000','51001','51002'] -%}
-  {%- set pre = pre ~ 'OperationMessageText=' ~ operation ~ ',' -%}
-{%- elif code == '52001' -%}
-  {%- set pre = pre ~ 'FailureFlag=false, RequestResponseType=initial, ConfigChangeData=' ~ change ~ ', ObjectType=UPSCategory, ObjectName=' ~ target ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+{%- set event_time = timestamp + module.datetime.timedelta(milliseconds=module.rand.number.integer(0, 9999)) -%}
+{%- set inner_time = event_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] -%}
+{%- set payload = inner_time ~ ' +00:00 ' ~ seq_text ~ ' ' ~ code ~ ' NOTICE ' ~ desc ~ ', ConfigVersionId=' ~ version ~ ', ' ~ config_fields ~ 'AdminInterface=GUI, AdminIPAddress=' ~ src ~ ', ' -%}
+{%- if code in ['51001', '51002'] -%}{%- set payload = payload ~ 'AdminSession=AdminGUI_Session, ' -%}{%- endif -%}
+{%- set payload = payload ~ 'AdminName=' ~ actor ~ ', ' -%}
+{%- if code in ['51000', '51001', '51002'] -%}
+  {%- set payload = payload ~ 'OperationMessageText=' ~ operation ~ ',' -%}
 {%- else -%}
-  {%- set pre = pre ~ 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSLogTarget, ObjectName=RemoteCollector,' -%}
+  {%- set payload = payload ~ config_tail -%}
 {%- endif -%}
-{%- set original = '<181>' ~ timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.ise_name ~ ' CISE_Administrative_and_Operational_Audit ' ~ mid ~ ' 1 0 ' ~ pre -%}
-{%- set cise = {'acs':{'instance':params.ise_name},'admin':{'interface':'GUI'},'category':{'name':'CISE_Administrative_and_Operational_Audit'},'config_version':{'id':version},'message':{'code':code,'description':desc,'id':mid},'segment':{'number':0,'total':1}} -%}
-{%- if code in ['51001','51002'] -%}{%- do cise.admin.update({'session':'AdminGUI_Session'}) -%}{%- endif -%}
-{%- if operation -%}{%- do cise.update({'operation_message':{'text':operation}}) -%}{%- endif -%}
+{%- set original = '<181>' ~ event_time.strftime('%b %e %H:%M:%S') ~ ' ' ~ params.ise_name ~ ' CISE_Administrative_and_Operational_Audit ' ~ mid ~ ' 1 0 ' ~ payload -%}
+{%- set cise = {'admin': {'interface': 'GUI'}, 'category': {'name': 'CISE_Administrative_and_Operational_Audit'}, 'config_version': {'id': version}, 'message': {'code': code, 'description': desc, 'id': mid}, 'segment': {'number': 0, 'total': 1}} -%}
+{%- if code in ['51001', '51002'] -%}{%- do cise.admin.update({'session': 'AdminGUI_Session'}) -%}{%- endif -%}
+{%- if code in ['51000', '51001', '51002'] -%}{%- do cise.update({'operation_message': {'text': operation}}) -%}{%- endif -%}
 {%- do cise.update(detail) -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':category,'code':code,'dataset':'cisco_ise.log','kind':'event','original':original,'outcome':outcome,'sequence':seq,'timezone':'+00:00','type':event_type},'agent':{'ephemeral_id':'15e00000-1111-4444-8888-123456789abc','id':'15e00000-1111-4444-8888-123456789abc','name':'syslog-collector','type':'filebeat','version':'8.17.0'},'elastic_agent':{'id':'15e00000-1111-4444-8888-123456789abc','snapshot':false,'version':'8.17.0'},'cisco_ise':{'log':cise},'client':{'ip':src,'user':{'name':actor}},'data_stream':{'dataset':'cisco_ise.log','namespace':'default','type':'logs'},'host':{'hostname':params.ise_name,'ip':[params.ise_ip]},'input':{'type':'udp'},'log':{'level':'notice','source':{'address':params.ise_ip ~ ':514'},'syslog':{'priority':181,'severity':{'name':'notice'}}},'message':pre,'related':{'hosts':[params.ise_name],'ip':[src,params.ise_ip],'user':[actor]},'tags':['preserve_original_event','cisco-ise','forwarded'],'user':{'name':actor}} -%}
+{%- set event = {'action': action, 'code': code, 'dataset': 'cisco_ise.log', 'kind': 'event', 'original': original, 'sequence': seq, 'timezone': '+00:00'} -%}
+{%- if category is not none -%}{%- do event.update({'category': category}) -%}{%- endif -%}
+{%- if event_type is not none -%}{%- do event.update({'type': event_type}) -%}{%- endif -%}
+{%- if outcome is not none -%}{%- do event.update({'outcome': outcome}) -%}{%- endif -%}
+{%- set out = {'@timestamp': event_time.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': event, 'cisco_ise': {'log': cise}, 'client': {'ip': src, 'user': {'name': actor}}, 'host': {'hostname': params.ise_name}, 'observer': {'name': params.ise_name, 'product': 'Identity Services Engine', 'vendor': 'Cisco', 'version': '3.4'}, 'log': {'level': 'notice', 'syslog': {'priority': 181, 'severity': {'name': 'notice'}}}, 'message': payload, 'related': {'hosts': [params.ise_name], 'ip': [src], 'user': [actor]}, 'user': {'name': actor}} -%}
 {{- out | tojson -}}
