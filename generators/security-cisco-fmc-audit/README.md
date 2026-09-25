@@ -6,20 +6,20 @@ Cisco Secure Firewall Management Center 7.4.0 audit Syslog records for console v
 
 | Audit action | Synthetic background frequency | ECS category |
 | --- | --- | --- |
-| NAT policy editor Page View | 65% | web |
-| NAT Page View | 25% | web |
-| `csm_processes` Login Success | 10% | authentication |
-| NetworkObject create | Anomaly sequence only | configuration |
-| NAT policy save | Anomaly sequence only | configuration |
-| Pre-deploy Global Configuration Generation task completion | Anomaly sequence only | configuration |
+| NAT policy editor Page View | ~53% background | web |
+| NAT Page View | ~20% background | web |
+| `csm_processes` Login Success | ~8% background | authentication |
+| NetworkObject create | ~6% background; also in sequence | configuration |
+| NAT policy save | ~6% background; also in sequence | configuration |
+| Pre-deploy Global Configuration Generation task completion | ~6% background; also in sequence | configuration |
 
-Weights and one-record-per-second input are synthetic demo settings, not measured FMC frequencies.
+Weights and one-record-per-minute input are synthetic demo settings, not measured FMC frequencies. The background includes independent object creations, policy saves, and task completions; it does not assemble them into the four-step sequence.
 
 ## Anomaly Chain
 
-After 60 routine records, an administrator from an unusual address opens the NAT policy editor, creates a network object, and saves a NAT policy. The next record is a successful pre-deploy global configuration generation task on the same management center. Correlate the first three steps by `user.name`, `source.ip`, `observer.name`, and time; associate the task record by `observer.name` and close timing. A rule can surface an object creation and NAT policy save from a previously unseen management address.
+After 60 routine records, an administrator from an unusual address opens the NAT policy editor, creates a network object, and saves a NAT policy. Three minutes after the view, a successful pre-deploy global configuration generation task appears on the same management center. Correlate the first three steps by `user.name`, `source.ip`, `observer.name`, and a three-minute window; associate the task record by `observer.name` and close timing. A rule can surface the ordered edit-and-save sequence from one management address; the same address also appears on isolated background actions.
 
-Cisco's task-completion line uses `admin@localhost` and does not name the policy or object. It does not prove which change caused the task, that deployment completed, or that traffic behavior changed. `anomaly_mode: true` is the default; `false` emits only routine Page View and Login Success records. Sort by `@timestamp` because output lines can be reordered.
+Cisco's task-completion line uses `admin@localhost` and does not name the policy or object. It does not prove which change caused the task, that deployment completed, or that traffic behavior changed. `anomaly_mode: true` is the default; `false` emits independent management actions, including isolated object creations, policy saves, and task completions; the unusual address can also appear on an ordinary action. Sort by `@timestamp` because output lines can be reordered.
 
 ## Parameters
 
@@ -57,7 +57,7 @@ Copied from an actual anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T14:23:14+00:00",
+  "@timestamp": "2026-09-25T14:52:00+00:00",
   "cisco": {
     "fmc": {
       "audit": {
@@ -77,7 +77,7 @@ Copied from an actual anomaly-mode run:
     "code": "FMC-AUDIT",
     "dataset": "cisco.fmc.audit",
     "kind": "event",
-    "original": "Sep 25 14:23:14 firepower: [FMC-AUDIT] sfdccsm: admin@198.51.100.44, Objects > Object Management > NetworkObject, create csm-lab",
+    "original": "Sep 25 14:52:00 firepower: [FMC-AUDIT] sfdccsm: admin@198.51.100.44, Objects > Object Management > NetworkObject, create csm-lab",
     "type": [
       "creation"
     ]
@@ -105,7 +105,7 @@ Copied from an actual anomaly-mode run:
 
 The published Cisco examples include a collector-side timestamp, `localhost`, and receiver address before the FMC Syslog line. `event.original` contains the FMC-originating portion beginning with the `Sep ... firepower:` header. The `[FMC-AUDIT]` marker, components, action text, and field order follow Cisco's examples; addresses, object/policy names, and times are synthetic. All fields in the selected FMC-originating examples are present in `event.original` and mapped where meaningful to ECS or `cisco.fmc.audit`.
 
-Both modes were generated and parsed as JSON. The four-step management sequence appeared only in anomaly mode. Cisco's cited example is FMC 7.4.0 native audit Syslog. KUMA 4.2 lists Secure Firewall Management Center CEF; this pack does not generate CEF, and compatibility with that out-of-the-box normalizer is not established.
+Both modes were generated and parsed as JSON. The four-step management sequence spanned three simulated minutes in anomaly mode and did not appear in background mode. Each constituent action type appeared independently in background mode. Cisco's cited example is FMC 7.4.0 native audit Syslog. KUMA 4.2 lists Secure Firewall Management Center CEF; this pack does not generate CEF, and compatibility with that out-of-the-box normalizer is not established.
 
 ## References
 
