@@ -1,0 +1,78 @@
+{%- set step = vars.step -%}
+{%- set kind = step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('to_attack', true) -%}
+      {%- set chain_index = (shared.get('chain_index', 0) % 2147483647) + 1 -%}
+      {%- do shared.set('chain_index', chain_index) -%}
+      {%- do shared.set('attack_share_id', params.anomaly_share_id + chain_index - 1) -%}
+    {%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['login','file_read','file_write','file_share'],[15,55,20,10]) -%}
+{%- endif -%}
+{%- set file = samples.files.pick() -%}
+{%- set path = file.path -%}{%- set file_id = file.id -%}
+{%- set user = params.normal_user -%}{%- set remote = params.normal_ip -%}
+{%- set method = 'GET' -%}{%- set url = '/remote.php/dav/files/' ~ user ~ '/Projects/' ~ path.split('/')[-1] -%}
+{%- set message = 'File with id "' ~ file_id ~ '" accessed: "' ~ path ~ '"' -%}
+{%- if kind == 'login' -%}
+  {%- set method = 'POST' -%}{%- set url = '/login' -%}
+  {%- set message = 'Login successful: "' ~ user ~ '"' -%}
+{%- elif kind == 'file_write' -%}
+  {%- set method = 'PUT' -%}
+  {%- set message = 'File with id "' ~ file_id ~ '" written to: "' ~ path ~ '"' -%}
+{%- elif kind == 'file_share' -%}
+  {%- set method = 'POST' -%}{%- set url = '/ocs/v2.php/apps/files_sharing/api/v1/shares' -%}
+  {%- set share_id = (shared.get('routine_share_id', 50000) % 2147483647) + 1 -%}
+  {%- do shared.set('routine_share_id', share_id) -%}
+  {%- set message = 'The file "' ~ path ~ '" with ID "' ~ file_id ~ '" has been shared via link with permissions "1" (Share ID: ' ~ share_id ~ ')' -%}
+{%- elif kind == 'file_read' -%}
+  {#- The default file-access fields above are already complete. -#}
+{%- elif kind.startswith('fail_') -%}
+  {%- set user = '--' -%}{%- set remote = params.anomaly_ip -%}
+  {%- set method = 'POST' -%}{%- set url = '/login' -%}
+  {%- set message = 'Login failed: "' ~ params.anomaly_user ~ '"' -%}
+{%- else -%}
+  {%- set user = params.anomaly_user -%}{%- set remote = params.anomaly_ip -%}
+  {%- set path = params.anomaly_file -%}{%- set file_id = params.anomaly_file_id -%}
+  {%- if kind == 'success' -%}
+    {%- set method = 'POST' -%}{%- set url = '/login' -%}
+    {%- set message = 'Login successful: "' ~ user ~ '"' -%}
+  {%- elif kind == 'attack_file_read' -%}
+    {%- set url = '/remote.php/dav/files/' ~ user ~ '/Finance/Payroll/2026-Q3.xlsx' -%}
+    {%- set message = 'File with id "' ~ file_id ~ '" accessed: "' ~ path ~ '"' -%}
+  {%- elif kind == 'share_link' -%}
+    {%- set method = 'POST' -%}{%- set url = '/ocs/v2.php/apps/files_sharing/api/v1/shares' -%}
+    {%- set message = 'The file "' ~ path ~ '" with ID "' ~ file_id ~ '" has been shared via link with permissions "1" (Share ID: ' ~ shared.get('attack_share_id') ~ ')' -%}
+  {%- elif kind == 'expiration_remove' -%}
+    {%- set method = 'PUT' -%}{%- set url = '/ocs/v2.php/apps/files_sharing/api/v1/shares/' ~ shared.get('attack_share_id') -%}
+    {%- set message = 'The expiration date of the publicly shared file with ID "' ~ file_id ~ '" has been removed' -%}
+  {%- elif kind == 'permissions_change' -%}
+    {%- set method = 'PUT' -%}{%- set url = '/ocs/v2.php/apps/files_sharing/api/v1/shares/' ~ shared.get('attack_share_id') -%}
+    {%- set message = 'The permissions of the shared file "' ~ path ~ '" with ID "' ~ file_id ~ '" have been changed to "31"' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set req_id = module.rand.string.letters(20) -%}
+{%- set original = {'reqId':req_id,'level':1,'time':timestamp.isoformat(),'remoteAddr':remote,'user':user,'app':'admin_audit','method':method,'url':url,'scriptName':'/ocs/v2.php' if url.startswith('/ocs/') else ('/index.php' if url == '/login' else '/remote.php'),'message':message,'userAgent':'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/122.0.0.0 Safari/537.36','version':params.server_version} -%}
+{%- set action = 'file-access' -%}{%- set category = ['file'] -%}{%- set event_type = ['access'] -%}{%- set outcome = 'success' -%}
+{%- if kind in ['login', 'success'] -%}
+  {%- set action = 'user-login' -%}{%- set category = ['authentication'] -%}{%- set event_type = ['start'] -%}
+{%- elif kind.startswith('fail_') -%}
+  {%- set action = 'user-login-failed' -%}{%- set category = ['authentication'] -%}{%- set event_type = ['denied'] -%}{%- set outcome = 'failure' -%}
+{%- elif kind == 'file_write' -%}
+  {%- set action = 'file-write' -%}{%- set event_type = ['change'] -%}
+{%- elif kind in ['file_share', 'share_link'] -%}
+  {%- set action = 'share-create' -%}{%- set event_type = ['creation'] -%}
+{%- elif kind == 'expiration_remove' -%}
+  {%- set action = 'share-expiration-remove' -%}{%- set event_type = ['change'] -%}
+{%- elif kind == 'permissions_change' -%}
+  {%- set action = 'share-permissions-change' -%}{%- set event_type = ['change'] -%}
+{%- endif -%}
+{%- set actor = params.anomaly_user if kind.startswith('fail_') else user -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':category,'dataset':'nextcloud.audit','kind':'event','original':original|tojson,'outcome':outcome,'type':event_type},'host':{'name':params.server_name},'http':{'request':{'method':method}},'log':{'level':'info'},'message':message,'nextcloud':{'audit':original},'related':{'ip':[remote],'user':[actor]},'source':{'ip':remote},'tags':['nextcloud','admin_audit'],'url':{'path':url},'user_agent':{'original':original.userAgent}} -%}
+{%- if user != '--' -%}{%- do out.update({'user':{'name':user}}) -%}{%- endif -%}
+{{- out | tojson -}}
