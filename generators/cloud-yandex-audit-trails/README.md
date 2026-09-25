@@ -1,33 +1,28 @@
 # Yandex Cloud Audit Trails
 
-Generates ECS-compatible JSON with a native Audit Trails control-plane record in `event.original` and parsed data under `yandex_cloud.audit`. The native record uses the snake_case JSON layout in the Audit Trails log format reference.
-
-Reference coverage: **22/22 selected common fields and structural slots applicable to successful control-plane events, including subject, authorization, resource path and request metadata. Conditional error and token_info blocks are omitted because these emitted operations succeed and do not model token impersonation.**
+Generates ECS JSON Lines with a native Yandex Cloud management-audit record in `event.original` and parsed fields in `yandex_cloud.audit`. The selected fields and event names follow the [Audit Trails management-log format](https://yandex.cloud/en/docs/audit-trails/concepts/format) and the event-specific references below. This pack models successful control-plane operations in one organization, cloud and folder. It does not model data-plane activity.
 
 ## Event Types
 
-| Native event | Routine weight | Category |
+| Audit event | Routine weight | Modeled operation |
 | --- | ---: | --- |
-| `compute.CreateInstance` | 56% | Compute configuration |
-| `compute.UpdateInstance` | 29% | Compute configuration |
-| `resourcemanager.UpdateFolder` | 15% | Folder configuration |
-| `iam.CreateServiceAccount` | Anomaly only | IAM |
-| `resourcemanager.SetFolderAccessBindings` | Anomaly only | IAM |
-| `iam.CreateAccessKey` | Anomaly only | IAM |
+| `compute.UpdateInstance` | 88% | Update a label on one of 64 stable VMs |
+| `compute.CreateInstance` | 2% | Create a VM with a new ID, name, disk and private IP; some receive one-to-one NAT |
+| `iam.CreateServiceAccount` | 3% | Create an independent maintenance account |
+| `resourcemanager.UpdateFolderAccessBindings` | 4% | Add a `viewer` or `editor` folder binding to an existing account |
+| `iam.CreateAccessKey` | 3% | Create a static key for an existing account |
 
-Weights are generator design values, not measured vendor production frequencies. One reusable template drives an FSM. The default input emits one event per second, preserving an observable order between anomaly steps.
+The weights describe this synthetic environment, not measured Yandex Cloud production frequencies. Both modes use all five event types. One event is emitted every ten minutes, or about 144 events per day. The two federated operators and their IP addresses occur in both modes, so actor, source address and event type alone do not identify the anomaly.
 
 ## Anomaly Chain
 
-With `event.template.params.anomaly_mode: true` (the default), the generator mixes background events with this sequence after every 240 routine events:
+With `anomaly_mode: true` (default), a single linked sequence begins after 144 routine events:
 
-1. One unusual federated user creates service account `svc-maint-NNNN`.
-2. The same actor grants that account the folder `editor` role via `SetFolderAccessBindings`.
-3. The same actor creates a static access key for that service account.
+1. The second operator creates a new service account.
+2. The same operator adds that account to the folder with the `editor` role through `UpdateFolderAccessBindings`.
+3. The same operator creates a static access key for that account.
 
-Rules can detect service-account creation followed by privilege grant and key creation within a short window. Correlate by actor ID, folder ID and the service-account ID shared by all three `details` objects. Each chain uses a distinct service-account ID and key ID.
-
-Set `anomaly_mode: false` to emit only background. No anomaly steps or transition into the chain occur in that mode.
+The three records are ten minutes apart and share the new `service_account_id` in event-specific `details`. A detection can require this order, matching actor and account IDs, and a 20-minute window. Routine account creation, access grants and key creation remain independent and do not form the same three-event sequence. The chain occurs once per generator run. Set `anomaly_mode: false` to emit background activity only.
 
 ## Parameters
 
@@ -37,40 +32,46 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `cloud_id`, `folder_id`, `organization_id` | `b1gcontosocloud01`, `b1gcontosofolder1`, `bpfcontosoorg001` | Resource path |
-| `normal_subject_id`, `normal_subject_name`, `normal_source_ip` | `ajeoperator000001`, `cloud.operator`, `10.60.1.27` | Routine actor |
-| `anomaly_subject_id`, `anomaly_subject_name`, `anomaly_source_ip` | `ajeoutsider000001`, `external.admin`, `198.51.100.105` | Anomaly actor |
-| `created_service_account_id`, `created_service_account_name` | `ajebackdoor000001`, `svc-maint` | Prefixes for per-chain service accounts |
-| `anomaly_interval_events` | `240` | Routine events between chains |
-| `anomaly_mode` | `true` | Enable the chain; `false` emits only background |
+| `cloud_id`, `folder_id`, `organization_id` | `b1g0a10235b15143e07a`, `b1g2a15c9bea04fe16e5`, `bpf8fce59da310dc940c` | Resource path |
+| `normal_subject_id`, `normal_subject_name`, `normal_source_ip` | `aje29545c72dd3fe508a`, `cloud.operator`, `10.60.1.27` | Primary federated operator |
+| `anomaly_subject_id`, `anomaly_subject_name`, `anomaly_source_ip` | `ajeead78627c1eb1858a`, `external.admin`, `198.51.100.105` | Secondary federated operator, also present in background |
+| `service_account_prefix` | `svc-maint` | Prefix for newly created accounts |
+| `anomaly_interval_events` | `144` | Number of routine events before the one-shot chain |
+| `anomaly_mode` | `true` | Include the linked chain |
 
 ### Output Parameters
 
-The shipped configuration writes `output/events.json` relative to the generator. It declares no top-level `${params.*}` or `${secrets.*}` overrides. Change `output.file.path` or replace the output plugin to deliver to a SIEM.
+The shipped output writes JSON Lines to `output/events.json` relative to the generator. There are no top-level `${params.*}` or `${secrets.*}` overrides. Change the file output plugin to deliver events to a SIEM. The `samples/` directory holds stable VM and existing service-account identities.
 
 ## Usage
 
-Run from the content-packs repository root:
+Run in live mode from the content-packs repository root:
 
 ```bash
 eventum generate --path generators/cloud-yandex-audit-trails/generator.yml --id cloud-yandex-audit-trails --live-mode true
 ```
 
-Use `--live-mode false` for a fast local sample run.
+For a bounded sample-mode run, use:
 
-## Sample Output
-
-This complete event was copied from an enabled-mode generator run:
-
-```json
-{"@timestamp": "2026-09-25T11:54:22+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "yandex_cloud", "dataset": "yandex_cloud.audit", "id": "d7df01f7-21c4-443c-8569-2a4a32fb3550", "action": "CreateAccessKey", "category": ["iam"], "type": ["change"], "outcome": "success", "original": "{\"authentication\": {\"authenticated\": true, \"federation_id\": \"bpfcontosofed001\", \"federation_name\": \"contoso\", \"federation_type\": \"PRIVATE_FEDERATION\", \"subject_id\": \"ajeoutsider000001\", \"subject_name\": \"external.admin\", \"subject_type\": \"FEDERATED_USER_ACCOUNT\"}, \"authorization\": {\"authorized\": true}, \"details\": {\"access_key_id\": \"ajeaccesskey0001\", \"created_at\": \"2026-09-25T11:54:22+00:00\", \"description\": \"Maintenance automation\", \"key_id\": \"ajekey0001\", \"service_account_id\": \"ajebackdoor0000010001\", \"service_account_name\": \"svc-maint-0001\"}, \"event_id\": \"d7df01f7-21c4-443c-8569-2a4a32fb3550\", \"event_source\": \"iam\", \"event_status\": \"DONE\", \"event_time\": \"2026-09-25T11:54:22+00:00\", \"event_type\": \"yandex.cloud.audit.iam.CreateAccessKey\", \"request_metadata\": {\"remote_address\": \"198.51.100.105\", \"request_id\": \"be138890-703d-4ed4-bd86-a9d1367d2188\", \"user_agent\": \"yc/0.157\"}, \"request_parameters\": {}, \"resource_metadata\": {\"path\": [{\"resource_id\": \"bpfcontosoorg001\", \"resource_name\": \"contoso-org\", \"resource_type\": \"organization-manager.organization\"}, {\"resource_id\": \"b1gcontosocloud01\", \"resource_name\": \"contoso-cloud\", \"resource_type\": \"resource-manager.cloud\"}, {\"resource_id\": \"b1gcontosofolder1\", \"resource_name\": \"production\", \"resource_type\": \"resource-manager.folder\"}]}, \"response\": {}}"}, "source": {"ip": "198.51.100.105"}, "user": {"id": "ajeoutsider000001", "name": "external.admin"}, "cloud": {"provider": "yandex", "account": {"id": "b1gcontosocloud01"}}, "yandex_cloud": {"audit": {"authentication": {"authenticated": true, "federation_id": "bpfcontosofed001", "federation_name": "contoso", "federation_type": "PRIVATE_FEDERATION", "subject_id": "ajeoutsider000001", "subject_name": "external.admin", "subject_type": "FEDERATED_USER_ACCOUNT"}, "authorization": {"authorized": true}, "details": {"access_key_id": "ajeaccesskey0001", "created_at": "2026-09-25T11:54:22+00:00", "description": "Maintenance automation", "key_id": "ajekey0001", "service_account_id": "ajebackdoor0000010001", "service_account_name": "svc-maint-0001"}, "event_id": "d7df01f7-21c4-443c-8569-2a4a32fb3550", "event_source": "iam", "event_status": "DONE", "event_time": "2026-09-25T11:54:22+00:00", "event_type": "yandex.cloud.audit.iam.CreateAccessKey", "request_metadata": {"remote_address": "198.51.100.105", "request_id": "be138890-703d-4ed4-bd86-a9d1367d2188", "user_agent": "yc/0.157"}, "request_parameters": {}, "resource_metadata": {"path": [{"resource_id": "bpfcontosoorg001", "resource_name": "contoso-org", "resource_type": "organization-manager.organization"}, {"resource_id": "b1gcontosocloud01", "resource_name": "contoso-cloud", "resource_type": "resource-manager.cloud"}, {"resource_id": "b1gcontosofolder1", "resource_name": "production", "resource_type": "resource-manager.folder"}]}, "response": {}}}}
+```bash
+timeout 1 eventum generate --path generators/cloud-yandex-audit-trails/generator.yml --id cloud-yandex-audit-trails-sample --live-mode false --keep-order true
 ```
 
-## References and Limits
+The first linked chain appears after about 24 hours of event time.
 
-- [Yandex Cloud Audit Trails JSON format](https://yandex.cloud/ru/docs/audit-trails/concepts/format): common control-plane schema and sample.
-- [Yandex Cloud control-plane event list](https://yandex.cloud/ru/docs/audit-trails/concepts/events): event names and services.
-- [CreateServiceAccount event schema](https://yandex.cloud/en/docs/audit-trails/audit/iam/events-ref/CreateServiceAccount) and [SetFolderAccessBindings schema](https://yandex.cloud/ru/docs/audit-trails/audit/resourcemanager/events-ref/SetFolderAccessBindings): chain detail fields.
-- [KUMA 4.0 supported event sources](https://support.kaspersky.com/kuma/4.0/en-US/255782.htm): IAM, Compute and Resource Manager support inventory.
+## Sample output
 
-Yandex Cloud also publishes event-specific protoJSON references with camelCase names. This pack follows the Audit Trails exported-log example and general snake_case format, so consumers should select the matching parser. Service-specific `request_parameters` and `response` are empty because the generic format does not define their schemas. No data-plane events are modeled.
+This complete JSON Line is a `CreateAccessKey` record from an enabled-mode run, immediately after the matching account creation and folder-role grant:
+
+```json
+{"@timestamp": "2026-09-26T17:40:00+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "yandex_cloud", "dataset": "yandex_cloud.audit", "id": "16a449ed-a6b7-4a82-9852-dad0a9a4a9d8", "action": "CreateAccessKey", "category": ["iam"], "type": ["change"], "outcome": "success", "original": "{\"authentication\": {\"authenticated\": true, \"federation_id\": \"bpffd0b1506f5e3af1f1\", \"federation_name\": \"contoso\", \"federation_type\": \"PRIVATE_FEDERATION\", \"subject_id\": \"ajeead78627c1eb1858a\", \"subject_name\": \"external.admin\", \"subject_type\": \"FEDERATED_USER_ACCOUNT\"}, \"authorization\": {\"authorized\": true}, \"details\": {\"access_key_id\": \"ajeb23af260f79248318\", \"created_at\": \"2026-09-26T17:40:00+00:00\", \"description\": \"Maintenance automation\", \"key_id\": \"YCc2f24601f17841008fc2ccd\", \"service_account_id\": \"aje267f953d84dd4d7ba\", \"service_account_name\": \"svc-maint-000005\"}, \"event_id\": \"16a449ed-a6b7-4a82-9852-dad0a9a4a9d8\", \"event_source\": \"iam\", \"event_status\": \"DONE\", \"event_time\": \"2026-09-26T17:40:00+00:00\", \"event_type\": \"yandex.cloud.audit.iam.CreateAccessKey\", \"request_metadata\": {\"remote_address\": \"198.51.100.105\", \"request_id\": \"53a139f3-35bc-4a99-b4ab-2e97bcd68c4c\", \"user_agent\": \"yc/0.157\"}, \"resource_metadata\": {\"path\": [{\"resource_id\": \"bpf8fce59da310dc940c\", \"resource_name\": \"contoso-org\", \"resource_type\": \"organization-manager.organization\"}, {\"resource_id\": \"b1g0a10235b15143e07a\", \"resource_name\": \"contoso-cloud\", \"resource_type\": \"resource-manager.cloud\"}, {\"resource_id\": \"b1g2a15c9bea04fe16e5\", \"resource_name\": \"production\", \"resource_type\": \"resource-manager.folder\"}]}}"}, "source": {"ip": "198.51.100.105"}, "user": {"id": "ajeead78627c1eb1858a", "name": "external.admin"}, "related": {"ip": ["198.51.100.105"], "user": ["external.admin"]}, "cloud": {"provider": "yandex", "account": {"id": "b1g0a10235b15143e07a"}}, "yandex_cloud": {"audit": {"authentication": {"authenticated": true, "federation_id": "bpffd0b1506f5e3af1f1", "federation_name": "contoso", "federation_type": "PRIVATE_FEDERATION", "subject_id": "ajeead78627c1eb1858a", "subject_name": "external.admin", "subject_type": "FEDERATED_USER_ACCOUNT"}, "authorization": {"authorized": true}, "details": {"access_key_id": "ajeb23af260f79248318", "created_at": "2026-09-26T17:40:00+00:00", "description": "Maintenance automation", "key_id": "YCc2f24601f17841008fc2ccd", "service_account_id": "aje267f953d84dd4d7ba", "service_account_name": "svc-maint-000005"}, "event_id": "16a449ed-a6b7-4a82-9852-dad0a9a4a9d8", "event_source": "iam", "event_status": "DONE", "event_time": "2026-09-26T17:40:00+00:00", "event_type": "yandex.cloud.audit.iam.CreateAccessKey", "request_metadata": {"remote_address": "198.51.100.105", "request_id": "53a139f3-35bc-4a99-b4ab-2e97bcd68c4c", "user_agent": "yc/0.157"}, "resource_metadata": {"path": [{"resource_id": "bpf8fce59da310dc940c", "resource_name": "contoso-org", "resource_type": "organization-manager.organization"}, {"resource_id": "b1g0a10235b15143e07a", "resource_name": "contoso-cloud", "resource_type": "resource-manager.cloud"}, {"resource_id": "b1g2a15c9bea04fe16e5", "resource_name": "production", "resource_type": "resource-manager.folder"}]}}}}
+```
+
+## Source fidelity and limits
+
+- [Management-log format and complete `CreateInstance` example](https://yandex.cloud/en/docs/audit-trails/concepts/format): native snake_case envelope, actor, authorization, resource path, request metadata and VM details.
+- Event-specific schemas: [CreateInstance](https://yandex.cloud/en/docs/audit-trails/audit/compute/events-ref/CreateInstance), [UpdateInstance](https://yandex.cloud/en/docs/audit-trails/audit/compute/events-ref/UpdateInstance), [CreateServiceAccount](https://yandex.cloud/en/docs/audit-trails/audit/iam/events-ref/CreateServiceAccount), [UpdateFolderAccessBindings](https://yandex.cloud/en/docs/audit-trails/audit/resourcemanager/events-ref/UpdateFolderAccessBindings) and [CreateAccessKey](https://yandex.cloud/en/docs/audit-trails/audit/iam/events-ref/CreateAccessKey): modeled `details` fields.
+- [Folder access operations](https://yandex.cloud/en/docs/resource-manager/operations/folder/set-access-bindings): `UpdateFolderAccessBindings` adds a role; `SetFolderAccessBindings` replaces the full binding set, so it is not used for the grant step.
+- [Static access keys](https://yandex.cloud/en/docs/iam/concepts/authorization/access-key): key IDs start with `YC` and have 25 characters.
+
+Audit Trails can deliver records through Object Storage, Cloud Logging or Data Streams, each with a different transport container. This pack emits one native JSON record inside ECS per line; it does not reproduce those containers. The NAT-enabled CreateInstance variant covers all 42 selected structural paths in the vendor example; a private-only VM omits the two public-address paths. Optional request/response, token-impersonation and error sections are omitted because their concrete values are not established for these successful synthetic operations. Event-specific references use protoJSON camelCase; the native record uses the snake_case exported-log style shown in the management-log example. No live tenant capture has been compared.

@@ -2,47 +2,87 @@
 {%- if step == 'routine' -%}
   {%- do shared.pop('to_anomaly', none) -%}
   {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}
-      {%- do shared.set('arc_no', (shared.get('arc_no', 0) % 9999) + 1) -%}
-      {%- do shared.set('to_anomaly', true) -%}
-    {%- endif -%}
-  {%- else -%}
-    {%- do shared.set('routine_count', count) -%}
+  {%- do shared.set('routine_count', count if count < params.anomaly_interval_events else params.anomaly_interval_events) -%}
+  {%- if params.anomaly_mode and not shared.get('anomaly_done', false) and count >= params.anomaly_interval_events -%}
+    {%- do shared.set('anomaly_done', true) -%}
+    {%- do shared.set('to_anomaly', true) -%}
   {%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['CreateInstance', 'UpdateInstance', 'UpdateFolder'], [56, 29, 15]) -%}
+  {%- set kind = module.rand.weighted_choice(['CreateInstance', 'UpdateInstance', 'CreateServiceAccount', 'UpdateFolderAccessBindings', 'CreateAccessKey'], [2, 88, 3, 4, 3]) -%}
 {%- else -%}
-  {%- set kind = {'create_account': 'CreateServiceAccount', 'grant_role': 'SetFolderAccessBindings', 'create_key': 'CreateAccessKey'}[step] -%}
+  {%- set kind = {'create_account': 'CreateServiceAccount', 'grant_role': 'UpdateFolderAccessBindings', 'create_key': 'CreateAccessKey'}[step] -%}
 {%- endif -%}
-{%- set is_anomaly = step != 'routine' -%}
-{%- set service = 'iam' if kind in ['CreateServiceAccount', 'CreateAccessKey'] else ('resourcemanager' if kind in ['SetFolderAccessBindings', 'UpdateFolder'] else 'compute') -%}
-{%- set subject_id = params.anomaly_subject_id if is_anomaly else params.normal_subject_id -%}
-{%- set subject_name = params.anomaly_subject_name if is_anomaly else params.normal_subject_name -%}
-{%- set source_ip = params.anomaly_source_ip if is_anomaly else params.normal_source_ip -%}
-{%- set service_account_id = params.created_service_account_id ~ ('%04d' % shared.get('arc_no', 1)) -%}
-{%- set service_account_name = params.created_service_account_name ~ '-' ~ ('%04d' % shared.get('arc_no', 1)) -%}
+{%- set is_chain = step != 'routine' -%}
+{%- set is_second_actor = is_chain or module.rand.chance(0.25) -%}
+{%- set subject_id = params.anomaly_subject_id if is_second_actor else params.normal_subject_id -%}
+{%- set subject_name = params.anomaly_subject_name if is_second_actor else params.normal_subject_name -%}
+{%- set source_ip = params.anomaly_source_ip if is_second_actor else params.normal_source_ip -%}
+{%- set service = 'iam' if kind in ['CreateServiceAccount', 'CreateAccessKey'] else ('resourcemanager' if kind == 'UpdateFolderAccessBindings' else 'compute') -%}
 {%- set event_id = module.rand.crypto.uuid4() | string -%}
 {%- set request_id = module.rand.crypto.uuid4() | string -%}
-{%- set details = {} -%}
-{%- if kind == 'CreateServiceAccount' -%}
-  {%- do details.update({'service_account_id': service_account_id, 'service_account_name': service_account_name, 'description': 'Maintenance automation', 'labels': {'team': 'infra'}, 'status': 'ACTIVE'}) -%}
-{%- elif kind == 'SetFolderAccessBindings' -%}
-  {%- do details.update({'folder_id': params.folder_id, 'folder_name': 'production', 'access_binding_deltas': [{'action': 'ADD', 'access_binding': {'role_id': 'editor', 'subject_id': service_account_id, 'subject_type': 'SERVICE_ACCOUNT', 'subject_name': service_account_name}}]}) -%}
+{%- if kind == 'CreateInstance' -%}
+  {%- set vm_count = (shared.get('new_vm_count', 0) % 4000) + 1 -%}
+  {%- do shared.set('new_vm_count', vm_count) -%}
+  {%- set id_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
+  {%- set disk_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
+  {%- set instance_id = 'fhm' ~ id_hex[:17] -%}
+  {%- set instance_name = 'ci-job-' ~ ('%05d' % vm_count) -%}
+  {%- set octet3 = 20 + (vm_count // 200) -%}
+  {%- set octet4 = 20 + (vm_count % 200) -%}
+  {%- set instance_ip = '10.60.' ~ octet3 ~ '.' ~ octet4 -%}
+  {%- set mac_address = '02:00:00:%02x:%02x:%02x' % ((vm_count // 65536) % 256, (vm_count // 256) % 256, vm_count % 256) -%}
+  {%- set primary_v4_address = {'address': instance_ip} -%}
+  {%- if module.rand.chance(0.3) -%}
+    {%- do primary_v4_address.update({'one_to_one_nat': {'address': '203.0.113.' ~ (20 + (vm_count % 200)), 'ip_version': 'IPV4'}}) -%}
+  {%- endif -%}
+  {%- set details = {'instance_id': instance_id, 'instance_name': instance_name, 'zone_id': module.rand.choice(['ru-central1-a', 'ru-central1-b', 'ru-central1-d']), 'platform_id': 'standard-v3', 'metadata_keys': ['ssh-keys', 'user-data'], 'network_settings': {'type': 'STANDARD'}, 'placement_policy': {}, 'os': {'type': 'LINUX'}, 'product_ids': ['fd8j7i4d1e3f9a5b2c6d'], 'resources': {'memory': '4294967296', 'cores': '2', 'core_fraction': '100'}, 'boot_disk': {'mode': 'READ_WRITE', 'device_name': instance_name ~ '-boot', 'auto_delete': true, 'disk_id': 'epd' ~ disk_hex[:17]}, 'network_interfaces': [{'index': '0', 'mac_address': mac_address, 'subnet_id': 'e9b0ba6b3ff9de4bb42d', 'primary_v4_address': primary_v4_address}], 'fqdn': instance_id ~ '.auto.internal'} -%}
+{%- elif kind == 'UpdateInstance' -%}
+  {%- set instance = samples.instances.pick() -%}
+  {%- set release_no = module.rand.number.integer(100, 999) -%}
+  {%- set details = {'instance_id': instance.id, 'instance_name': instance.name, 'labels': {'deployment': 'rollout-' ~ release_no}, 'update_mask': 'labels'} -%}
+{%- elif kind == 'CreateServiceAccount' -%}
+  {%- set sa_count = (shared.get('new_sa_count', 0) % 999999) + 1 -%}
+  {%- do shared.set('new_sa_count', sa_count) -%}
+  {%- set id_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
+  {%- set service_account_id = 'aje' ~ id_hex[:17] -%}
+  {%- set service_account_name = params.service_account_prefix ~ '-' ~ ('%06d' % sa_count) -%}
+  {%- if is_chain -%}
+    {%- do shared.set('chain_sa_id', service_account_id) -%}
+    {%- do shared.set('chain_sa_name', service_account_name) -%}
+  {%- endif -%}
+  {%- set details = {'service_account_id': service_account_id, 'service_account_name': service_account_name, 'description': 'Maintenance automation', 'labels': {'team': 'infra'}, 'status': 'ACTIVE'} -%}
+{%- elif kind == 'UpdateFolderAccessBindings' -%}
+  {%- if is_chain -%}
+    {%- set service_account_id = shared.get('chain_sa_id') -%}
+    {%- set service_account_name = shared.get('chain_sa_name') -%}
+    {%- set role_id = 'editor' -%}
+  {%- else -%}
+    {%- set account = samples.service_accounts.pick() -%}
+    {%- set service_account_id = account.id -%}
+    {%- set service_account_name = account.name -%}
+    {%- set role_id = module.rand.choice(['viewer', 'editor']) -%}
+  {%- endif -%}
+  {%- set details = {'folder_id': params.folder_id, 'folder_name': 'production', 'access_binding_deltas': [{'action': 'ADD', 'access_binding': {'role_id': role_id, 'subject_id': service_account_id, 'subject_type': 'SERVICE_ACCOUNT', 'subject_name': service_account_name}}]} -%}
 {%- elif kind == 'CreateAccessKey' -%}
-  {%- do details.update({'service_account_id': service_account_id, 'service_account_name': service_account_name, 'access_key_id': 'ajeaccesskey' ~ ('%04d' % shared.get('arc_no', 1)), 'key_id': 'ajekey' ~ ('%04d' % shared.get('arc_no', 1)), 'description': 'Maintenance automation', 'created_at': timestamp.isoformat()}) -%}
-{%- elif kind == 'UpdateFolder' -%}
-  {%- do details.update({'folder_id': params.folder_id, 'folder_name': 'production'}) -%}
-{%- else -%}
-  {%- do details.update({'instance_id': 'fhmlabvm000001', 'instance_name': 'lab-vm-01', 'zone_id': 'ru-central1-a'}) -%}
+  {%- if is_chain -%}
+    {%- set service_account_id = shared.pop('chain_sa_id') -%}
+    {%- set service_account_name = shared.pop('chain_sa_name') -%}
+  {%- else -%}
+    {%- set account = samples.service_accounts.pick() -%}
+    {%- set service_account_id = account.id -%}
+    {%- set service_account_name = account.name -%}
+  {%- endif -%}
+  {%- set access_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
+  {%- set key_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
+  {%- set details = {'service_account_id': service_account_id, 'service_account_name': service_account_name, 'access_key_id': 'aje' ~ access_hex[:17], 'key_id': 'YC' ~ key_hex[:23], 'description': 'Maintenance automation', 'created_at': timestamp.isoformat()} -%}
 {%- endif -%}
-{%- set native = {'event_id': event_id, 'event_source': service, 'event_type': 'yandex.cloud.audit.' ~ service ~ '.' ~ kind, 'event_time': timestamp.isoformat(), 'authentication': {'authenticated': true, 'subject_type': 'FEDERATED_USER_ACCOUNT', 'subject_id': subject_id, 'subject_name': subject_name, 'federation_id': 'bpfcontosofed001', 'federation_name': 'contoso', 'federation_type': 'PRIVATE_FEDERATION'}, 'authorization': {'authorized': true}, 'resource_metadata': {'path': [{'resource_type': 'organization-manager.organization', 'resource_id': params.organization_id, 'resource_name': 'contoso-org'}, {'resource_type': 'resource-manager.cloud', 'resource_id': params.cloud_id, 'resource_name': 'contoso-cloud'}, {'resource_type': 'resource-manager.folder', 'resource_id': params.folder_id, 'resource_name': 'production'}]}, 'request_metadata': {'remote_address': source_ip, 'user_agent': 'yc/0.157', 'request_id': request_id}, 'event_status': 'DONE', 'details': details, 'request_parameters': {}, 'response': {}} -%}
+{%- set native = {'event_id': event_id, 'event_source': service, 'event_type': 'yandex.cloud.audit.' ~ service ~ '.' ~ kind, 'event_time': timestamp.isoformat(), 'authentication': {'authenticated': true, 'subject_type': 'FEDERATED_USER_ACCOUNT', 'subject_id': subject_id, 'subject_name': subject_name, 'federation_id': 'bpffd0b1506f5e3af1f1', 'federation_name': 'contoso', 'federation_type': 'PRIVATE_FEDERATION'}, 'authorization': {'authorized': true}, 'resource_metadata': {'path': [{'resource_type': 'organization-manager.organization', 'resource_id': params.organization_id, 'resource_name': 'contoso-org'}, {'resource_type': 'resource-manager.cloud', 'resource_id': params.cloud_id, 'resource_name': 'contoso-cloud'}, {'resource_type': 'resource-manager.folder', 'resource_id': params.folder_id, 'resource_name': 'production'}]}, 'request_metadata': {'remote_address': source_ip, 'user_agent': 'yc/0.157', 'request_id': request_id}, 'event_status': 'DONE', 'details': details} -%}
 {
   "@timestamp": {{ timestamp.isoformat() | tojson }},
   "ecs": {"version": "8.17.0"},
   "event": {"kind": "event", "module": "yandex_cloud", "dataset": "yandex_cloud.audit", "id": {{ event_id | tojson }}, "action": {{ kind | tojson }}, "category": {{ (['iam'] if service in ['iam', 'resourcemanager'] else ['configuration']) | tojson }}, "type": ["change"], "outcome": "success", "original": {{ native | tojson | tojson }}},
   "source": {"ip": {{ source_ip | tojson }}},
   "user": {"id": {{ subject_id | tojson }}, "name": {{ subject_name | tojson }}},
+  "related": {"ip": [{{ source_ip | tojson }}], "user": [{{ subject_name | tojson }}]},
   "cloud": {"provider": "yandex", "account": {"id": {{ params.cloud_id | tojson }}}},
   "yandex_cloud": {"audit": {{ native | tojson }}}
 }
