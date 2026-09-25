@@ -1,0 +1,55 @@
+{%- set step = vars.step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_anomaly', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('arc_no', (shared.get('arc_no', 0) % 9999) + 1) -%}
+      {%- do shared.set('to_anomaly', true) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', count) -%}
+  {%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['granted', 'denied'], [86, 14]) -%}
+{%- else -%}
+  {%- set kind = {'failed_one': 'denied', 'failed_two': 'denied', 'authorized': 'granted', 'restore_delete': 'restore', 'repository_delete': 'repository'}[step] -%}
+{%- endif -%}
+{%- set is_anomaly = step != 'routine' -%}
+{%- set username = params.anomaly_user if is_anomaly else params.normal_user -%}
+{%- set source_ip = params.anomaly_source_ip if is_anomaly else params.normal_source_ip -%}
+{%- set qualified_user = 'TECH\\' ~ username -%}
+{%- set repo_id = params.repository_id[:-4] ~ ('%04d' % shared.get('arc_no', 1)) -%}
+{%- set repo_name = params.repository_name ~ ' ' ~ ('%04d' % shared.get('arc_no', 1)) -%}
+{%- set vm_name = params.vm_name ~ '-' ~ ('%04d' % shared.get('arc_no', 1)) -%}
+{%- set event_id = {'granted': 44003, 'denied': 44002, 'restore': 10050, 'repository': 28200}[kind] -%}
+{%- set event_action = {'granted': 'authorization_granted', 'denied': 'authorization_denied', 'restore': 'restore_point_deleted', 'repository': 'backup_repository_deleted'}[kind] -%}
+{%- set severity = 'warning' if kind != 'granted' else 'info' -%}
+{%- set app = 'Veeam_Security' if kind in ['granted', 'denied'] else 'Veeam_MP' -%}
+{%- set description = {'granted': 'Authorization was successful.', 'denied': 'Authorization request was denied: an authentication has failed.', 'restore': 'Restore point for VM ' ~ vm_name ~ ' has been removed by user ' ~ qualified_user ~ '.', 'repository': 'Backup repository ' ~ repo_name ~ ' has been deleted.'}[kind] -%}
+{%- set attrs = {'VbrHostName': params.server_fqdn, 'VbrVersion': params.version, 'Version': '1', 'Description': description} -%}
+{%- if kind in ['granted', 'denied'] -%}
+  {%- do attrs.update({'SourceIpAddress': source_ip, 'ClientId': 'veeam-backup-web-ui', 'FriendlyName': username, 'Subject': 'UID-' ~ username, 'ResourceId': 'veeam-gateway-api-service', 'RedirectUri': '/'}) -%}
+  {%- if kind == 'denied' -%}
+    {%- do attrs.update({'Reason': '1'}) -%}
+  {%- endif -%}
+{%- elif kind == 'restore' -%}
+  {%- do attrs.update({'OibID': '3419db28-e212-48d7-9d63-67fd22a' ~ ('%05d' % shared.get('arc_no', 1)), 'OriginalOibID': '3419db28-e212-48d7-9d63-67fd22a' ~ ('%05d' % shared.get('arc_no', 1)), 'VmRef': 'vm-' ~ ('%04d' % shared.get('arc_no', 1)), 'VmName': vm_name, 'ServerName': 'pdcsrv01.contoso.test', 'DateTime': timestamp.strftime('%m/%d/%Y %H:%M:%S'), 'IsCorrupted': 'False', 'Platform': '0', 'StorageSize': '13873971200', 'RepositoryID': repo_id, 'IsFull': 'True', 'UserFullInfo': '<ModifiedUserInfo fullName="' ~ qualified_user ~ '" loginType="0" />'}) -%}
+{%- else -%}
+  {%- do attrs.update({'RepositoryID': repo_id, 'Type': '0', 'RepositoryName': repo_name, 'ChangesXML': '<changes><object id="' ~ repo_id ~ '" name="' ~ repo_name ~ '" /></changes>', 'UserName': qualified_user, 'UserFullInfo': '<ModifiedUserInfo fullName="' ~ qualified_user ~ '" loginType="0" />'}) -%}
+{%- endif -%}
+{%- set parts = [] -%}
+{%- for key, value in attrs.items() -%}
+  {%- do parts.append(key ~ '="' ~ value ~ '"') -%}
+{%- endfor -%}
+{%- set original = '1 ' ~ timestamp.isoformat() ~ ' ' ~ params.server_name ~ ' ' ~ app ~ ' - - [origin enterpriseId="31023"] [categoryId=0 instanceId=' ~ event_id ~ ' ' ~ parts | join(' ') ~ ']' -%}
+{
+  "@timestamp": {{ timestamp.isoformat() | tojson }},
+  "ecs": {"version": "8.17.0"},
+  "event": {"kind": "event", "module": "veeam", "dataset": "veeam.vbr.syslog", "code": {{ event_id | string | tojson }}, "category": {{ (['authentication'] if kind in ['granted', 'denied'] else ['configuration']) | tojson }}, "action": {{ event_action | tojson }}, "type": {{ (["start", "allowed"] if kind == "granted" else (["start", "denied"] if kind == "denied" else ["deletion"])) | tojson }}, "outcome": {{ ('failure' if kind == 'denied' else 'success') | tojson }}, "original": {{ original | tojson }}},
+  "message": {{ description | tojson }},
+  "host": {"name": {{ params.server_name | tojson }}},
+  "source": {"ip": {{ (source_ip if kind in ['granted', 'denied'] else none) | tojson }}},
+  "user": {"name": {{ username | tojson }}},
+  "veeam": {"event_id": {{ event_id }}, "app": {{ app | tojson }}, "severity": {{ severity | tojson }}, "enterprise_id": 31023, "category_id": 0, "parameters": {{ attrs | tojson }}}
+}
