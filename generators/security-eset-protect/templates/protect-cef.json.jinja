@@ -1,0 +1,58 @@
+{%- set interval = params.anomaly_interval_events | int -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (interval + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and not shared.get('chain_done', false) and tick >= interval -%}
+{%- if chain -%}
+  {%- if tick == interval -%}
+    {%- set chosen_host = samples.endpoints.pick() -%}
+    {%- set chosen_object = samples.objects.pick() -%}
+    {%- do shared.set('chain_host', dict(id=chosen_host.id, name=chosen_host.name, ip=chosen_host.ip, user=chosen_host.user)) -%}
+    {%- do shared.set('chain_object', dict(path=chosen_object.path, sha1=chosen_object.sha1, threat=chosen_object.threat)) -%}
+  {%- endif -%}
+  {%- set station = shared.get('chain_host') -%}
+  {%- set obj = shared.get('chain_object') -%}
+  {%- set kind = 'threat' if tick == interval + 3 else 'hips' -%}
+  {%- if kind == 'threat' -%}
+    {%- do shared.pop('chain_host') -%}
+    {%- do shared.pop('chain_object') -%}
+    {%- do shared.set('chain_done', true) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set station = samples.endpoints.pick() -%}
+  {%- set obj = samples.objects.pick() -%}
+  {%- set roll = module.rand.number.integer(1, 100) -%}
+  {%- set kind = 'firewall' if roll <= 45 else ('threat' if roll <= 75 else 'hips') -%}
+{%- endif -%}
+{%- set rt = timestamp.strftime('%b %d %Y %H:%M:%S') -%}
+{%- set common = 'dvc=' ~ station.ip ~ ' dvchost=' ~ station.name ~ ' deviceExternalId=' ~ station.id ~ ' ESETProtectDeviceGroupName=All/Workstations ESETProtectDeviceOsName=Microsoft Windows 11 Pro ESETProtectDeviceGroupDescription=Workstations rt=' ~ rt ~ ' ' -%}
+{%- set cef_path = obj.path | replace('\\', '\\\\') -%}
+{%- set uri_path = obj.path | replace('\\', '/') -%}
+{%- set cef_user = station.user | replace('\\', '\\\\') -%}
+{%- if kind == 'hips' -%}
+  {%- set class_id = '303' -%}
+  {%- set event_name = 'Attempt to run a suspicious object Blocked' -%}
+  {%- set ext = 'cat=ESET HIPS Event cs3=C:\\\\Windows\\\\explorer.exe cs3Label=Application cs4=Attempt to run a suspicious object cs4Label=Operation cs5=' ~ cef_path ~ ' cs5Label=Target act=Blocked cn1=1 cn1Label=Handled cs1=Suspicious attempt to launch an application cs1Label=Rule ID cs2=Block suspicious application cs2Label=Rule Name cnt=1' -%}
+  {%- set category = 'intrusion_detection' -%}
+  {%- set event_type = 'denied' -%}
+  {%- set action = 'Blocked' -%}
+{%- elif kind == 'threat' -%}
+  {%- set class_id = '183' -%}
+  {%- set event_name = 'File scanner cleaned a virus' -%}
+  {%- set engine = '29000 (' ~ timestamp.strftime('%Y%m%d') ~ ')' -%}
+  {%- set ext = 'cat=ESET Threat Event cs1=' ~ obj.threat ~ ' cs1Label=Threat Name cs2=' ~ engine ~ ' cs2Label=Engine Version cs3=Virus cs3Label=Threat Type cs4=Real-time file system protection cs4Label=Scanner ID cs5=virlog.dat cs5Label=Scan ID act=Cleaned by deleting fileType=File filePath=file:///' ~ uri_path ~ ' cn1=1 cn1Label=Handled suser=' ~ cef_user ~ ' sprod=C:\\\\Windows\\\\explorer.exe cs7=Event occurred on a newly created file cs7Label=Circumstances deviceCustomDate1=' ~ rt ~ ' deviceCustomDate1Label=FirstSeen cs8=' ~ obj.sha1 ~ ' cs8Label=Hash' -%}
+  {%- set category = 'malware' -%}
+  {%- set event_type = 'info' -%}
+  {%- set action = 'Cleaned by deleting' -%}
+{%- else -%}
+  {%- set class_id = '209' -%}
+  {%- set event_name = 'Detected port scanning attack' -%}
+  {%- set source_ip = module.rand.choice(['198.51.100.19', '203.0.113.24', '192.0.2.77']) -%}
+  {%- set source_port = module.rand.number.integer(20000, 65000) -%}
+  {%- set dest_port = module.rand.weighted_choice([445, 3389, 22, 1433], [40, 25, 20, 15]) -%}
+  {%- set ext = 'cat=ESET Firewall Event msg=TCP Port Scanning attack src=' ~ source_ip ~ ' spt=' ~ source_port ~ ' dst=' ~ station.ip ~ ' dpt=' ~ dest_port ~ ' proto=TCP act=Blocked cn1=1 cn1Label=Handled cnt=1 deviceProcessName=System deviceDirection=0 suser=' ~ cef_user ~ ' cs2=Block port scan cs2Label=Rule Name cs3=Win32/Botnet.generic cs3Label=Threat Name' -%}
+  {%- set category = 'network' -%}
+  {%- set event_type = 'denied' -%}
+  {%- set action = 'Blocked' -%}
+{%- endif -%}
+{%- set raw = 'CEF:0|ESET|Protect|' ~ params.protect_version ~ '|' ~ class_id ~ '|' ~ event_name ~ '|5|' ~ common ~ ext -%}
+{"@timestamp":{{ timestamp.isoformat() | tojson }},"ecs":{"version":"8.17.0"},"event":{"kind":"alert","module":"eset","dataset":"eset.protect","code":{{ class_id | tojson }},"action":{{ action | tojson }},"category":[{{ category | tojson }}],"type":[{{ event_type | tojson }}],"severity":5,"original":{{ raw | tojson }}},"host":{"name":{{ station.name | tojson }},"id":{{ station.id | tojson }},"ip":[{{ station.ip | tojson }}],"os":{"name":"Microsoft Windows 11 Pro"}},"observer":{"name":{{ params.protect_host | tojson }},"product":"Protect","vendor":"ESET","version":{{ params.protect_version | tojson }}},"eset":{"protect":{"category":{{ kind | tojson }},"class_id":{{ class_id | tojson }},"action":{{ action | tojson }}}},"related":{"ip":[{{ station.ip | tojson }}{% if kind == 'firewall' %},{{ source_ip | tojson }}{% endif %}]{% if kind != 'hips' %},"user":[{{ station.user | tojson }}]{% endif %}{% if kind == 'threat' %},"hash":[{{ obj.sha1 | tojson }}]{% endif %}}{% if kind != 'firewall' %},"file":{"path":{{ obj.path | tojson }}{% if kind == 'threat' %},"hash":{"sha1":{{ obj.sha1 | tojson }}}{% endif %}}{% endif %}{% if kind != 'hips' %},"user":{"name":{{ station.user | tojson }}}{% endif %}{% if kind == 'firewall' %},"source":{"ip":{{ source_ip | tojson }},"port":{{ source_port | tojson }}},"destination":{"ip":{{ station.ip | tojson }},"port":{{ dest_port | tojson }}},"network":{"transport":"tcp"}{% endif %}}
