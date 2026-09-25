@@ -1,60 +1,59 @@
-# Kaspersky Linux Mail Security CEF
+# Kaspersky Security for Linux Mail Server CEF
 
-KLMS ScanLogic mail authentication and antivirus CEF records, distinct from Kaspersky Secure Mail Gateway. The generator writes ECS JSON with the native CEF record in `event.original`.
+Generates ECS JSON with a KLMS ScanLogic syslog/CEF record in `event.original`. The selected stream is the [KLMS syslog CEF export](https://support.kaspersky.com/KLMS/8.2/en-US/151504.htm), not the Kaspersky Secure Mail Gateway (KSMG), KATA, or Web Traffic Security streams.
 
-## Event types
+## Event Types
 
-| Event code | Meaning | Approximate frequency | ECS category |
-| --- | --- | --- | --- |
-| `LMS_EV_SCAN_LOGIC_MA_STATUS` | SPF/DKIM/DMARC scan | ~99% in anomaly mode | email |
-| `LMS_EV_SCAN_LOGIC_AV_STATUS` | Antivirus scan | ~1% in anomaly mode | malware |
+| Native class | Routine behavior | Meaning |
+|---|---|---|
+| `LMS_EV_SCAN_LOGIC_MA_STATUS` | Most records; `ViolationNotFound` or `ViolationFound` | SPF, DKIM and DMARC scan for a message |
+| `LMS_EV_SCAN_LOGIC_AV_STATUS` | About one tenth of records; `Clean` or `Infected` | Antivirus scan for the preceding message |
 
-Frequencies are synthetic scenario weights, not measured production rates.
+These are generator choices, not measured KLMS traffic rates. The raw fields and per-class permitted key lists follow [KLMS 8.2 ScanLogic documentation](https://support.kaspersky.com/KLMS/8.2/en-US/151789.htm). The status values come from the KLMS [mail authentication](https://support.kaspersky.com/KLMS/8.2/en-US/149345.htm) and [antivirus](https://support.kaspersky.com/KLMS/8.2/en-US/90878.htm) catalogs. `Skip` and `Reject` are configurable [message actions](https://support.kaspersky.com/KLMS/8.2/en-US/61193.htm).
 
 ## Anomaly Chain
 
-After about 80 routine mail-authentication records, three messages from 198.51.100.74 to finance@example.test fail SPF, DKIM and DMARC. The third message has a subsequent antivirus-status record with the same `email.local_id` and native `cs1` value. Correlate sender, recipient and relay IP, then join the final two records on message ID. This supports a spoofed-mail campaign with a malicious payload detection.
+`anomaly_mode: true` is the default. After 120 routine records, one four-record sequence on consecutive minute ticks contains three mail-authentication failures from `billing@invoice-example.test`, received from relay `198.51.100.74` for `finance@example.test`. The third message then has an `Infected` antivirus record. That AV record carries the same native `cs1` message ID, sender, recipient, relay address and `fsize` as the third authentication record. Correlate the three failures on relay, sender and recipient within four minutes, then join the AV result on message ID.
 
-`anomaly_mode: true` is the default and mixes this chain into ordinary traffic. Set it to `false` for background records only. Correlate by `@timestamp` because output-line order can differ under concurrent generation.
+The same sender, recipient and relay have authentication failures at 20-minute gaps in both modes. A separate message has an authentication failure and an infected AV result on adjacent ticks in both modes. Other routine messages also produce clean or infected AV results. No individual event marks the chain. `anomaly_mode: false` omits only the short four-record sequence. The generator models a rejected spoofed-mail attempt with a malicious payload; it does not imply delivery to the mailbox.
 
 ## Parameters
 
 ### Event Parameters
 
-Edit `event.template.params` in `generator.yml`.
+Edit `event.template.params` in `generator.yml`:
 
-| Name | Default | Purpose |
-| --- | --- | --- |
-| `anomaly_mode` | `true` | Enable spoofed-mail chain. |
-| `anomaly_interval_events` | `80` | Routine records between chains. |
-| `mail_host` | `mail-01.example.test` | KLMS syslog hostname. |
-| `product_version` | `8.0MP2` | CEF version shown in Kaspersky example. |
-| `unusual_sender` | `billing@invoice-example.test` | Chain sender. |
-| `target_recipient` | `finance@example.test` | Chain mailbox. |
-| `unusual_relay_ip` | `198.51.100.74` | Chain relay. |
+| Parameter | Default | Purpose |
+|---|---|---|
+| `anomaly_mode` | `true` | Include one short chain; `false` emits background only |
+| `mail_host` | `mail-01.example.test` | Synthetic syslog host |
+| `product_version` | `8.0MP2` | CEF header value shown in Kaspersky's illustrative header |
+| `unusual_sender` | `billing@invoice-example.test` | Sender used in both modes |
+| `target_recipient` | `finance@example.test` | Recipient used in both modes |
+| `unusual_relay_ip` | `198.51.100.74` | SMTP relay address used in both modes |
 
 ### Output Parameters
 
-The shipped file output works without overrides. To send records elsewhere, replace `output.file` with the desired output plugin and use top-level `params`/`secrets` substitutions for destination and credentials. No top-level placeholders are required by this pack.
+The shipped file output needs no credentials. Replace it with a SIEM output plugin and configure its endpoint and credentials there. A collector expecting native syslog/CEF must receive `event.original` rather than the outer JSON object.
 
 ## Usage
 
-From the content-packs repository:
+Run from the content-packs repository root:
 
 ```bash
-eventum generate --path generators/email-kaspersky-klms/generator.yml --id kaspersky-klms --live-mode false
-eventum generate --path generators/email-kaspersky-klms/generator.yml --id kaspersky-klms --live-mode true
+eventum generate --path generators/email-kaspersky-klms/generator.yml --id klms --live-mode false --keep-order true
+eventum generate --path generators/email-kaspersky-klms/generator.yml --id klms --live-mode true --keep-order true
 ```
 
-The file output is `generators/email-kaspersky-klms/output/events.json`. Extract `event.original` when a collector requires raw CEF rather than ECS JSON.
+Batch mode generates continuously until interrupted. Live mode emits one record per minute; the sixth cron field is seconds. The output file is `generators/email-kaspersky-klms/output/events.json`.
 
-## Sample output
+## Sample Output
 
-Copied from an actual Eventum anomaly-mode run:
+This complete event is copied from a real anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T13:04:17+00:00",
+  "@timestamp": "2026-09-25T19:36:00+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -64,7 +63,7 @@ Copied from an actual Eventum anomaly-mode run:
         "billing@invoice-example.test"
       ]
     },
-    "local_id": "synthetic-klms-1-1",
+    "local_id": "1b35d85e77327677",
     "to": {
       "address": [
         "finance@example.test"
@@ -72,14 +71,14 @@ Copied from an actual Eventum anomaly-mode run:
     }
   },
   "event": {
-    "action": "scanned",
+    "action": "reject",
     "category": [
       "email"
     ],
     "code": "LMS_EV_SCAN_LOGIC_MA_STATUS",
     "dataset": "kaspersky.klms",
     "kind": "event",
-    "original": "Sep 25 13:04:17 mail-01.example.test KLMS: CEF:0|AO Kaspersky Lab|Kaspersky Linux Mail Security|8.0MP2|LMS_EV_SCAN_LOGIC_MA_STATUS|mail authentication status|Low|cs1=synthetic-klms-1-1 cs1Label=MessageId src=198.51.100.74 act=scanned fsize=40192 suser=billing@invoice-example.test duser=finance@example.test cs2=mail-authentication cs2Label=Rules reason=authentication-failed cs4=fail cs4Label=SpfVerdict cs5=fail cs5Label=DkimVerdict cs6=fail cs6Label=DmarcVerdict outcome=Failed",
+    "original": "September 25, 2026 19:36:00 mail-01.example.test CEF:0|AO Kaspersky Lab|Kaspersky Linux Mail Security|8.0MP2|LMS_EV_SCAN_LOGIC_MA_STATUS|mail authentication status|Low|cs1=1b35d85e77327677 cs1Label=MessageId src=198.51.100.74 act=Reject fsize=15913 suser=billing@invoice-example.test duser=finance@example.test cs2=Default cs2Label=Rules cs4=Fail cs4Label=SpfVerdict cs5=Fail cs5Label=DkimVerdict cs6=Fail cs6Label=DmarcVerdict outcome=ViolationFound",
     "type": [
       "info"
     ]
@@ -87,9 +86,9 @@ Copied from an actual Eventum anomaly-mode run:
   "kaspersky": {
     "klms": {
       "class_id": "LMS_EV_SCAN_LOGIC_MA_STATUS",
-      "dkim": "fail",
-      "dmarc": "fail",
-      "spf": "fail"
+      "dkim": "Fail",
+      "dmarc": "Fail",
+      "spf": "Fail"
     }
   },
   "observer": {
@@ -104,14 +103,8 @@ Copied from an actual Eventum anomaly-mode run:
 }
 ```
 
-## Scope and validation
+## Source and Validation Limit
 
-17/17 selected documented CEF fields are represented across the MA_STATUS and AV_STATUS records. Other ScanLogic classes and administrative event groups are out of scope. Both modes were generated and parsed; a time-sorted complete chain was found in anomaly mode and no chain records appeared in background mode.
+Kaspersky's [CEF format page](https://support.kaspersky.com/KLMS/8.2/en-US/151684.htm) provides a complete `LMS_EV_SETTINGS_CHANGED` example with `CEF:0`, vendor/product strings and `8.0MP2`. Its [ScanLogic page](https://support.kaspersky.com/KLMS/8.2/en-US/151789.htm) lists applicable keys for MA and AV classes but publishes no complete native ScanLogic record. Consequently, the exact ScanLogic CEF name, severity, `act`/`outcome` serialization, `cs1` ID format and syslog-prefix form cannot be certified without a KLMS capture. The generated values follow the documented field meanings and status/action catalogs, but full raw fidelity remains unverified. This is a versioned illustrative CEF stream, not a validated appliance fixture.
 
-This is KLMS, not the existing KSMG generator; the products have separate KUMA normalizers. The CEF header uses the 8.0MP2 version from the vendor example and the ScanLogic fields documented in KLMS 8.2 help. Exact action/status vocabulary and compatibility with every KLMS release were not verified against a live appliance. KESL is not covered by this pack.
-
-## References
-
-- [KLMS 8.2 CEF message structure](https://support.kaspersky.com/KLMS/8.2/en-US/151684.htm)
-- [KLMS 8.2 ScanLogic fields](https://support.kaspersky.com/KLMS/8.2/en-US/151789.htm)
-- [KUMA 4.2 supported sources](https://support.kaspersky.ru/kuma/4.2/255782)
+Kaspersky's [KUMA supported-source table](https://support.kaspersky.com/help/kuma/3.0.3/en-US/255782.htm) lists distinct KLMS and KSMG syslog/CEF normalizers, as well as separate KATA and KWTS sources. The native class IDs overlap KSMG, but the product and stream identities differ. No KLMS-specific Elastic integration fixture is used; the outer ECS fields are a synthetic SIEM-friendly projection.
