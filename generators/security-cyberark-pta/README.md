@@ -14,7 +14,7 @@ PTA emits detections, so even background events are individual **alerts**, not b
 
 With `anomaly_mode: true` (the default), four separate suspected-credential-theft incidents identify the same source user, source host and source IP against four different destination users and hosts over four event timestamps. Every alert has a distinct `cs2` EventID and `cs3` PTA incident link. Correlate `suser`, `src`, and distinct `duser` or `dst` values within a short window to prioritize a concentrated campaign. Eventum may interleave output lines; sort by `@timestamp` before sequence analysis.
 
-With `anomaly_mode: false`, only independent source-target alert pairs remain. It removes the linked source user and IP but does not suppress alert-class telemetry. The series represents multiple PTA detections; it is not a sequence of underlying login or credential-retrieval events.
+With `anomaly_mode: false`, only independent source-target alert pairs remain. The same source user, host and IP still appear in isolated background alerts, but the four-target burst is absent. The series represents multiple PTA detections; it is not a sequence of underlying login or credential-retrieval events.
 
 ## Parameters
 
