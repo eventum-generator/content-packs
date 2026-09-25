@@ -1,84 +1,100 @@
-# Oracle Database Unified Audit Trail
+# Oracle Database 19c Unified Audit Trail
 
-Synthetic rows shaped like a selected SQL result from Oracle Database `UNIFIED_AUDIT_TRAIL`. This pack models a database connector polling the view, not Oracle syslog.
+Generates JSON rows from a defined 22-column projection of Oracle Database 19c `UNIFIED_AUDIT_TRAIL`. The modeled source is a connector polling the database view, not Oracle syslog or a native Oracle JSON transport.
 
 ## Event Types
 
-| Action | Baseline frequency | Meaning |
-| --- | ---: | --- |
-| `SELECT` | 78% | Audited table read |
-| `LOGON` | 18% | Successful session start |
-| `UPDATE` | 4% | Audited data change |
-| `LOGON` / `RETURN_CODE=1017` | Chain only | Invalid credentials |
-| `GRANT` / `ROLE=DBA` | Chain only | Privileged role granted |
+| `ACTION_NAME` | Scenario | `UNIFIED_AUDIT_POLICIES` |
+| --- | --- | --- |
+| `LOGON`, success | Application and administrator session start | `APP_SESSION_AUDIT` |
+| `LOGON`, `RETURN_CODE=1017` | Invalid username/password | `ORA_LOGON_FAILURES` |
+| `SELECT` | Reporting, HR, and payroll table reads | `APP_DATA_AUDIT` |
+| `UPDATE` | HR employee phone update | `APP_DATA_AUDIT` |
+| `GRANT` | Administrator assigns an application role to a user | `ORA_ACCOUNT_MGMT` |
+| `LOGOFF` | End of a successful session | `APP_SESSION_AUDIT` |
 
-The FSM emits ordinary traffic, then periodically inserts the chain when enabled. Baseline percentages are synthetic workload assumptions, not a measured Oracle distribution.
+Application clients are sampled from 38 synthetic user/host pairs. Once connected, they mostly execute audited `SELECT` statements; HR clients occasionally execute `UPDATE` and any client may disconnect. Administrator activity and login failures are less frequent. These weights are workload assumptions, not measured Oracle frequencies.
+
+## Audit Configuration Assumed
+
+Unified auditing is enabled, and the following policies are enabled in the modeled Oracle 19c database:
+
+```sql
+AUDIT POLICY ORA_LOGON_FAILURES WHENEVER NOT SUCCESSFUL;
+CREATE AUDIT POLICY APP_SESSION_AUDIT ACTIONS LOGON, LOGOFF;
+AUDIT POLICY APP_SESSION_AUDIT WHENEVER SUCCESSFUL;
+CREATE AUDIT POLICY APP_DATA_AUDIT ACTIONS
+  SELECT ON REPORTING.DAILY_SALES,
+  SELECT ON HR.EMPLOYEES,
+  UPDATE ON HR.EMPLOYEES,
+  SELECT ON FINANCE.PAYROLL;
+AUDIT POLICY APP_DATA_AUDIT WHENEVER SUCCESSFUL;
+AUDIT POLICY ORA_ACCOUNT_MGMT;
+```
+
+`ORA_LOGON_FAILURES` is enabled by default in newly created 19c databases, but not necessarily in upgraded ones. `ORA_ACCOUNT_MGMT` must be enabled explicitly. The custom policies above are example deployment configuration, not built-in Oracle policies. They deliberately split successful session activity, object access, failed authentication, and role grants so each emitted record has a matching policy.
+
+`HR.EMPLOYEES` uses the Oracle sample schema. `REPORTING.DAILY_SALES` and `FINANCE.PAYROLL` are synthetic application tables. Assume `FINANCE_DBA` (or the configured `target_user`) has direct `SELECT` on `FINANCE.PAYROLL` and `ADMIN OPTION` on `PAYROLL_READ`. That role grants `SELECT` on `FINANCE.PAYROLL`. `SEC_ADMIN` has `ADMIN OPTION` on `APP_REPORTER`. `BI_ANALYST` and the configured `grantee` are database users. The successful grants are authorized actions whose *timing and correlation* make the enabled chain suspicious; the pack does not imply that Oracle would reject them.
 
 ## Anomaly Chain
 
-Four failed `LOGON` rows for `FINANCE_DBA` from `wkst-091.corp.example` (`RETURN_CODE=1017`) precede a successful logon. The successful `SESSIONID` is reused for a `SELECT` on `FINANCE.PAYROLL` and `GRANT DBA TO REPORT_RO`; the `DBUSERNAME`, `USERHOST`, and timestamps link the steps. A rule can correlate failures followed by success and a privileged grant, or flag sensitive reads within that session. The failed attempts have their own session IDs, as they did not establish a session.
+`anomaly_mode` defaults to `true`. After 250 ordinary rows, one eight-row sequence occurs:
 
-`anomaly_mode` defaults to `true`. Set it to `false` in `event.template.params` to generate only ordinary `LOGON`, `SELECT`, and `UPDATE` rows.
+1. Four `LOGON` failures (`RETURN_CODE=1017`) for the configured administrator from one client host. Each failed connection has its own `SESSIONID`.
+2. A successful `LOGON` by the same account and host creates a new session.
+3. That session reads `FINANCE.PAYROLL`, grants `PAYROLL_READ` to the configured user, then logs off. Its `SESSIONID` is stable and its `ENTRY_ID` and `STATEMENT_ID` advance from 1 to 4.
+
+A detection can correlate the four failures with the later successful session, sensitive read, and role assignment. The same account, host, table, role, grantee, actions, and an isolated failed login also occur in background traffic. Background events do not reproduce the complete ordered sequence. With `anomaly_mode: false`, only background is generated. The chain runs once per generator instance, not every 250 rows.
 
 ## Parameters
 
 ### Event Parameters
 
+Edit `event.template.params` in `generator.yml`:
+
 | Name | Default | Purpose |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Include the correlated chain |
-| `database_id` | `3459081234` | Synthetic `DBID` |
-| `target_user` | `FINANCE_DBA` | Account in the chain |
-| `attacker_host` | `wkst-091.corp.example` | Client host in the chain |
-| `grantee` | `REPORT_RO` | Account receiving the DBA role |
+| `anomaly_mode` | `true` | Include the one-shot chain |
+| `database_id` | `3459081234` | Synthetic numeric `DBID` |
+| `target_user` | `FINANCE_DBA` | Administrator account used in background and chain |
+| `attacker_host` | `wkst-091.corp.example` | Client host used in background and chain |
+| `grantee` | `REPORT_USER` | Database user that receives `PAYROLL_READ` in the chain and `APP_REPORTER` in background |
 
 ### Output Parameters
 
-The shipped configuration writes `output/events.json` and requires no connection parameters or secrets. For a SIEM destination, replace the `file` output in a local copy with the chosen output plugin, using `${params.siem_host}` and `${secrets.siem_token}` placeholders for that plugin's endpoint and credentials.
+The shipped pack writes `output/events.json` and needs no credentials. To send it to a SIEM, replace the file output with the appropriate plugin in a local copy. Configure that plugin's endpoint and secret using top-level `${params.*}` and `${secrets.*}` substitutions as required by the destination.
 
 ## Usage
 
+From the `content-packs` repository:
+
 ```bash
-eventum generate --path generators/database-oracle-unified-audit/generator.yml --id oracle-unified-audit --live-mode false
-eventum generate --path generators/database-oracle-unified-audit/generator.yml --id oracle-unified-audit --live-mode true
+uv run --project ../eventum eventum generate --path generators/database-oracle-unified-audit/generator.yml --id oracle-audit --live-mode false
+uv run --project ../eventum eventum generate --path generators/database-oracle-unified-audit/generator.yml --id oracle-audit --live-mode true
 ```
+
+The first command generates as fast as possible until stopped; the second follows the one-event-per-second cron schedule. Results are written as JSON Lines to `output/events.json`.
 
 ## Sample Output
 
-This row was copied from a real generator run.
+This complete row is copied from a 721-row default-parameter run. It is row 7 of the one-shot sequence:
 
 ```json
-{
-  "ACTION_NAME": "GRANT",
-  "AUDIT_TYPE": "Standard",
-  "CLIENT_PROGRAM_NAME": "sqlplus",
-  "CURRENT_USER": "FINANCE_DBA",
-  "DBID": 3459081234,
-  "DBUSERNAME": "FINANCE_DBA",
-  "ENTRY_ID": 3,
-  "EVENT_TIMESTAMP": "2026-09-25T12:20:07+00:00",
-  "EVENT_TIMESTAMP_UTC": "2026-09-25T12:20:07+00:00",
-  "INSTANCE_ID": 1,
-  "OBJECT_NAME": null,
-  "OBJECT_SCHEMA": null,
-  "OS_USERNAME": "oracle-client",
-  "RETURN_CODE": 0,
-  "ROLE": "DBA",
-  "SESSIONID": 262335,
-  "SQL_BINDS": null,
-  "SQL_TEXT": "GRANT DBA TO REPORT_RO",
-  "STATEMENT_ID": 9067,
-  "TARGET_USER": "REPORT_RO",
-  "UNIFIED_AUDIT_POLICIES": "APP_ACCESS_AUDIT",
-  "USERHOST": "wkst-091.corp.example"
-}
+{"ACTION_NAME": "GRANT", "AUDIT_TYPE": "Standard", "CLIENT_PROGRAM_NAME": "sqlplus@wkst-091.corp.example (TNS V1-V3)", "CURRENT_USER": "FINANCE_DBA", "DBID": 3459081234, "DBUSERNAME": "FINANCE_DBA", "ENTRY_ID": 3, "EVENT_TIMESTAMP": "2026-09-26 00:04:16.000000", "EVENT_TIMESTAMP_UTC": "2026-09-26 00:04:16.000000", "INSTANCE_ID": 1, "OBJECT_NAME": null, "OBJECT_SCHEMA": null, "OS_USERNAME": "ops", "RETURN_CODE": 0, "ROLE": "PAYROLL_READ", "SESSIONID": 100056, "SQL_BINDS": null, "SQL_TEXT": "GRANT PAYROLL_READ TO REPORT_USER", "STATEMENT_ID": 3, "TARGET_USER": "REPORT_USER", "UNIFIED_AUDIT_POLICIES": "ORA_ACCOUNT_MGMT", "USERHOST": "wkst-091.corp.example"}
 ```
 
-## Coverage and Limits
+## Projection and Limits
 
-The generator covers 22/22 selected Standard audit-row columns, including identifiers, action/result, client identity, object, SQL, and grant fields. The Oracle view also has many feature-specific columns for Database Vault, XS, RMAN, Data Pump, and other audit types; those are outside this Standard-row scope. Null columns remain null where an action does not populate them. `EVENT_TIMESTAMP` and `EVENT_TIMESTAMP_UTC` share UTC in this synthetic setup; a real connector's local timestamp rendering depends on the database session time zone. `UNIFIED_AUDIT_TRAIL` is populated only when unified auditing and relevant policies are enabled. The `UNIFIED_AUDIT_POLICIES` values here assume example policies are configured. The output is a native SQL row rather than ECS.
+The 22 selected fields cover audit type; session, entry, and statement IDs; local and UTC timestamps; action and result; database/OS user and client; database/instance ID; affected object and SQL; role and grantee; and matching policies. This is **22/22 selected projection fields**, not coverage of the full view. Database Vault, RMAN, Data Pump, proxy, and other feature-specific columns are outside this Standard audit-row scope.
+
+The modeled connector serializes Oracle `NUMBER` columns as JSON numbers and SQL `NULL` as JSON null. It formats both `TIMESTAMP(6)` columns as `YYYY-MM-DD HH24:MI:SS.FF6`. The generator uses Eventum's default UTC timezone, so local and UTC timestamp values are equal in this example. Oracle stores these columns without a timezone suffix; the JSON text representation here is a declared connector choice. `SQL_BINDS` is null because every modeled statement uses SQL literals. Failed logons use null `CURRENT_USER` because no effective session user has been established.
+
+`SESSIONID` values are synthetic identifiers, not an emulation of Oracle's ID allocation. `ENTRY_ID` advances per audited record in a session. `STATEMENT_ID` also advances by one because the model emits one audit record per statement; real statements can generate multiple audit entries, and unobserved statements can create gaps. The role and object names outside `HR.EMPLOYEES` are example application objects. There is no version-matched Oracle 19c capture of this complete 22-column JSON export, so exact byte-level row fidelity and the nullability of every field in live deployments remain unverified.
 
 ## References
 
-- [Oracle Database 19c `UNIFIED_AUDIT_TRAIL` column reference](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/UNIFIED_AUDIT_TRAIL.html)
-- [Oracle Database audit trail administration](https://docs.oracle.com/en/database/oracle/oracle-database/21/dbseg/administering-the-audit-trail.html)
+- [Oracle Database 19c `UNIFIED_AUDIT_TRAIL` column definitions](https://docs.oracle.com/en/database/oracle/oracle-database/19/refrn/UNIFIED_AUDIT_TRAIL.html)
+- [Oracle Database 19c predefined unified audit policies](https://docs.oracle.com/en/database/oracle/oracle-database/19/dbseg/auditing-activities-predefined-unified-audit-policies.html)
+- [Oracle Database 19c object audit policy syntax and examples](https://docs.oracle.com/en/database/oracle/oracle-database/19/dbseg/auditing-object-actions.html)
+- [Oracle Database 19c example of a `LOGON`, `LOGOFF` policy](https://docs.oracle.com/en/database/oracle/oracle-database/19/dbseg/troubleshooting-for-audit.html)
+- [Oracle Database 19c `CLIENT_PROGRAM_NAME` SQL*Plus example](https://docs.oracle.com/en/database/oracle/oracle-database/19/dvadm/database-vault-administrators-guide.pdf)

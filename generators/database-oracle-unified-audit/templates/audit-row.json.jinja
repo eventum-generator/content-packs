@@ -1,63 +1,161 @@
-{%- for key in ['to_failed_logons', 'to_success_logon', 'to_sensitive_select', 'to_role_grant', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- set statement_id = (shared.get('statement_id', 9000) % 2000000000) + 1 -%}{%- do shared.set('statement_id', statement_id) -%}
-{%- set action = module.rand.weighted_choice(['LOGON', 'SELECT', 'UPDATE'], [18, 78, 4]) -%}
-{%- set username = module.rand.choice(['APP_READ', 'HR_APP', 'REPORT_RO']) -%}
-{%- set userhost = module.rand.choice(['app01.corp.example', 'bi01.corp.example', 'batch01.corp.example']) -%}
-{%- set sessionid = module.rand.number.integer(100000, 999999) -%}
+{%- set event_no = shared.get('event_no', 0) + 1 -%}
+{%- do shared.set('event_no', event_no) -%}
+{%- set sessions = shared.get('sessions', {}) -%}
+{%- set attack_step = event_no - 250 if params.anomaly_mode else 0 -%}
+{%- set username = none -%}
+{%- set userhost = none -%}
+{%- set os_username = 'svc_app' -%}
+{%- set program = 'JDBC Thin Client' -%}
+{%- set action = none -%}
+{%- set workload = 'reporting' -%}
+{%- set role = none -%}
+{%- set target = none -%}
 {%- set return_code = 0 -%}
-{%- set schema = 'HR' if username == 'HR_APP' else 'REPORTING' -%}
-{%- set object = 'EMPLOYEES' if schema == 'HR' else 'DAILY_SALES' -%}
-{%- if action == 'UPDATE' -%}{%- set username = 'HR_APP' -%}{%- set schema = 'HR' -%}{%- set object = 'EMPLOYEES' -%}{%- set userhost = 'app01.corp.example' -%}{%- endif -%}
-{%- set sql = none if action == 'LOGON' else ('SELECT * FROM ' ~ schema ~ '.' ~ object ~ ' WHERE ID = :1' if action == 'SELECT' else 'UPDATE HR.EMPLOYEES SET LAST_LOGIN = SYSTIMESTAMP WHERE ID = :1') -%}
-{%- set role = none -%}{%- set target = none -%}{%- set entry = 1 -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 60 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('failed_count', 0) -%}{%- do shared.set('to_failed_logons', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-{%- elif stage == 'failed_logons' -%}
-  {%- set action = 'LOGON' -%}{%- set username = params.target_user -%}{%- set userhost = params.attacker_host -%}{%- set return_code = 1017 -%}{%- set sql = none -%}{%- set schema = none -%}{%- set object = none -%}
-  {%- set count = shared.get('failed_count', 0) + 1 -%}{%- do shared.set('failed_count', count) -%}
-  {%- if count >= 4 -%}{%- do shared.set('to_success_logon', true) -%}{%- endif -%}
-{%- else -%}
-  {%- set username = params.target_user -%}{%- set userhost = params.attacker_host -%}
-  {%- if stage == 'success_logon' -%}
-    {%- set action = 'LOGON' -%}{%- set sql = none -%}{%- set schema = none -%}{%- set object = none -%}
-    {%- do shared.set('attack_sessionid', sessionid) -%}{%- do shared.set('to_sensitive_select', true) -%}
-  {%- elif stage == 'sensitive_select' -%}
-    {%- set sessionid = shared.get('attack_sessionid') -%}{%- set entry = 2 -%}
-    {%- set action = 'SELECT' -%}{%- set schema = 'FINANCE' -%}{%- set object = 'PAYROLL' -%}{%- set sql = 'SELECT EMPLOYEE_ID, BANK_ACCOUNT FROM FINANCE.PAYROLL' -%}
-    {%- do shared.set('to_role_grant', true) -%}
+{%- if 1 <= attack_step <= 8 -%}
+  {%- set username = params.target_user -%}
+  {%- set userhost = params.attacker_host -%}
+  {%- set os_username = 'ops' -%}
+  {%- set program = 'sqlplus' -%}
+  {%- set workload = 'finance' -%}
+  {%- if attack_step <= 4 -%}
+    {%- set action = 'LOGON' -%}
+    {%- set return_code = 1017 -%}
+  {%- elif attack_step == 5 -%}
+    {%- set action = 'LOGON' -%}
+  {%- elif attack_step == 6 -%}
+    {%- set action = 'SELECT' -%}
+  {%- elif attack_step == 7 -%}
+    {%- set action = 'GRANT' -%}
+    {%- set role = 'PAYROLL_READ' -%}
+    {%- set target = params.grantee -%}
   {%- else -%}
-    {%- set sessionid = shared.get('attack_sessionid') -%}{%- set entry = 3 -%}
-    {%- set action = 'GRANT' -%}{%- set schema = none -%}{%- set object = none -%}{%- set role = 'DBA' -%}{%- set target = params.grantee -%}{%- set sql = 'GRANT DBA TO ' ~ params.grantee -%}
-    {%- do shared.pop('attack_sessionid', none) -%}{%- do shared.set('to_routine', true) -%}
+    {%- set action = 'LOGOFF' -%}
+  {%- endif -%}
+{%- elif event_no in [20, 40, 80, 120, 160, 200, 220, 240] -%}
+  {%- set os_username = 'ops' -%}
+  {%- set program = 'sqlplus' -%}
+  {%- if event_no <= 160 -%}
+    {%- set username = params.target_user -%}
+    {%- set userhost = params.attacker_host -%}
+    {%- set workload = 'finance' -%}
+    {%- if event_no == 20 or event_no == 160 -%}
+      {%- set action = 'LOGON' -%}
+      {%- if event_no == 160 -%}{%- set return_code = 1017 -%}{%- endif -%}
+    {%- elif event_no == 40 -%}{%- set action = 'SELECT' -%}
+    {%- elif event_no == 80 -%}
+      {%- set action = 'GRANT' -%}
+      {%- set role = 'PAYROLL_READ' -%}
+      {%- set target = 'BI_ANALYST' -%}
+    {%- else -%}{%- set action = 'LOGOFF' -%}{%- endif -%}
+  {%- else -%}
+    {%- set username = 'SEC_ADMIN' -%}
+    {%- set userhost = 'admin01.corp.example' -%}
+    {%- if event_no == 200 -%}{%- set action = 'LOGON' -%}
+    {%- elif event_no == 220 -%}
+      {%- set action = 'GRANT' -%}
+      {%- set role = 'APP_REPORTER' -%}
+      {%- set target = params.grantee -%}
+    {%- else -%}{%- set action = 'LOGOFF' -%}{%- endif -%}
+  {%- endif -%}
+{%- else -%}
+  {%- if event_no > 300 and module.rand.number.integer(1, 100) <= 3 -%}
+    {%- set username = params.target_user -%}
+    {%- set userhost = params.attacker_host -%}
+    {%- set os_username = 'ops' -%}
+    {%- set program = 'sqlplus' -%}
+    {%- set workload = 'finance' -%}
+  {%- else -%}
+    {%- set client = samples.clients.pick() -%}
+    {%- set username = client.username -%}
+    {%- set userhost = client.userhost -%}
+    {%- set os_username = client.os_username -%}
+    {%- set program = client.program -%}
+    {%- set workload = client.workload -%}
+  {%- endif -%}
+  {%- set key = username ~ '@' ~ userhost -%}
+  {%- if key not in sessions -%}
+    {%- set action = 'LOGON' -%}
+  {%- else -%}
+    {%- set roll = module.rand.number.integer(1, 100) -%}
+    {%- if roll <= 3 -%}{%- set action = 'LOGOFF' -%}
+    {%- elif workload == 'finance' and roll <= 4 -%}
+      {%- set action = 'GRANT' -%}
+      {%- set role = 'PAYROLL_READ' -%}
+      {%- set target = 'BI_ANALYST' -%}
+    {%- elif workload == 'hr' and roll <= 13 -%}{%- set action = 'UPDATE' -%}
+    {%- else -%}{%- set action = 'SELECT' -%}{%- endif -%}
   {%- endif -%}
 {%- endif -%}
+{%- set key = username ~ '@' ~ userhost -%}
+{%- if action == 'LOGON' -%}
+  {%- set sessionid = shared.get('next_sessionid', 100000) + 1 -%}
+  {%- do shared.set('next_sessionid', sessionid) -%}
+  {%- set entry_id = 1 -%}
+  {%- set statement_id = 1 -%}
+  {%- if return_code == 0 -%}
+    {%- do sessions.update({key: {'sessionid': sessionid, 'entry': 1, 'statement': 1}}) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set session = sessions[key] -%}
+  {%- set sessionid = session.sessionid -%}
+  {%- set entry_id = session.entry + 1 -%}
+  {%- set statement_id = session.statement + 1 -%}
+  {%- if action == 'LOGOFF' -%}
+    {%- do sessions.pop(key) -%}
+  {%- else -%}
+    {%- do sessions.update({key: {'sessionid': sessionid, 'entry': entry_id, 'statement': statement_id}}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- do shared.set('sessions', sessions) -%}
+{%- set schema = none -%}
+{%- set object = none -%}
+{%- set sql = none -%}
+{%- if action == 'SELECT' -%}
+  {%- if workload == 'finance' -%}
+    {%- set schema = 'FINANCE' -%}
+    {%- set object = 'PAYROLL' -%}
+    {%- set sql = 'SELECT EMPLOYEE_ID, BANK_ACCOUNT FROM FINANCE.PAYROLL' -%}
+  {%- elif workload == 'hr' -%}
+    {%- set schema = 'HR' -%}
+    {%- set object = 'EMPLOYEES' -%}
+    {%- set sql = 'SELECT EMPLOYEE_ID, DEPARTMENT_ID FROM HR.EMPLOYEES WHERE DEPARTMENT_ID = 50' -%}
+  {%- else -%}
+    {%- set schema = 'REPORTING' -%}
+    {%- set object = 'DAILY_SALES' -%}
+    {%- set sql = 'SELECT SALE_DATE, NET_AMOUNT FROM REPORTING.DAILY_SALES WHERE REGION_ID = 4' -%}
+  {%- endif -%}
+{%- elif action == 'UPDATE' -%}
+  {%- set schema = 'HR' -%}
+  {%- set object = 'EMPLOYEES' -%}
+  {%- set sql = "UPDATE HR.EMPLOYEES SET PHONE_NUMBER = '515.123.4567' WHERE EMPLOYEE_ID = 100" -%}
+{%- elif action == 'GRANT' -%}
+  {%- set sql = 'GRANT ' ~ role ~ ' TO ' ~ target -%}
+{%- endif -%}
+{%- set policy = 'ORA_LOGON_FAILURES' if return_code == 1017 else 'APP_SESSION_AUDIT' if action in ['LOGON', 'LOGOFF'] else 'APP_DATA_AUDIT' if action in ['SELECT', 'UPDATE'] else 'ORA_ACCOUNT_MGMT' -%}
+{%- if program == 'sqlplus' -%}{%- set program = ('sqlplus@' ~ userhost ~ ' (TNS V1-V3)')[:48] -%}{%- endif -%}
+{%- set clock = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f') -%}
 {%- set row = {
   'AUDIT_TYPE': 'Standard',
   'SESSIONID': sessionid,
-  'ENTRY_ID': entry,
+  'ENTRY_ID': entry_id,
   'STATEMENT_ID': statement_id,
-  'EVENT_TIMESTAMP': timestamp.isoformat(),
-  'EVENT_TIMESTAMP_UTC': timestamp.isoformat(),
+  'EVENT_TIMESTAMP': clock,
+  'EVENT_TIMESTAMP_UTC': clock,
   'ACTION_NAME': action,
   'RETURN_CODE': return_code,
   'DBUSERNAME': username,
-  'OS_USERNAME': 'oracle-client',
+  'OS_USERNAME': os_username,
   'USERHOST': userhost,
-  'CLIENT_PROGRAM_NAME': 'JDBC Thin Client' if stage == 'routine' else 'sqlplus',
+  'CLIENT_PROGRAM_NAME': program,
   'DBID': params.database_id,
   'INSTANCE_ID': 1,
   'OBJECT_SCHEMA': schema,
   'OBJECT_NAME': object,
   'SQL_TEXT': sql,
-  'SQL_BINDS': ':1=42' if stage == 'routine' and action != 'LOGON' else none,
+  'SQL_BINDS': none,
   'ROLE': role,
   'TARGET_USER': target,
-  'UNIFIED_AUDIT_POLICIES': 'ORA_LOGON_FAILURES' if return_code != 0 else 'APP_ACCESS_AUDIT',
-  'CURRENT_USER': username
+  'UNIFIED_AUDIT_POLICIES': policy,
+  'CURRENT_USER': username if return_code == 0 else none
 } -%}
 {{- row | tojson -}}
