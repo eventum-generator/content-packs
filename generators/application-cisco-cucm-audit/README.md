@@ -8,16 +8,16 @@ Synthetic Cisco Unified Communications Manager 14.0.1.10000-20 application audit
 | --- | ---: | --- | --- |
 | `UserLogging` / login | 43.1% | `authentication` | Successful CUCM Administration login |
 | `UserLogging` / logout | 43.1% | `authentication` | Successful Administration logout |
-| `GeneralConfigurationUpdate` / `processnode` updated | 12.1% | `configuration` | Existing processnode record updated |
-| `GeneralConfigurationUpdate` / `processnode` added | 1.7% | `configuration` | New processnode record added in the anomaly chain |
+| `GeneralConfigurationUpdate` / `processnode` updated | 6.9% | `configuration` | Existing processnode record updated |
+| `GeneralConfigurationUpdate` / `processnode` added | 6.9% | `configuration` | New processnode record added in routine and anomaly sessions |
 
-The template uses FSM mode and emits one event per simulated minute from one CUCM publisher. A routine cycle has 24 administrator sessions; every fourth session updates an existing `processnode` record. An anomaly cycle adds one four-event session. Frequencies and timing are synthetic, not Cisco production telemetry.
+The template uses FSM mode and emits one event per simulated minute from one CUCM publisher. A routine cycle has 24 administrator sessions; every fourth session changes a `processnode` record, and every eighth adds one. An anomaly cycle adds one four-event session. Frequencies and timing are synthetic, not Cisco production telemetry.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), `breakglass-admin` connects from `198.51.100.45`, an address outside the routine admin pool, and logs into CUCM Administration. The same user and client address then add and update `cimp-shadow-<n>.example.test` in the `processnode` table before logging out. The four steps occur within three simulated minutes; the two configuration records share the record key. A rule can group by `user.name` and `source.ip`, sort by `@timestamp`, and alert on an unusual client followed by a `processnode` add and update. Output row order is not a reliable clock.
+With `anomaly_mode: true` (the default), `breakglass-admin` connects from `198.51.100.45`, an address also seen in isolated routine sessions, and logs into CUCM Administration. The same user and client address then add and update `cimp-shadow-<n>.example.test` in the `processnode` table before logging out. The four steps occur within three simulated minutes; the two configuration records share the record key. A rule can group by `user.name` and `source.ip`, sort by `@timestamp`, and alert on an add and update of the same `processnode` key in one short session. Output row order is not a reliable clock.
 
-This is a synthetic high-interest administrative sequence, not proof of compromise. Cisco's primary sample shows the same four native event forms and record-key linkage. `CorrelationID` is empty for these short rows; it is used by CUCM to join fragments of one oversized audit message, not to identify this admin session. With `anomaly_mode: false`, only routine login, update, and logout records appear. The break-glass actor, off-pool client, and `processnode` additions are absent.
+This is a synthetic high-interest administrative sequence, not proof of compromise. Cisco's primary sample shows the same four native event forms and record-key linkage. `CorrelationID` is empty for these short rows; it is used by CUCM to join fragments of one oversized audit message, not to identify this admin session. With `anomaly_mode: false`, routine sessions include occasional break-glass logins and processnode additions, but no add-and-update sequence on one record key.
 
 ## Parameters
 
