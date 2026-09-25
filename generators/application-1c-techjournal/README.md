@@ -1,24 +1,23 @@
 # 1C:Enterprise Technological Log Generator
 
-Produces ECS JSON events that carry the documented 1C:Enterprise 8.3 technological log JSON record in `event.original` and `one_c.techjournal`. This is the **technological log** for platform calls and lock diagnostics, separate from the 1C event log generator.
+Generates synthetic 1C:Enterprise 8.3.27 **technological-log JSON** records inside an ECS envelope. This platform diagnostic log is separate from the 1C EventJournal registration log.
 
 ## Event Types
 
-| Native `name` | Routine frequency | Category |
+| Native `name` | Background frequency | Meaning |
 |---|---:|---|
-| `SCALL` | 80% | Outbound server call |
-| `CALL` | 18% | Incoming server call |
-| `TLOCK` | 2% | Managed transaction lock check |
-| `TTIMEOUT` | Chain only | Lock timeout |
-| `EXCP` | Chain only | Platform exception |
+| `SCALL` | 79% | Outgoing remote call |
+| `CALL` | 17% | Incoming remote call |
+| `TLOCK` | 3% | Managed transaction lock operation or wait |
+| `EXCP` | 1% | Platform exception |
 
-Routine weights are synthetic defaults, not measured 1C production rates. The FSM emits a four-event chain after every 200 routine events when anomaly mode is on.
+The frequencies are synthetic workload settings, not measured 1C rates. The source profile assumes `log.format=json` and `logcfg.xml` configured to record these four event types and their selected properties. Native values are JSON strings, including `duration` in microseconds, as in the [8.3.27 specification](https://1c-dn.com/library/tutorials/1c_enterprise_administrator_guide_file_mode_8_3_27/).
 
 ## Anomaly Chain
 
-The user `batch_admin` and client `92` make a slower `CALL`, encounter a `TLOCK` wait on `Document.SalesOrder`, then emit `TTIMEOUT` and `EXCP`. All four records share `ClientID`, `SessionID`, `OSThread`, `Usr`, and infobase. Each remote call gets a bounded, increasing `CallID`. Durations rise above routine calls while staying within consecutive generated timestamps. A detector can correlate a slow call, lock wait, timeout, and exception for the same session and thread.
+After at least 200 background records, the `batch_admin` session waits for another connection's managed lock on `InfoRg42.DIMS` (`TLOCK`, `t:connectID=16`, `WaitConnections=17`). It then records an `EXCP` whose description identifies a managed-lock wait timeout, followed by the completed `CALL`. The three records share `Usr`, `SessionID`, `OSThread`, `t:clientID`, `t:connectID`, infobase, and execution context. The `CALL` completes last and its duration spans the lock wait. A detector can correlate the prolonged wait and exception with the enclosing call by session and connection.
 
-`anomaly_mode` defaults to `true`. Set it to `false` for only routine `SCALL`, `CALL`, and `TLOCK` records.
+The background contains the same users, sessions, event names, lock region, and context, but never this complete three-record sequence. The chain occurs once, after its thread has been idle long enough for the enclosing call to start. `anomaly_mode` defaults to `true`; set it to `false` for background only.
 
 ## Parameters
 
@@ -28,41 +27,48 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `anomaly_mode` | `true` | Include or omit the lock-failure chain |
-| `anomaly_interval_events` | `200` | Routine events between chains |
-| `host_name` | `onec-app-01` | 1C application host |
-| `infobase` | `accounting` | Infobase name |
-| `process_name` | `rphost` | 1C process name |
-| `routine_user` | `accountant01` | Routine actor |
-| `unusual_user` | `batch_admin` | Chain actor |
-| `routine_client_id` | `8` | Routine client identifier |
-| `unusual_client_id` | `92` | Chain client identifier |
+| `anomaly_mode` | `true` | Include the one-shot chain |
+| `anomaly_after_events` | `200` | Minimum background records before the chain; actual start waits for a free thread |
+| `host_name` | `onec-app-01` | Server host |
+| `infobase` | `accounting` | Infobase name (`p:processName`) |
+| `process_name` | `rphost` | 1C process |
+| `routine_user` | `accountant01` | First background session |
+| `contending_user` | `batch_admin` | Second background session and chain participant |
+| `routine_client_id` | `518` | First session's `t:clientID` |
+| `contending_client_id` | `592` | Second session's `t:clientID` |
 
 ### Output Parameters
 
-The shipped configuration writes `output/events.json` and needs no output parameters or secrets. Replace the `output` block to deliver elsewhere, using that plugin's `${params.*}` and `${secrets.*}` placeholders for endpoint settings and credentials.
+The shipped configuration writes `output/events.json` and needs no endpoint parameters or secrets. To send events elsewhere, replace the `output` block with the desired plugin and its `${params.*}` and `${secrets.*}` placeholders.
 
 ## Usage
 
-From the content-packs repository root:
+From the content-packs repository root, set `input[0].cron.start` and `input[0].cron.end` for a finite batch run. For example, `2026-09-25T00:00:00+00:00` and `2026-09-25T00:06:00+00:00` produce 361 records, including the default anomaly chain.
 
 ```bash
-eventum generate --path generators/application-1c-techjournal/generator.yml --id onec-techjournal --live-mode false
-eventum generate --path generators/application-1c-techjournal/generator.yml --id onec-techjournal --live-mode true
+uv run --project ../eventum eventum generate --path generators/application-1c-techjournal/generator.yml --id onec-techjournal --live-mode false
 ```
 
-Batch mode runs continuously until interrupted. Live mode emits one record per second.
+For a continuous stream, leave `end` unset and use live mode:
+
+```bash
+uv run --project ../eventum eventum generate --path generators/application-1c-techjournal/generator.yml --id onec-techjournal --live-mode true
+```
 
 ## Sample Output
 
-This complete event was copied from a generator run:
+This synthetic event was copied from a finite generator run. It is not a vendor-captured record.
 
 ```json
-{"@timestamp": "2026-09-25T12:25:32+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "TTIMEOUT", "category": ["database"], "dataset": "1c.techjournal", "kind": "event", "original": "{\"ClientID\": \"92\", \"OSThread\": \"15968\", \"Regions\": \"Document.SalesOrder\", \"SessionID\": \"421\", \"Usr\": \"batch_admin\", \"WaitConnections\": \"ClientID=88\", \"depth\": \"0\", \"duration\": \"900000\", \"level\": \"ERROR\", \"name\": \"TTIMEOUT\", \"p:processName\": \"accounting\", \"process\": \"rphost\", \"ts\": \"2026-09-25T12:25:32.000000\"}", "type": ["error"]}, "host": {"name": "onec-app-01"}, "one_c": {"techjournal": {"ClientID": "92", "OSThread": "15968", "Regions": "Document.SalesOrder", "SessionID": "421", "Usr": "batch_admin", "WaitConnections": "ClientID=88", "depth": "0", "duration": "900000", "level": "ERROR", "name": "TTIMEOUT", "p:processName": "accounting", "process": "rphost", "ts": "2026-09-25T12:25:32.000000"}}, "process": {"name": "rphost"}, "user": {"name": "batch_admin"}}
+{"@timestamp": "2026-09-25T00:03:23.016897+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "TLOCK", "dataset": "1c.techjournal", "kind": "event", "original": "{\"ts\":\"2026-09-25T00:03:23.016897\",\"duration\":\"2000000\",\"name\":\"TLOCK\",\"depth\":\"5\",\"level\":\"INFO\",\"process\":\"rphost\",\"p:processName\":\"accounting\",\"OSThread\":\"15968\",\"t:clientID\":\"592\",\"t:applicationName\":\"1CV8C\",\"t:computerName\":\"client-01\",\"t:connectID\":\"16\",\"SessionID\":\"421\",\"Usr\":\"batch_admin\",\"AppID\":\"1CV8C\",\"Regions\":\"InfoRg42.DIMS\",\"Locks\":\"InfoRg42.DIMS Exclusive Fld43=\\\"DOC-0042\\\"\",\"WaitConnections\":\"17\",\"Context\":\"\u041e\u0431\u0449\u0438\u0439\u041c\u043e\u0434\u0443\u043b\u044c.\u0417\u0430\u043f\u0438\u0441\u044c\u0414\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u043e\u0432.\u041c\u043e\u0434\u0443\u043b\u044c : 81 : \u041d\u0430\u0431\u043e\u0440\u0417\u0430\u043f\u0438\u0441\u0435\u0439.\u0417\u0430\u043f\u0438\u0441\u0430\u0442\u044c();\"}", "type": ["info"]}, "host": {"name": "onec-app-01"}, "one_c": {"techjournal": {"AppID": "1CV8C", "Context": "\u041e\u0431\u0449\u0438\u0439\u041c\u043e\u0434\u0443\u043b\u044c.\u0417\u0430\u043f\u0438\u0441\u044c\u0414\u043e\u043a\u0443\u043c\u0435\u043d\u0442\u043e\u0432.\u041c\u043e\u0434\u0443\u043b\u044c : 81 : \u041d\u0430\u0431\u043e\u0440\u0417\u0430\u043f\u0438\u0441\u0435\u0439.\u0417\u0430\u043f\u0438\u0441\u0430\u0442\u044c();", "Locks": "InfoRg42.DIMS Exclusive Fld43=\"DOC-0042\"", "OSThread": "15968", "Regions": "InfoRg42.DIMS", "SessionID": "421", "Usr": "batch_admin", "WaitConnections": "17", "depth": "5", "duration": "2000000", "level": "INFO", "name": "TLOCK", "p:processName": "accounting", "process": "rphost", "t:applicationName": "1CV8C", "t:clientID": "592", "t:computerName": "client-01", "t:connectID": "16", "ts": "2026-09-25T00:03:23.016897"}}, "process": {"name": "rphost"}, "user": {"name": "batch_admin"}}
 ```
+
+`event.original` contains the native JSON object encoded as a string; `one_c.techjournal` contains the parsed native fields. The emitted file itself is ECS JSON, so a consumer must extract `event.original` to ingest it as a native 1C JSON log.
 
 ## Source and Scope
 
-The [1C:Enterprise 8.3.27 technological-log file specification](https://kb.1ci.com/1C_Enterprise_Platform/Guides/Administrator_Guides/1C_Enterprise_8.3.27_Administrator_Guide/Appendix_3._Description_and_location_of_internal_files/3.24._logcfg.xml/3.24.3._Technological_log_files/) gives the JSON keys `ts`, `duration`, `name`, `depth`, `level`, and source properties. The [logcfg.xml event and property catalog](https://kb.1ci.com/1C_Enterprise_Platform/Guides/Administrator_Guides/1C_Enterprise_8.3.22_Administrator_Guide/Appendix_3._Description_and_location_of_internal_files/3.22._logcfg.xml/3.22.2._Configuration_file_structure/) documents `CALL`, `SCALL`, `TLOCK`, `TTIMEOUT`, `EXCP`, and their properties. This pack assumes `log.format=json` and appropriate event/property selection in `logcfg.xml`. It covers all 14 keys in the vendor's selected `SCALL` JSON sample, plus the lock and exception properties used in this scenario. It does not cover the full technological-log event catalog.
+The [1C 8.3.27 Administrator Guide](https://1c-dn.com/library/tutorials/1c_enterprise_administrator_guide_file_mode_8_3_27/) defines JSON technological-log format, event names, property meanings, and a complete 14-field `SCALL` JSON record. The [1C ITS `CALL` sample](https://its.1c.ru/db/content/metod8dev/src/developers/scalability/troubleshooting/i8105860.htm), [1C ITS lock investigation with `TLOCK` and `EXCP` records](https://its.1c.ru/db/content/metod8dev/src/developers/scalability/troubleshooting/i8106006.htm), and [1C ITS managed-lock exception description](https://its.1c.ru/db/content/metod8dev/src/developers/scalability/methods/i8105809.htm) ground the field choices and lock sequence. The selected properties, user sessions, and event frequencies remain synthetic.
 
-The [KUMA 4.0 source table](https://support.kaspersky.com/kuma/4.0/en-US/255782.htm) lists a regexp normalizer for 1C TechJournal. This pack uses the vendor-documented 8.3.27 JSON format, so compatibility with that KUMA normalizer has not been verified. Use a parser configured for the JSON format.
+**BLOCKED_RAW_EVIDENCE:** complete first-party JSON records for `CALL`, `TLOCK`, and `EXCP` have not been found. Their shapes follow the vendor's text examples and text-to-JSON rule; exact per-event 8.3.27 JSON field sets remain unverified. `TTIMEOUT` is documented in the event catalog but excluded because no complete first-party raw record was found. This pack does not claim production fidelity for that event.
+
+The [KUMA 4.0 source table](https://support.kaspersky.com/kuma/4.0/en-US/255782.htm) lists a regexp normalizer for 1C TechJournal. That text normalizer's compatibility with this JSON profile is unverified; configure a parser for the JSON profile. The generator does not cover the complete technological-log catalog.
