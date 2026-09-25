@@ -6,14 +6,14 @@ Synthetic Staffcop Enterprise 5.8 Syslog connector events in the vendor-document
 
 | Native event | Approximate share with anomaly mode | ECS category | Meaning |
 | --- | ---: | --- | --- |
-| `Screenshot` | 97.2% | `host` | Endpoint screenshot event, optionally matching a policy |
-| `Stat` | 2.8% | `host` | Statistics event with two matching policies in the chain |
+| `Screenshot` | 91.7% | `host` | Endpoint screenshot event, optionally matching a policy |
+| `Stat` | 8.3% | `host` | Statistics event with two matching policies in routine activity or the chain |
 
-The template uses FSM mode and emits one event per five simulated minutes from twelve ordinary endpoints and one chain endpoint. The syslog header represents the connector's forwarding time, three minutes after the `time` field and ECS `@timestamp`. The vendor documents roughly five-minute forwarding. With anomaly mode disabled, the stream contains only routine `Screenshot` events, about one in five with one policy match. These proportions are synthetic scenario choices.
+The template uses FSM mode and emits one event per five simulated minutes from twelve ordinary endpoints and a thirteenth endpoint that also has benign activity. The syslog header represents the connector's forwarding time, three minutes after the `time` field and ECS `@timestamp`. The vendor documents roughly five-minute forwarding. With anomaly mode disabled, the stream contains routine `Screenshot` and `Stat` events. About one in five routine screenshots has one policy match, while occasional routine `Stat` events from other employees have two. These proportions are synthetic scenario choices.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), `ivan` on `WS-023` produces two `Screenshot` events without policy matches, then a screenshot matching `Скриншоты`, then a `Stat` event matching both `Скриншоты` and `Финансовые данные`. The four events share the user, computer, IP, and application and span 15 simulated minutes. A detection can group by `user.name` and `host.name`, sort by `@timestamp`, and alert on the screenshot series ending with two policy matches. The file's row order is not a reliable clock. With `anomaly_mode: false`, only ordinary `employee1`–`employee12` activity is generated; the linked actor and `Stat` step are absent.
+With `anomaly_mode: true` (the default), `ivan` on `WS-023` produces two `Screenshot` events without policy matches, then a screenshot matching `Скриншоты`, then a `Stat` event matching both `Скриншоты` and `Финансовые данные`. The four events share the user, computer, IP, and application and span 15 simulated minutes. A detection can group by `user.name` and `host.name`, sort by `@timestamp`, and alert on the screenshot series ending with two policy matches. The file's row order is not a reliable clock. The same actor also emits isolated benign screenshots in both modes. With `anomaly_mode: false`, routine `Stat` records with two policies and the actor’s benign screenshots remain, but their four-step sequence does not occur.
 
 The policies are illustrative names. A `Stat` event with two matches does not prove that earlier screenshots caused it, and policy count is not a severity scale. The sequence gives rule authors correlated events without claiming causality not present in the source.
 
@@ -55,7 +55,7 @@ This JSON event was copied from an anomaly-mode run, not handwritten:
 
 ```json
 {
-  "@timestamp": "2026-09-25T17:07:00+00:00",
+  "@timestamp": "2026-09-25T17:47:00+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -66,7 +66,7 @@ This JSON event was copied from an anomaly-mode run, not handwritten:
     ],
     "id": "468036",
     "kind": "event",
-    "original": "Sep 25 17:10:00 staffcop-srv staffcop: id=\"468036\" time=\"Sep 25 17:07:00\" event=\"Stat\" computer=\"WS-023\" ip=\"10.20.4.23\" user=\"ivan\" app=\"chrome\" policy_1=\"\u0421\u043a\u0440\u0438\u043d\u0448\u043e\u0442\u044b\" policy_2=\"\u0424\u0438\u043d\u0430\u043d\u0441\u043e\u0432\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435\"",
+    "original": "Sep 25 17:50:00 staffcop-srv staffcop: id=\"468036\" time=\"Sep 25 17:47:00\" event=\"Stat\" computer=\"WS-023\" ip=\"10.20.4.23\" user=\"ivan\" app=\"chrome\" policy_1=\"\u0421\u043a\u0440\u0438\u043d\u0448\u043e\u0442\u044b\" policy_2=\"\u0424\u0438\u043d\u0430\u043d\u0441\u043e\u0432\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435\"",
     "type": [
       "info"
     ]
@@ -95,8 +95,8 @@ This JSON event was copied from an anomaly-mode run, not handwritten:
     ]
   },
   "staffcop": {
-    "event_time": "2026-09-25T17:07:00+00:00",
-    "forwarded_at": "2026-09-25T17:10:00+00:00",
+    "event_time": "2026-09-25T17:47:00+00:00",
+    "forwarded_at": "2026-09-25T17:50:00+00:00",
     "policy_matches": [
       "\u0421\u043a\u0440\u0438\u043d\u0448\u043e\u0442\u044b",
       "\u0424\u0438\u043d\u0430\u043d\u0441\u043e\u0432\u044b\u0435 \u0434\u0430\u043d\u043d\u044b\u0435"
