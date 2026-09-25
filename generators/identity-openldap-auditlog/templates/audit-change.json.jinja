@@ -1,0 +1,48 @@
+{%- for key in ['to_add_account', 'to_add_group_member', 'to_reset_password', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- set serial = (shared.get('serial', 1000) % 999999) + 1 -%}{%- do shared.set('serial', serial) -%}
+{%- set epoch = timestamp.timestamp() | int -%}
+{%- set generalized = timestamp.strftime('%Y%m%d%H%M%SZ') -%}
+{%- set csn = timestamp.strftime('%Y%m%d%H%M%S') ~ '.000000Z#' ~ '%06d'|format(serial % 1000000) ~ '#000#000000' -%}
+{%- set actor = 'cn=admin,' ~ params.base_dn -%}
+{%- set uid = module.rand.choice(['marina', 'pavel', 'irina', 'boris']) -%}
+{%- set dn = 'uid=' ~ uid ~ ',ou=People,' ~ params.base_dn -%}
+{%- set change = 'modify' -%}{%- set attribute = module.rand.weighted_choice(['description', 'telephoneNumber', 'title', 'mail'], [40, 25, 20, 15]) -%}{%- set value = {'description': 'Staff account reviewed', 'telephoneNumber': '+1 555 010 2400', 'title': 'Analyst', 'mail': uid ~ '@corp.example'}[attribute] -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 60 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_add_account', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{%- else -%}
+  {%- set actor = params.operator_dn -%}
+  {%- set member_dn = 'uid=' ~ params.backdoor_uid ~ ',ou=People,' ~ params.base_dn -%}
+  {%- if stage == 'add_account' -%}
+    {%- set change = 'add' -%}{%- set dn = member_dn -%}{%- set attribute = 'uid' -%}{%- set value = params.backdoor_uid -%}
+    {%- do shared.set('to_add_group_member', true) -%}
+  {%- elif stage == 'add_group_member' -%}
+    {%- set dn = 'cn=' ~ params.privileged_group ~ ',ou=Groups,' ~ params.base_dn -%}{%- set attribute = 'member' -%}{%- set value = member_dn -%}
+    {%- do shared.set('to_reset_password', true) -%}
+  {%- else -%}
+    {%- set dn = member_dn -%}{%- set attribute = 'userPassword' -%}{%- set value = '{SSHA}Y2xlYXJseS1zeW50aGV0aWMtcGFzc3dvcmQ=' -%}
+    {%- do shared.set('to_routine', true) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set prefix = '# ' ~ change ~ ' ' ~ epoch ~ ' ' ~ params.base_dn ~ ' ' ~ actor ~ '\ndn: ' ~ dn ~ '\nchangetype: ' ~ change ~ '\n' -%}
+{%- if change == 'add' -%}
+  {%- set body = 'objectClass: top\nobjectClass: person\nobjectClass: organizationalPerson\nobjectClass: inetOrgPerson\nstructuralObjectClass: inetOrgPerson\nentryUUID: ' ~ module.rand.crypto.uuid4() ~ '\nuid: ' ~ value ~ '\ncn: Service Backup\nsn: Backup\nuserPassword: {SSHA}Y2xlYXJseS1zeW50aGV0aWMtcGFzc3dvcmQ=\ncreatorsName: ' ~ actor ~ '\ncreateTimestamp: ' ~ generalized ~ '\nmodifiersName: ' ~ actor ~ '\nmodifyTimestamp: ' ~ generalized ~ '\nentryCSN: ' ~ csn ~ '\n' -%}
+{%- else -%}
+  {%- set operation = 'add' if attribute == 'member' else 'replace' -%}
+  {%- set body = operation ~ ': ' ~ attribute ~ '\n' ~ attribute ~ ': ' ~ value ~ '\n-\nreplace: entryCSN\nentryCSN: ' ~ csn ~ '\n-\nreplace: modifiersName\nmodifiersName: ' ~ actor ~ '\n-\nreplace: modifyTimestamp\nmodifyTimestamp: ' ~ generalized ~ '\n-\n' -%}
+{%- endif -%}
+{%- set original = prefix ~ body ~ '# end ' ~ change ~ ' ' ~ epoch -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['iam'], 'type': ['creation'] if change == 'add' else ['change'], 'action': 'ldap-' ~ change, 'outcome': 'success', 'original': original},
+  'host': {'name': params.host_name},
+  'user': {'name': actor},
+  'related': {'user': [actor, dn]},
+  'ldap': {'auditlog': {'base_dn': params.base_dn, 'actor_dn': actor, 'target_dn': dn, 'change_type': change, 'attribute': attribute, 'value': value, 'entry_csn': csn}}
+} -%}
+{{- event | tojson -}}
