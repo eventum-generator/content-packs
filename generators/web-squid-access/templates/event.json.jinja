@@ -1,0 +1,46 @@
+{%- set step = vars.step -%}
+{%- set kind = step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['get_miss','get_hit','connect','denied'],[55,25,15,5]) -%}
+{%- endif -%}
+{%- set req = samples.requests.pick() -%}
+{%- set src = req.client_ip -%}{%- set actor = req.user -%}
+{%- set url = req.url -%}{%- set dst = req.origin_ip -%}
+{%- set method = 'GET' -%}{%- set status = 200 -%}
+{%- set result = 'TCP_MISS' -%}{%- set peer = 'DIRECT' -%}
+{%- set bytes = req.bytes -%}{%- set duration = 140 -%}
+{%- set content_type = 'text/html' -%}
+{%- if kind == 'get_hit' -%}
+  {%- set result = 'TCP_HIT' -%}{%- set peer = 'NONE' -%}{%- set dst = '-' -%}{%- set duration = 3 -%}
+{%- elif kind == 'connect' -%}
+  {%- set method = 'CONNECT' -%}{%- set url = 'updates.corp.example:443' -%}
+  {%- set bytes = 4230 -%}{%- set duration = 5012 -%}
+  {%- set content_type = '-' -%}
+{%- elif kind in ['denied','deny_1','deny_2','deny_3'] -%}
+  {%- set result = 'TCP_DENIED' -%}{%- set peer = 'NONE' -%}
+  {%- set dst = '-' -%}{%- set status = 403 -%}
+  {%- set bytes = 333 -%}{%- set duration = 1 -%}
+  {%- if kind.startswith('deny_') -%}
+    {%- set src = params.anomaly_ip -%}{%- set actor = params.anomaly_user -%}{%- set url = params.anomaly_url -%}
+  {%- endif -%}
+{%- elif kind in ['allowed_1','allowed_2'] -%}
+  {%- set src = params.anomaly_ip -%}{%- set actor = params.anomaly_user -%}
+  {%- set url = params.anomaly_url -%}{%- set dst = params.anomaly_origin_ip -%}
+  {%- set bytes = 2320812 if kind == 'allowed_1' else 2421401 -%}
+  {%- set duration = 3862 if kind == 'allowed_1' else 4012 -%}
+  {%- set content_type = 'text/csv' -%}
+{%- endif -%}
+{%- set epoch = '%.3f' % timestamp.timestamp() -%}
+{%- set original = epoch ~ ' ' ~ duration ~ ' ' ~ src ~ ' ' ~ result ~ '/' ~ status ~ ' ' ~ bytes ~ ' ' ~ method ~ ' ' ~ url ~ ' ' ~ actor ~ ' ' ~ peer ~ '/' ~ dst ~ ' ' ~ content_type -%}
+{%- set offset = shared.get('offset', 0) -%}
+{%- do shared.set('offset', (offset + original|length + 1) % 2147483647) -%}
+{%- set related_ip = [src] if dst == '-' else [src,dst] -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'agent':{'ephemeral_id':'5a110000-1111-4444-8888-123456789abc','id':'5a110000-1111-4444-8888-123456789abc','name':params.proxy_name,'type':'filebeat','version':'8.17.0'},'elastic_agent':{'id':'5a110000-1111-4444-8888-123456789abc','snapshot':false,'version':'8.17.0'},'data_stream':{'dataset':'squid.log','namespace':'default','type':'logs'},'event':{'agent_id_status':'verified','category':['web'],'dataset':'squid.log','duration':duration * 1000000,'ingested':timestamp.isoformat(),'kind':'event','module':'squid','original':original,'outcome':'failure' if status == 403 else 'success','type':['access']},'http':{'request':{'method':method},'response':{'status_code':status,'bytes':bytes}},'input':{'type':'filestream'},'log':{'file':{'path':'/var/log/squid/access.log'},'offset':offset},'observer':{'hostname':params.proxy_name,'ip':params.proxy_ip,'product':'Squid','type':'proxy','vendor':'Squid'},'related':{'ip':related_ip,'user':[actor]},'source':{'address':src,'ip':src,'user':{'name':actor}},'squid':{'peer_status':peer,'result_code':result,'status_code':status},'tags':['preserve_original_event','squid-log'],'url':{'original':url}} -%}
+{%- if dst != '-' -%}{%- do out.update({'destination':{'address':dst,'ip':dst,'bytes':bytes}}) -%}{%- endif -%}
+{{- out | tojson -}}
