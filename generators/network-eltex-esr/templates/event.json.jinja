@@ -1,0 +1,261 @@
+{# The official ESR reference gives MSG bodies and a separate RFC 5424 envelope. #}
+{%- set step = vars.step -%}
+{%- set extra = {} -%}
+{%- set category = ['network'] -%}
+{%- set event_type = ['info'] -%}
+{%- set outcome = 'success' -%}
+{%- set group = 'FIREWALL' -%}
+{%- set severity_code = 'I' -%}
+{%- set mnemonic = 'LOG' -%}
+{%- set action = 'firewall_permitted' -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- do shared.pop('to_normal', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('arc_no', (shared.get('arc_no', 0) % 9999) + 1) -%}
+      {%- do shared.set('to_attack', true) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', count) -%}
+  {%- endif -%}
+  {%- set kind = module.rand.weighted_choice(
+      ['permit', 'deny', 'nat', 'ips', 'normal', 'failed'],
+      [620, 200, 150, 15, 10, 5]) -%}
+  {%- set flow = samples.flows | random -%}
+  {%- if kind == 'permit' or kind == 'deny' -%}
+    {%- set decision = 'permitted' if kind == 'permit' else 'denied' -%}
+    {%- set action = 'firewall_' ~ decision -%}
+    {%- set event_type = ['connection',
+        'allowed' if kind == 'permit' else 'denied'] -%}
+    {%- set outcome = 'success' if kind == 'permit' else 'failure' -%}
+    {%- set body = "zone-pair 'trust untrust' rule " ~ flow.rule
+        ~ ' (VRF_prod) ' ~ decision ~ ' tcp '
+        ~ flow.source_ip ~ ':' ~ flow.source_port ~ ' ('
+        ~ flow.interface ~ ' ' ~ flow.interface_mac ~ ') -> '
+        ~ flow.destination_ip ~ ':' ~ flow.destination_port
+        ~ ', dscp 0' -%}
+    {%- do extra.update({'source': {'ip': flow.source_ip,
+        'port': flow.source_port, 'zone': 'trust'},
+        'destination': {'ip': flow.destination_ip,
+            'port': flow.destination_port, 'zone': 'untrust'},
+        'network': {'transport': 'tcp'},
+        'eltex': {'esr': {'zone_pair': 'trust untrust',
+            'rule': flow.rule, 'vrf': 'VRF_prod', 'decision': decision,
+            'interface': {'name': flow.interface,
+                'mac': flow.interface_mac}, 'dscp': 0}}}) -%}
+  {%- elif kind == 'nat' -%}
+    {%- set group = 'NAT' -%}
+    {%- set action = 'snat_translation' -%}
+    {%- set event_type = ['connection', 'allowed'] -%}
+    {%- set body = "SNAT ruleset 'office-egress' rule 1 (VRF_prod) "
+        ~ 'permitted translation for tcp ' ~ flow.source_ip ~ ':'
+        ~ flow.source_port ~ ' to ' ~ flow.nat_ip ~ ':'
+        ~ flow.nat_port -%}
+    {%- do extra.update({'source': {'ip': flow.source_ip,
+        'port': flow.source_port,
+        'nat': {'ip': flow.nat_ip, 'port': flow.nat_port}},
+        'network': {'transport': 'tcp'},
+        'eltex': {'esr': {'nat': {'type': 'SNAT',
+            'ruleset': 'office-egress', 'rule': 1,
+            'vrf': 'VRF_prod', 'decision': 'permitted'}}}}) -%}
+  {%- elif kind == 'ips' -%}
+    {%- set group = 'IPS' -%}
+    {%- set mnemonic = 'INFO' -%}
+    {%- set action = 'ips_drop' -%}
+    {%- set category = ['network', 'intrusion_detection'] -%}
+    {%- set event_type = ['denied'] -%}
+    {%- set outcome = 'failure' -%}
+    {%- set body = '[Drop] [1:30010:0] Rule 10 Drop '
+        ~ '[Classification: Generic ICMP event] [Priority: 3] '
+        ~ '{ICMP} ' ~ flow.source_ip ~ ':2048 -> '
+        ~ flow.destination_ip ~ ':0' -%}
+    {%- do extra.update({'source': {'ip': flow.source_ip,
+        'port': 2048}, 'destination': {'ip': flow.destination_ip,
+        'port': 0}, 'network': {'transport': 'icmp'},
+        'eltex': {'esr': {'ips': {'action': 'Drop',
+            'signature_id': '1:30010:0',
+            'group_id': 1, 'rule_id': 30010, 'revision': 0,
+            'description': 'Rule 10 Drop',
+            'classification': 'Generic ICMP event',
+            'priority': 3}}}}) -%}
+  {%- elif kind == 'failed' -%}
+    {%- set group = 'AAA' -%}
+    {%- set mnemonic = 'SSH' -%}
+    {%- set action = 'ssh_password_failed' -%}
+    {%- set category = ['authentication'] -%}
+    {%- set event_type = ['start', 'denied'] -%}
+    {%- set outcome = 'failure' -%}
+    {%- set body = 'Failed password for ' ~ params.normal_user
+        ~ ' from ' ~ params.normal_source_ip ~ ' port 50225 ssh2' -%}
+    {%- do extra.update({'user': {'name': params.normal_user},
+        'source': {'ip': params.normal_source_ip, 'port': 50225},
+        'destination': {'ip': params.router_ip, 'port': 22},
+        'network': {'transport': 'tcp'},
+        'eltex': {'esr': {'ssh': {'protocol': 'ssh2'}}}}) -%}
+  {%- else -%}
+    {%- do shared.set('to_normal', true) -%}
+    {%- set body = "zone-pair 'trust untrust' rule " ~ flow.rule
+        ~ ' (VRF_prod) permitted tcp ' ~ flow.source_ip ~ ':'
+        ~ flow.source_port ~ ' (' ~ flow.interface ~ ' '
+        ~ flow.interface_mac ~ ') -> ' ~ flow.destination_ip ~ ':'
+        ~ flow.destination_port ~ ', dscp 0' -%}
+    {%- set event_type = ['connection', 'allowed'] -%}
+    {%- do extra.update({'source': {'ip': flow.source_ip,
+        'port': flow.source_port, 'zone': 'trust'},
+        'destination': {'ip': flow.destination_ip,
+            'port': flow.destination_port, 'zone': 'untrust'},
+        'network': {'transport': 'tcp'},
+        'eltex': {'esr': {'zone_pair': 'trust untrust',
+            'rule': flow.rule, 'vrf': 'VRF_prod',
+            'decision': 'permitted', 'interface': {
+                'name': flow.interface,
+                'mac': flow.interface_mac}, 'dscp': 0}}}) -%}
+  {%- endif -%}
+{%- elif step in ['normal_ssh', 'unusual_ssh', 'service_ssh'] -%}
+  {%- set group = 'AAA' -%}
+  {%- set mnemonic = 'SSH' -%}
+  {%- set actor = params.normal_user if step == 'normal_ssh'
+      else (params.unusual_user if step == 'unusual_ssh'
+      else params.service_user_prefix ~ ('%03d' % shared.get('arc_no', 1))) -%}
+  {%- set src = params.normal_source_ip if step == 'normal_ssh'
+      else params.unusual_source_ip -%}
+  {%- set port = 50225 if step == 'normal_ssh' else 55443 -%}
+  {%- set body = 'Accepted password for ' ~ actor ~ ' from '
+      ~ src ~ ' port ' ~ port ~ ' ssh2' -%}
+  {%- set action = 'ssh_password_accepted' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start', 'allowed'] -%}
+  {%- do extra.update({'user': {'name': actor},
+      'source': {'ip': src, 'port': port},
+      'destination': {'ip': params.router_ip, 'port': 22},
+      'network': {'transport': 'tcp'},
+      'eltex': {'esr': {'ssh': {'protocol': 'ssh2'}}}}) -%}
+{%- elif step in ['normal_open', 'normal_close', 'unusual_open'] -%}
+  {%- set group = 'AAA-LOCAL' -%}
+  {%- set mnemonic = 'SESSION' -%}
+  {%- set actor = params.unusual_user if step == 'unusual_open'
+      else params.normal_user -%}
+  {%- set opened = step != 'normal_close' -%}
+  {%- set body = 'ssh: session ' ~ ('opened' if opened else 'closed')
+      ~ ' for user ' ~ actor -%}
+  {%- set action = 'session_opened' if opened else 'session_closed' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start'] if opened else ['end'] -%}
+  {%- do extra.update({'user': {'name': actor},
+      'eltex': {'esr': {'session': {'access': 'ssh'}}}}) -%}
+{%- elif step in ['probe_1', 'probe_2', 'probe_3'] -%}
+  {%- set group = 'AAA' -%}
+  {%- set mnemonic = 'SSH' -%}
+  {%- set body = 'Failed password for ' ~ params.unusual_user
+      ~ ' from ' ~ params.unusual_source_ip
+      ~ ' port 55443 ssh2' -%}
+  {%- set action = 'ssh_password_failed' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start', 'denied'] -%}
+  {%- set outcome = 'failure' -%}
+  {%- do extra.update({'user': {'name': params.unusual_user},
+      'source': {'ip': params.unusual_source_ip, 'port': 55443},
+      'destination': {'ip': params.router_ip, 'port': 22},
+      'network': {'transport': 'tcp'},
+      'eltex': {'esr': {'ssh': {'protocol': 'ssh2'}}}}) -%}
+{%- elif step == 'enable_password' -%}
+  {%- set group = 'USER' -%}
+  {%- set mnemonic = 'INFO' -%}
+  {%- set body = "password for '$enab15$' changed by '"
+      ~ params.unusual_user ~ "'" -%}
+  {%- set action = 'enable_password_changed' -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- do extra.update({'user': {'name': params.unusual_user},
+      'eltex': {'esr': {'privilege_level': 15}}}) -%}
+{%- elif step == 'user_add' -%}
+  {%- set group = 'USER' -%}
+  {%- set mnemonic = 'ADD' -%}
+  {%- set service_user = params.service_user_prefix
+      ~ ('%03d' % shared.get('arc_no', 1)) -%}
+  {%- set body = 'User ' ~ service_user ~ ' was created' -%}
+  {%- set action = 'user_created' -%}
+  {%- set category = ['iam'] -%}
+  {%- set event_type = ['creation'] -%}
+  {%- do extra.update({'user': {'target': {'name': service_user}}}) -%}
+{%- elif step == 'privilege_change' -%}
+  {%- set group = 'USER' -%}
+  {%- set mnemonic = 'INFO' -%}
+  {%- set service_user = params.service_user_prefix
+      ~ ('%03d' % shared.get('arc_no', 1)) -%}
+  {%- set body = 'Privilege level of user ' ~ service_user
+      ~ ' was changed from 5 to 14' -%}
+  {%- set action = 'user_privilege_changed' -%}
+  {%- set category = ['iam'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- do extra.update({'user': {'target': {'name': service_user}},
+      'eltex': {'esr': {'privilege': {'old': 5, 'new': 14}}}}) -%}
+{%- else -%}
+  {%- set group = 'TIME' -%}
+  {%- set mnemonic = 'INFO' -%}
+  {%- set body = 'System time was changed by user '
+      ~ params.unusual_user -%}
+  {%- set action = 'system_time_changed' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- do extra.update({'user': {'name': params.unusual_user}}) -%}
+{%- endif -%}
+{%- set raw = '%' ~ group ~ '-' ~ severity_code
+    ~ '-' ~ mnemonic ~ ': ' ~ body -%}
+{%- set sequence = shared.get('sequence', 0) + 1 -%}
+{%- do shared.set('sequence', sequence % 2147483647) -%}
+{%- set app_name = 'login' if group in ['AAA', 'AAA-LOCAL']
+    else group.lower() -%}
+{%- set facility = 10 if group in ['AAA', 'AAA-LOCAL',
+    'USER', 'TIME'] else 16 -%}
+{%- set severity = {'I': 6, 'W': 4, 'F': 2}[severity_code] -%}
+{%- set priority = facility * 8 + severity -%}
+{%- set frame = '<' ~ priority ~ '>1 ' ~ timestamp.isoformat()
+    ~ ' ' ~ params.router_name ~ ' ' ~ app_name ~ ' - - - '
+    ~ sequence ~ ': ' ~ raw -%}
+{
+  "@timestamp": {{ timestamp.isoformat() | tojson }},
+  "ecs": {"version": "8.17.0"},
+  "event": {
+    "action": {{ action | tojson }},
+    "category": {{ category | tojson }},
+    "dataset": "eltex.esr.syslog",
+    "kind": "event",
+    "module": "eltex",
+    "original": {{ frame | tojson }},
+    "outcome": {{ outcome | tojson }},
+    "type": {{ event_type | tojson }}
+  },
+  "message": {{ raw | tojson }},
+  "log": {
+    "level": {{ {'I': 'info', 'W': 'warning',
+      'F': 'critical'}[severity_code] | tojson }},
+    "syslog": {"priority": {{ priority }},
+      "facility": {"code": {{ facility }}},
+      "severity": {"code": {{ severity }}},
+      "appname": {{ app_name | tojson }},
+      "version": "1"}
+  },
+  "observer": {
+    "hostname": {{ params.router_name | tojson }},
+    "ip": {{ params.router_ip | tojson }},
+    "name": {{ params.router_name | tojson }},
+    "product": "ESR",
+    "type": "router",
+    "vendor": "Eltex"
+  },
+  "eltex": {"esr": {
+    "group": {{ group | tojson }},
+    "mnemonic": {{ mnemonic | tojson }},
+    "severity_code": {{ severity_code | tojson }},
+    "sequence_number": {{ sequence }},
+    "details": {{ extra.get('eltex', {}).get('esr', {}) | tojson }}
+  }}{% if extra.get('source') %},
+  "source": {{ extra.source | tojson }}{% endif %}{% if extra.get('destination') %},
+  "destination": {{ extra.destination | tojson }}{% endif %}{% if extra.get('network') %},
+  "network": {{ extra.network | tojson }}{% endif %}{% if extra.get('user') %},
+  "user": {{ extra.user | tojson }}{% endif %}
+}
