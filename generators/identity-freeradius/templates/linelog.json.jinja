@@ -1,0 +1,77 @@
+{%- set step = vars.step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('start_anomaly', none) -%}
+  {%- do shared.pop('start_normal', none) -%}
+  {%- set n = shared.get('routine_count', 0) + 1 -%}
+  {%- if n >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('start_anomaly', true) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', n) -%}
+  {%- endif -%}
+  {%- set action = module.rand.weighted_choice(
+      ['accept', 'reject'], [70, 30]) -%}
+  {%- if action == 'accept' and not shared.get('start_anomaly') -%}
+    {%- do shared.set('start_normal', true) -%}
+  {%- endif -%}
+  {%- set user = params.ordinary_user -%}
+  {%- set station = params.ordinary_station -%}
+{%- elif step.startswith('normal_') -%}
+  {%- set action = step.removeprefix('normal_') -%}
+  {%- set user = params.ordinary_user -%}
+  {%- set station = params.ordinary_station -%}
+{%- else -%}
+  {%- set action = 'reject' if step.startswith('reject_') else step -%}
+  {%- set user = params.unusual_user -%}
+  {%- set station = params.unusual_station -%}
+{%- endif -%}
+{%- set principal = '[' ~ user ~ ']' -%}
+{%- set port = params.nas_port -%}
+{%- if action == 'reject' -%}
+  {%- set message = 'Login incorrect (Invalid user credentials): '
+      ~ principal ~ ' (from ' ~ params.nas_client ~ ' port '
+      ~ port ~ ' cli ' ~ station ~ ')' -%}
+  {%- set outcome = 'failure' -%}
+  {%- set event_type = ['start'] -%}
+{%- elif action == 'accept' -%}
+  {%- set message = 'Login OK: ' ~ principal ~ ' (from '
+      ~ params.nas_client ~ ' port ' ~ port ~ ' cli '
+      ~ station ~ ')' -%}
+  {%- set outcome = 'success' -%}
+  {%- set event_type = ['start'] -%}
+{%- elif action == 'connect' -%}
+  {%- set message = 'Connect: ' ~ principal ~ ' (did '
+      ~ params.called_station ~ ' cli ' ~ station ~ ' port '
+      ~ port ~ ' ip 10.50.0.45)' -%}
+  {%- set outcome = 'success' -%}
+  {%- set event_type = ['start'] -%}
+{%- else -%}
+  {%- set message = 'Disconnect: ' ~ principal ~ ' (did '
+      ~ params.called_station ~ ' cli ' ~ station ~ ' port '
+      ~ port ~ ' ip 10.50.0.45) 3600 seconds' -%}
+  {%- set outcome = 'success' -%}
+  {%- set event_type = ['end'] -%}
+{%- endif -%}
+{%- set radius = {'client_shortname': params.nas_client,
+    'nas_port': port, 'calling_station_id': station} -%}
+{%- if action == 'reject' -%}
+  {%- do radius.update({'module_failure_message':
+      'Invalid user credentials'}) -%}
+{%- endif -%}
+{{ {'@timestamp': timestamp.isoformat(),
+    'ecs': {'version': '8.17.0'},
+    'event': {'dataset': 'freeradius.linelog',
+        'module': 'freeradius', 'kind': 'event',
+        'category': ['session'] if action in ['connect',
+            'disconnect'] else ['authentication'], 'type': event_type,
+        'action': action, 'outcome': outcome,
+        'original': message},
+    'message': message,
+    'host': {'name': params.radius_host},
+    'service': {'name': 'radiusd'},
+    'user': {'name': user},
+    'source': {'mac': station},
+    'radius': radius
+} | tojson }}
