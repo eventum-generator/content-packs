@@ -4,22 +4,22 @@ F5 BIG-IP AFM layer 3/4 firewall and Network DoS CEF events. Eventum emits ECS J
 
 ## Event types
 
-| AFM action or status | Synthetic frequency | ECS category |
-| --- | --- | --- |
-| Network `Accept` | 50% of background records | network |
-| Network `Open` | 25% of background records | network |
-| Network `Closed` | 25% of background records | network |
-| DoS `Attack Started` | Once per anomaly sequence | network, intrusion_detection |
-| DoS `Attack Sampled` with `Drop` | Three times per anomaly sequence | network, intrusion_detection |
-| DoS `Attack Stopped` | Once per anomaly sequence | network, intrusion_detection |
+| AFM action or status | Approximate share with default anomaly mode | ECS category |
+| --- | ---: | --- |
+| Network `Accept` | 37.7% | network |
+| Network `Open` | 22.6% | network |
+| Network `Closed` | 22.6% | network |
+| DoS `Attack Started` | 3.8% | network, intrusion_detection |
+| DoS `Attack Sampled` with `Drop` | 9.4% | network, intrusion_detection |
+| DoS `Attack Stopped` | 3.8% | network, intrusion_detection |
 
-The one-record-per-second input, routine proportions, and DoS sequence frequency are synthetic demo settings, not measured AFM rates. Routine `Open` and `Closed` records share a source/destination tuple and port.
+One default 53-record cycle contains 48 background records followed by a five-event linked sequence in anomaly mode. Four of the background records are isolated DoS events; the other 44 are ordinary network records. Frequencies and the one-record-per-second input are synthetic demo settings, not measured AFM rates. Routine `Open` and `Closed` records share a source/destination tuple and port.
 
 ## Anomaly Chain
 
-After 48 routine records, a Network DoS attack starts, produces three dropped bad-checksum samples, and stops. The five records share `f5.afm.attack_id`, `source.ip`, `destination.ip`, `destination.port`, and `observer.name`. In a bounded sample run, all 72 complete chains spanned four seconds by `@timestamp`, with one second between adjacent steps; changing the input cadence changes that interval. A SIEM rule can correlate a start followed by repeated drops for one attack ID; a separate rule can count distinct attack IDs from one source over time. The sample count is synthetic and does not encode packet volume.
+After 48 background records, one Network DoS attack starts, produces three dropped bad-checksum samples, and stops. The five events share `f5.afm.attack_id`, `source.ip`, `destination.ip`, `destination.port`, and `observer.name`. In the final bounded anomaly-mode run, 47 complete chains each spanned four seconds by `@timestamp`; changing the input cadence changes that interval. A SIEM rule can correlate one `Attack Started`, three `Attack Sampled`, and one `Attack Stopped` for the same attack ID within a short window. The sample count is synthetic and does not encode packet volume.
 
-`anomaly_mode: true` is the default. `false` emits only ordinary `Accept`, `Open`, and `Closed` network records. Correlate by `@timestamp` because output lines can arrive out of order.
+`anomaly_mode: true` is the default. Both modes also emit isolated `Attack Started`, `Attack Sampled`, and `Attack Stopped` records with different attack IDs. Some use the same source and destination as the linked sequence. With `anomaly_mode: false`, all six event variants remain but no attack ID has the complete five-event sequence; background DoS records sharing one source/destination are separated by more than 10 seconds. Correlate by `@timestamp` because output lines can arrive out of order.
 
 ## Parameters
 
@@ -29,7 +29,7 @@ Edit `event.template.params` in `generator.yml`.
 
 | Name | Default | Purpose |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Enable the Network DoS sequence. |
+| `anomaly_mode` | `true` | Enable the linked five-event Network DoS sequence. |
 | `anomaly_interval_events` | `48` | Background records before each sequence. |
 | `bigip_host` | `bigip-afm.lab.example` | Synthetic BIG-IP hostname. |
 | `bigip_management_ip` | `10.0.0.5` | Management address in CEF and ECS. |
@@ -60,7 +60,7 @@ Copied from an actual anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T14:41:09+00:00",
+  "@timestamp": "2026-09-25T15:00:05+00:00",
   "destination": {
     "ip": "2001:db8:20::3",
     "port": 80
@@ -77,7 +77,7 @@ Copied from an actual anomaly-mode run:
     "code": "Bad TCP checksum",
     "dataset": "f5.afm",
     "kind": "event",
-    "original": "CEF:0|F5|Advanced Firewall Module|11.3.0.2790.300|Bad TCP checksum|Drop|8|dvchost=bigip-afm.lab.example dvc=10.0.0.5 rt=Sep 25 2026 14:41:09 act=Drop cn1=3083822790 cn1Label=attack_id cs1=Attack Sampled cs1Label=attack_status src= spt=52123 dst= dpt=80 cs2=/Common/external cs2Label=vlan cs3=/Common/app-vs cs3Label=virtual_name cn4=0 cn4Label=route_domain c6a2=2001:db8:10::99 c6a2Label=source_address c6a3=2001:db8:20::3 c6a3Label=destination_address",
+    "original": "CEF:0|F5|Advanced Firewall Module|11.3.0.2790.300|Bad TCP checksum|Drop|8|dvchost=bigip-afm.lab.example dvc=10.0.0.5 rt=Sep 25 2026 15:00:05 act=Drop cn1=3083822790 cn1Label=attack_id cs1=Attack Sampled cs1Label=attack_status src= spt=52123 dst= dpt=80 cs2=/Common/external cs2Label=vlan cs3=/Common/app-vs cs3Label=virtual_name cn4=0 cn4Label=route_domain c6a2=2001:db8:10::99 c6a2Label=source_address c6a3=2001:db8:20::3 c6a3Label=destination_address",
     "type": [
       "denied"
     ]
@@ -122,7 +122,7 @@ Copied from an actual anomaly-mode run:
 
 The F5 External Monitoring 13.0.0 guide includes complete AFM CEF examples for Network Event `Accept`, `Open`, and `Closed`, and a Network DoS `Attack Sampled` event from BIG-IP 11.3.0. The generated CEF retains every extension key from the corresponding selected examples. IPs, virtual servers, timestamps, and attack IDs are synthetic. The guide documents `Attack Started` and `Attack Stopped` states and allowed actions, but shows a full DoS CEF line only for `Attack Sampled`; the start/stop lines are modeled from that layout and field catalog. The `11.3.0.2790.300` version reflects the DoS example; the cited IPv4 Network Event examples use another 11.3.0 build.
 
-Both modes were generated and parsed as JSON. The five-step DoS sequence appeared only in anomaly mode. KUMA 4.2 lists F5 BIG-IP AFM CEF over Syslog; this pack preserves a CEF message body but does not add a Syslog envelope, and compatibility with its out-of-the-box normalizer has not been tested.
+Both modes were generated and parsed as JSON; CEF headers and native DoS keys were checked against the source format. All six variants appeared in both modes; only anomaly mode contained a complete five-event sequence on one attack ID. Background DoS statuses used distinct attack IDs and never formed a dense source/destination cluster. KUMA 4.2 lists F5 BIG-IP AFM CEF over Syslog; this pack preserves a CEF message body but does not add a Syslog envelope, and compatibility with its out-of-the-box normalizer has not been tested.
 
 ## References
 

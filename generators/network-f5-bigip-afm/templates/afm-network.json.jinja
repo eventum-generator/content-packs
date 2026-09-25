@@ -6,17 +6,26 @@
 {%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 5) -%}
 {%- do shared.set('tick', tick) -%}
 {%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set background_dos = tick < params.anomaly_interval_events and tick in [8, 20, 32, 44] -%}
+{%- set dos_event = chain or background_dos -%}
 {%- set rt = event_time.strftime('%b %d %Y %H:%M:%S') -%}
-{%- if chain -%}
-  {%- set step = tick - params.anomaly_interval_events -%}
-  {%- if step == 0 -%}
-    {%- do shared.set('attack_cycle', (shared.get('attack_cycle', 0) + 1) % 1000000) -%}
+{%- if dos_event -%}
+  {%- if chain -%}
+    {%- set step = tick - params.anomaly_interval_events -%}
+    {%- if step == 0 -%}
+      {%- do shared.set('attack_cycle', (shared.get('attack_cycle', 0) + 1) % 1000000) -%}
+    {%- endif -%}
+    {%- set attack_id = 3083822789 + shared.get('attack_cycle', 1) -%}
+    {%- set attack_status = ['Attack Started', 'Attack Sampled', 'Attack Sampled', 'Attack Sampled', 'Attack Stopped'][step] -%}
+  {%- else -%}
+    {%- set background_attack_seq = (shared.get('background_attack_seq', 0) + 1) % 1000000 -%}
+    {%- do shared.set('background_attack_seq', background_attack_seq) -%}
+    {%- set attack_id = 4000000000 + background_attack_seq -%}
+    {%- set attack_status = 'Attack Started' if tick == 8 else ('Attack Stopped' if tick == 32 else 'Attack Sampled') -%}
   {%- endif -%}
-  {%- set attack_id = 3083822789 + shared.get('attack_cycle', 1) -%}
-  {%- set attack_status = ['Attack Started', 'Attack Sampled', 'Attack Sampled', 'Attack Sampled', 'Attack Stopped'][step] -%}
-  {%- set action = 'Drop' if step in [1, 2, 3] else 'None' -%}
-  {%- set src_ip = params.attack_source_ipv6 -%}
-  {%- set dst_ip = params.attack_destination_ipv6 -%}
+  {%- set action = 'Drop' if attack_status == 'Attack Sampled' else 'None' -%}
+  {%- set src_ip = params.attack_source_ipv6 if chain or tick in [8, 44] else '2001:db8:10::54' -%}
+  {%- set dst_ip = params.attack_destination_ipv6 if chain or tick in [8, 44] else '2001:db8:20::7' -%}
   {%- set src_port = 52123 -%}
   {%- set dst_port = 80 -%}
   {%- set raw = 'CEF:0|F5|Advanced Firewall Module|' ~ params.product_version
@@ -33,8 +42,8 @@
     ~ ' cn4=0 cn4Label=route_domain'
     ~ ' c6a2=' ~ src_ip ~ ' c6a2Label=source_address'
     ~ ' c6a3=' ~ dst_ip ~ ' c6a3Label=destination_address' -%}
-  {%- set event_type = ['start'] if step == 0 else (['end'] if step == 4 else ['denied']) -%}
-  {%- set event_action = 'dos_' ~ ('started' if step == 0 else ('stopped' if step == 4 else 'sampled')) -%}
+  {%- set event_type = ['start'] if attack_status == 'Attack Started' else (['end'] if attack_status == 'Attack Stopped' else ['denied']) -%}
+  {%- set event_action = 'dos_' ~ ('started' if attack_status == 'Attack Started' else ('stopped' if attack_status == 'Attack Stopped' else 'sampled')) -%}
   {%- set f5 = {'afm': {'attack_id': attack_id, 'attack_status': attack_status,
     'attack_name': 'Bad TCP checksum', 'action': action,
     'vlan': params.vlan, 'virtual_server': params.virtual_server}} -%}
@@ -74,9 +83,9 @@
 {%- set record = {'@timestamp': event_time.isoformat(),
   'ecs': {'version': '8.17.0'},
   'event': {'kind': 'event', 'dataset': 'f5.afm',
-    'category': ['network', 'intrusion_detection'] if chain else ['network'],
+    'category': ['network', 'intrusion_detection'] if dos_event else ['network'],
     'type': event_type, 'action': event_action,
-    'code': 'Bad TCP checksum' if chain else '23003137',
+    'code': 'Bad TCP checksum' if dos_event else '23003137',
     'original': raw},
   'observer': {'name': params.bigip_host, 'ip': [params.bigip_management_ip],
     'vendor': 'F5', 'product': 'Advanced Firewall Module', 'version': params.product_version},
