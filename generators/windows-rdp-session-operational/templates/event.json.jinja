@@ -1,0 +1,30 @@
+{%- set step = vars.step -%}
+{%- set attack = step.startswith('attack_') -%}
+{%- set logon = 'logon' in step -%}
+{%- if step == 'routine_logon' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set n = shared.get('routine_sessions',0) + 1 -%}
+  {%- if n >= params.anomaly_interval_sessions -%}
+    {%- do shared.set('routine_sessions',0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack',true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_sessions',n) -%}{%- endif -%}
+{%- endif -%}
+{%- if logon -%}
+  {%- set session_id = (shared.get('session_counter',100) % 65535) + 1 -%}{%- do shared.set('session_counter',session_id) -%}
+  {%- do shared.set('session_id',session_id) -%}
+  {%- set activity = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}{%- do shared.set('activity',activity) -%}
+  {%- if attack -%}
+    {%- set actor = params.anomaly_users[(step.split('_')[-1]|int)-1] -%}
+    {%- do shared.set('user',actor) -%}{%- do shared.set('client_ip',params.anomaly_ip) -%}
+  {%- else -%}
+    {%- set sample = samples.sessions.pick() -%}
+    {%- do shared.set('user',sample.user) -%}{%- do shared.set('client_ip',sample.ip) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set actor = shared.get('user') -%}{%- set src = shared.get('client_ip') -%}
+{%- set session_id = shared.get('session_id') -%}{%- set activity = shared.get('activity') -%}
+{%- set record = (shared.get('record_counter',40000) % 2147483647) + 1 -%}{%- do shared.set('record_counter',record) -%}
+{%- set event_id = 21 if logon else 24 -%}
+{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-TerminalServices-LocalSessionManager" Guid="{5d896912-022d-40aa-a3a8-4fa5515c76d7}"/><EventID>' ~ event_id ~ '</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x1000000000000000</Keywords><TimeCreated SystemTime="' ~ timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '0Z"/><EventRecordID>' ~ record ~ '</EventRecordID><Correlation ActivityID="' ~ activity ~ '"/><Execution ProcessID="1152" ThreadID="1636"/><Channel>Microsoft-Windows-TerminalServices-LocalSessionManager/Operational</Channel><Computer>' ~ params.host_name ~ '</Computer><Security UserID="S-1-5-18"/></System><UserData><EventXML xmlns="Event_NS"><User>' ~ (actor|e) ~ '</User><SessionID>' ~ session_id ~ '</SessionID><Address>' ~ src ~ '</Address></EventXML></UserData></Event>' -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'session-logon' if logon else 'session-disconnected','category':['authentication','session'],'code':event_id|string,'dataset':'windows.rdp_session_operational','kind':'event','original':xml,'type':['start'] if logon else ['end']},'host':{'name':params.host_name,'ip':[params.host_ip]},'message':('Remote Desktop Services: Session logon succeeded' if logon else 'Remote Desktop Services: Session has been disconnected'),'related':{'ip':[src],'user':[actor]},'source':{'ip':src},'tags':['rdp-session-operational','preserve_original_event'],'user':{'name':actor},'windows':{'rdp_session':{'user':actor,'session_id':session_id,'address':src}},'winlog':{'activity_id':activity,'channel':'Microsoft-Windows-TerminalServices-LocalSessionManager/Operational','event_id':event_id,'provider_name':'Microsoft-Windows-TerminalServices-LocalSessionManager','record_id':record}} -%}
+{{- out | tojson -}}
