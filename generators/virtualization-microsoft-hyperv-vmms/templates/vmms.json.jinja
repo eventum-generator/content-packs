@@ -1,0 +1,40 @@
+{%- for key in ['to_cancelled', 'to_failed', 'to_merge_failed', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set routine_count = shared.get('routine_count', 0) + 1 -%}
+  {%- if routine_count >= 45 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_cancelled', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', routine_count) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['cancelled', 'failed', 'merge_failed'], [45, 40, 15]) -%}
+  {%- set vm = module.rand.choice([['WEB-01', '742A75F8-3518-434F-9827-CDA0B2D6CC21'], ['FILE-03', '55425F62-113E-401A-B998-3BF7EFC76308'], ['SQL-01', '1D52F7A0-F043-401A-919C-8AFE4317A47B']]) -%}
+  {%- set vm_name = vm[0] -%}{%- set vm_id = vm[1] -%}
+{%- else -%}
+  {%- set kind = stage -%}{%- set vm_name = params.affected_vm_name -%}{%- set vm_id = params.affected_vm_id -%}
+  {%- if stage == 'cancelled' -%}{%- do shared.set('to_failed', true) -%}
+  {%- elif stage == 'failed' -%}{%- do shared.set('to_merge_failed', true) -%}
+  {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{%- endif -%}
+{%- set record_id = shared.get('record_id', 50000) + 1 -%}
+{%- do shared.set('record_id', 50000 if record_id >= 999999 else record_id) -%}
+{%- set event_id = 18014 if kind == 'cancelled' else 18012 if kind == 'failed' else 19100 -%}
+{%- set iso_time = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%fZ') -%}
+{%- if kind == 'cancelled' -%}
+  {%- set message = "Checkpoint operation for '" ~ vm_name ~ "' was cancelled. (Virtual machine ID " ~ vm_id ~ ')' -%}
+{%- elif kind == 'failed' -%}
+  {%- set message = "Checkpoint operation for '" ~ vm_name ~ "' failed. (Virtual machine ID " ~ vm_id ~ ')' -%}
+{%- else -%}
+  {%- set message = "'" ~ vm_name ~ "' background disk merge failed to complete: The process cannot access the file because it is being used by another process. (0x80070020). (Virtual machine ID " ~ vm_id ~ ')' -%}
+{%- endif -%}
+{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-Hyper-V-VMMS" Guid="{6066f867-7ca1-4418-85fd-36e3f9c0600c}"/><EventID>' ~ event_id ~ '</EventID><Version>0</Version><Level>2</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime="' ~ iso_time ~ '"/><EventRecordID>' ~ record_id ~ '</EventRecordID><Correlation/><Execution ProcessID="2748" ThreadID="1160"/><Channel>Microsoft-Windows-Hyper-V-VMMS-Admin</Channel><Computer>' ~ params.host_name ~ '</Computer><Security UserID="S-1-5-18"/></System><UserData><VmlEventLog xmlns="http://www.microsoft.com/Windows/Virtualization/Events"><VmName>' ~ vm_name ~ '</VmName><VmId>' ~ vm_id ~ '</VmId>' ~ ('<ErrorMessage>%%2147942432</ErrorMessage><ErrorCode>0x80070020</ErrorCode>' if kind == 'merge_failed' else '') ~ '</VmlEventLog></UserData></Event>' -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['host'], 'type': ['error'], 'action': 'checkpoint-cancelled' if kind == 'cancelled' else 'checkpoint-failed' if kind == 'failed' else 'disk-merge-failed', 'code': event_id | string, 'outcome': 'failure', 'original': xml},
+  'host': {'name': params.host_name},
+  'related': {'hosts': [params.host_name]},
+  'winlog': {'channel': 'Microsoft-Windows-Hyper-V-VMMS-Admin', 'provider_name': 'Microsoft-Windows-Hyper-V-VMMS', 'record_id': record_id, 'user': {'identifier': 'S-1-5-18'}},
+  'hyperv': {'vm': {'name': vm_name, 'id': vm_id}, 'error_code': '0x80070020' if kind == 'merge_failed' else none},
+  'message': message
+} -%}
+{{- event | tojson -}}
