@@ -1,0 +1,182 @@
+{%- set phase = vars.phase -%}
+{%- set person = samples.users.pick() -%}
+{%- set vm_row = samples.vms.pick() -%}
+{%- set actor = person.name -%}
+{%- set client_ip = person.ip -%}
+{%- set user_agent = person.user_agent -%}
+{%- set vm_name = vm_row.name -%}
+{%- set vm_id = vm_row.id -%}
+{%- set severity = 'info' -%}
+{%- if phase == 'routine' -%}
+  {%- do shared.pop('to_routine') -%}
+  {%- set kind = module.rand.weighted_choice(
+    ['UserLoginSessionEvent', 'UserLogoutSessionEvent',
+     'VmPoweredOnEvent', 'VmPoweredOffEvent', 'VmReconfiguredEvent'],
+    [38, 32, 15, 10, 5]) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 250 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('to_failed_login', true) -%}
+    {%- else -%}
+      {%- do shared.set('to_routine', true) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', count) -%}
+    {%- do shared.set('to_routine', true) -%}
+  {%- endif -%}
+{%- elif phase == 'failed_login' -%}
+  {%- do shared.pop('to_failed_login') -%}
+  {%- set kind = 'EventEx' -%}
+  {%- set actors = ['VSPHERE.LOCAL\\ops.ivanov',
+    'VSPHERE.LOCAL\\ops.petrova',
+    'VSPHERE.LOCAL\\helpdesk.smirnov',
+    params.domain ~ '\\' ~ params.attack_user] -%}
+  {%- set step = shared.get('spray_step', 0) -%}
+  {%- set actor = actors[step] -%}
+  {%- set client_ip = params.attack_ip -%}
+  {%- if step < 3 -%}
+    {%- do shared.set('spray_step', step + 1) -%}
+    {%- do shared.set('to_failed_login', true) -%}
+  {%- else -%}
+    {%- do shared.set('spray_step', 0) -%}
+    {%- do shared.set('to_attack_login', true) -%}
+  {%- endif -%}
+{%- elif phase == 'attack_login' -%}
+  {%- do shared.pop('to_attack_login') -%}
+  {%- set kind = 'UserLoginSessionEvent' -%}
+  {%- set actor = params.domain ~ '\\' ~ params.attack_user -%}
+  {%- set client_ip = params.attack_ip -%}
+  {%- set user_agent = 'Mozilla/5.0' -%}
+{%- elif phase == 'permission_add' -%}
+  {%- set kind = 'PermissionAddedEvent' -%}
+  {%- set actor = params.domain ~ '\\' ~ params.attack_user -%}
+  {%- set vm_name = none -%}
+  {%- set vm_id = none -%}
+{%- elif phase == 'vm_reconfigure' -%}
+  {%- set kind = 'VmReconfiguredEvent' -%}
+  {%- set actor = params.domain ~ '\\' ~ params.attack_user -%}
+  {%- set vm_name = params.critical_vm -%}
+  {%- set vm_id = 'vm-900' -%}
+{%- else -%}
+  {%- set kind = 'VmPoweredOffEvent' -%}
+  {%- set actor = params.domain ~ '\\' ~ params.attack_user -%}
+  {%- set vm_name = params.critical_vm -%}
+  {%- set vm_id = 'vm-900' -%}
+{%- endif -%}
+{%- set key = (shared.get('event_key', 575791) % 2147483646) + 1 -%}
+{%- do shared.set('event_key', key) -%}
+{%- set user_name = actor.split('\\')[-1] -%}
+{%- set has_client = kind in ['EventEx', 'UserLoginSessionEvent',
+  'UserLogoutSessionEvent'] -%}
+{%- if kind == 'EventEx' -%}
+  {%- set message = 'Failed login ' ~ user_name ~ ' from ' ~ client_ip ~
+    ' at ' ~ timestamp.strftime('%m/%d/%Y %H:%M:%S') ~ ' GMT in SSO' -%}
+  {%- set action = 'login' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start', 'denied'] -%}
+  {%- set outcome = 'failure' -%}
+{%- elif kind == 'UserLoginSessionEvent' -%}
+  {%- set message = 'User ' ~ actor ~ '@' ~ client_ip ~
+    ' logged in as ' ~ user_agent -%}
+  {%- set action = 'login' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start', 'allowed'] -%}
+  {%- set outcome = 'success' -%}
+{%- elif kind == 'UserLogoutSessionEvent' -%}
+  {%- set message = 'User ' ~ actor ~ '@' ~ client_ip ~
+     ' logged out (login time: ' ~ timestamp.strftime('%A, %d %B, %Y %I:%M:%S %p') ~ ', number of API invocations: 3, user agent: ' ~
+    user_agent ~ ')' -%}
+  {%- set action = 'logout' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['end'] -%}
+  {%- set outcome = 'success' -%}
+{%- elif kind == 'PermissionAddedEvent' -%}
+  {%- set message = 'Permission added for ' ~ params.granted_principal ~
+    ' on ' ~ params.datacenter ~ ' with role Administrator by ' ~ actor -%}
+  {%- set action = 'permission-added' -%}
+  {%- set category = ['iam'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- set outcome = 'success' -%}
+{%- elif kind == 'VmReconfiguredEvent' -%}
+  {%- set message = 'Reconfigured virtual machine ' ~ vm_name ~ ' by ' ~ actor -%}
+  {%- set action = 'vm-reconfigured' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- set outcome = 'success' -%}
+{%- elif kind == 'VmPoweredOnEvent' -%}
+  {%- set message = 'VM ' ~ vm_name ~ ' powered on by ' ~ actor -%}
+  {%- set action = 'vm-powered-on' -%}
+  {%- set category = ['host'] -%}
+  {%- set event_type = ['start'] -%}
+  {%- set outcome = 'success' -%}
+{%- else -%}
+  {%- set message = 'VM ' ~ vm_name ~ ' powered off by ' ~ actor -%}
+  {%- set action = 'vm-powered-off' -%}
+  {%- set category = ['host'] -%}
+  {%- set event_type = ['end'] -%}
+  {%- set outcome = 'success' -%}
+{%- endif -%}
+{%- set event_class = 'vim.event.' ~ kind -%}
+{%- set created = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%fZ') -%}
+{%- set raw = '<14>1 ' ~ timestamp.isoformat() ~ ' ' ~ params.vcenter_host ~
+  ' vpxd 58650 - -  Event [' ~ key ~ '] [1-1] [' ~ created ~
+  '] [' ~ event_class ~ '] [' ~ severity ~ '] [' ~ actor ~ '] [' ~
+  params.datacenter ~ '] [' ~ key ~ '] [' ~ message ~ ']' -%}
+{%- set body = {
+  '@timestamp': timestamp.isoformat(),
+  'agent': {
+    'ephemeral_id': params.agent_ephemeral_id, 'id': params.agent_id,
+    'name': params.vcenter_host, 'type': 'filebeat',
+    'version': params.agent_version
+  },
+  'data_stream': {'dataset': 'vsphere.log', 'namespace': 'default',
+    'type': 'logs'},
+  'ecs': {'version': params.ecs_version},
+  'elastic_agent': {'id': params.agent_id, 'snapshot': false,
+    'version': params.agent_version},
+  'event': {
+    'agent_id_status': 'verified', 'dataset': 'vsphere.log',
+    'ingested': timestamp.isoformat(), 'original': raw,
+    'timezone': '+00:00', 'id': key | string,
+    'kind': 'event', 'category': category, 'type': event_type,
+    'action': action, 'outcome': outcome
+  },
+  'host': {
+    'architecture': 'x86_64', 'containerized': false,
+    'hostname': params.vcenter_host, 'id': params.vcenter_id,
+    'ip': [params.vcenter_ip], 'mac': [params.vcenter_mac],
+    'name': params.vcenter_host,
+    'os': {'family': 'linux', 'kernel': '5.10.0',
+      'name': 'VMware Photon OS', 'platform': 'photon',
+      'type': 'linux', 'version': '5.0'}
+  },
+  'input': {'type': 'udp'},
+  'log': {'level': severity, 'source': {'address': params.vcenter_ip ~ ':59146'},
+    'syslog': {'priority': 14}, 'logger': event_class},
+  'message': message,
+  'process': {'name': 'vpxd', 'pid': 58650},
+  'tags': ['preserve_original_event', 'vmware-sphere'],
+  'user': {'name': user_name, 'domain': params.domain},
+  'related': {'user': [user_name]},
+  'vsphere': {'event': {'class': event_class, 'key': key,
+    'created_time': created, 'user_name': actor}}
+} -%}
+{%- if has_client -%}
+  {%- do body.update({'client': {'ip': client_ip},
+    'source': {'ip': client_ip}}) -%}
+  {%- do body.related.update({'ip': [client_ip]}) -%}
+  {%- if kind != 'EventEx' -%}
+    {%- do body.update({'user_agent': {'original': user_agent}}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if vm_name is not none and not has_client -%}
+  {%- do body.vsphere.event.update({'vm': {'name': vm_name, 'id': vm_id}}) -%}
+{%- endif -%}
+{%- if kind == 'PermissionAddedEvent' -%}
+  {%- do body.vsphere.event.update({'permission': {
+    'principal': params.granted_principal, 'role': 'Administrator',
+    'entity': params.datacenter}}) -%}
+  {%- do body.related.user.append(params.granted_principal.split('\\')[-1]) -%}
+{%- endif -%}
+{{ body | tojson }}
