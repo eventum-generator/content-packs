@@ -1,0 +1,48 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- if chain -%}
+  {%- set kind = ['admin_login', 'policy_edit', 'policy_edit', 'client_policy_download'][step] -%}
+  {%- set admin = params.target_admin -%}
+  {%- set policy = params.target_policy -%}
+  {%- set client = params.target_client -%}
+{%- else -%}
+  {%- set kind = module.rand.weighted_choice(['admin_login', 'policy_add', 'client_policy_download'], [15, 10, 75]) -%}
+  {%- set admin = module.rand.choice(['admin-one', 'admin-two']) -%}
+  {%- set policy = module.rand.choice(['Workstation AV Policy', 'Server AV Policy']) -%}
+  {%- set client = module.rand.choice(['ws-office-01.example.test', 'ws-office-02.example.test', 'srv-web-01.example.test']) -%}
+{%- endif -%}
+{%- if kind == 'admin_login' -%}
+  {%- set description = 'Administrator log on succeeded' -%}
+  {%- set dataset = 'symantec.sepm_administrative' -%}
+  {%- set fields = [params.site_name, params.server_name, params.sepm_domain, admin, description] -%}
+  {%- set category = 'authentication' -%}
+  {%- set type = 'start' -%}
+{%- elif kind in ['policy_edit', 'policy_add'] -%}
+  {%- set description = '2:The policy was edited' if kind == 'policy_edit' else '0:The policy was added' -%}
+  {%- set dataset = 'symantec.sepm_policy' -%}
+  {%- set fields = [params.site_name, params.server_name, params.sepm_domain, admin, description, policy] -%}
+  {%- set category = 'configuration' -%}
+  {%- set type = 'change' if kind == 'policy_edit' else 'creation' -%}
+{%- else -%}
+  {%- set description = 'The client has downloaded the policy successfully' -%}
+  {%- set dataset = 'symantec.sepm_agent_activity' -%}
+  {%- set fields = [params.site_name, params.server_name, params.sepm_domain, description, client, 'user1', 'EXAMPLE'] -%}
+  {%- set category = 'configuration' -%}
+  {%- set type = 'info' -%}
+{%- endif -%}
+{%- set raw = fields | join(',') -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': dataset, 'category': [category],
+    'type': [type], 'action': kind, 'original': raw},
+  'host': {'name': params.server_name},
+  'user': {'name': admin} if kind != 'client_policy_download' else {'name': 'user1'},
+  'symantec': {'sepm': {'site': params.site_name, 'domain': params.sepm_domain,
+    'description': description, 'policy_name': policy if kind in ['policy_edit', 'policy_add'] else none,
+    'client_host': client if kind == 'client_policy_download' else none}}} -%}
+{{ record | tojson }}
