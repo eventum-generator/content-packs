@@ -1,0 +1,58 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- set av = chain and step == 3 -%}
+{%- if chain and step == 0 -%}
+  {%- do shared.set('episode', (shared.get('episode', 0) + 1) % 1000000) -%}
+{%- endif -%}
+{%- if chain -%}
+  {%- set message_id = 'synthetic-klms-' ~ shared.get('episode', 1) ~ '-' ~ (3 if av else step + 1) -%}
+  {%- set relay_ip = params.unusual_relay_ip -%}
+  {%- set sender = params.unusual_sender -%}
+  {%- set recipient = params.target_recipient -%}
+{%- else -%}
+  {%- set message_id = 'synthetic-klms-' ~ module.rand.string.digits(9) -%}
+  {%- set relay_ip = module.rand.choice(['198.51.100.11','198.51.100.12','198.51.100.13']) -%}
+  {%- set sender = module.rand.choice(['news@partner.example.test','alerts@vendor.example.test','orders@shop.example.test']) -%}
+  {%- set recipient = module.rand.choice(['ops@example.test','support@example.test','sales@example.test']) -%}
+{%- endif -%}
+{%- set class_id = 'LMS_EV_SCAN_LOGIC_AV_STATUS' if av else 'LMS_EV_SCAN_LOGIC_MA_STATUS' -%}
+{%- set name = 'antivirus scan status' if av else 'mail authentication status' -%}
+{%- set ext = 'cs1=' ~ message_id ~ ' cs1Label=MessageId src=' ~ relay_ip
+  ~ ' act=' ~ ('blocked' if av else 'scanned')
+  ~ ' fsize=' ~ (40192 if chain else module.rand.number.integer(2048, 22000))
+  ~ ' suser=' ~ sender ~ ' duser=' ~ recipient
+  ~ ' cs2=' ~ ('default-protection' if av else 'mail-authentication') ~ ' cs2Label=Rules' -%}
+{%- if av -%}
+  {%- set ext = ext ~ ' reason=infected outcome=Infected' -%}
+{%- else -%}
+  {%- set verdict = 'fail' if chain else 'pass' -%}
+  {%- set ext = ext ~ ' reason=' ~ ('authentication-failed' if chain else 'authenticated')
+    ~ ' cs4=' ~ verdict ~ ' cs4Label=SpfVerdict'
+    ~ ' cs5=' ~ verdict ~ ' cs5Label=DkimVerdict'
+    ~ ' cs6=' ~ verdict ~ ' cs6Label=DmarcVerdict'
+    ~ ' outcome=' ~ ('Failed' if chain else 'Passed') -%}
+{%- endif -%}
+{%- set raw = event_time.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.mail_host
+  ~ ' KLMS: CEF:0|AO Kaspersky Lab|Kaspersky Linux Mail Security|'
+  ~ params.product_version ~ '|' ~ class_id ~ '|' ~ name ~ '|'
+  ~ ('High' if av else 'Low') ~ '|' ~ ext -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'kaspersky.klms',
+    'category': ['malware'] if av else ['email'],
+    'type': ['info'],
+    'code': class_id, 'action': 'blocked' if av else 'scanned', 'original': raw},
+  'observer': {'hostname': params.mail_host, 'vendor': 'Kaspersky',
+    'product': 'Kaspersky Linux Mail Security', 'version': params.product_version},
+  'source': {'ip': relay_ip},
+  'email': {'local_id': message_id, 'from': {'address': [sender]}, 'to': {'address': [recipient]}},
+  'kaspersky': {'klms': {'class_id': class_id,
+    'spf': verdict if not av else none,
+    'dkim': verdict if not av else none,
+    'dmarc': verdict if not av else none}}} -%}
+{{ record | tojson }}
