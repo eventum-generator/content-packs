@@ -17,7 +17,7 @@ The one-record-per-second input, routine proportions, and DoS sequence frequency
 
 ## Anomaly Chain
 
-After 48 routine records, a Network DoS attack starts, produces three dropped bad-checksum samples, and stops. The five records share `f5.afm.attack_id`, `source.ip`, `destination.ip`, `destination.port`, and `observer.name`. A SIEM rule can correlate a start followed by repeated drops for one attack ID; a separate rule can count distinct attack IDs from one source over time. The sample count is synthetic and does not encode packet volume.
+After 48 routine records, a Network DoS attack starts, produces three dropped bad-checksum samples, and stops. The five records share `f5.afm.attack_id`, `source.ip`, `destination.ip`, `destination.port`, and `observer.name`. In a bounded sample run, all 72 complete chains spanned four seconds by `@timestamp`, with one second between adjacent steps; changing the input cadence changes that interval. A SIEM rule can correlate a start followed by repeated drops for one attack ID; a separate rule can count distinct attack IDs from one source over time. The sample count is synthetic and does not encode packet volume.
 
 `anomaly_mode: true` is the default. `false` emits only ordinary `Accept`, `Open`, and `Closed` network records. Correlate by `@timestamp` because output lines can arrive out of order.
 
