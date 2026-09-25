@@ -1,0 +1,65 @@
+{%- for flag in ['to_create_role', 'to_grant', 'to_select_sensitive', 'to_drop_role', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 48 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_create_role', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['SELECT', 'UPDATE', 'USE_KEYSPACE'], [76, 18, 6]) -%}
+  {%- set actor = module.rand.choice(['app_reader', 'app_writer', 'etl_job']) -%}
+  {%- set ip = module.rand.choice(['10.20.40.21', '10.20.40.22', '10.20.40.23']) -%}
+{%- else -%}
+  {%- set kind = {'create_role': 'CREATE_ROLE', 'grant': 'GRANT', 'select_sensitive': 'SELECT', 'drop_role': 'DROP_ROLE'}[stage] -%}
+  {%- set actor = params.temporary_role if stage == 'select_sensitive' else 'cassandra' -%}
+  {%- set ip = params.suspect_ip -%}
+  {%- if stage == 'create_role' -%}{%- do shared.set('to_grant', true) -%}
+  {%- elif stage == 'grant' -%}{%- do shared.set('to_select_sensitive', true) -%}
+  {%- elif stage == 'select_sensitive' -%}{%- do shared.set('to_drop_role', true) -%}
+  {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{%- endif -%}
+{%- if kind == 'SELECT' -%}
+  {%- set category = 'QUERY' -%}
+  {%- set table = params.sensitive_table if stage == 'select_sensitive' else 'orders' -%}
+  {%- set operation = 'SELECT * FROM ' ~ params.keyspace ~ '.' ~ table ~ ';' -%}
+  {%- set ecs_category = ['database'] -%}
+  {%- set ecs_type = ['access'] -%}
+{%- elif kind == 'UPDATE' -%}
+  {%- set category = 'DML' -%}
+  {%- set table = 'orders' -%}
+  {%- set operation = "UPDATE " ~ params.keyspace ~ ".orders SET status = 'paid' WHERE order_id = 42;" -%}
+  {%- set ecs_category = ['database'] -%}
+  {%- set ecs_type = ['change'] -%}
+{%- elif kind == 'USE_KEYSPACE' -%}
+  {%- set category = 'OTHER' -%}
+  {%- set table = none -%}
+  {%- set operation = 'USE ' ~ params.keyspace ~ ';' -%}
+  {%- set ecs_category = ['database'] -%}
+  {%- set ecs_type = ['access'] -%}
+{%- elif kind == 'CREATE_ROLE' -%}
+  {%- set category = 'DCL' -%}
+  {%- set table = none -%}
+  {%- set operation = "CREATE ROLE " ~ params.temporary_role ~ " WITH LOGIN = true AND PASSWORD = '*******';" -%}
+  {%- set ecs_category = ['iam'] -%}
+  {%- set ecs_type = ['creation'] -%}
+{%- elif kind == 'GRANT' -%}
+  {%- set category = 'DCL' -%}
+  {%- set table = params.sensitive_table -%}
+  {%- set operation = 'GRANT SELECT ON TABLE ' ~ params.keyspace ~ '.' ~ table ~ ' TO ' ~ params.temporary_role ~ ';' -%}
+  {%- set ecs_category = ['iam'] -%}
+  {%- set ecs_type = ['change'] -%}
+{%- else -%}
+  {%- set category = 'DCL' -%}
+  {%- set table = none -%}
+  {%- set operation = 'DROP ROLE ' ~ params.temporary_role ~ ';' -%}
+  {%- set ecs_category = ['iam'] -%}
+  {%- set ecs_type = ['deletion'] -%}
+{%- endif -%}
+{%- set port = 46264 if stage == 'routine' else 46265 -%}
+{%- set stamp = (timestamp.timestamp() * 1000) | int -%}
+{%- set message = 'user:' ~ actor ~ '|host:' ~ params.host_ip ~ ':7000|source:/' ~ ip ~ '|port:' ~ port ~ '|timestamp:' ~ stamp ~ '|type:' ~ kind ~ '|category:' ~ category ~ '|ks:' ~ params.keyspace ~ ('|scope:' ~ table if table else '') ~ '|operation:' ~ operation -%}
+{%- set original = 'Type: AuditLog\nLogMessage:\n' ~ message -%}
+{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ecs_category, 'type': ecs_type, 'action': kind.lower().replace('_', '-'), 'original': original}, 'host': {'name': params.host_name, 'ip': [params.host_ip]}, 'source': {'ip': ip, 'port': port}, 'user': {'name': actor}, 'related': {'ip': [ip, params.host_ip], 'user': [actor]}, 'cassandra': {'audit': {'viewer_record_type': 'AuditLog', 'category': category, 'type': kind, 'keyspace': params.keyspace, 'operation': operation, 'timestamp_ms': stamp}}} -%}
+{%- if table -%}{%- do payload.cassandra.audit.update({'scope': table}) -%}{%- endif -%}
+{%- if stage in ['create_role', 'grant', 'select_sensitive', 'drop_role'] -%}{%- do payload.cassandra.audit.update({'temporary_role': params.temporary_role}) -%}{%- endif -%}
+{{- payload | tojson -}}
