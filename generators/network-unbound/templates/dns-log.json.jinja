@@ -1,0 +1,44 @@
+{%- for key in ['to_normal_query', 'to_normal_reply', 'to_beacon_query', 'to_beacon_reply', 'to_payload_query', 'to_payload_reply'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- set is_reply = stage.endswith('_reply') -%}
+{%- set client = shared.get('client') if is_reply else module.rand.choice(['10.20.30.11', '10.20.30.12', '10.20.30.13', '10.20.30.14']) -%}
+{%- set qname = shared.get('qname') if is_reply else module.rand.choice(['intranet.corp.example.', 'mail.corp.example.', 'updates.example.', 'corp.example.']) -%}
+{%- set qtype = shared.get('qtype') if is_reply else module.rand.weighted_choice(['A', 'AAAA', 'MX'], [80, 15, 5]) -%}
+{%- if stage == 'normal_query' -%}
+  {%- do shared.set('client', client) -%}{%- do shared.set('qname', qname) -%}{%- do shared.set('qtype', qtype) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 50 -%}{%- do shared.set('routine_count', 0) -%}{%- do shared.set('attack_pending', params.anomaly_mode) -%}{%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- do shared.set('to_normal_reply', true) -%}
+{%- elif stage == 'normal_reply' -%}
+  {%- if shared.pop('attack_pending', false) -%}{%- do shared.set('to_beacon_query', true) -%}{%- else -%}{%- do shared.set('to_normal_query', true) -%}{%- endif -%}
+{%- elif stage == 'beacon_query' -%}
+  {%- set client = params.suspicious_client_ip -%}{%- set qname = params.tunnel_domain ~ '.' -%}{%- set qtype = 'A' -%}
+  {%- do shared.set('client', client) -%}{%- do shared.set('qname', qname) -%}{%- do shared.set('qtype', qtype) -%}{%- do shared.set('payload_count', 0) -%}{%- do shared.set('to_beacon_reply', true) -%}
+{%- elif stage == 'beacon_reply' -%}
+  {%- do shared.set('to_payload_query', true) -%}
+{%- elif stage == 'payload_query' -%}
+  {%- set client = params.suspicious_client_ip -%}
+  {%- set count = shared.get('payload_count', 0) + 1 -%}{%- do shared.set('payload_count', count) -%}
+  {%- set qname = ('%02d'|format(count)) ~ module.rand.string.hex(24) ~ '.' ~ params.tunnel_domain ~ '.' -%}{%- set qtype = 'TXT' -%}
+  {%- do shared.set('client', client) -%}{%- do shared.set('qname', qname) -%}{%- do shared.set('qtype', qtype) -%}{%- do shared.set('to_payload_reply', true) -%}
+{%- else -%}
+  {%- if shared.get('payload_count', 0) >= 8 -%}{%- do shared.set('payload_count', 0) -%}{%- do shared.set('to_normal_query', true) -%}{%- else -%}{%- do shared.set('to_payload_query', true) -%}{%- endif -%}
+{%- endif -%}
+{%- set response_code = 'NOERROR' if qname.endswith('corp.example.') or stage.startswith('beacon') else ('NXDOMAIN' if stage.startswith('payload') else 'NOERROR') -%}
+{%- set from_cache = 0 if stage.startswith('payload') else module.rand.weighted_choice([0, 1], [30, 70]) -%}
+{%- set latency = '0.041357' if from_cache == 0 else '0.000082' -%}
+{%- set size = 112 if response_code == 'NOERROR' else 97 -%}
+{%- set message = ('reply: ' if is_reply else 'query: ') ~ client ~ ' ' ~ qname ~ ' ' ~ qtype ~ ' IN' ~ (' ' ~ response_code ~ ' ' ~ latency ~ ' ' ~ from_cache ~ ' ' ~ size if is_reply else '') -%}
+{%- set original = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.host_name ~ ' unbound[2137:0]: ' ~ message -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['network'], 'type': ['info'], 'action': 'dns-reply' if is_reply else 'dns-query', 'original': original},
+  'host': {'name': params.host_name},
+  'process': {'name': 'unbound', 'pid': 2137},
+  'source': {'ip': client},
+  'related': {'ip': [client]},
+  'dns': {'type': 'answer' if is_reply else 'query', 'question': {'name': qname, 'type': qtype, 'class': 'IN'}, 'response_code': response_code if is_reply else none},
+  'unbound': {'worker_id': 0, 'reply': {'time_to_resolve': latency|float, 'from_cache': from_cache, 'response_size': size} if is_reply else none}
+} -%}
+{{- event | tojson -}}
