@@ -1,79 +1,147 @@
-{%- for key in ['to_peer_lookup', 'to_peer_failure', 'to_ike_established', 'to_child_established', 'to_vpn_traffic', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
+{%- for key in ['to_peer_lookup', 'to_peer_failure', 'to_peer_lookup_valid', 'to_ike_established', 'to_child_established', 'to_vpn_traffic', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
 {%- set stage = vars.stage -%}
-{%- set is_firewall = stage in ['routine', 'vpn_traffic'] -%}
-{%- set process = 'filterlog' if is_firewall else 'charon' -%}
-{%- set pid = 72237 if is_firewall else 18610 -%}
-{%- set priority = 134 if is_firewall else 30 -%}
-{%- set src_ip = module.rand.choice(['10.20.7.14', '10.20.7.32', '10.20.8.17']) -%}
-{%- set service = module.rand.weighted_choice([['10.20.0.53', 53, 'udp'], ['10.20.1.15', 443, 'tcp'], ['192.0.2.44', 443, 'tcp'], ['10.20.1.21', 22, 'tcp']], [55, 25, 15, 5]) -%}
-{%- set dst_ip = service[0] -%}
-{%- set dst_port = service[1] -%}
-{%- set transport = service[2] -%}
-{%- set src_port = module.rand.number.integer(49152, 65535) -%}
-{%- set action = 'pass' -%}
-{%- set tracker = 1534283903 -%}
-{%- set interface = 'igb1.12' -%}
+{%- set kind = stage -%}
+{%- set admin_port = none -%}
 {%- if stage == 'routine' -%}
-  {%- set action = module.rand.weighted_choice(['pass', 'block'], [72, 28]) -%}
-  {%- if action == 'block' -%}{%- set tracker = 1000000103 -%}{%- endif -%}
   {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 100 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}
-      {%- do shared.set('failure_count', 0) -%}
-      {%- do shared.set('to_peer_lookup', true) -%}
-    {%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- do shared.set('routine_count', count) -%}
+  {%- if count == 20 -%}{%- set kind = 'peer_lookup' -%}
+  {%- elif count == 21 -%}{%- set kind = 'peer_failure' -%}
+  {%- elif count in [99, 1200] -%}{%- set kind = 'peer_lookup_valid' -%}
+  {%- elif count in [100, 1201] -%}{%- set kind = 'ike_established' -%}
+  {%- elif count in [101, 1202] -%}{%- set kind = 'child_established' -%}
+  {%- elif count == 300 -%}{%- set admin_port = 445 -%}
+  {%- elif count == 450 -%}{%- set admin_port = 3389 -%}
+  {%- elif count == 600 -%}{%- set admin_port = 5985 -%}
+  {%- endif -%}
+  {%- if count == 720 and params.anomaly_mode -%}
+    {%- do shared.set('failure_count', 0) -%}
+    {%- do shared.set('to_peer_lookup', true) -%}
+  {%- endif -%}
 {%- elif stage == 'peer_lookup' -%}
   {%- do shared.set('to_peer_failure', true) -%}
 {%- elif stage == 'peer_failure' -%}
   {%- set count = shared.get('failure_count', 0) + 1 -%}
   {%- do shared.set('failure_count', count) -%}
-  {%- if count >= 3 -%}{%- do shared.set('to_ike_established', true) -%}{%- else -%}{%- do shared.set('to_peer_lookup', true) -%}{%- endif -%}
-{%- elif stage == 'ike_established' -%}{%- do shared.set('to_child_established', true) -%}
-{%- elif stage == 'child_established' -%}{%- do shared.set('traffic_count', 0) -%}{%- do shared.set('to_vpn_traffic', true) -%}
-{%- else -%}
-  {%- set src_ip = params.remote_tunnel_ip -%}
-  {%- set dst_ip = params.internal_target_ip -%}
-  {%- set dst_port = [445, 3389, 5985][shared.get('traffic_count', 0)] -%}
-  {%- set tracker = params.suspicious_rule_tracker -%}
-  {%- set interface = 'enc0' -%}
-  {%- set count = shared.get('traffic_count', 0) + 1 -%}
-  {%- if count >= 3 -%}{%- do shared.set('traffic_count', 0) -%}{%- do shared.set('to_routine', true) -%}{%- else -%}{%- do shared.set('traffic_count', count) -%}{%- endif -%}
-{%- endif -%}
-{%- if is_firewall -%}
-  {%- if stage == 'vpn_traffic' -%}{%- set transport = 'tcp' -%}{%- endif -%}
-  {%- if transport == 'udp' -%}
-    {%- set payload = '115,,,' ~ tracker ~ ',' ~ interface ~ ',match,' ~ action ~ ',in,4,0x0,,63,' ~ module.rand.number.integer(1000, 65000) ~ ',0,DF,17,udp,69,' ~ src_ip ~ ',' ~ dst_ip ~ ',' ~ src_port ~ ',' ~ dst_port ~ ',49' -%}
-  {%- else -%}
-    {%- set payload = '146,,,' ~ tracker ~ ',' ~ interface ~ ',match,' ~ action ~ ',in,4,0x0,,63,' ~ module.rand.number.integer(1000, 65000) ~ ',0,DF,6,tcp,60,' ~ src_ip ~ ',' ~ dst_ip ~ ',' ~ src_port ~ ',' ~ dst_port ~ ',0,S,' ~ module.rand.number.integer(1000000, 9999999) ~ ',,64240,,mss;sackOK;TS;nop;wscale' -%}
-  {%- endif -%}
-{%- elif stage == 'peer_lookup' -%}
-  {%- set payload = '12[CFG] looking for pre-shared key peer configs matching ' ~ params.wan_ip ~ '...' ~ params.remote_peer_ip ~ '[vpn-ext]' -%}
-{%- elif stage == 'peer_failure' -%}
-  {%- set payload = '12[IKE] no peer config found' -%}
+  {%- if count == 3 -%}{%- do shared.set('to_peer_lookup_valid', true) -%}
+  {%- else -%}{%- do shared.set('to_peer_lookup', true) -%}{%- endif -%}
+{%- elif stage == 'peer_lookup_valid' -%}
+  {%- do shared.set('to_ike_established', true) -%}
 {%- elif stage == 'ike_established' -%}
-  {%- set payload = '09[IKE] IKE_SA ' ~ params.tunnel_name ~ '[11] established between ' ~ params.wan_ip ~ '[' ~ params.wan_ip ~ ']...' ~ params.remote_peer_ip ~ '[' ~ params.remote_peer_ip ~ ']' -%}
+  {%- do shared.set('to_child_established', true) -%}
+{%- elif stage == 'child_established' -%}
+  {%- do shared.set('traffic_count', 0) -%}
+  {%- do shared.set('to_vpn_traffic', true) -%}
 {%- else -%}
-  {%- set payload = '09[IKE] CHILD_SA ' ~ params.tunnel_name ~ '{2} established with SPIs cf4973bf_i c1cbfdf2_o and TS ' ~ params.internal_target_ip.rsplit('.', 1)[0] ~ '.0/24|/0 === ' ~ params.remote_tunnel_ip.rsplit('.', 1)[0] ~ '.0/24|/0' -%}
+  {%- set admin_port = [445, 3389, 5985][shared.get('traffic_count', 0)] -%}
+  {%- set count = shared.get('traffic_count', 0) + 1 -%}
+  {%- do shared.set('traffic_count', count) -%}
+  {%- if count == 3 -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
 {%- endif -%}
-{%- set original = '<' ~ priority ~ '>1 ' ~ timestamp.isoformat() ~ ' ' ~ params.hostname ~ ' ' ~ process ~ ' ' ~ pid ~ ' - - ' ~ payload -%}
+{%- set is_firewall = kind in ['routine', 'vpn_traffic'] -%}
+{%- set process = 'filterlog' if is_firewall else 'charon' -%}
+{%- set pid = 72237 if is_firewall else 18610 -%}
+{%- set priority = 134 if is_firewall else 30 -%}
+{%- set src_ip = none -%}
+{%- set dst_ip = none -%}
+{%- set src_port = none -%}
+{%- set dst_port = none -%}
+{%- set interface = none -%}
+{%- set direction = none -%}
+{%- set tracker = none -%}
+{%- set action = none -%}
+{%- set transport = none -%}
+{%- set packet_length = none -%}
+{%- if is_firewall -%}
+  {%- if stage == 'vpn_traffic' or admin_port is not none -%}
+    {%- set profile = 'vpn_admin' -%}
+  {%- else -%}
+    {%- set profile = module.rand.weighted_choice(['lan_dns', 'lan_https', 'lan_web', 'wan_https', 'wan_ssh', 'vpn_service'], [30, 25, 20, 15, 5, 5]) -%}
+  {%- endif -%}
+  {%- set src_port = module.rand.number.integer(49152, 65535) -%}
+  {%- set direction = 'in' -%}
+  {%- if profile in ['wan_https', 'wan_ssh'] -%}
+    {%- set src_ip = '198.51.100.' ~ module.rand.number.integer(80, 95) -%}
+    {%- set dst_ip = params.wan_ip -%}
+    {%- set dst_port = 443 if profile == 'wan_https' else 22 -%}
+    {%- set interface = 'igb0' -%}
+    {%- set action = 'block' -%}
+    {%- set tracker = 1000000103 -%}
+    {%- set rule_number = 5 -%}
+    {%- set subrule = 16777216 -%}
+    {%- set network_direction = 'inbound' -%}
+  {%- elif profile in ['vpn_service', 'vpn_admin'] -%}
+    {%- set src_ip = params.remote_tunnel_ip -%}
+    {%- set dst_ip = params.internal_target_ip -%}
+    {%- set dst_port = admin_port if profile == 'vpn_admin' else module.rand.choice([53, 443]) -%}
+    {%- set interface = 'enc0' -%}
+    {%- set action = 'pass' -%}
+    {%- set tracker = params.ipsec_pass_rule_tracker -%}
+    {%- set rule_number = 146 -%}
+    {%- set subrule = '' -%}
+    {%- set network_direction = 'inbound' -%}
+  {%- else -%}
+    {%- set src_ip = module.rand.choice(['10.20.7.14', '10.20.7.32', '10.20.8.17']) -%}
+    {%- set dst_ip = '10.20.0.53' if profile == 'lan_dns' else '10.20.1.15' if profile == 'lan_https' else '192.0.2.44' -%}
+    {%- set dst_port = 53 if profile == 'lan_dns' else 443 -%}
+    {%- set interface = 'igb1.12' -%}
+    {%- set action = 'pass' -%}
+    {%- set tracker = 1690001001 -%}
+    {%- set rule_number = 115 -%}
+    {%- set subrule = '' -%}
+    {%- set network_direction = 'outbound' if profile == 'lan_web' else 'internal' -%}
+  {%- endif -%}
+  {%- set ttl = module.rand.number.integer(47, 61) if profile in ['wan_https', 'wan_ssh'] else module.rand.number.integer(62, 64) -%}
+  {%- set transport = 'udp' if dst_port == 53 else 'tcp' -%}
+  {%- set packet_length = 69 if transport == 'udp' else 60 -%}
+  {%- set ip_id = module.rand.number.integer(1, 65535) -%}
+  {%- set prefix = rule_number ~ ',' ~ subrule ~ ',,' ~ tracker ~ ',' ~ interface ~ ',match,' ~ action ~ ',' ~ direction ~ ',4,0x0,,' ~ ttl ~ ',' ~ ip_id ~ ',0,DF,' -%}
+  {%- if transport == 'udp' -%}
+    {%- set payload = prefix ~ '17,udp,69,' ~ src_ip ~ ',' ~ dst_ip ~ ',' ~ src_port ~ ',' ~ dst_port ~ ',49' -%}
+  {%- else -%}
+    {%- set payload = prefix ~ '6,tcp,60,' ~ src_ip ~ ',' ~ dst_ip ~ ',' ~ src_port ~ ',' ~ dst_port ~ ',0,S,' ~ module.rand.number.integer(1, 4294967295) ~ ',,64240,,mss;sackOK;TS;nop;wscale' -%}
+  {%- endif -%}
+{%- elif kind == 'peer_lookup' -%}
+  {%- set attempt_id = shared.get('ike_attempt_id', 17) + 1 -%}
+  {%- do shared.set('ike_attempt_id', attempt_id) -%}
+  {%- set payload = '12[CFG] <' ~ attempt_id ~ '> looking for pre-shared key peer configs matching ' ~ params.wan_ip ~ '...' ~ params.remote_peer_ip ~ '[vpn-ext]' -%}
+{%- elif kind == 'peer_lookup_valid' -%}
+  {%- set attempt_id = shared.get('ike_attempt_id', 17) + 1 -%}
+  {%- do shared.set('ike_attempt_id', attempt_id) -%}
+  {%- set payload = '12[CFG] <' ~ attempt_id ~ '> looking for pre-shared key peer configs matching ' ~ params.wan_ip ~ '...' ~ params.remote_peer_ip ~ '[' ~ params.remote_peer_ip ~ ']' -%}
+{%- elif kind == 'peer_failure' -%}
+  {%- set payload = '12[IKE] <' ~ shared.get('ike_attempt_id', 18) ~ '> no peer config found' -%}
+{%- elif kind == 'ike_established' -%}
+  {%- set success_id = shared.get('success_id', 0) + 1 -%}
+  {%- do shared.set('success_id', success_id) -%}
+  {%- set attempt_id = shared.get('ike_attempt_id', 19) -%}
+  {%- set payload = '03[IKE] <' ~ params.tunnel_name ~ '|' ~ attempt_id ~ '> IKE_SA ' ~ params.tunnel_name ~ '[' ~ attempt_id ~ '] established between ' ~ params.wan_ip ~ '[' ~ params.wan_ip ~ ']...' ~ params.remote_peer_ip ~ '[' ~ params.remote_peer_ip ~ ']' -%}
+{%- else -%}
+  {%- set success_id = shared.get('success_id', 1) -%}
+  {%- set spi_in = ['c1cbfdf2', 'ad7294b8', '8b23c165'][success_id - 1] -%}
+  {%- set spi_out = ['cf4973bf', '7e308b95', '1f45e87c'][success_id - 1] -%}
+  {%- set attempt_id = shared.get('ike_attempt_id', 19) -%}
+  {%- set payload = '16[IKE] <' ~ params.tunnel_name ~ '|' ~ attempt_id ~ '> CHILD_SA ' ~ params.tunnel_name ~ '{' ~ success_id ~ '} established with SPIs ' ~ spi_in ~ '_i ' ~ spi_out ~ '_o and TS ' ~ params.internal_target_ip.rsplit('.', 1)[0] ~ '.0/24|/0 === ' ~ params.remote_tunnel_ip.rsplit('.', 1)[0] ~ '.0/24|/0' -%}
+{%- endif -%}
+{%- set event_time = timestamp + module.datetime.timedelta(microseconds=module.rand.number.integer(0, 999999)) -%}
+{%- set syslog_time = event_time.isoformat(timespec='microseconds') -%}
+{%- set original = '<' ~ priority ~ '>1 ' ~ syslog_time ~ ' ' ~ params.hostname ~ ' ' ~ process ~ ' ' ~ pid ~ ' - - ' ~ payload -%}
 {%- set event = {
-  '@timestamp': timestamp.isoformat(),
+  '@timestamp': syslog_time,
   'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'category': ['network'], 'type': ['connection'] if is_firewall else ['info'], 'action': action if is_firewall else ('ipsec-peer-lookup' if stage == 'peer_lookup' else 'ipsec-peer-not-found' if stage == 'peer_failure' else 'ipsec-ike-established' if stage == 'ike_established' else 'ipsec-child-established'), 'original': original, 'dataset': 'pfsense.log'},
+  'event': {'kind': 'event', 'category': ['network'], 'type': ['connection'] if is_firewall else ['info'], 'action': action if is_firewall else ('ipsec-peer-lookup' if kind in ['peer_lookup', 'peer_lookup_valid'] else 'ipsec-peer-not-found' if kind == 'peer_failure' else 'ipsec-ike-established' if kind == 'ike_established' else 'ipsec-child-established'), 'original': original, 'dataset': 'pfsense.log'},
   'data_stream': {'dataset': 'pfsense.log', 'type': 'logs', 'namespace': 'default'},
   'host': {'name': params.hostname},
-  'observer': {'name': params.hostname, 'product': 'pfSense', 'vendor': 'Netgate', 'type': 'firewall'},
+  'observer': {'name': params.hostname, 'product': 'pfSense', 'vendor': 'Netgate', 'type': 'firewall', 'version': '2.9.0'},
   'process': {'name': process, 'pid': pid},
   'syslog': {'priority': priority, 'facility': {'code': priority // 8}, 'severity': {'code': priority % 8}},
   'message': payload,
   'log': {'syslog': {'priority': priority}}
 } -%}
 {%- if is_firewall -%}
-  {%- do event.update({'source': {'ip': src_ip, 'port': src_port}, 'destination': {'ip': dst_ip, 'port': dst_port}, 'related': {'ip': [src_ip, dst_ip]}, 'network': {'transport': transport, 'direction': 'inbound', 'bytes': 69 if transport == 'udp' else 60}, 'rule': {'id': tracker|string}, 'pfsense': {'ip': {'tos': '0x0', 'ttl': 63, 'offset': 0, 'flags': 'DF'}}}) -%}
+  {%- do event.update({'source': {'ip': src_ip, 'port': src_port}, 'destination': {'ip': dst_ip, 'port': dst_port}, 'related': {'ip': [src_ip, dst_ip]}, 'network': {'transport': transport, 'direction': network_direction}, 'rule': {'id': tracker|string}, 'pfsense': {'interface': interface, 'direction': direction, 'ip': {'tos': '0x0', 'ttl': ttl, 'id': ip_id, 'offset': 0, 'flags': 'DF', 'length': packet_length}}}) -%}
   {%- if transport == 'udp' -%}{%- do event.pfsense.update({'udp': {'length': 49}}) -%}{%- else -%}{%- do event.pfsense.update({'tcp': {'flags': 'S', 'window': 64240, 'length': 0}}) -%}{%- endif -%}
-{%- elif stage != 'peer_failure' -%}
+{%- elif kind in ['peer_lookup', 'peer_lookup_valid', 'ike_established'] -%}
   {%- do event.update({'source': {'ip': params.remote_peer_ip}, 'destination': {'ip': params.wan_ip}, 'related': {'ip': [params.remote_peer_ip, params.wan_ip]}}) -%}
 {%- endif -%}
 {{- event | tojson -}}
