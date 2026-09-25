@@ -1,0 +1,118 @@
+{# Native lines use the formats shown in the ALD Pro SIEM integration guide. #}
+{% macro kdc(user_name, client_ip, service, result, params) -%}
+{%- set principal = user_name ~ '@' ~ params.realm -%}
+{%- set service_principal = service ~ '@' ~ params.realm -%}
+{%- set etypes = 'aes256-cts-hmac-sha1-96(18), aes128-cts-hmac-sha1-96(17)' -%}
+{%- set request = 'TGS_REQ' if result == 'tgs_issue' else 'AS_REQ' -%}
+{%- set status = 'PREAUTH_FAILED' if result == 'preauth_failed' else 'ISSUE' -%}
+{%- set raw = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.dc_host ~ ' krb5kdc[2611]: ' ~ request ~ ' (2 etypes {' ~ etypes ~ '}) ' ~ client_ip ~ ': ' ~ status ~ ': ' -%}
+{%- if result == 'preauth_failed' -%}
+  {%- set raw = raw ~ principal ~ ' for ' ~ service_principal ~ ', Preauthentication failed' -%}
+{%- else -%}
+  {%- set raw = raw ~ 'authtime ' ~ (timestamp.timestamp() | int) ~ ', etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18), ses=aes256-cts-hmac-sha1-96(18)}, ' ~ principal ~ ' for ' ~ service_principal -%}
+{%- endif -%}
+{%- set body = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': params.ecs_version},
+  'host': {'name': params.dc_host},
+  'agent': {'type': 'eventum'},
+  'log': {'file': {'path': '/var/log/auth.log'}},
+  'process': {'name': 'krb5kdc', 'pid': 2611},
+  'event': {
+    'kind': 'event', 'category': ['authentication'],
+    'type': ['denied'] if result == 'preauth_failed' else ['start', 'allowed'],
+    'action': status, 'outcome': 'failure' if result == 'preauth_failed' else 'success',
+    'dataset': 'aldpro.krb5kdc', 'module': 'aldpro', 'original': raw
+  },
+  'message': raw,
+  'source': {'ip': client_ip},
+  'user': {'name': user_name, 'domain': params.realm},
+  'related': {'ip': [client_ip], 'user': [user_name]},
+  'aldpro': {'krb5kdc': {
+    'request': request, 'result': status, 'client_ip': client_ip,
+    'principal': principal, 'service': service_principal,
+    'etypes': [18, 17]
+  }}
+} -%}
+{%- if result != 'preauth_failed' -%}
+  {%- do body.aldpro.krb5kdc.update({'authtime': timestamp.timestamp() | int}) -%}
+{%- endif -%}
+{{ body | tojson }}
+{%- endmacro %}
+
+{% macro access(operation, conn, op, actor, target_dn, params, client_ip) -%}
+{%- set stamp = timestamp.strftime('%d/%b/%Y:%H:%M:%S.') ~ '%09d' % (timestamp.microsecond * 1000) ~ ' +0000' -%}
+{%- set prefix = '[' ~ stamp ~ '] conn=' ~ conn ~ ' op=' ~ op ~ ' ' -%}
+{%- set is_result = operation == 'bind_result' or operation == 'mod_result' -%}
+{%- if operation == 'bind_request' -%}
+  {%- set raw = prefix ~ 'BIND dn="" method=sasl version=3 mech=GSSAPI' -%}
+{%- elif operation == 'bind_result' -%}
+  {%- set raw = prefix ~ 'RESULT err=0 tag=97 nentries=0 wtime=0.000063000 optime=0.001450000 etime=0.001513000 dn="' ~ actor ~ '"' -%}
+{%- elif operation == 'mod_request' -%}
+  {%- set raw = prefix ~ 'MOD dn="' ~ target_dn ~ '"' -%}
+{%- else -%}
+  {%- set raw = prefix ~ 'RESULT err=0 tag=103 nentries=0 wtime=0.000268000 optime=0.025042000 etime=0.025310000' -%}
+{%- endif -%}
+{%- set fields = {'conn': conn, 'op': op, 'operation': 'RESULT' if is_result else ('BIND' if operation == 'bind_request' else 'MOD')} -%}
+{%- if operation == 'mod_request' -%}{%- do fields.update({'dn': target_dn}) -%}{%- endif -%}
+{%- if is_result -%}
+  {%- if operation == 'bind_result' -%}
+    {%- do fields.update({'err': 0, 'tag': 97, 'nentries': 0, 'wtime': 0.000063, 'optime': 0.00145, 'etime': 0.001513}) -%}
+  {%- else -%}
+    {%- do fields.update({'err': 0, 'tag': 103, 'nentries': 0, 'wtime': 0.000268, 'optime': 0.025042, 'etime': 0.025310}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if operation == 'bind_request' -%}{%- do fields.update({'method': 'sasl', 'mech': 'GSSAPI', 'version': 3}) -%}{%- endif -%}
+{%- if operation == 'bind_result' -%}{%- do fields.update({'dn': actor}) -%}{%- endif -%}
+{%- set body = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': params.ecs_version},
+  'host': {'name': params.dc_host},
+  'agent': {'type': 'eventum'},
+  'log': {'file': {'path': '/var/log/dirsrv/slapd-' ~ params.directory_instance ~ '/access'}},
+  'event': {
+    'kind': 'event', 'category': ['authentication'] if operation.startswith('bind') else ['iam'],
+    'type': ['info'] if not is_result else (['start', 'allowed'] if operation == 'bind_result' else ['change']),
+    'action': operation, 'outcome': 'success' if is_result else 'unknown',
+    'dataset': 'aldpro.dirsrv_access', 'module': 'aldpro', 'original': raw
+  },
+  'message': raw,
+  'source': {'ip': client_ip},
+  'user': {'name': params.compromised_user, 'domain': params.realm},
+  'related': {'ip': [client_ip], 'user': [params.compromised_user]},
+  'aldpro': {'dirsrv': {'access': fields}}
+} -%}
+{{ body | tojson }}
+{%- endmacro %}
+
+{% macro audit(attribute, value, actor, target_dn, params) -%}
+{%- set entryusn = (shared.get('entryusn', 100000) % 900000000) + 1 -%}
+{%- do shared.set('entryusn', entryusn) -%}
+{%- set change = 'add' if attribute == 'member' else 'replace' -%}
+{%- set audit_time = timestamp.strftime('%Y%m%d%H%M%S') -%}
+{%- set modify_time = timestamp.strftime('%Y%m%d%H%M%SZ') -%}
+{%- set raw = 'time: ' ~ audit_time ~ '\ndn: ' ~ target_dn ~ '\nresult: 0\nchangetype: modify\n' ~ change ~ ': ' ~ attribute ~ '\n' ~ attribute ~ ': ' ~ value ~ '\n-\nreplace: modifiersname\nmodifiersname: ' ~ actor ~ '\n-\nreplace: modifytimestamp\nmodifytimestamp: ' ~ modify_time ~ '\n-\nreplace: entryusn\nentryusn: ' ~ entryusn ~ '\n-' -%}
+{%- set body = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': params.ecs_version},
+  'host': {'name': params.dc_host},
+  'agent': {'type': 'eventum'},
+  'log': {'file': {'path': '/var/log/dirsrv/slapd-' ~ params.directory_instance ~ '/audit'}},
+  'event': {
+    'kind': 'event', 'category': ['iam'], 'type': ['change'],
+    'action': 'modify-' ~ attribute, 'outcome': 'success',
+    'dataset': 'aldpro.dirsrv_audit', 'module': 'aldpro', 'original': raw
+  },
+  'message': raw,
+  'user': {'name': params.compromised_user, 'domain': params.realm},
+  'related': {'user': [params.compromised_user] if attribute != 'member' else [params.compromised_user, params.added_user]},
+  'aldpro': {'dirsrv': {'audit': {
+    'time': audit_time, 'dn': target_dn, 'result': 0,
+    'changetype': 'modify', 'attribute_operation': change,
+    'attribute': attribute, 'attribute_value': value,
+    'modifiersname': actor, 'modifytimestamp': modify_time,
+    'entryusn': entryusn
+  }}}
+} -%}
+{{ body | tojson }}
+{%- endmacro %}
