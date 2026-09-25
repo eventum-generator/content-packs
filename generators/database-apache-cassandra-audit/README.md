@@ -52,15 +52,13 @@ Copied from an `anomaly_mode: true` run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T13:17:03+00:00",
+  "@timestamp": "2026-09-25T13:21:36+00:00",
   "cassandra": {
     "audit": {
       "category": "DCL",
-      "keyspace": "finance",
       "operation": "GRANT SELECT ON TABLE finance.payroll TO temp_reader;",
-      "scope": "payroll",
       "temporary_role": "temp_reader",
-      "timestamp_ms": 1790342223000,
+      "timestamp_ms": 1790342496000,
       "type": "GRANT",
       "viewer_record_type": "AuditLog"
     }
@@ -74,7 +72,7 @@ Copied from an `anomaly_mode: true` run:
       "iam"
     ],
     "kind": "event",
-    "original": "Type: AuditLog\nLogMessage:\nuser:cassandra|host:10.20.30.10:7000|source:/192.0.2.83|port:46265|timestamp:1790342223000|type:GRANT|category:DCL|ks:finance|scope:payroll|operation:GRANT SELECT ON TABLE finance.payroll TO temp_reader;",
+    "original": "Type: AuditLog\nLogMessage:\nuser:cassandra|host:10.20.30.10:7000|source:/192.0.2.83|port:46265|timestamp:1790342496000|type:GRANT|category:DCL|operation:GRANT SELECT ON TABLE finance.payroll TO temp_reader;",
     "type": [
       "change"
     ]
@@ -106,7 +104,7 @@ Copied from an `anomaly_mode: true` run:
 
 ## Coverage and Limits
 
-All nine common fields in the official viewer example are present: `user`, `host`, `source`, `port`, `timestamp`, `type`, `category`, `ks`, and `operation`. `scope` is also present for table operations, giving 10/10 applicable fields. Cassandra emits audit records per node only when audit logging is enabled; the default setting is disabled. The model is the text printed by `auditlogviewer` from `BinAuditLogger`, not binary `.cq4` file bytes and not the `FileAuditLogger` SLF4J file layout. The viewer's own diagnostic messages are omitted. Cassandra obfuscates passwords in parsed DCL statements, so the generated role password is masked. KUMA 4.2 lists a Cassandra file source, but compatibility of that normalizer with viewer text is unverified.
+The official viewer field set is covered 10/10 across applicable operations: `user`, `host`, `source`, `port`, `timestamp`, `type`, `category`, `ks`, `scope`, and `operation`. Global DCL role records omit `ks` and `scope`; table queries include both. Cassandra emits audit records per node only when audit logging is enabled; the default setting is disabled. The model is the text printed by `auditlogviewer` from `BinAuditLogger`, not binary `.cq4` file bytes and not the `FileAuditLogger` SLF4J file layout. The viewer's own diagnostic messages are omitted. Cassandra obfuscates passwords in parsed DCL statements, so the generated role password is masked. KUMA 4.2 lists a Cassandra file source, but compatibility of that normalizer with viewer text is unverified.
 
 ## References
 
