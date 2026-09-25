@@ -1,0 +1,51 @@
+{%- set previous_time = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous_time is none or timestamp > previous_time else previous_time + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set interval = params.anomaly_interval_events | int -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (interval + 7) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= interval -%}
+{%- set step = tick - interval if chain else tick % 4 -%}
+{%- if chain -%}
+  {%- set common_name = params.suspicious_common_name -%}
+  {%- set source_ip = params.first_public_ip if step <= 2 else params.second_public_ip -%}
+  {%- set source_port = 52144 if step <= 2 else 59021 -%}
+  {%- set tunnel_ip = params.tunnel_ip -%}
+{%- else -%}
+  {%- if step == 0 -%}
+    {%- set routine_id = (shared.get('routine_id', 0) % 1000000) + 1 -%}
+    {%- do shared.set('routine_id', routine_id) -%}
+    {%- do shared.set('routine_cn', module.rand.choice(['anna-laptop', 'pavel-phone', 'ops-workstation', 'svc-backup'])) -%}
+    {%- do shared.set('routine_ip', module.rand.choice(['198.51.100.41', '198.51.100.42', '203.0.113.21'])) -%}
+    {%- do shared.set('routine_port', 41000 + routine_id % 20000) -%}
+  {%- endif -%}
+  {%- set common_name = shared.get('routine_cn') -%}
+  {%- set source_ip = shared.get('routine_ip') -%}
+  {%- set source_port = shared.get('routine_port') -%}
+  {%- set tunnel_ip = '10.8.0.' ~ (20 + shared.get('routine_id') % 150) -%}
+{%- endif -%}
+{%- set endpoint = source_ip ~ ':' ~ source_port -%}
+{%- if chain and step == 5 -%}
+  {%- set action = 'duplicate-cn-drop' -%}
+  {%- set message = "MULTI: new connection by client '" ~ common_name ~ "' will cause previous active sessions by this client to be dropped. Remember to use the --duplicate-cn option if you want multiple clients using the same certificate or username to concurrently connect." -%}
+  {%- set event_type = 'info' -%}
+{%- elif (step == 0 or (chain and step == 3)) -%}
+  {%- set action = 'verify' -%}
+  {%- set message = endpoint ~ ' VERIFY OK: depth=0, CN=' ~ common_name -%}
+  {%- set event_type = 'info' -%}
+{%- elif (step == 1 or (chain and step == 4)) -%}
+  {%- set action = 'peer-connection' -%}
+  {%- set message = endpoint ~ ' [' ~ common_name ~ '] Peer Connection Initiated with [AF_INET]' ~ endpoint -%}
+  {%- set event_type = 'start' -%}
+{%- elif not chain and step == 3 -%}
+  {%- set action = 'data-channel' -%}
+  {%- set message = common_name ~ '/' ~ endpoint ~ " Data Channel: using negotiated cipher 'AES-256-GCM'" -%}
+  {%- set event_type = 'info' -%}
+{%- else -%}
+  {%- set action = 'pool-assignment' -%}
+  {%- set message = 'MULTI_sva: pool returned IPv4=' ~ tunnel_ip ~ ', IPv6=(Not enabled)' -%}
+  {%- set event_type = 'info' -%}
+{%- endif -%}
+{%- set prefix = event_time.strftime('%a %b ') ~ event_time.day ~ event_time.strftime(' %H:%M:%S %Y ') -%}
+{%- set raw = prefix ~ message -%}
+{"@timestamp":{{ event_time.isoformat() | tojson }},"ecs":{"version":"8.17.0"},"event":{"kind":"event","module":"openvpn","dataset":"openvpn.server","action":{{ action | tojson }},"category":["network"],"type":[{{ event_type | tojson }}],"original":{{ raw | tojson }}},"host":{"name":{{ params.vpn_host | tojson }}},"source":{"ip":{{ source_ip | tojson }},"port":{{ source_port }}},"user":{"name":{{ common_name | tojson }}},"openvpn":{"common_name":{{ common_name | tojson }},"source_address":{{ endpoint | tojson }},"tunnel_ip":{{ tunnel_ip | tojson }}},"message":{{ message | tojson }}}
