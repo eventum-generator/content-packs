@@ -1,0 +1,41 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 3) -%}
+{%- do shared.set('tick', tick) -%}
+{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
+{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
+{%- if chain -%}
+  {%- set kind = ['KL_Malicious_URL', 'KL_Malicious_Hash_MD5', 'KL_Malicious_URL'][step] -%}
+  {%- set endpoint_ip = params.target_endpoint_ip -%}
+  {%- set user_name = params.target_user -%}
+  {%- set url = params.target_url if step != 1 else '-' -%}
+  {%- set hash = params.target_md5 if step == 1 else '-' -%}
+{%- else -%}
+  {%- set kind = module.rand.weighted_choice(['KL_Malicious_URL', 'KL_Phishing_URL', 'KL_Malicious_Hash_MD5'], [65, 25, 10]) -%}
+  {%- set endpoint_ip = module.rand.choice(['192.0.2.20', '192.0.2.21', '192.0.2.22']) -%}
+  {%- set user_name = module.rand.choice(['analyst', 'developer', 'operator']) -%}
+  {%- set url = module.rand.choice(['https://ioc.example.test/a', 'https://phish.example.test/login']) if kind != 'KL_Malicious_Hash_MD5' else '-' -%}
+  {%- set hash = '44D88612FEA8A8F36DE82E1278ABB02F' if kind == 'KL_Malicious_Hash_MD5' else '-' -%}
+{%- endif -%}
+{%- set indicator = hash if hash != '-' else url -%}
+{%- set event_id = 10000 + (shared.get('event_id', -1) + 1) % 999999999 -%}
+{%- do shared.set('event_id', event_id - 10000) -%}
+{%- set raw = 'CEF:0|Kaspersky Lab|Kaspersky CyberTrace for ArcSight|2.0|2|CyberTrace Detection Event|8|'
+  ~ ' reason=' ~ kind ~ ' dst=198.51.100.10 src=' ~ endpoint_ip
+  ~ ' fileHash=' ~ hash ~ ' request=' ~ url
+  ~ ' sourceServiceName=ExampleVendor sproc=EndpointSecurity suser=' ~ user_name
+  ~ ' msg=CyberTrace detected ' ~ kind ~ ' externalId=' ~ event_id
+  ~ ' cs5Label=MatchedIndicator cs5=' ~ indicator
+  ~ ' cs6Label=Context cs6=feed=Example_Feed.json' -%}
+{%- set record = {'@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'alert', 'dataset': 'kaspersky.cybertrace',
+    'category': ['threat'], 'type': ['indicator'], 'code': kind,
+    'action': 'indicator_match', 'original': raw},
+  'source': {'ip': endpoint_ip}, 'destination': {'ip': '198.51.100.10'},
+  'user': {'name': user_name},
+  'related': {'ip': [endpoint_ip, '198.51.100.10'], 'user': [user_name]},
+  'kaspersky': {'cybertrace': {'matched_indicator': indicator,
+    'external_id': event_id, 'feed': 'Example_Feed.json'}}} -%}
+{{ record | tojson }}
