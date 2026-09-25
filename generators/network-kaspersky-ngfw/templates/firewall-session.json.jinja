@@ -1,0 +1,92 @@
+{%- set previous = shared.get('previous_time') -%}
+{%- set clock = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set event_time = clock if previous is none or clock > previous else previous + module.datetime.timedelta(seconds=30) -%}
+{%- do shared.set('previous_time', event_time) -%}
+{%- set stage = shared.get('anomaly_stage', -1) -%}
+{%- set phase = shared.get('routine_phase', 0) -%}
+{%- set routine_count = shared.get('routine_count', 0) -%}
+{%- if params.anomaly_mode and stage == -1 and phase == 0 and routine_count >= params.anomaly_delay_sessions -%}
+  {%- set stage = 0 -%}
+{%- endif -%}
+{%- set chain = 0 <= stage < 4 -%}
+{%- set started = stage % 2 == 0 if chain else phase == 0 -%}
+{%- if started -%}
+  {%- set session_id = (shared.get('next_session_id', 900000) + 1) % 100000000 -%}
+  {%- do shared.set('next_session_id', session_id) -%}
+  {%- if chain -%}
+    {%- set profile = 'large_smb' -%}
+    {%- set transfer_index = stage // 2 -%}
+  {%- else -%}
+    {%- set routine_index = shared.get('routine_index', -1) + 1 -%}
+    {%- do shared.set('routine_index', routine_index % 240) -%}
+    {%- set profile = 'large_smb' if routine_index in [6, 126] else
+      ('small_smb' if routine_index % 20 == 19 else
+       ('dns' if routine_index % 20 == 18 else
+        ('http' if routine_index % 20 == 17 else 'https'))) -%}
+    {%- set transfer_index = 1 if routine_index == 126 else 0 -%}
+    {%- do shared.set('routine_count', [routine_count + 1, params.anomaly_delay_sessions] | min) -%}
+    {%- do shared.set('routine_phase', 1) -%}
+  {%- endif -%}
+  {%- set src = params.large_smb_source_ip if profile == 'large_smb' else
+    module.rand.choice(['10.20.1.21', '10.20.1.22', '10.20.1.23', '10.20.1.24']) -%}
+  {%- set dst = params.large_smb_destination_ip if profile == 'large_smb' else
+    ('10.20.2.8' if profile == 'small_smb' else
+     module.rand.choice(['198.51.100.12', '198.51.100.13'])) -%}
+  {%- set dpt = 445 if profile in ['large_smb', 'small_smb'] else
+    (53 if profile == 'dns' else (80 if profile == 'http' else 443)) -%}
+  {%- set bytes_out = (75000000 if transfer_index == 0 else 82000000) if profile == 'large_smb' else
+    (module.rand.number.integer(100000, 500000) if profile == 'small_smb' else
+     (module.rand.number.integer(500, 2000) if profile == 'dns' else
+      module.rand.number.integer(2000, 80000))) -%}
+  {%- set bytes_in = 2800000 if profile == 'large_smb' else
+    (module.rand.number.integer(2000, 9000) if profile == 'small_smb' else
+     module.rand.number.integer(300, 1500)) -%}
+  {%- set session = {'id': session_id, 'src': src, 'dst': dst, 'spt': module.rand.number.integer(49152, 61000),
+    'dpt': dpt, 'profile': profile, 'start': event_time, 'bytes_in': bytes_in, 'bytes_out': bytes_out,
+    'rule': 'Internal SMB inspection' if profile == 'large_smb' else 'Office access'} -%}
+  {%- do shared.set('active_session', session) -%}
+{%- else -%}
+  {%- set session = shared.get('active_session') -%}
+  {%- do shared.set('active_session', none) -%}
+  {%- if not chain -%}
+    {%- do shared.set('routine_phase', 0) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if chain -%}
+  {%- do shared.set('anomaly_stage', stage + 1) -%}
+{%- endif -%}
+{%- set duration = 0 if started else (event_time - session.start).total_seconds() | int -%}
+{%- set client_bytes = 64 if started else session.bytes_in -%}
+{%- set server_bytes = 0 if started else session.bytes_out -%}
+{%- set client_packets = 1 if started else (40000 if session.profile == 'large_smb' else
+  (module.math.ceil(client_bytes / 300) | int)) -%}
+{%- set server_packets = 0 if started else (module.math.ceil(server_bytes / 1400) | int) -%}
+{%- set name = 'Session start' if started else 'Firewall' -%}
+{%- set ext = 'rt=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%SZ') ~ ' dtz=UTC+00:00'
+  ~ ' cs4=Low cs4Label=Priority devicePayloadId=' ~ session.id
+  ~ ' cs1=' ~ session.rule ~ ' cs1Label=SecurityRule act=Inspect FullMatch=yes'
+  ~ ' start=' ~ session.start.strftime('%Y-%m-%dT%H:%M:%SZ')
+  ~ (' end=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%SZ') if not started else '')
+  ~ ' cn1=' ~ duration ~ ' cn1Label=Duration'
+  ~ ' cn2=' ~ client_packets ~ ' cn2Label=ClientPackets'
+  ~ ' cn3=' ~ server_packets ~ ' cn3Label=ServerPackets'
+  ~ ' in=' ~ client_bytes ~ ' out=' ~ server_bytes
+  ~ ' dvchost=' ~ params.device_host ~ ' src=' ~ session.src ~ ' dst=' ~ session.dst
+  ~ ' proto=TCP spt=' ~ session.spt ~ ' dpt=' ~ session.dpt
+  ~ ' KasperskyNGFWTCPRedir=no app=Unknown' -%}
+{%- set raw = 'CEF:0|Kaspersky|NGFW|' ~ params.device_version ~ '|Firewall|' ~ name ~ '|Unknown|' ~ ext -%}
+{%- set event = {'kind': 'event', 'dataset': 'kaspersky.ngfw', 'category': ['network'],
+  'type': ['start'] if started else ['end'], 'action': name, 'original': raw,
+  'start': session.start.isoformat()} -%}
+{%- if not started -%}
+  {%- do event.update({'end': event_time.isoformat(), 'duration': duration * 1000000000}) -%}
+{%- endif -%}
+{%- set record = {'@timestamp': event_time.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': event,
+  'observer': {'hostname': params.device_host, 'vendor': 'Kaspersky', 'product': 'NGFW', 'version': params.device_version},
+  'source': {'ip': session.src, 'port': session.spt, 'bytes': client_bytes},
+  'destination': {'ip': session.dst, 'port': session.dpt, 'bytes': server_bytes},
+  'network': {'transport': 'tcp', 'protocol': 'smb' if session.profile in ['large_smb', 'small_smb'] else session.profile,
+    'bytes': client_bytes + server_bytes, 'packets': client_packets + server_packets},
+  'kaspersky': {'ngfw': {'session_id': session.id | string, 'rule': session.rule, 'action': 'Inspect'}}} -%}
+{{ record | tojson }}
