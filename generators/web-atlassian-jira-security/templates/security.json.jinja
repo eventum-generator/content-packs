@@ -1,0 +1,64 @@
+{%- for flag in ['to_failure_1', 'to_failure_2', 'to_failure_3', 'to_failure_4', 'to_captcha', 'to_passed', 'to_logout', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= 48 -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('chain_session', module.rand.string.letters_lowercase(7)) -%}
+      {%- do shared.set('to_failure_1', true) -%}
+    {%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['passed', 'failed', 'logout'], [65, 20, 15]) -%}
+  {%- set actor = module.rand.choice(['alice', 'bob', 'carol', 'david']) -%}
+  {%- set ip = module.rand.choice(['10.20.4.11', '10.20.4.12', '10.20.4.13', '10.20.4.14']) -%}
+  {%- set session = module.rand.string.letters_lowercase(7) -%}
+  {%- set failure_count = 1 -%}
+{%- else -%}
+  {%- set actor = params.target_user -%}
+  {%- set ip = params.suspect_ip -%}
+  {%- if stage.startswith('failure_') -%}
+    {%- set kind = 'failed' -%}
+    {%- set failure_count = stage[-1] | int -%}
+    {%- do shared.set('to_failure_' ~ (failure_count + 1), true) if failure_count < 4 else shared.set('to_captcha', true) -%}
+  {%- else -%}
+    {%- set kind = stage -%}
+    {%- set failure_count = 4 -%}
+    {%- if stage == 'captcha' -%}{%- do shared.set('to_passed', true) -%}
+    {%- elif stage == 'passed' -%}{%- do shared.set('to_logout', true) -%}
+    {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+  {%- endif -%}
+  {%- set session = shared.get('chain_session') if kind != 'logout' else module.rand.string.letters_lowercase(7) -%}
+{%- endif -%}
+{%- if kind == 'failed' -%}
+  {%- set message = "The user '" ~ actor ~ "' has FAILED authentication. Failure count equals " ~ failure_count -%}
+  {%- set username = 'anonymous' -%}
+  {%- set action = 'authentication-failed' -%}
+  {%- set event_type = ['start'] -%}
+{%- elif kind == 'captcha' -%}
+  {%- set message = "The user '" ~ actor ~ "' is required to answer a CAPTCHA elevated security check. Failure count equals 4" -%}
+  {%- set username = 'anonymous' -%}
+  {%- set action = 'captcha-required' -%}
+  {%- set event_type = ['denied'] -%}
+{%- elif kind == 'passed' -%}
+  {%- set message = "The user '" ~ actor ~ "' has PASSED authentication." -%}
+  {%- set username = actor -%}
+  {%- set action = 'authentication-passed' -%}
+  {%- set event_type = ['start'] -%}
+{%- else -%}
+  {%- set message = "The user '" ~ actor ~ "' has logged out." -%}
+  {%- set username = actor -%}
+  {%- set action = 'logout' -%}
+  {%- set event_type = ['end'] -%}
+{%- endif -%}
+{%- set request_seq = shared.get('request_seq', 100) + 1 -%}
+{%- do shared.set('request_seq', 100 if request_seq >= 999999 else request_seq) -%}
+{%- set request_id = '1054x' ~ request_seq ~ 'x1' -%}
+{%- set url = '/secure/Logout!default.jspa' if kind == 'logout' else '/login.jsp' -%}
+{%- set context = '/jira' ~ url ~ ('; user: ' ~ actor if kind == 'logout' else '') -%}
+{%- set stamp = timestamp.strftime('%Y-%m-%d %H:%M:%S,%f')[:23] ~ '+0000' -%}
+{%- set original = stamp ~ ' http-nio-8080-exec-12 url: ' ~ context ~ ' ' ~ username ~ ' ' ~ request_id ~ ' ' ~ session ~ ' ' ~ ip ~ ' ' ~ url ~ ' ' ~ message -%}
+{%- set event = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['authentication'], 'type': event_type, 'action': action, 'original': original}, 'host': {'name': params.host_name}, 'process': {'thread': {'name': 'http-nio-8080-exec-12'}}, 'log': {'file': {'path': 'atlassian-jira-security.log'}}, 'source': {'ip': ip}, 'user': {'name': username}, 'related': {'ip': [ip], 'user': [actor]}, 'jira': {'security': {'target_user': actor, 'session_id': session, 'request_id': request_id, 'request_url': url, 'context_url': context, 'message': message}}} -%}
+{%- if kind in ['failed', 'captcha'] -%}{%- do event.jira.security.update({'failure_count': failure_count}) -%}{%- endif -%}
+{%- if stage == 'logout' -%}{%- do shared.pop('chain_session', none) -%}{%- endif -%}
+{{- event | tojson -}}
