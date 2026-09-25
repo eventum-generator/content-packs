@@ -1,26 +1,24 @@
 # Microsoft DNS Server Audit and Analytical Logs
 
-Produces ECS-compatible Windows DNS Server Audit and Analytical events. The Audit channel carries configuration changes; the Analytical channel carries DNS query and response records. A real deployment must enable Analytical logging separately.
-
-Reference field coverage: **63/63 fields across the three [Elastic DNS Audit parsed test events](https://github.com/elastic/integrations/blob/main/packages/microsoft_dnsserver/data_stream/audit/_dev/test/pipeline/test-events.json-expected.json). This reference includes ingestion and host metadata, which the pack fills with stable synthetic values. Analytical 256/257 messages follow the Microsoft event catalog rather than that Audit-only fixture.**
+Generates parsed Windows DNS Server events in ECS JSON, with native `winlog.event_data` and rendered messages. Audit records describe policy changes; ETW Analytical records describe queries and replies. This is a small, synthetic authoritative `corp.example` server, not a raw `.etl` or Windows XML export. A real server enables Analytical logging separately from the default Audit channel.
 
 ## Event Types
 
-| Native event ID | Meaning | Routine selection |
-| --- | --- | ---: |
-| 256 → 257 | Query received, then linked success response | 85% of routine starts |
-| 536 | Cache record purged | 8% |
-| 514 | Zone setting updated | 5% |
-| 540 | Root hints modified | 2% |
-| 577 → 256 × 3 → 580 | Policy created, unanswered queries, policy deleted | Anomaly only |
+| Native ID | Channel | Role in this scenario |
+| --- | --- | --- |
+| 256 `QUERY_RECEIVED` | Analytical | Incoming query, including source, XID, RD, and valid DNS packet bytes |
+| 257 `RESPONSE_SUCCESS` | Analytical | Successful A reply with the same QNAME, client, XID, port, and ETW GUID |
+| 259 `IGNORED_QUERY` | Analytical | Policy-matched query with no 257 reply |
+| 577 `POLICY_OP` | Audit | Creates a server-level `Ignore` query policy |
+| 580 `POLICY_OP` | Audit | Deletes that policy |
 
-Routine percentages are configured selection weights, not measured vendor frequencies. One reusable Jinja template covers the FSM states; the source-specific native records are emitted alongside normalized ECS fields. The `event.sequence` and device counters are bounded.
+The default clock produces two records per second, usually a 256/257 transaction separated by 3 ms. The source selects eight internal A records. A baseline maintenance policy is created after 100 transactions, remains for about 30 minutes, and receives three 256/259 transactions roughly eight minutes apart before it is deleted. These are scenario settings, not measured production event frequencies.
 
 ## Anomaly Chain
 
-At every 250 routine starts, the state machine creates server-level policy `ShadowIgnore` (event 577) with `Action=Ignore` and criteria `FQDN=EQ,*.updates.corp.example`. Three event-256 queries for `beacon.updates.corp.example` then arrive from `10.20.4.17` without corresponding 257 responses. Event 580 deletes the same policy. Correlate by DNS server, policy name, criteria, QNAME, client IP, XID, and timestamps. A rule can detect a short-lived Ignore policy or a sudden query-to-response gap for a domain. The absence of a response is an inference from the generated stream, not a direct error event. DNS Analytical logging must be enabled in a real installation to see queries.
+With `anomaly_mode: true` (the default), the same administrator creates the same `ShadowIgnore` policy a second time after 3,600 routine transactions. Three 256/259 pairs for `beacon.updates.corp.example.` from `10.20.4.17` follow one second apart; the policy is deleted three seconds after creation. The QNAME, source, policy name, action, and event IDs also occur in the baseline. A useful detection correlates a 577 with a burst of policy-matched 259 events and a 580 on the same DNS server within a short window, instead of matching a single field. Correlate each 256/259 pair by QNAME, QTYPE, XID, source IP and nearby time; do not expect a 257 reply for an ignored query.
 
-`anomaly_mode: true` is the default. Set `event.template.params.anomaly_mode: false` to generate routine background only. The anomaly identities and targeted objects do not appear in background mode.
+With `anomaly_mode: false`, the baseline maintenance policy and sparse ignored queries remain, but the short-lived burst does not occur. The one-shot chain and the baseline policy are separate state transitions; neither grows an unbounded collection.
 
 ## Parameters
 
@@ -30,17 +28,20 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `server_name`, `server_ip` | `dns-01.corp.example`, `10.20.0.53` | Single DNS server identity |
-| `admin_name` | `DNSAdmin` | Audit change actor |
-| `client_ip` | `10.20.4.17` | Query source for the chain |
-| `normal_zone`, `anomaly_zone` | `corp.example`, `updates.corp.example` | Normal and targeted DNS namespaces |
-| `policy_name` | `ShadowIgnore` | Short-lived Ignore policy |
-| `anomaly_interval_events` | `250` | Routine starts between chains; counter is bounded |
-| `anomaly_mode` | `true` | Include chain; `false` emits background only |
+| `server_name`, `server_ip` | `dns-01.corp.example`, `10.20.0.53` | DNS server identity |
+| `admin_name` | `DNSAdmin` | Policy-change actor |
+| `client_ip` | `10.20.4.17` | Client for ignored queries |
+| `normal_zone` | `corp.example` | Authoritative zone in events |
+| `anomaly_zone` | `updates.corp.example` | Policy FQDN criterion and ignored QNAME suffix |
+| `policy_name` | `ShadowIgnore` | Policy used by both maintenance and anomaly sequences |
+| `anomaly_interval_events` | `3600` | Routine transaction count before the short-lived sequence; values below 1,901 are delayed until the baseline policy closes |
+| `anomaly_mode` | `true` | Enables the short-lived sequence |
+
+The ordinary QNAMEs, clients and A answers are in `samples/queries.json`. Update that file when changing `normal_zone`.
 
 ### Output Parameters
 
-The shipped configuration writes `output/events.json` locally and needs no `${params.*}` or `${secrets.*}` overrides. Change `output.file.path` or replace the output plugin when connecting to a SIEM.
+The shipped configuration writes `output/events.json` and has no required `${params.*}` or `${secrets.*}` values. Change `output.file.path` or the output plugin to deliver to a SIEM.
 
 ## Usage
 
@@ -50,134 +51,135 @@ From the content-packs repository root:
 eventum generate --path generators/windows-dns-server-audit/generator.yml --id windows-dns-server-audit --live-mode true
 ```
 
-Adjust the cron expression and count in `generator.yml` for a different event rate.
+For a bounded sample, prefix the command with `timeout 2` and set `--live-mode false`; the mode switch alone does not stop a continuous cron generator. The default clock and count live in `generator.yml`.
 
 ## Sample Output
 
-Copied from a real enabled-mode generator run:
+A complete 259 event copied from an enabled generator run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T14:34:02+00:00",
+  "@timestamp": "2026-09-25T18:53:12.003000+00:00",
   "data_stream": {
-    "dataset": "microsoft_dnsserver.audit",
+    "dataset": "microsoft_dnsserver.analytical",
     "namespace": "default",
     "type": "logs"
+  },
+  "dns": {
+    "id": "51115",
+    "question": {
+      "name": "beacon.updates.corp.example",
+      "registered_domain": "corp.example",
+      "top_level_domain": "example",
+      "type": "A"
+    }
   },
   "ecs": {
     "version": "8.17.0"
   },
   "event": {
-    "action": "POLICY_OP",
-    "agent_id_status": "verified",
     "category": [
-      "configuration"
+      "network"
     ],
-    "code": "577",
-    "created": "2026-09-25T14:34:02+00:00",
-    "dataset": "microsoft_dnsserver.audit",
-    "ingested": "2026-09-25T14:34:02+00:00",
+    "code": "259",
+    "dataset": "microsoft_dnsserver.analytical",
     "kind": "event",
     "provider": "Microsoft-Windows-DNSServer",
-    "sequence": 9812,
+    "severity": 2,
     "type": [
-      "creation"
+      "protocol"
     ]
   },
   "host": {
-    "architecture": "x86_64",
     "hostname": "dns-01.corp.example",
-    "id": "d0500000-1111-4444-8888-123456789abc",
     "ip": [
       "10.20.0.53"
     ],
-    "mac": [
-      "02-42-AC-11-00-53"
-    ],
     "name": "dns-01.corp.example",
     "os": {
-      "build": "20348.2322",
       "family": "windows",
-      "kernel": "10.0.20348.2322 (WinBuild.160101.0800)",
       "name": "Windows Server 2022 Datacenter",
       "platform": "windows",
-      "type": "windows",
-      "version": "10.0"
+      "type": "windows"
     }
   },
   "input": {
-    "type": "winlog"
+    "type": "etw"
   },
   "log": {
-    "level": "information"
+    "file": {
+      "path": "Microsoft-Windows-DNSServer-Analytical.etl"
+    },
+    "level": "error"
   },
-  "message": "A server level policy ShadowIgnore for Query processing has been created on server dns-01.corp.example with following properties: Processing order:1; Criteria:FQDN=EQ,*.updates.corp.example; Action:Ignore; Condition:And; IsEnabled:True.",
+  "message": "IGNORED_QUERY: TCP=0; InterfaceIP=10.20.0.53; Source=10.20.4.17; Reason=Policy; QNAME=beacon.updates.corp.example.; QTYPE=1; XID=51115; Zone=corp.example; PolicyName=ShadowIgnore; AdditionalInfo = VirtualizationInstance: .",
   "microsoft_dnsserver": {
-    "audit": {
-      "action": "Ignore",
-      "condition": "And",
-      "criteria": "FQDN=EQ,*.updates.corp.example",
-      "is_enabled": "True",
-      "name_server": "dns-01.corp.example",
-      "policy": "ShadowIgnore",
-      "processing_order": "1",
-      "type": "Query processing"
-    }
-  },
-  "process": {
-    "pid": 852,
-    "thread": {
-      "id": 7708
+    "analytical": {
+      "additional_info": ".",
+      "description": "Ignored query",
+      "interface_ip": "10.20.0.53",
+      "policy_name": "ShadowIgnore",
+      "question_name": "beacon.updates.corp.example.",
+      "question_type": "A",
+      "reason": "Policy",
+      "source": {
+        "ip": "10.20.4.17"
+      },
+      "xid": "51115",
+      "zone": "corp.example"
     }
   },
   "related": {
-    "user": [
-      "DNSAdmin"
+    "ip": [
+      "10.20.4.17"
     ]
   },
-  "tags": [
-    "preserve_duplicate_custom_fields"
-  ],
-  "user": {
-    "name": "DNSAdmin"
+  "source": {
+    "ip": "10.20.4.17"
   },
   "winlog": {
-    "api": "wineventlog",
-    "channel": "Microsoft-Windows-DNSServer/Audit",
-    "computer_name": "dns-01.corp.example",
+    "channel": "Microsoft-Windows-DNS-Server/Analytical",
     "event_data": {
-      "Action": "Ignore",
-      "Condition": "And",
-      "Criteria": "FQDN=EQ,*.updates.corp.example",
-      "IsEnabled": "True",
-      "Policy": "ShadowIgnore",
-      "ProcessingOrder": "1",
-      "ServerName": "dns-01.corp.example",
-      "Type": "Query processing"
+      "AdditionalInfo": ".",
+      "InterfaceIP": "10.20.0.53",
+      "PolicyName": "ShadowIgnore",
+      "QNAME": "beacon.updates.corp.example.",
+      "QTYPE": "1",
+      "Reason": "Policy",
+      "Source": "10.20.4.17",
+      "TCP": "0",
+      "XID": "51115",
+      "Zone": "corp.example"
     },
-    "event_id": "577",
-    "keywords": [
-      "AUDIT_POLICY"
+    "flags": [
+      "64_BIT_HEADER",
+      "EXTENDED_INFO",
+      "PROCESSOR_INDEX"
     ],
-    "opcode": "Info",
+    "flags_raw": "0x241",
+    "keywords": [
+      "IGNORED_QUERY"
+    ],
+    "keywords_raw": "0x8000000000000008",
+    "level": "Error",
+    "level_raw": 2,
+    "opcode_raw": 0,
     "provider_guid": "{eb79061a-a566-4698-9119-3ed2807060e7}",
+    "provider_message": "Microsoft-Windows-DNS-Server",
     "provider_name": "Microsoft-Windows-DNSServer",
-    "record_id": "9812",
-    "task": "POLICY_OP",
-    "user": {
-      "domain": "dns-01.corp.example",
-      "identifier": "S-1-5-21-1000000000-1000000000-1000000000-500",
-      "name": "DNSAdmin",
-      "type": "User"
-    }
+    "session": "Microsoft-Windows-DNSServer-Analytical.etl",
+    "task": "LOOK_UP",
+    "task_raw": 1,
+    "version": 0
   }
 }
 ```
 
 ## References and Limits
 
-- [Microsoft DNS logging and event IDs](https://learn.microsoft.com/en-us/windows-server/networking/dns/dns-logging-and-diagnostics): 256/257 Analytical and 514/536/540/577/580 Audit families.
-- [Elastic Microsoft DNS Server integration](https://github.com/elastic/integrations/tree/main/packages/microsoft_dnsserver/data_stream/audit): normalized Audit fields.
-- [KUMA 4.0 supported sources](https://support.kaspersky.com/kuma/4.0/en-US/255782.htm): source prioritization.
+- [Microsoft DNS logging and diagnostics](https://learn.microsoft.com/en-us/windows-server/networking/dns/dns-logging-and-diagnostics): Audit IDs 577/580, Analytical IDs 257/259, and separate logging configuration. The table omits 256.
+- [Microsoft DNS policy behavior](https://learn.microsoft.com/en-us/powershell/module/dnsserver/add-dnsserverqueryresolutionpolicy?view=windowsserver2025-ps): `Ignore` drops a matched query without answering it.
+- [Elastic Audit input fixtures](https://github.com/elastic/integrations/blob/main/packages/microsoft_dnsserver/data_stream/audit/_dev/test/pipeline/test-events.json): actual 577 structure and message.
+- [Elastic Analytical ETW input fixtures](https://github.com/elastic/integrations/blob/main/packages/microsoft_dnsserver/data_stream/analytical/_dev/test/pipeline/test-events.json) and [parsed fixtures](https://github.com/elastic/integrations/blob/main/packages/microsoft_dnsserver/data_stream/analytical/_dev/test/pipeline/test-events.json-expected.json): actual 256/257/259 field sets and collector shape.
 
-The generated policy is a synthetic security scenario. Audit messages alone do not prove whether a query was dropped; that conclusion requires correlating Analytical query and response events. The query and response IDs are paired by XID for ordinary traffic.
+All fields in the selected 256 (13/13), 257 (20/20), 259 (10/10), and 577 (8/8) native `event_data` structures are emitted. The published 259 examples have `Reason=System` and `PolicyName=NULL`. They do not show a policy-matched 259, so the generated `Reason=Policy`, named policy and `Zone=corp.example` are inferences from the documented `Ignore` behavior and 259 schema. The 580 field names come from the documented event text; a full 580 native sample was unavailable. These details need validation against an actual policy-hit capture before claiming full native fidelity. The output is parsed ECS JSON, with no `event.original` Windows XML or raw ETL bytes.

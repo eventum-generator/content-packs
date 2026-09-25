@@ -1,107 +1,91 @@
 {%- set step = vars.step -%}
-{%- set record = (shared.get('record_id', 0) % 2147483647) + 1 -%}
-{%- do shared.set('record_id', record) -%}
-{%- set kind = step -%}
+{%- set routine_count = shared.get('routine_count', 0) -%}
 {%- if step == 'routine' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- do shared.pop('to_response', none) -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
-  {%- else -%}
-    {%- do shared.set('routine_count', count) -%}
+  {%- set routine_count = [routine_count + 1, ([params.anomaly_interval_events, 1901] | max) + 1] | min -%}
+  {%- do shared.set('routine_count', routine_count) -%}
+  {%- if routine_count == 100 -%}{%- do shared.set('to_background_create', true) -%}{%- endif -%}
+  {%- if routine_count == 1900 -%}{%- do shared.set('to_background_delete', true) -%}{%- endif -%}
+  {%- if params.anomaly_mode and routine_count >= params.anomaly_interval_events and routine_count > 1900 and not shared.get('policy_active') and not shared.get('attack_done') -%}
+    {%- do shared.set('to_attack', true) -%}
   {%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['query','cache','zone','root_hints'],[85,8,5,2]) -%}
+  {%- if shared.get('policy_active') and routine_count % 500 == 0 -%}
+    {%- do shared.set('to_ignored', true) -%}
+    {%- set q = {'qname': 'beacon.' ~ params.anomaly_zone ~ '.', 'qtype': '1', 'client_ip': params.client_ip} -%}
+  {%- else -%}
+    {%- set selected = samples.queries.pick() -%}
+    {%- set q = {'qname': selected.qname, 'qtype': selected.qtype, 'client_ip': selected.client_ip, 'answer_ip': selected.answer_ip} -%}
+  {%- endif -%}
+  {%- do q.update({'xid': module.rand.number.integer(1, 65535), 'port': module.rand.number.integer(49152, 65535), 'guid': '{' ~ (module.rand.crypto.uuid4()|string|upper) ~ '}', 'received_at': timestamp}) -%}
+  {%- do shared.set('pending_query', q) -%}
+{%- elif step.startswith('attack_query_') -%}
+  {%- set q = {'qname': 'beacon.' ~ params.anomaly_zone ~ '.', 'qtype': '1', 'client_ip': params.client_ip, 'xid': module.rand.number.integer(1, 65535), 'port': module.rand.number.integer(49152, 65535), 'guid': '{' ~ (module.rand.crypto.uuid4()|string|upper) ~ '}', 'received_at': timestamp} -%}
+  {%- do shared.set('pending_query', q) -%}
+{%- elif step in ['normal_response', 'ignored_background'] or step.startswith('attack_ignored_') -%}
+  {%- set q = shared.pop('pending_query') -%}
+  {%- if step == 'ignored_background' -%}{%- do shared.pop('to_ignored', none) -%}{%- endif -%}
 {%- endif -%}
-{%- set eid = '536' -%}
-{%- set action = 'CACHE_OP' -%}
-{%- set task = 'CACHE_OP' -%}
-{%- set channel = 'Microsoft-Windows-DNSServer/Audit' -%}
-{%- set category = ['configuration'] -%}
-{%- set event_type = ['info'] -%}
-{%- set keywords = ['AUDIT_CACHE'] -%}
-{%- set data = {} -%}
-{%- set dns = {} -%}
-{%- set user = {'name': params.admin_name} -%}
-{%- set related = {'user': [params.admin_name]} -%}
-{%- set msg = '' -%}
-{%- if kind in ['query','normal_response','blocked_query_1','blocked_query_2','blocked_query_3'] -%}
-  {%- set eid = '256' -%}
-  {%- set channel = 'Microsoft-Windows-DNSServer/Analytical' -%}
-  {%- set task = 'LOOKUP' -%}
-  {%- set action = 'LOOKUP' -%}
-  {%- set keywords = ['DNS_QUERY'] -%}
-  {%- set category = ['network'] -%}
-  {%- set event_type = ['protocol'] -%}
-  {%- if kind == 'normal_response' -%}
-    {%- set q = shared.pop('last_query', {'qname': 'www.corp.example', 'qtype': 'A', 'client_ip': params.client_ip, 'xid': '0011'}) -%}
-    {%- set eid = '257' -%}
-    {%- set event_type = ['protocol','end'] -%}
-    {%- set msg = 'RESPONSE_SUCCESS: TCP=False; InterfaceIP=' ~ params.server_ip ~ '; Destination=' ~ q.client_ip ~ '; AA=True; AD=False; QNAME=' ~ q.qname ~ '; QTYPE=' ~ q.qtype ~ '; XID=' ~ q.xid ~ '; DNSSEC=False; RCODE=NOERROR; Port=53001; Flags=0x8180; Scope=Default; Zone=' ~ params.normal_zone ~ '; PolicyName=;' -%}
-    {%- do data.update({'QNAME': q.qname,'QTYPE': q.qtype,'XID': q.xid,'RCODE': 'NOERROR','Destination': q.client_ip,'PolicyName': ''}) -%}
-  {%- elif kind.startswith('blocked_query') -%}
-    {%- set qname = 'beacon.' ~ params.anomaly_zone -%}
-    {%- set xid = 'A' ~ ('%03d' % (shared.get('attack_no', 1) % 999)) ~ kind[-1] -%}
-    {%- set msg = 'QUERY_RECEIVED: TCP=False; InterfaceIP=' ~ params.server_ip ~ '; Source=' ~ params.client_ip ~ '; QNAME=' ~ qname ~ '; QTYPE=A; XID=' ~ xid ~ '; Port=53001;' -%}
-    {%- do data.update({'QNAME': qname,'QTYPE': 'A','XID': xid,'Source': params.client_ip}) -%}
+{%- set is_query = step == 'routine' or step.startswith('attack_query_') -%}
+{%- set is_ignored = step == 'ignored_background' or step.startswith('attack_ignored_') -%}
+{%- set is_response = step == 'normal_response' -%}
+{%- set is_audit = not (is_query or is_ignored or is_response) -%}
+{%- set event_time = q.received_at + module.datetime.timedelta(milliseconds=3) if is_ignored or is_response else timestamp -%}
+{%- set dataset = 'microsoft_dnsserver.audit' if is_audit else 'microsoft_dnsserver.analytical' -%}
+{%- set eid = '577' if step in ['policy_create', 'attack_create'] else '580' if is_audit else '256' if is_query else '259' if is_ignored else '257' -%}
+{%- set winlog = {'channel': 'Microsoft-Windows-DNSServer/Audit' if is_audit else 'Microsoft-Windows-DNS-Server/Analytical', 'provider_guid': '{eb79061a-a566-4698-9119-3ed2807060e7}', 'provider_name': 'Microsoft-Windows-DNSServer', 'event_data': {}} -%}
+{%- set out = {'@timestamp': event_time.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'code': eid, 'provider': 'Microsoft-Windows-DNSServer', 'kind': 'event', 'dataset': dataset}, 'data_stream': {'type': 'logs', 'dataset': dataset, 'namespace': 'default'}, 'host': {'name': params.server_name, 'hostname': params.server_name, 'ip': [params.server_ip], 'os': {'name': 'Windows Server 2022 Datacenter', 'family': 'windows', 'platform': 'windows', 'type': 'windows'}}, 'input': {'type': 'winlog' if is_audit else 'etw'}, 'log': {'level': 'information' if not is_ignored else 'error'}, 'winlog': winlog} -%}
+{%- if is_audit -%}
+  {%- set record = shared.get('audit_record_id', 0) + 1 -%}
+  {%- do shared.set('audit_record_id', record) -%}
+  {%- do winlog.update({'api': 'wineventlog', 'computer_name': params.server_name, 'event_id': eid, 'record_id': record|string, 'opcode': 'Info', 'task': 'POLICY_OP', 'keywords': ['AUDIT_POLICY'], 'user': {'domain': params.server_name, 'identifier': 'S-1-5-21-1000000000-1000000000-1000000000-500', 'name': params.admin_name, 'type': 'User'}}) -%}
+  {%- do out.event.update({'action': 'POLICY_OP', 'category': ['configuration'], 'type': ['creation'] if eid == '577' else ['deletion'], 'sequence': record}) -%}
+  {%- do out.update({'user': {'name': params.admin_name}, 'related': {'user': [params.admin_name]}}) -%}
+  {%- if eid == '577' -%}
+    {%- do shared.pop('to_background_create', none) -%}
+    {%- do shared.pop('to_attack', none) -%}
+    {%- do shared.set('policy_active', true) -%}
+    {%- set criteria = 'FQDN=EQ,*.' ~ params.anomaly_zone -%}
+    {%- set msg = 'A server level policy ' ~ params.policy_name ~ ' for Query processing has been created on server ' ~ params.server_name ~ ' with following properties: Processing order:1; Criteria:' ~ criteria ~ '; Action:Ignore; Condition:And; IsEnabled:True.' -%}
+    {%- do winlog.event_data.update({'Policy': params.policy_name, 'Condition': 'And', 'Action': 'Ignore', 'Type': 'Query processing', 'ProcessingOrder': '1', 'IsEnabled': 'True', 'ServerName': params.server_name, 'Criteria': criteria}) -%}
+    {%- do out.update({'microsoft_dnsserver': {'audit': {'policy': params.policy_name, 'condition': 'And', 'action': 'Ignore', 'type': 'Query processing', 'processing_order': '1', 'is_enabled': 'True', 'name_server': params.server_name, 'criteria': criteria}}}) -%}
   {%- else -%}
-    {%- set q = samples.queries.pick() -%}
-    {%- set xid = '%04X' % module.rand.number.integer(0, 65535) -%}
-    {%- set msg = 'QUERY_RECEIVED: TCP=False; InterfaceIP=' ~ params.server_ip ~ '; Source=' ~ q.client_ip ~ '; QNAME=' ~ q.qname ~ '; QTYPE=' ~ q.qtype ~ '; XID=' ~ xid ~ '; Port=53001;' -%}
-    {%- do data.update({'QNAME': q.qname,'QTYPE': q.qtype,'XID': xid,'Source': q.client_ip}) -%}
-    {%- if not shared.get('to_attack') -%}
-      {%- do shared.set('last_query', {'qname': q.qname,'qtype': q.qtype,'client_ip': q.client_ip,'xid': xid}) -%}
-      {%- do shared.set('to_response', true) -%}
-    {%- endif -%}
-  {%- endif -%}
-  {%- do related.update({'ip': [data.get('Source', data.get('Destination', params.client_ip))]}) -%}
-  {%- set user = {} -%}
-{%- elif kind in ['policy_create','policy_delete'] -%}
-  {%- set eid = '577' if kind == 'policy_create' else '580' -%}
-  {%- set action = 'POLICY_OP' -%}
-  {%- set task = 'POLICY_OP' -%}
-  {%- set keywords = ['AUDIT_POLICY'] -%}
-  {%- set event_type = ['creation'] if kind == 'policy_create' else ['deletion'] -%}
-  {%- if kind == 'policy_create' -%}
-    {%- do shared.set('attack_no', (shared.get('attack_no', 0) % 999) + 1) -%}
-    {%- set msg = 'A server level policy ' ~ params.policy_name ~ ' for Query processing has been created on server ' ~ params.server_name ~ ' with following properties: Processing order:1; Criteria:FQDN=EQ,*.' ~ params.anomaly_zone ~ '; Action:Ignore; Condition:And; IsEnabled:True.' -%}
-    {%- do data.update({'Policy': params.policy_name,'Condition': 'And','Action': 'Ignore','Type': 'Query processing','ProcessingOrder': '1','IsEnabled': 'True','ServerName': params.server_name,'Criteria': 'FQDN=EQ,*.' ~ params.anomaly_zone}) -%}
-    {%- do dns.update({'policy': params.policy_name,'condition': 'And','action': 'Ignore','type': 'Query processing','processing_order': '1','is_enabled': 'True','name_server': params.server_name,'criteria': 'FQDN=EQ,*.' ~ params.anomaly_zone}) -%}
-  {%- else -%}
+    {%- do shared.pop('to_background_delete', none) -%}
+    {%- do shared.pop('policy_active', none) -%}
+    {%- if step == 'attack_delete' -%}{%- do shared.set('attack_done', true) -%}{%- endif -%}
     {%- set msg = 'The server level policy ' ~ params.policy_name ~ ' has been deleted from server ' ~ params.server_name ~ '.' -%}
-    {%- do data.update({'Policy': params.policy_name,'ServerName': params.server_name}) -%}
-    {%- do dns.update({'policy': params.policy_name,'name_server': params.server_name}) -%}
+    {%- do winlog.event_data.update({'Policy': params.policy_name, 'ServerName': params.server_name}) -%}
+    {%- do out.update({'microsoft_dnsserver': {'audit': {'policy': params.policy_name, 'name_server': params.server_name}}}) -%}
   {%- endif -%}
-{%- elif kind == 'zone' -%}
-  {%- set eid = '514' -%}
-  {%- set action = 'ZONE_OP' -%}
-  {%- set task = 'ZONE_OP' -%}
-  {%- set keywords = ['AUDIT_ZONE'] -%}
-  {%- set event_type = ['change'] -%}
-  {%- set msg = 'The zone ' ~ params.normal_zone ~ ' was updated. The Aging setting has been set to True.' -%}
-  {%- do data.update({'Zone': params.normal_zone,'Setting': 'Aging','Value': 'True'}) -%}
-{%- elif kind == 'root_hints' -%}
-  {%- set eid = '540' -%}
-  {%- set action = 'Configuration' -%}
-  {%- set task = 'Configuration' -%}
-  {%- set keywords = ['AUDIT_ROOTHINTS'] -%}
-  {%- set event_type = ['change'] -%}
-  {%- set msg = 'The root hints have been modified.' -%}
 {%- else -%}
-  {%- set eid = '536' -%}
-  {%- set msg = 'A record of type 1, QNAME www.' ~ params.normal_zone ~ ' was purged from scope Default in cache.' -%}
-  {%- do data.update({'Scope': 'Default','QNAME': 'www.' ~ params.normal_zone,'QTYPE': '1'}) -%}
-  {%- do dns.update({'scope': 'Default','qname': 'www.' ~ params.normal_zone,'qtype': '1'}) -%}
+  {%- set name = namespace(wire='') -%}
+  {%- for label in q.qname.rstrip('.').split('.') -%}
+    {%- set name.wire = name.wire ~ ('%02X' % (label|length)) ~ label.encode('ascii').hex().upper() -%}
+  {%- endfor -%}
+  {%- set question = name.wire ~ '00' ~ ('%04X' % (q.qtype|int)) ~ '0001' -%}
+  {%- set xid_hex = '%04X' % q.xid -%}
+  {%- set guid = q.guid -%}
+  {%- set data = {'TCP': '0', 'InterfaceIP': params.server_ip, 'QNAME': q.qname, 'QTYPE': q.qtype, 'XID': q.xid|string, 'AdditionalInfo': '.'} -%}
+  {%- do winlog.update({'task': 'LOOK_UP', 'keywords': ['QUERY_RECEIVED' if is_query else 'IGNORED_QUERY' if is_ignored else 'RESPONSE_SUCCESS'], 'flags': ['64_BIT_HEADER', 'EXTENDED_INFO', 'PROCESSOR_INDEX'], 'flags_raw': '0x241', 'opcode_raw': 0, 'version': 0, 'session': 'Microsoft-Windows-DNSServer-Analytical.etl', 'keywords_raw': '0x8000000000000001' if is_query else '0x8000000000000008' if is_ignored else '0x8000000000000002', 'level': 'Error' if is_ignored else 'Information', 'level_raw': 2 if is_ignored else 4, 'task_raw': 1, 'provider_message': 'Microsoft-Windows-DNS-Server', 'event_data': data}) -%}
+  {%- do out.event.update({'severity': 2 if is_ignored else 4, 'category': ['network'], 'type': ['protocol']}) -%}
+  {%- do out.update({'log': {'level': 'error' if is_ignored else 'information', 'file': {'path': 'Microsoft-Windows-DNSServer-Analytical.etl'}}, 'dns': {'id': q.xid|string, 'question': {'name': q.qname.rstrip('.'), 'registered_domain': params.normal_zone, 'top_level_domain': 'example', 'type': 'A'}}, 'microsoft_dnsserver': {'analytical': {'question_name': q.qname, 'question_type': 'A', 'xid': q.xid|string, 'interface_ip': params.server_ip, 'additional_info': '.'}}}) -%}
+  {%- if is_query -%}
+    {%- set packet = '0x' ~ xid_hex ~ '01000001000000000000' ~ question -%}
+    {%- do data.update({'Source': q.client_ip, 'RD': '1', 'Port': q.port|string, 'Flags': '256', 'PacketData': packet, 'BufferSize': ((packet|length - 2) // 2)|string, 'GUID': guid}) -%}
+    {%- do out.update({'source': {'ip': q.client_ip, 'port': q.port}, 'related': {'ip': [q.client_ip]}, 'message': 'QUERY_RECEIVED: TCP=0; InterfaceIP=' ~ params.server_ip ~ '; Source=' ~ q.client_ip ~ '; RD=1; QNAME=' ~ q.qname ~ '; QTYPE=' ~ q.qtype ~ '; XID=' ~ q.xid ~ '; Port=' ~ q.port ~ '; Flags=256; PacketData=' ~ packet ~ '; AdditionalInfo = VirtualizationInstanceOptionValue: .; GUID=' ~ guid}) -%}
+    {%- do out.microsoft_dnsserver.analytical.update({'description': 'Query received', 'source': {'ip': q.client_ip, 'port': q.port}, 'guid': guid, 'packet_data': packet, 'bytes_sent': (packet|length - 2) // 2}) -%}
+    {%- do out.dns.update({'header_flags': ['RD']}) -%}
+  {%- elif is_ignored -%}
+    {%- do data.update({'Source': q.client_ip, 'Reason': 'Policy', 'Zone': params.normal_zone, 'PolicyName': params.policy_name}) -%}
+    {%- do out.update({'source': {'ip': q.client_ip}, 'related': {'ip': [q.client_ip]}, 'message': 'IGNORED_QUERY: TCP=0; InterfaceIP=' ~ params.server_ip ~ '; Source=' ~ q.client_ip ~ '; Reason=Policy; QNAME=' ~ q.qname ~ '; QTYPE=' ~ q.qtype ~ '; XID=' ~ q.xid ~ '; Zone=' ~ params.normal_zone ~ '; PolicyName=' ~ params.policy_name ~ '; AdditionalInfo = VirtualizationInstance: .'}) -%}
+    {%- do out.microsoft_dnsserver.analytical.update({'description': 'Ignored query', 'source': {'ip': q.client_ip}, 'reason': 'Policy', 'zone': params.normal_zone, 'policy_name': params.policy_name}) -%}
+  {%- else -%}
+    {%- set ip = namespace(wire='') -%}
+    {%- for octet in q.answer_ip.split('.') -%}{%- set ip.wire = ip.wire ~ ('%02X' % (octet|int)) -%}{%- endfor -%}
+    {%- set packet = '0x' ~ xid_hex ~ '85800001000100000000' ~ question ~ 'C00C000100010000012C0004' ~ ip.wire -%}
+    {%- do data.update({'Destination': q.client_ip, 'AA': '1', 'AD': '0', 'DNSSEC': '0', 'RCODE': '0', 'Port': q.port|string, 'Flags': '34176', 'Scope': 'Default', 'Zone': params.normal_zone, 'PolicyName': 'NULL', 'PacketData': packet, 'BufferSize': ((packet|length - 2) // 2)|string, 'ElapsedTime': '3', 'GUID': guid}) -%}
+    {%- do out.update({'destination': {'ip': q.client_ip, 'port': q.port}, 'related': {'ip': [q.client_ip]}, 'message': 'RESPONSE_SUCCESS: TCP=0; InterfaceIP=' ~ params.server_ip ~ '; Destination=' ~ q.client_ip ~ '; AA=1; AD=0; QNAME=' ~ q.qname ~ '; QTYPE=' ~ q.qtype ~ '; XID=' ~ q.xid ~ '; DNSSEC=0; RCODE=0; Port=' ~ q.port ~ '; Flags=34176; Scope=Default; Zone=' ~ params.normal_zone ~ '; PolicyName=NULL; PacketData=' ~ packet ~ '; AdditionalInfo= VirtualizationInstance:.; ElapsedTime=3; GUID=' ~ guid}) -%}
+    {%- do out.microsoft_dnsserver.analytical.update({'description': 'Response success', 'destination': {'ip': q.client_ip, 'port': q.port}, 'response_code': 'NoError', 'dnssec': '0', 'scope': 'Default', 'zone': params.normal_zone, 'elapsed_time': '3', 'guid': guid, 'packet_data': packet, 'bytes_sent': (packet|length - 2) // 2}) -%}
+    {%- do out.dns.update({'response_code': 'NoError'}) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set winlog = {'api':'wineventlog','channel':channel,'computer_name':params.server_name,'event_id':eid,'event_data':data,'keywords':keywords,'opcode':'Info','provider_guid':'{eb79061a-a566-4698-9119-3ed2807060e7}','provider_name':'Microsoft-Windows-DNSServer','record_id': record|string,'task':task} -%}
-{%- if channel.endswith('/Audit') -%}{%- do winlog.update({'user': {'domain': params.server_name,'identifier':'S-1-5-21-1000000000-1000000000-1000000000-500','name':params.admin_name,'type':'User'}}) -%}{%- endif -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'agent_id_status':'verified','category':category,'code':eid,'created':timestamp.isoformat(),'dataset':'microsoft_dnsserver.audit' if channel.endswith('/Audit') else 'microsoft_dnsserver.analytical','ingested':timestamp.isoformat(),'kind':'event','provider':'Microsoft-Windows-DNSServer','sequence':record,'type':event_type},'data_stream':{'dataset':'microsoft_dnsserver.audit' if channel.endswith('/Audit') else 'microsoft_dnsserver.analytical','namespace':'default','type':'logs'},'host':{'architecture':'x86_64','hostname':params.server_name,'id':'d0500000-1111-4444-8888-123456789abc','ip':[params.server_ip],'mac':['02-42-AC-11-00-53'],'name':params.server_name,'os':{'build':'20348.2322','family':'windows','kernel':'10.0.20348.2322 (WinBuild.160101.0800)','name':'Windows Server 2022 Datacenter','platform':'windows','type':'windows','version':'10.0'}},'input':{'type':'winlog'},'log':{'level':'information'},'message':msg,'process':{'pid':852,'thread':{'id':7708}},'related':related,'tags':['preserve_duplicate_custom_fields'],'winlog':winlog} -%}
-{%- if data.QNAME is defined -%}
-  {%- set qtype = data.QTYPE if data.QTYPE is defined else 'A' -%}
-  {%- do out.update({'dns':{'question':{'name':data.QNAME,'registered_domain':params.normal_zone,'top_level_domain':'example','type':'A' if qtype == '1' else qtype}}}) -%}
-  {%- if kind == 'cache' -%}{%- do dns.update({'question_name':data.QNAME,'question_type':data.QTYPE}) -%}{%- endif -%}
-{%- endif -%}
-{%- if user -%}{%- do out.update({'user':user}) -%}{%- endif -%}
-{%- if dns -%}{%- do out.update({'microsoft_dnsserver':{'audit':dns}}) -%}{%- endif -%}
+{%- if is_audit -%}{%- do out.update({'message': msg}) -%}{%- endif -%}
 {{- out | tojson -}}
