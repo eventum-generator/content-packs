@@ -1,27 +1,26 @@
 # Postfix SMTP Syslog
 
-Generates native Postfix `smtpd`, `qmgr` and `smtp` syslog messages with consistent queue IDs and ECS correlation fields. The full syslog record is in `event.original`.
-
-Reference coverage: **14/14 documented native slots** across the modeled Postfix records: syslog timestamp, host, service, PID, queue ID, client address, SASL username, envelope sender, size, recipient count, recipient, relay, DSN and delivery status. Postfix has no Elastic integration sample for a broader ECS comparison.
+Generates Postfix 3.8.3+ submission-relay messages for `smtpd`, `cleanup`, `qmgr` and `smtp`. The complete native syslog line is in `event.original`; the output file contains parsed ECS JSON, not bare syslog lines. This profile assumes SASL is enabled on the submission service.
 
 ## Event Types
 
-| Native record | Meaning | Routine selection |
+| Native record | Purpose | Background selection |
 | --- | --- | ---: |
-| `postfix/smtpd` queue ID, `client=`, `sasl_username=` | Accepted submission | 70% of routine entries |
-| `postfix/qmgr` `from=`, `size=`, `nrcpt=1` | Active accepted message | Follows acceptance |
-| `postfix/smtp` `to=`, `relay=`, `dsn=`, `status=sent` | Delivered recipient | Follows queue activation |
-| `postfix/qmgr` `removed` | Queue completion | Follows delivery |
-| `postfix/smtpd` `NOQUEUE: reject` | Recipient rejection | 30% of routine entries |
-| SASL failures, accepted submission with `nrcpt=5`, five deliveries | Suspicious submission | Anomaly only |
+| `postfix/smtpd` with `client=`, `sasl_method=LOGIN`, `sasl_username=` | Accepted authenticated message | 90% of routine decisions |
+| `postfix/smtpd` `NOQUEUE: reject: RCPT` | Unknown recipient rejected before queueing | 7% of routine decisions |
+| `postfix/smtpd` `SASL LOGIN authentication failed` | Isolated failed login | 3% of routine decisions, at least 20 generated records apart |
+| `postfix/cleanup` `message-id=` | Message enters the queue | After every acceptance |
+| `postfix/qmgr` `from=`, `size=`, `nrcpt=` | Queue activation | After cleanup; ordinary `nrcpt` is 1/2/5 with weights 85/13/2 |
+| `postfix/smtp` `to=`, `relay=`, `delay=`, `delays=`, `dsn=`, `status=sent` | One successful recipient delivery | One per queued recipient |
+| `postfix/qmgr` `removed` | Message leaves the queue | After every modeled delivery completes |
 
-Weights apply to initial routine choices; an accepted message expands into four syslog records. They are configured weights, not measured Postfix frequencies. The authentication-failure line with `sasl_username` requires Postfix 3.6.12 or newer in the 3.6 line.
+The weights are synthetic configuration choices for a mostly successful submission relay, not measured Postfix frequencies. The one-second input tick is also a configurable synthetic traffic rate. Routine senders and recipients vary; queue IDs, relay addresses, per-recipient counts and delivery delays remain internally consistent.
 
 ## Anomaly Chain
 
-Three SASL LOGIN failures for `payroll@corp.example` from `10.99.3.51` are followed by an accepted `smtpd` submission from that identity. The resulting queue ID remains identical through one `qmgr` record (`nrcpt=5`), five `smtp status=sent` recipient deliveries and `qmgr removed`. Correlate failures and acceptance by username, source IP and host; correlate the subsequent message by queue ID. Rules can detect repeated failures preceding an accepted submission and an unusual recipient fan-out. The failure records have no queue ID because no message was accepted yet.
+After 250 routine decisions, one episode emits three failed SASL LOGIN attempts from the same user, IP and `smtpd` PID, followed by an accepted message from that session. Its queue ID then links `cleanup`, `qmgr nrcpt=5`, five distinct `smtp status=sent` deliveries and `qmgr removed`. A rule can correlate repeated failures followed by a successful submission, then count delivered recipients by queue ID. Failed authentications have no queue ID, so the correlation into the accepted message uses the user, IP, host, PID and time window.
 
-`anomaly_mode: true` is the default. Set `event.template.params.anomaly_mode: false` for background only. The payroll identity and five-recipient submission are absent in background mode.
+`anomaly_mode: true` is the default. With `false`, only background is emitted. The target user and IP, isolated failures and five-recipient deliveries also occur in background; no individual value or record marks the episode. The mode changes the sequence, not the event schema.
 
 ## Parameters
 
@@ -31,15 +30,15 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `mail_host`, `mail_ip` | `mail-01.corp.example`, `10.80.0.5` | Mail server identity |
-| `normal_user`, `normal_ip` | `service@corp.example`, `10.80.1.20` | Routine sender |
-| `anomaly_user`, `anomaly_ip` | `payroll@corp.example`, `10.99.3.51` | Chain actor |
-| `anomaly_interval_events` | `250` | Background events between chains |
-| `anomaly_mode` | `true` | Include anomaly sequence; `false` emits background only |
+| `mail_host`, `mail_ip` | `mail-01.corp.example`, `10.80.0.5` | Postfix host identity |
+| `normal_user`, `normal_ip` | `service@corp.example`, `10.80.1.20` | First routine sender; seven more are in `samples/senders.json` |
+| `anomaly_user`, `anomaly_ip` | `payroll@corp.example`, `10.99.3.51` | Episode identity, also used by routine mail and isolated failures |
+| `anomaly_interval_events` | `250` | Routine decisions before the single episode |
+| `anomaly_mode` | `true` | Include the episode; `false` emits background only |
 
 ### Output Parameters
 
-The shipped config writes `output/events.json` and has no `${params.*}` or `${secrets.*}` placeholders. Change `output.file.path` or replace the output plugin to connect a SIEM.
+The shipped configuration writes `output/events.json` and has no `${params.*}` or `${secrets.*}` placeholders. Change `output.file.path` or replace the output plugin for a SIEM. A collector expecting raw syslog should extract `event.original`.
 
 ## Usage
 
@@ -49,33 +48,26 @@ From the content-packs repository root:
 eventum generate --path generators/email-postfix/generator.yml --id email-postfix --live-mode true
 ```
 
-For a short local sample, use `--live-mode false` and stop the command after enough events.
+For a finite sample, add `input.cron.start` and `input.cron.end`, then run with `--live-mode false`.
 
 ## Sample Output
 
-The following event came from an enabled-mode run:
+This accepted message was copied from a verified anomaly-mode run. The same record shape also appears in background.
 
 ```json
 {
-  "@timestamp": "2026-09-25T12:36:50+00:00",
+  "@timestamp": "2026-09-25T00:19:30+00:00",
   "ecs": {
     "version": "8.17.0"
   },
-  "email": {
-    "to": {
-      "address": [
-        "invoice1@partner.example"
-      ]
-    }
-  },
   "event": {
-    "action": "delivery-sent",
+    "action": "smtp-accept",
     "category": [
       "email"
     ],
     "dataset": "postfix.syslog",
     "kind": "event",
-    "original": "Sep 25 12:36:50 mail-01.corp.example postfix/smtp[2401]: 00000338: to=<invoice1@partner.example>, relay=mx.partner.example[198.51.100.25]:25, delay=0.8, delays=0.1/0.1/0.2/0.4, dsn=2.0.0, status=sent (250 2.0.0 Ok: queued as REMOTE1)",
+    "original": "Sep 25 00:19:30 mail-01.corp.example postfix/smtpd[2400]: 4F657A0489: client=unknown[10.99.3.51], sasl_method=LOGIN, sasl_username=payroll@corp.example",
     "outcome": "success",
     "type": [
       "info"
@@ -90,10 +82,10 @@ The following event came from an enabled-mode run:
   "log": {
     "level": "info",
     "syslog": {
-      "appname": "postfix/smtp"
+      "appname": "postfix/smtpd"
     }
   },
-  "message": "00000338: to=<invoice1@partner.example>, relay=mx.partner.example[198.51.100.25]:25, delay=0.8, delays=0.1/0.1/0.2/0.4, dsn=2.0.0, status=sent (250 2.0.0 Ok: queued as REMOTE1)",
+  "message": "4F657A0489: client=unknown[10.99.3.51], sasl_method=LOGIN, sasl_username=payroll@corp.example",
   "observer": {
     "hostname": "mail-01.corp.example",
     "ip": "10.80.0.5",
@@ -102,30 +94,48 @@ The following event came from an enabled-mode run:
     "vendor": "Postfix"
   },
   "postfix": {
-    "queue_id": "00000338",
-    "service": "smtp"
+    "queue_id": "4F657A0489",
+    "sasl": {
+      "username": "payroll@corp.example"
+    },
+    "service": "smtpd"
   },
   "process": {
-    "name": "postfix/smtp",
-    "pid": 2401
+    "name": "postfix/smtpd",
+    "pid": 2400
   },
   "related": {
     "hosts": [
       "mail-01.corp.example"
+    ],
+    "ip": [
+      "10.99.3.51"
+    ],
+    "user": [
+      "payroll@corp.example"
     ]
+  },
+  "source": {
+    "ip": "10.99.3.51"
   },
   "tags": [
     "postfix",
     "preserve_original_event"
-  ]
+  ],
+  "user": {
+    "name": "payroll@corp.example"
+  }
 }
 ```
 
 ## References and Limits
 
-- [Postfix queue lifecycle](https://www.postfix.org/QSHAPE_README.html) describes tracking messages by queue ID.
-- [Postfix log examples](https://www.postfix.org/ETRN_README.html) show `qmgr` `from=`, `size=` and `nrcpt=` records.
-- [Postfix 3.6.12 release note](https://www.postfix.org/announcements/postfix-3.8.3.html) documents `sasl_username` on authentication failures.
-- [KUMA 4.0 supported sources](https://support.kaspersky.com/kuma/4.0/en-US/255782.htm) lists Postfix 3.6 syslog.
+- [Postfix architecture](https://www.postfix.org/OVERVIEW.html) documents the `smtpd` → `cleanup` → queue manager → `smtp` path.
+- [Postfix 3.8.3 announcement](https://www.postfix.org/announcements/postfix-3.8.3.html) documents `sasl_username` after authentication failure. The field was also backported to 3.7.8, 3.6.12 and 3.5.22; this generator models 3.8.3+.
+- [Postfix ETRN examples](https://www.postfix.org/ETRN_README.html) show queue activation with `from=`, `size=` and `nrcpt=`.
+- [Postfix connection-cache examples](https://www.postfix.org/CONNECTION_CACHE_README.html) show outbound `to=`, `relay=`, `delay=`, `delays=`, `dsn=` and `status=sent`.
+- [Postfix backscatter examples](https://www.postfix.org/BACKSCATTER_README.html) show `NOQUEUE: reject: RCPT` syntax.
+- [Postfix users list trace](https://www.mail-archive.com/postfix-users%40postfix.org/msg83417.html) shows one real queue ID through `smtpd`, `cleanup`, `qmgr`, `smtp` and `removed`.
+- [Postfix users list explanation](https://www.mail-archive.com/search?f=1&l=postfix-users%40postfix.org&o=newest&q=date%3A20110309) explains that `smtpd client=` creates a queue ID and `qmgr removed` closes that queue lifecycle.
 
-The file output is ECS JSON containing native syslog in `event.original`. A raw syslog collector needs that field extracted. Queue IDs link accepted mail to delivery, but authentication failures cannot be tied to a queue ID before acceptance.
+This is a selected successful-delivery path, not a complete Postfix mail log. It omits connection/TLS logs, postscreen, local delivery, bounce and deferred retries. An exact Postfix 3.8.3+ raw trace containing the complete three-failure-to-acceptance episode is not available in the cited evidence; the chain joins documented line formats and is a synthetic scenario. There is no source-specific Elastic integration sample used as a schema reference; `postfix.syslog` is the generator's ECS dataset name.

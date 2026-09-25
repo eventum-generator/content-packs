@@ -1,68 +1,144 @@
 {%- set step = vars.step -%}
 {%- set kind = step -%}
+{%- set seq = (shared.get('sequence', 0) % 2147483647) + 1 -%}
+{%- do shared.set('sequence', seq) -%}
 {%- if step == 'routine' -%}
   {%- do shared.pop('to_attack', none) -%}
   {%- do shared.pop('to_normal', none) -%}
   {%- set count = shared.get('routine_count', 0) + 1 -%}
   {%- if count >= params.anomaly_interval_events -%}
     {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['normal_accept','reject'],[70,30]) -%}
+    {%- if params.anomaly_mode and not shared.get('anomaly_done', false) -%}
+      {%- do shared.set('to_attack', true) -%}
+      {%- do shared.set('anomaly_done', true) -%}
+      {%- set kind = 'reject' -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do shared.set('routine_count', count) -%}
+  {%- endif -%}
+  {%- if kind == 'routine' -%}
+    {%- set kind = module.rand.weighted_choice(['normal_accept','reject','isolated_fail'],[90,7,3]) -%}
+    {%- if kind == 'isolated_fail' and seq - shared.get('last_routine_failure', -1000) < 20 -%}
+      {%- set kind = 'reject' -%}
+    {%- elif kind == 'isolated_fail' -%}
+      {%- do shared.set('last_routine_failure', seq) -%}
+    {%- endif -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set seq = (shared.get('sequence', 0) % 2147483647) + 1 -%}
-{%- do shared.set('sequence', seq) -%}
-{%- set queue = shared.get('active_queue', '') -%}
-{%- set service = 'smtpd' -%}{%- set level = 'info' -%}
-{%- set action = 'smtp-accept' -%}{%- set outcome = 'success' -%}
-{%- set category = ['email'] -%}{%- set event_type = ['info'] -%}
-{%- set actor = params.normal_user -%}{%- set src = params.normal_ip -%}
-{%- set sender = params.normal_user -%}
-{%- set recipient = shared.get('normal_recipient', 'user01@partner.example') -%}
+{%- set service = 'smtpd' -%}
+{%- set level = 'info' -%}
+{%- set action = 'smtp-accept' -%}
+{%- set outcome = 'success' -%}
+{%- set category = ['email'] -%}
+{%- set event_type = ['info'] -%}
+{%- set queue = '' -%}
+{%- set actor = '' -%}
+{%- set src = '' -%}
+{%- set sender = '' -%}
+{%- set recipient = '' -%}
+{%- set relay = none -%}
+{%- set recipient_count = none -%}
+{%- set message_id = none -%}
 {%- set msg = '' -%}
+{%- if kind in ['normal_accept','isolated_fail','reject'] -%}
+  {%- set sender_index = module.rand.number.integer(0, (samples.senders | length)) -%}
+  {%- if sender_index == (samples.senders | length) -%}
+    {%- set actor = params.anomaly_user -%}
+    {%- set src = params.anomaly_ip -%}
+    {%- set client = 'unknown' -%}
+  {%- else -%}
+    {%- set row = samples.senders[sender_index] -%}
+    {%- set actor = params.normal_user if sender_index == 0 else row.user -%}
+    {%- set src = params.normal_ip if sender_index == 0 else row.ip -%}
+    {%- set client = row.client -%}
+  {%- endif -%}
+  {%- set sender = actor -%}
+{%- endif -%}
 {%- if kind == 'normal_accept' -%}
-  {%- set queue = '%08X' % seq -%}
-  {%- do shared.set('active_queue', queue) -%}
-  {%- set rcpt = samples.recipients.pick() -%}
-  {%- set recipient = rcpt.email -%}{%- do shared.set('normal_recipient', recipient) -%}
-  {%- if not shared.get('to_attack') -%}{%- do shared.set('to_normal', true) -%}{%- endif -%}
-  {%- set msg = queue ~ ': client=client.corp.example[' ~ src ~ '], sasl_method=LOGIN, sasl_username=' ~ actor -%}
+  {%- set queue = module.rand.string.hex(10) | upper -%}
+  {%- do shared.update({'active_queue':queue,'active_sender':sender,'accepted_at':timestamp}) -%}
+  {%- do shared.set('to_normal', true) -%}
+  {%- set msg = queue ~ ': client=' ~ client ~ '[' ~ src ~ '], sasl_method=LOGIN, sasl_username=' ~ actor -%}
 {%- elif kind == 'reject' -%}
-  {%- set action = 'smtp-reject' -%}{%- set outcome = 'failure' -%}
+  {%- set action = 'smtp-reject' -%}
+  {%- set outcome = 'failure' -%}
   {%- set event_type = ['denied'] -%}
-  {%- set msg = 'NOQUEUE: reject: RCPT from unknown[' ~ src ~ ']: 550 5.1.1 <missing@corp.example>: Recipient address rejected: User unknown; from=<' ~ sender ~ '> to=<missing@corp.example> proto=ESMTP helo=<client.corp.example>' -%}
-{%- elif kind in ['fail_1','fail_2','fail_3'] -%}
-  {%- set actor = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
-  {%- set action = 'sasl-auth-failed' -%}{%- set outcome = 'failure' -%}
-  {%- set category = ['authentication','email'] -%}{%- set event_type = ['denied'] -%}
+  {%- set msg = 'NOQUEUE: reject: RCPT from ' ~ client ~ '[' ~ src ~ ']: 550 5.1.1 <missing@corp.example>: Recipient address rejected: User unknown; from=<' ~ sender ~ '> to=<missing@corp.example> proto=ESMTP helo=<' ~ client ~ '>' -%}
+{%- elif kind in ['isolated_fail','fail_1','fail_2','fail_3'] -%}
+  {%- if kind != 'isolated_fail' -%}
+    {%- if kind == 'fail_1' -%}{%- do shared.set('attack_smtpd_pid', 2400 + seq % 8) -%}{%- endif -%}
+    {%- set actor = params.anomaly_user -%}
+    {%- set src = params.anomaly_ip -%}
+  {%- endif -%}
+  {%- set action = 'sasl-auth-failed' -%}
+  {%- set outcome = 'failure' -%}
+  {%- set category = ['authentication','email'] -%}
+  {%- set event_type = ['denied'] -%}
   {%- set level = 'warning' -%}
   {%- set msg = 'warning: unknown[' ~ src ~ ']: SASL LOGIN authentication failed: authentication failure, sasl_username=' ~ actor -%}
 {%- elif kind == 'accepted' -%}
-  {%- set actor = params.anomaly_user -%}{%- set sender = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
-  {%- set queue = '%08X' % seq -%}{%- do shared.set('active_queue', queue) -%}
-  {%- set category = ['authentication','email'] -%}{%- set event_type = ['start','allowed'] -%}
+  {%- set actor = params.anomaly_user -%}
+  {%- set sender = actor -%}
+  {%- set src = params.anomaly_ip -%}
+  {%- set queue = module.rand.string.hex(10) | upper -%}
+  {%- do shared.update({'active_queue':queue,'active_sender':sender,'accepted_at':timestamp}) -%}
   {%- set msg = queue ~ ': client=unknown[' ~ src ~ '], sasl_method=LOGIN, sasl_username=' ~ actor -%}
+{%- elif kind in ['normal_cleanup','attack_cleanup'] -%}
+  {%- set service = 'cleanup' -%}
+  {%- set action = 'message-cleanup' -%}
+  {%- set queue = shared.get('active_queue') -%}
+  {%- set message_id = '<' ~ timestamp.strftime('%Y%m%d%H%M%S') ~ '.' ~ queue ~ '@' ~ params.mail_host ~ '>' -%}
+  {%- set msg = queue ~ ': message-id=' ~ message_id -%}
 {%- elif kind in ['normal_qmgr','attack_qmgr'] -%}
-  {%- set service = 'qmgr' -%}{%- set action = 'queue-active' -%}
-  {%- set sender = params.anomaly_user if kind == 'attack_qmgr' else params.normal_user -%}
-  {%- set count = 5 if kind == 'attack_qmgr' else 1 -%}
-  {%- set msg = queue ~ ': from=<' ~ sender ~ '>, size=' ~ (48210 if kind == 'attack_qmgr' else 3210) ~ ', nrcpt=' ~ count ~ ' (queue active)' -%}
-{%- elif kind in ['normal_smtp','attack_smtp_1','attack_smtp_2','attack_smtp_3','attack_smtp_4','attack_smtp_5'] -%}
-  {%- set service = 'smtp' -%}{%- set action = 'delivery-sent' -%}
-  {%- set event_type = ['info'] -%}
-  {%- if kind.startswith('attack_') -%}
-    {%- set sender = params.anomaly_user -%}
-    {%- set recipient = 'invoice' ~ kind[-1] ~ '@partner.example' -%}
+  {%- set service = 'qmgr' -%}
+  {%- set action = 'queue-active' -%}
+  {%- set queue = shared.get('active_queue') -%}
+  {%- set sender = shared.get('active_sender') -%}
+  {%- set recipient_count = 5 if kind == 'attack_qmgr' else module.rand.weighted_choice([1,2,5],[85,13,2]) -%}
+  {%- set first_recipient = module.rand.number.integer(0, (samples.recipients | length) - recipient_count) -%}
+  {%- set size = module.rand.number.clamp(module.rand.number.lognormal(8.9, 1.1), 512, 250000) | int -%}
+  {%- do shared.update({'recipient_count':recipient_count,'recipient_index':0,'first_recipient':first_recipient}) -%}
+  {%- set msg = queue ~ ': from=<' ~ sender ~ '>, size=' ~ size ~ ', nrcpt=' ~ recipient_count ~ ' (queue active)' -%}
+{%- elif kind == 'normal_smtp' or kind.startswith('attack_smtp_') -%}
+  {%- set service = 'smtp' -%}
+  {%- set action = 'delivery-sent' -%}
+  {%- set queue = shared.get('active_queue') -%}
+  {%- set index = shared.get('recipient_index') -%}
+  {%- set row = samples.recipients[shared.get('first_recipient') + index] -%}
+  {%- set recipient = row.email -%}
+  {%- set relay = row.relay_host ~ '[' ~ row.relay_ip ~ ']:25' -%}
+  {%- do shared.set('recipient_index', index + 1) -%}
+  {%- if kind == 'normal_smtp' -%}
+    {%- if index + 1 < shared.get('recipient_count') -%}
+      {%- do shared.set('more_normal', true) -%}
+    {%- else -%}
+      {%- do shared.pop('more_normal', none) -%}
+    {%- endif -%}
   {%- endif -%}
-  {%- set msg = queue ~ ': to=<' ~ recipient ~ '>, relay=mx.partner.example[198.51.100.25]:25, delay=0.8, delays=0.1/0.1/0.2/0.4, dsn=2.0.0, status=sent (250 2.0.0 Ok: queued as REMOTE' ~ (kind[-1] if kind.startswith('attack_') else '1') ~ ')' -%}
+  {%- set delay = [0.8, (timestamp - shared.get('accepted_at')).total_seconds()] | max -%}
+  {%- set delay = '%.1f' % delay -%}
+  {%- set queue_delay = '%.1f' % (delay | float - 0.7) -%}
+  {%- set msg = queue ~ ': to=<' ~ recipient ~ '>, relay=' ~ relay ~ ', delay=' ~ delay ~ ', delays=0.2/' ~ queue_delay ~ '/0.2/0.3, dsn=2.0.0, status=sent (250 2.0.0 Ok)' -%}
 {%- else -%}
-  {%- set service = 'qmgr' -%}{%- set action = 'queue-removed' -%}
+  {%- set service = 'qmgr' -%}
+  {%- set action = 'queue-removed' -%}
   {%- set event_type = ['end'] -%}
+  {%- set queue = shared.get('active_queue') -%}
   {%- set msg = queue ~ ': removed' -%}
 {%- endif -%}
-{%- set original = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.mail_host ~ ' postfix/' ~ service ~ '[2401]: ' ~ msg -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':category,'dataset':'postfix.syslog','kind':'event','original':original,'outcome':outcome,'type':event_type},'host':{'name':params.mail_host,'ip':[params.mail_ip]},'log':{'level':level,'syslog':{'appname':'postfix/' ~ service}},'message':msg,'observer':{'hostname':params.mail_host,'ip':params.mail_ip,'product':'Postfix','type':'mail','vendor':'Postfix'},'postfix':{'queue_id':queue if queue else 'NOQUEUE','service':service},'process':{'name':'postfix/' ~ service,'pid':2401},'related':{'hosts':[params.mail_host]},'tags':['postfix','preserve_original_event']} -%}
-{%- if kind in ['normal_accept','accepted','fail_1','fail_2','fail_3'] -%}
+{%- set pid = (shared.get('attack_smtpd_pid') if kind in ['fail_1','fail_2','fail_3','accepted'] else 2400 + seq % 8) if service == 'smtpd' else (2411 if service == 'qmgr' else (2420 + seq % 3 if service == 'cleanup' else 2450 + seq % 6)) -%}
+{%- set original = timestamp.strftime('%b %e %H:%M:%S') ~ ' ' ~ params.mail_host ~ ' postfix/' ~ service ~ '[' ~ pid ~ ']: ' ~ msg -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':category,'dataset':'postfix.syslog','kind':'event','original':original,'outcome':outcome,'type':event_type},'host':{'name':params.mail_host,'ip':[params.mail_ip]},'log':{'level':level,'syslog':{'appname':'postfix/' ~ service}},'message':msg,'observer':{'hostname':params.mail_host,'ip':params.mail_ip,'product':'Postfix','type':'mail','vendor':'Postfix'},'postfix':{'service':service},'process':{'name':'postfix/' ~ service,'pid':pid},'related':{'hosts':[params.mail_host]},'tags':['postfix','preserve_original_event']} -%}
+{%- if queue -%}
+  {%- do out.postfix.update({'queue_id':queue}) -%}
+{%- endif -%}
+{%- if message_id -%}
+  {%- do out.postfix.update({'message_id':message_id}) -%}
+{%- endif -%}
+{%- if recipient_count -%}
+  {%- do out.postfix.update({'recipient_count':recipient_count}) -%}
+{%- endif -%}
+{%- if kind in ['normal_accept','accepted','isolated_fail','fail_1','fail_2','fail_3'] -%}
   {%- do out.update({'source':{'ip':src},'user':{'name':actor}}) -%}
   {%- do out.postfix.update({'sasl':{'username':actor}}) -%}
   {%- do out.related.update({'ip':[src],'user':[actor]}) -%}
@@ -73,7 +149,16 @@
 {%- endif -%}
 {%- if kind in ['normal_qmgr','attack_qmgr'] -%}
   {%- do out.update({'email':{'from':{'address':[sender]}}}) -%}
-{%- elif kind in ['normal_smtp','attack_smtp_1','attack_smtp_2','attack_smtp_3','attack_smtp_4','attack_smtp_5'] -%}
+{%- elif kind == 'normal_smtp' or kind.startswith('attack_smtp_') -%}
   {%- do out.update({'email':{'to':{'address':[recipient]}}}) -%}
+{%- endif -%}
+{%- if kind == 'accepted' -%}{%- do shared.pop('attack_smtpd_pid', none) -%}{%- endif -%}
+{%- if kind in ['normal_removed','attack_removed'] -%}
+  {%- do shared.pop('active_queue', none) -%}
+  {%- do shared.pop('active_sender', none) -%}
+  {%- do shared.pop('accepted_at', none) -%}
+  {%- do shared.pop('recipient_count', none) -%}
+  {%- do shared.pop('recipient_index', none) -%}
+  {%- do shared.pop('first_recipient', none) -%}
 {%- endif -%}
 {{- out | tojson -}}
