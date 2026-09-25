@@ -1,0 +1,33 @@
+{%- set step = vars.step -%}
+{%- set chain = step.startswith('chain_') -%}
+{%- if step == 'routine_a' -%}
+  {%- do shared.pop('to_chain', none) -%}
+  {%- set count = shared.get('routine_count', 0) + 1 -%}
+  {%- if count >= params.anomaly_interval_events -%}
+    {%- do shared.set('routine_count', 0) -%}
+    {%- if params.anomaly_mode -%}{%- do shared.set('to_chain', true) -%}{%- endif -%}
+  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{%- endif -%}
+{%- set class_id = 9 if step.startswith('chain_denied') else (8 if step == 'chain_login' else (14 if step == 'chain_request' else module.rand.weighted_choice([14, 9, 8], [85, 10, 5]))) -%}
+{%- set name = 'Access Denied' if class_id == 9 else ('Logged on' if class_id == 8 else 'Request') -%}
+{%- set severity = 6 if class_id == 9 else 1 -%}
+{%- set src = params.chain_source_ip if chain else '10.42.1.' ~ module.rand.number.integer(10, 180) -%}
+{%- set user = params.chain_user if chain else module.rand.choice(['alice@example.test', 'bob@example.test', 'service@example.test']) -%}
+{%- set vs = params.virtual_ip ~ ':443' -%}
+{%- set srcport = module.rand.number.integer(40000, 60000) -%}
+{%- set extension = {'vs':vs,'event':name,'srcip':src} -%}
+{%- if class_id == 14 -%}
+  {%- do extension.update({'srcport':srcport,'method':'GET','url':'https://' ~ params.virtual_ip ~ ('/admin' if chain else module.rand.choice(['/','/app','/health'])),'user':user,'useragent':'Mozilla/5.0'}) -%}
+{%- else -%}
+  {%- do extension.update({'user':user,'msg':'denied access' if class_id == 9 else 'logged on'}) -%}
+{%- endif -%}
+{%- set pairs = [] -%}
+{%- for key,value in extension.items() -%}{%- do pairs.append(key ~ '=' ~ value|string) -%}{%- endfor -%}
+{%- set raw = 'CEF:0|Kemp|LM|1.0|' ~ class_id ~ '|' ~ name ~ '|' ~ severity ~ '|' ~ pairs|join(' ') -%}
+{%- set cef = {'version':0,'vendor':'Kemp','product':'LM','device_version':'1.0','class_id':class_id,'name':name,'severity':severity,'extension':extension} -%}
+{%- set specific = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'access-denied' if class_id == 9 else ('logged-on' if class_id == 8 else 'request'),'category':['authentication'] if class_id == 8 else ['web'],'code':class_id|string,'dataset':'kemp_loadmaster.esp','kind':'event','original':raw,'type':['denied'] if class_id == 9 else (['start'] if class_id == 8 else ['access'])},'host':{'name':params.device_name},'source':{'ip':src},'destination':{'ip':params.virtual_ip,'port':443},'related':{'ip':[src,params.virtual_ip],'user':[user]},'user':{'name':user},'kemp':{'loadmaster':cef}} -%}
+{%- if class_id == 14 -%}
+  {%- do specific.source.update({'port':srcport}) -%}
+  {%- do specific.update({'http':{'request':{'method':'GET'}},'url':{'full':extension.url}}) -%}
+{%- endif -%}
+{{- specific | tojson -}}
