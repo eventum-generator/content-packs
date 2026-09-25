@@ -4,9 +4,9 @@ Synthetic CyberArk PTA 12.6 credential-theft alert notifications for SIEM correl
 
 ## Event types
 
-| Native alert | Reference CEF class | Approximate frequency | ECS category/kind |
+| Native alert | Reference CEF class | Approximate frequency | ECS category/type (kind) |
 | --- | --- | --- | --- |
-| `Suspected credentials theft` | `1` in the tested 12.6 raw sample | 100%; independent alert subjects dominate, four linked alerts recur in anomaly mode | `threat` / `alert` |
+| `Suspected credentials theft` | `1` in the tested 12.6 raw sample | 100%; independent alert subjects dominate, four linked alerts recur in anomaly mode | `threat` / `info` (`alert`) |
 
 PTA emits detections, so even background events are individual **alerts**, not benign user actions. The generator models one PTA instance, with four fixed source/target pairs in the background.
 
