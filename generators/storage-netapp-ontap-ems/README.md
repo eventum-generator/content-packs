@@ -116,5 +116,5 @@ Configure an EMS destination and event filter that forwards these event names. F
 - [ONTAP 9.12.1 EMS syslog destination and message format](https://docs.netapp.com/us-en/ontap-cli-9121/event-notification-destination-create.html)
 - [ONTAP 9.12.1 invalid login EMS message](https://docs.netapp.com/us-en/ontap-ems-9121/security-invalid-events.html)
 - [ONTAP 9.12.1 lockout EMS message](https://docs.netapp.com/us-en/ontap-ems-9121/useradmin-lockedout-events.html)
-- [ONTAP 9.12.1 ZAPI Snapshot success EMS message](https://docs.netapp.com/us-en/ontap-ems-9121/pdfs/fullsite-sidebar/ONTAP_9_12_1_EMS_reference.pdf)
+- [ONTAP 9.12.1 full EMS catalog: login, lockout, and Snapshot messages](https://docs.netapp.com/us-en/ontap-ems-9121/pdfs/fullsite-sidebar/ONTAP_9_12_1_EMS_reference.pdf)
 - [NetApp EMS forwarding and filters](https://kb.netapp.com/on-prem/ontap/Ontap_OS/OS-KBs/Event_forwarding_to_a_Syslog_server)
