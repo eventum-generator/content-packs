@@ -10,13 +10,13 @@ Synthetic Windows `System` channel XML from the `Service Control Manager` provid
 | 7045 | Service installed | 2% | `configuration` / `change` |
 | 7040 | Service start type changed | 2% | `configuration` / `change` |
 
-Each event retains complete Event Viewer XML in `event.original` and parsed fields under `winlog.*`. The generator models four routine endpoints and two additional endpoints used in the correlated series. EventRecordID increases per host.
+Each event retains complete Event Viewer XML in `event.original` and parsed fields under `winlog.*`. The generator models six routine endpoints, including the two that also participate in the correlated series. EventRecordID increases per host.
 
 ## Anomaly Chain
 
 With `anomaly_mode: true` (the default), the same `ContosoTelemetry` service is installed on two endpoints from a `C:\ProgramData` executable, changed from `demand start` to `auto start` and then observed entering the `running` state on each host. The six events are `7045 → 7040 → 7036` on `chain_host_a`, followed by the same sequence on `chain_host_b`. Correlate the service name and image path across hosts, then check start-type and state transitions within 10 seconds. The validated one-second cadence produced a five-second span from the first to last event. Sort by `@timestamp` before sequence analysis because output lines may be interleaved.
 
-With `anomaly_mode: false`, ordinary service-state changes and independent installation/configuration pairs continue. The cross-host `ContosoTelemetry` series disappears. The SCM XML contains no reliable remote operator identity, so the chain does not attribute the installations to one user.
+With `anomaly_mode: false`, ordinary service-state changes and independent installation/configuration pairs continue. `ContosoTelemetry` appears in 7036, 7045 and 7040 on both series hosts, with the same image path; only the rapid six-step cross-host sequence disappears. In the validated 10-second rule, the anomaly run had nine complete matches and the background run had none, even though each had ordinary three-step same-host matches. The SCM XML contains no reliable remote operator identity, so the chain does not attribute the installations to one user.
 
 ## Parameters
 
@@ -54,7 +54,7 @@ This service installation event was copied from an anomaly-mode run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T15:10:43+00:00",
+  "@timestamp": "2026-09-25T14:59:36+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -66,7 +66,7 @@ This service installation event was copied from an anomaly-mode run:
     "code": "7045",
     "dataset": "windows.service_control_manager",
     "kind": "event",
-    "original": "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Service Control Manager\" Guid=\"{555908d1-a6d7-4695-8e1e-26931d2012f4}\" EventSourceName=\"Service Control Manager\" /><EventID Qualifiers=\"16384\">7045</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8080000000000000</Keywords><TimeCreated SystemTime=\"2026-09-25T15:10:43Z\" /><EventRecordID>1000</EventRecordID><Correlation /><Execution ProcessID=\"700\" ThreadID=\"1100\" /><Channel>System</Channel><Computer>WS-FIN-01.corp.example.test</Computer><Security UserID=\"S-1-5-18\" /></System><EventData><Data Name=\"ServiceName\">ContosoTelemetry</Data><Data Name=\"ImagePath\">C:\\ProgramData\\Contoso\\telemetry-svc.exe</Data><Data Name=\"ServiceType\">user mode service</Data><Data Name=\"StartType\">demand start</Data><Data Name=\"AccountName\">LocalSystem</Data></EventData></Event>",
+    "original": "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Service Control Manager\" Guid=\"{555908d1-a6d7-4695-8e1e-26931d2012f4}\" EventSourceName=\"Service Control Manager\" /><EventID Qualifiers=\"16384\">7045</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8080000000000000</Keywords><TimeCreated SystemTime=\"2026-09-25T14:59:36Z\" /><EventRecordID>1038</EventRecordID><Correlation /><Execution ProcessID=\"738\" ThreadID=\"1138\" /><Channel>System</Channel><Computer>WS-FIN-01.corp.example.test</Computer><Security UserID=\"S-1-5-18\" /></System><EventData><Data Name=\"ServiceName\">ContosoTelemetry</Data><Data Name=\"ImagePath\">C:\\ProgramData\\Contoso\\telemetry-svc.exe</Data><Data Name=\"ServiceType\">user mode service</Data><Data Name=\"StartType\">demand start</Data><Data Name=\"AccountName\">LocalSystem</Data></EventData></Event>",
     "provider": "Service Control Manager",
     "type": [
       "change"
@@ -118,8 +118,8 @@ This service installation event was copied from an anomaly-mode run:
     "level": "information",
     "provider_guid": "{555908d1-a6d7-4695-8e1e-26931d2012f4}",
     "provider_name": "Service Control Manager",
-    "record_id": 1000,
-    "time_created": "2026-09-25T15:10:43+00:00"
+    "record_id": 1038,
+    "time_created": "2026-09-25T14:59:36+00:00"
   }
 }
 ```
