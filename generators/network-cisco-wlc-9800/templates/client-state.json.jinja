@@ -1,0 +1,168 @@
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.round(ts.timestamp() * 1000) -%}
+{#- Synthetic workload, durations in ms. Sessions and absences are mixtures: a lognormal body plus a short tail (sleep/wake, band steering, re-authentication). Tails start at an offset, so density falls smoothly to zero with no floor cliff; upper limits truncate by redrawing. Episodes draw from the same tail components. -#}
+{%- set session_mu = module.math.log(35 * 60000) -%}{%- set session_sigma = 1.0 -%}
+{%- set gap_mu = module.math.log(10 * 60000) -%}{%- set gap_sigma = 1.2 -%}
+{%- macro draw(lo, mu, sigma, hi) -%}
+  {%- set ns = namespace(value=lo + module.rand.number.lognormal(mu, sigma)) -%}
+  {%- for attempt in range(16) if ns.value > hi -%}{%- set ns.value = lo + module.rand.number.lognormal(mu, sigma) -%}{%- endfor -%}
+  {{- [ns.value, hi] | min -}}
+{%- endmacro -%}
+{%- macro short_session(hi) -%}{{- draw(8000, module.math.log(40000), 0.8, hi) -}}{%- endmacro -%}
+{%- macro quick_reconnect(hi) -%}{{- draw(1000, module.math.log(5000), 0.7, hi) -}}{%- endmacro -%}
+{%- macro session() -%}{{- short_session(180000) if module.rand.chance(0.12) else draw(0, session_mu, session_sigma, 43200000) -}}{%- endmacro -%}
+{%- macro absence() -%}{{- quick_reconnect(60000) if module.rand.chance(0.12) else draw(0, gap_mu, gap_sigma, 28800000) -}}{%- endmacro -%}
+{%- if not shared.get('stations') -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'strict': true, 'ge': 6, 'le': 8760}},
+    'controller_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'}},
+    'ssid': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[^()\r\n]{1,32}$'}},
+    'suspicious_user': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._@+-]{1,64}$'}},
+    'suspicious_mac': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$'}},
+    'suspicious_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true}}
+  }} -%}
+  {%- set checked = module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set address = module.ipaddress.ip_address(checked.suspicious_ip) -%}
+  {%- set octets = module.builtins.bytearray.fromhex(checked.suspicious_mac.replace('.', '')) -%}
+  {%- set eui64 = module.ipaddress.IPv6Address(module.builtins.bytes([254, 128, 0, 0, 0, 0, 0, 0, octets[0] + (-2 if octets[0] % 4 >= 2 else 2), octets[1], octets[2], 255, 254, octets[3], octets[4], octets[5]])) -%}
+  {%- set stations = [] -%}
+  {%- for i in range(48) -%}
+    {%- set row = samples.clients[i] -%}
+    {%- if i == 0 -%}
+      {%- set profile = 'v4ll' if address.version == 4 else 'v6' -%}
+      {%- set ipv4 = module.builtins.str(address) if address.version == 4 else none -%}
+      {%- set ipv6 = module.builtins.str(address) if address.version == 6 else none -%}
+      {%- set ll = module.builtins.str(eui64) -%}
+    {%- else -%}
+      {%- set profile = row.profile -%}{%- set ipv4 = row.ipv4 -%}{%- set ipv6 = row.ipv6 -%}{%- set ll = row.link_local -%}
+    {%- endif -%}
+    {#- Address learned at RUN, then addresses added by later IP updates. -#}
+    {%- set plan = {'v4ll': ([ipv4], [ll]), 'dual': ([ipv4], [ll, ipv6]), 'v4': ([ipv4], []), 'v6': ([ll], [ipv6])}[profile] -%}
+    {%- do stations.append({'user': checked.suspicious_user if i == 0 else row.user, 'mac': checked.suspicious_mac.lower() if i == 0 else row.mac, 'floor': row.floor, 'home': i % 3, 'ipv4': ipv4, 'ipv6': ipv6, 'll': ll, 'run_ips': plan[0], 'learn': plan[1], 'active': false, 'ap': none, 'ips': [], 'pending': [], 'kind': 'run', 'due': now, 'end_at': now, 'run_at': 0, 'deleted_at': 0, 'hist': [], 'left': 0, 'aps': []}) -%}
+  {%- endfor -%}
+  {%- set seen_macs = [] -%}{%- set seen_addresses = [] -%}
+  {%- set valid = namespace(macs=true, addresses=true) -%}
+  {%- for station in stations -%}
+    {%- if station.mac in seen_macs -%}{%- set valid.macs = false -%}{%- endif -%}
+    {%- do seen_macs.append(station.mac) -%}
+    {%- for value, family in [(station.ipv4, 4), (station.ipv6, 6), (station.ll, 0)] -%}
+      {%- if value is not none -%}
+        {%- set ip = module.ipaddress.ip_address(value) -%}
+        {%- set wrong_class = (ip.is_link_local != (family == 0)) or (family == 0 and ip.version != 6) or (family != 0 and ip.version != family) -%}
+        {%- if wrong_class or value in seen_addresses or ip.is_multicast or ip.is_unspecified or ip.is_loopback or ip.is_reserved or (ip.version == 4 and (module.builtins.int(ip) < 16777216 or module.builtins.int(ip) % 256 in [0, 255])) -%}{%- set valid.addresses = false -%}{%- endif -%}
+        {%- do seen_addresses.append(value) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set guard = module.pydantic_core.SchemaValidator({'type': 'typed-dict', 'fields': {
+    'unique_station_macs': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}},
+    'distinct_unicast_addresses': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}},
+    'unicast_station_mac': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}},
+    'ascii_ssid': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}}
+  }}) -%}
+  {%- do guard.validate_python({'unique_station_macs': valid.macs, 'distinct_unicast_addresses': valid.addresses, 'unicast_station_mac': module.builtins.int(checked.suspicious_mac[:2], 16) % 2 == 0 and checked.suspicious_mac != '0000.0000.0000', 'ascii_ssid': checked.ssid.isascii()}) -%}
+  {#- Start in steady state: some clients are already associated before the first input timestamp. Residuals use the length-biased lognormal. -#}
+  {%- set mean_session = module.math.exp(session_mu + session_sigma ** 2 / 2) -%}
+  {%- set mean_gap = module.math.exp(gap_mu + gap_sigma ** 2 / 2) -%}
+  {%- for station in stations -%}
+    {%- if module.rand.chance(mean_session / (mean_session + mean_gap)) -%}
+      {%- set residual = module.rand.number.floating(0, 1) * (draw(0, session_mu + session_sigma ** 2, session_sigma, 43200000) | float) -%}
+      {%- do station.update({'active': true, 'ap': 'AP-Floor' ~ station.floor ~ '-' ~ module.rand.weighted_choice(['A', 'B', 'C'], [[50, 25, 25], [25, 50, 25], [25, 25, 50]][station.home]), 'ips': station.run_ips + station.learn, 'kind': 'delete', 'run_at': now - 36000000, 'due': now + module.builtins.int(residual)}) -%}
+    {%- else -%}
+      {%- set residual = module.rand.number.floating(0, 1) * (draw(0, gap_mu + gap_sigma ** 2, gap_sigma, 28800000) | float) -%}
+      {%- do station.update({'due': now + module.builtins.int(residual)}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.update({'stations': stations, 'episode_idx': none, 'episode_cursor': 0, 'episode_order': 0, 'next_episode_due': now + module.builtins.round(checked.anomaly_interval_hours * 3600000), 'last_ms': now - 1, 'last_tick': now, 'next_due': stations | map(attribute='due') | min}) -%}
+{%- endif -%}
+{%- set stations = shared.get('stations') -%}
+{#- After an input gap, overdue clients get fresh residual schedules instead of a backdated burst. -#}
+{%- if now - shared.get('last_tick') > 60000 -%}
+  {%- for station in stations if station.due < now -%}
+    {%- if station.left > 0 -%}
+      {%- set wait = quick_reconnect(30000) | float -%}
+    {%- elif station.kind == 'ipu' -%}
+      {%- set wait = draw(5, module.math.log(240), 1.0, 3000) | float -%}
+    {%- elif station.kind == 'delete' -%}
+      {%- set wait = module.rand.number.floating(0, 1) * (draw(0, session_mu + session_sigma ** 2, session_sigma, 43200000) | float) -%}
+    {%- else -%}
+      {%- set wait = module.rand.number.floating(0, 1) * (draw(0, gap_mu + gap_sigma ** 2, gap_sigma, 28800000) | float) -%}
+    {%- endif -%}
+    {%- do station.update({'due': now + module.builtins.int(wait)}) -%}
+    {%- if station.kind == 'ipu' and station.end_at < now -%}{%- do station.update({'end_at': now + module.builtins.int(module.rand.number.floating(0, 1) * (draw(0, session_mu + session_sigma ** 2, session_sigma, 43200000) | float))}) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('next_due', stations | map(attribute='due') | min) -%}
+{%- endif -%}
+{%- do shared.set('last_tick', now) -%}
+{#- A due episode starts on the first input tick at or after its due time, once the selected client is not learning addresses, any current association is at least three minutes old and any last DELETE is at least 90 seconds old. The next one is due one interval after the actual start, so an input gap never queues overdue episodes. -#}
+{%- if params.anomaly_mode and shared.get('episode_idx') is none and now >= shared.get('next_episode_due') -%}
+  {%- set idx = shared.get('episode_cursor') -%}
+  {%- set station = stations[idx] -%}
+  {%- if station.kind != 'ipu' and ((station.active and now - station.run_at >= 180000) or (not station.active and now - station.deleted_at >= 90000)) -%}
+    {%- set order = shared.get('episode_order') -%}
+    {%- do station.update({'left': 3, 'due': now + module.rand.number.integer(1, 999), 'aps': ['A', 'B', 'C'][order:] + ['A', 'B', 'C'][:order]}) -%}
+    {%- do shared.update({'episode_idx': idx, 'episode_cursor': (idx + 1) % 48, 'episode_order': (order + 1) % 3, 'next_episode_due': now + module.builtins.round(params.anomaly_interval_hours * 3600000), 'next_due': [shared.get('next_due'), station.due] | min}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set pick = namespace(station=none) -%}
+{%- for candidate in stations -%}
+  {%- if candidate.due <= now and (pick.station is none or candidate.due < pick.station.due) -%}{%- set pick.station = candidate -%}{%- endif -%}
+{%- endfor -%}
+{%- set station = pick.station -%}
+{%- set rec = [station.due, shared.get('last_ms') + 1] | max -%}
+{%- set kind = station.kind -%}
+{%- if kind == 'run' -%}
+  {%- if station.left > 0 -%}
+    {%- set ap_suffix = station.aps[3 - station.left] -%}
+    {%- do station.update({'left': station.left - 1}) -%}
+    {%- set dwell = (short_session(100000) | float) if station.left > 0 else (session() | float) -%}
+    {%- if station.left == 0 -%}{%- do shared.set('episode_idx', none) -%}{%- endif -%}
+  {%- else -%}
+    {#- Ordinary traffic never completes the chain shape: after two consecutive associations of at most 120 s on two APs, each reached within 60 s, a quick reconnect stays on one of those two APs. -#}
+    {%- set h = station.hist -%}
+    {%- if h | length >= 2 and h[-1].end is not none and h[-2].end is not none and h[-1].end - h[-1].run <= 120000 and rec - h[-1].end <= 60000 and h[-2].end - h[-2].run <= 120000 and h[-1].run - h[-2].end <= 60000 and h[-1].ap != h[-2].ap -%}
+      {%- set ap_suffix = module.rand.choice([h[-1].ap[-1], h[-2].ap[-1]]) -%}
+    {%- else -%}
+      {%- set ap_suffix = module.rand.weighted_choice(['A', 'B', 'C'], [[50, 25, 25], [25, 50, 25], [25, 25, 50]][station.home]) -%}
+    {%- endif -%}
+    {%- set dwell = (session() | float) -%}
+  {%- endif -%}
+  {%- do station.update({'active': true, 'run_at': rec, 'ap': 'AP-Floor' ~ station.floor ~ '-' ~ ap_suffix, 'ips': station.run_ips, 'pending': station.learn, 'end_at': rec + module.builtins.int(dwell), 'hist': station.hist[-1:] + [{'ap': 'AP-Floor' ~ station.floor ~ '-' ~ ap_suffix, 'run': rec, 'end': none}]}) -%}
+  {%- set ips = station.ips -%}
+  {%- set code = 'CLIENT_MOVED_TO_RUN_STATE' -%}
+  {%- set tail = 'associated to AP (' ~ station.ap ~ ') with SSID (' ~ params.ssid ~ ')' -%}
+{%- elif kind == 'ipu' -%}
+  {%- do station.update({'ips': station.ips + station.pending[:1], 'pending': station.pending[1:]}) -%}
+  {%- set ips = station.ips -%}
+  {%- set code = 'CLIENT_IP_UPDATED' -%}
+  {%- set tail = 'IP address updated, associated to AP (' ~ station.ap ~ ') with SSID (' ~ params.ssid ~ ')' -%}
+{%- else -%}
+  {#- DELETE lists link-local first and IPv4 last, as in the 17.11 open-authentication DELETE example. -#}
+  {%- set ips = (station.ips | select('equalto', station.ll) | list) + (station.ips | reject('in', [station.ll, station.ipv4]) | list) + (station.ips | select('equalto', station.ipv4) | list) -%}
+  {%- if station.hist -%}{%- do station.hist[-1].update({'end': rec}) -%}{%- endif -%}
+  {%- do station.update({'active': false, 'ips': [], 'pending': [], 'deleted_at': rec}) -%}
+  {%- set code = 'CLIENT_MOVED_TO_DELETE_STATE' -%}
+  {%- set tail = 'disconnected from AP (' ~ station.ap ~ ') with SSID (' ~ params.ssid ~ ')' -%}
+{%- endif -%}
+{#- Next step of this station: address learning milliseconds to seconds after RUN unless the session ends first, DELETE at session end, RUN after an absence. -#}
+{%- set delay = ((draw(5, module.math.log(240), 1.0, 3000) if kind == 'run' else draw(500, module.math.log(2500), 0.8, 15000)) | float) if kind != 'delete' and station.pending else 0 -%}
+{%- if kind != 'delete' and station.pending and rec + delay < station.end_at -%}
+  {%- do station.update({'kind': 'ipu', 'due': rec + module.builtins.int(delay)}) -%}
+{%- elif kind != 'delete' -%}
+  {%- do station.update({'kind': 'delete', 'due': [station.end_at, rec + 1] | max}) -%}
+{%- else -%}
+  {%- set wait = (quick_reconnect(30000) if station.left > 0 else absence()) | float -%}
+  {%- do station.update({'kind': 'run', 'due': rec + module.builtins.int(wait)}) -%}
+{%- endif -%}
+{%- do shared.update({'last_ms': rec, 'next_due': stations | map(attribute='due') | min}) -%}
+{%- set primary = station.ipv4 if station.ipv4 in ips else (ips | reject('in', [station.ll]) | list or ips)[0] -%}
+{%- set moment = ts + module.datetime.timedelta(milliseconds=rec - now) -%}
+{%- set native_time = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][moment.month - 1] ~ ' ' ~ ('%2d' | format(moment.day)) ~ moment.strftime(' %H:%M:%S.') ~ ('%03d' | format(moment.microsecond // 1000)) ~ ' UTC' -%}
+{%- set original = native_time ~ ': %CLIENT_ORCH_LOG-7-' ~ code ~ ': Chassis 1 R0/0: wncd: Username (' ~ station.user ~ '), MAC: ' ~ station.mac ~ ', IP ' ~ (ips | join(' ')) ~ ' ' ~ tail -%}
+{%- set digits = station.mac.replace('.', '').upper() -%}
+{%- set ecs_mac = digits[0:2] ~ '-' ~ digits[2:4] ~ '-' ~ digits[4:6] ~ '-' ~ digits[6:8] ~ '-' ~ digits[8:10] ~ '-' ~ digits[10:12] -%}
+{%- set action = {'run': 'run', 'ipu': 'ip-update', 'delete': 'delete'}[kind] -%}
+{%- set state = {'run': 'run', 'ipu': 'ip_update', 'delete': 'delete'}[kind] -%}
+{{- {'@timestamp': moment.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['network'], 'type': {'run': ['connection', 'start'], 'ipu': ['connection', 'info'], 'delete': ['connection', 'end']}[kind], 'action': action, 'code': code, 'provider': 'CLIENT_ORCH_LOG', 'severity': 7, 'timezone': '+00:00', 'original': original}, 'host': {'name': params.controller_name}, 'agent': {'type': 'eventum', 'name': 'synthetic-wlc-reader'}, 'log': {'level': 'debugging'}, 'process': {'name': 'wncd'}, 'user': {'name': station.user}, 'client': {'ip': primary, 'address': primary, 'mac': ecs_mac}, 'related': {'ip': ips, 'user': [station.user]}, 'cisco_wlc': {'ap_name': station.ap, 'ssid': params.ssid, 'chassis': '1 R0/0', 'client_state': state, 'client_mac': station.mac, 'client_ips': ips}} | tojson -}}
