@@ -1,24 +1,28 @@
 # Microsoft DNS Server Audit and Analytical Logs
 
-Generates parsed Windows DNS Server events in ECS JSON, with native `winlog.event_data` and rendered messages. Audit records describe policy changes; ETW Analytical records describe queries and replies. This is a small, synthetic authoritative `corp.example` server, not a raw `.etl` or Windows XML export. A real server enables Analytical logging separately from the default Audit channel.
+Generates parsed Windows DNS Server policy Audit records and ETW Analytical query records as ECS JSON. The selected profile is a Windows Server 2022 authoritative IPv4/UDP server with recursion disabled, one pre-existing zone and eight pre-existing A records. It enables the Analytical channel separately from the default Audit channel. Output is parsed collector JSON, with native `winlog.event_data` and rendered messages. It is not a Windows XML, EVTX or ETL export.
 
 ## Event Types
 
 | Native ID | Channel | Role in this scenario |
 | --- | --- | --- |
-| 256 `QUERY_RECEIVED` | Analytical | Incoming query, including source, XID, RD, and valid DNS packet bytes |
-| 257 `RESPONSE_SUCCESS` | Analytical | Successful A reply with the same QNAME, client, XID, port, and ETW GUID |
-| 259 `IGNORED_QUERY` | Analytical | Policy-matched query with no 257 reply |
-| 577 `POLICY_OP` | Audit | Creates a server-level `Ignore` query policy |
-| 580 `POLICY_OP` | Audit | Deletes that policy |
+| 256 `QUERY_RECEIVED` | Analytical | Incoming A query, source IP/port, XID, RD and DNS packet bytes |
+| 257 `RESPONSE_SUCCESS` | Analytical | Authoritative A answer, matching QNAME, client, port, XID and GUID |
+| 259 `IGNORED_QUERY` | Analytical | Server policy drops the incoming query, with no 257 reply |
+| 577 `POLICY_OP` | Audit | Creates an enabled server-level `Ignore` query policy |
+| 580 `POLICY_OP` | Audit | Deletes an existing policy |
 
-The default clock produces two records per second, usually a 256/257 transaction separated by 3 ms. The source selects eight internal A records. A baseline maintenance policy is created after 100 transactions, remains for about 30 minutes, and receives three 256/259 transactions roughly eight minutes apart before it is deleted. These are scenario settings, not measured production event frequencies.
+The clock renders two records per ten-second tick, normally one 256/257 transaction. The source timestamps place completion 3 ms after reception, rather than at its template invocation. DNS response flags are QR/AA/RD with RA clear, RCODE 0 and one A answer with TTL 300. Packet lengths, XIDs, questions and answer bytes agree with the parsed fields. The 3 ms duration, TTL, 0.1 transaction/s rate and administrative schedule are synthetic scenario assumptions, not vendor measurements.
+
+Both modes create a maintenance policy after about 100 seconds and subsequently every two hours from its actual creation. It remains for about 30 minutes and receives three dropped queries eight minutes apart. The background also contains ordinary successful queries from the same `client_ip`. The zone and its eight sample A records already exist before capture and remain unchanged. This pack does not emit zone or resource-record mutation events.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), the same administrator creates the same `ShadowIgnore` policy a second time after 3,600 routine transactions. Three 256/259 pairs for `beacon.updates.corp.example.` from `10.20.4.17` follow one second apart; the policy is deleted three seconds after creation. The QNAME, source, policy name, action, and event IDs also occur in the baseline. A useful detection correlates a 577 with a burst of policy-matched 259 events and a 580 on the same DNS server within a short window, instead of matching a single field. Correlate each 256/259 pair by QNAME, QTYPE, XID, source IP and nearby time; do not expect a 257 reply for an ignored query.
+`anomaly_mode: true` is the default. After `anomaly_interval_seconds` (six hours by default), the administrator creates a short-lived `Ignore` policy. Three 256/259 query/drop pairs for `beacon.updates.corp.example.` from `10.20.4.17` follow ten seconds apart, then the administrator deletes the policy. Under the shipped clock this policy lives 30 seconds. Correlate creation, three closely spaced drops and deletion on the same server and policy name within a minute. Each received/dropped query is joined by QNAME, QTYPE, XID, source IP and nearby time. Ignored records have no native port, packet or GUID field. No successful response follows a dropped query.
 
-With `anomaly_mode: false`, the baseline maintenance policy and sparse ignored queries remain, but the short-lived burst does not occur. The one-shot chain and the baseline policy are separate state transitions; neither grows an unbounded collection.
+Episodes repeat from the previous actual creation time, with a fresh UUID suffix in the policy name and fresh query XIDs/GUIDs. The same name pattern, administrator, client, QNAME, `Ignore` action and event classes occur in maintenance activity in both modes. There is one active policy and one pending query. A due short episode waits for a maintenance policy to close and for the current pair to complete, so its actual interval can exceed the configured interval by up to roughly 30 minutes plus two ten-second ticks. Delayed episodes do not catch up in a burst. Maintenance also waits for an active short episode. Changing the input cadence changes the observed episode duration and query spacing.
+
+`anomaly_mode: false` retains maintenance policy lifecycles and their sparse drops, but produces no short three-drop episode.
 
 ## Parameters
 
@@ -29,15 +33,15 @@ Edit `event.template.params` in `generator.yml`:
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `server_name`, `server_ip` | `dns-01.corp.example`, `10.20.0.53` | DNS server identity |
-| `admin_name` | `DNSAdmin` | Policy-change actor |
-| `client_ip` | `10.20.4.17` | Client for ignored queries |
-| `normal_zone` | `corp.example` | Authoritative zone in events |
-| `anomaly_zone` | `updates.corp.example` | Policy FQDN criterion and ignored QNAME suffix |
-| `policy_name` | `ShadowIgnore` | Policy used by both maintenance and anomaly sequences |
-| `anomaly_interval_events` | `3600` | Routine transaction count before the short-lived sequence; values below 1,901 are delayed until the baseline policy closes |
-| `anomaly_mode` | `true` | Enables the short-lived sequence |
+| `admin_name` | `DNSAdmin` | Renamed local administrator, synthetic SID ending in 500 |
+| `client_ip` | `10.20.4.17` | Client for drops and ordinary `www` queries |
+| `normal_zone` | `corp.example` | Pre-existing authoritative zone |
+| `anomaly_zone` | `updates.corp.example` | FQDN policy criterion and ignored-query suffix |
+| `policy_name` | `QueryFilter` | Name stem for maintenance and short policies, followed by a UUID |
+| `anomaly_interval_seconds` | `21600` | Positive recurrence interval, supported values at least 3,600 seconds |
+| `anomaly_mode` | `true` | Enables repeated short policy episodes |
 
-The ordinary QNAMEs, clients and A answers are in `samples/queries.json`. Update that file when changing `normal_zone`.
+Use valid ASCII DNS names and IPv4 addresses. `anomaly_zone` must be a subdomain of `normal_zone`. Keep the name stem short enough that stem plus hyphen and UUID fits the documented 256-character policy-name limit. Ordinary QNAMEs, clients and answers live in `samples/queries.json`. Update that file when changing the zone or address plan. No template lookup creates or changes a DNS record.
 
 ### Output Parameters
 
@@ -48,29 +52,27 @@ The shipped configuration writes `output/events.json` and has no required `${par
 From the content-packs repository root:
 
 ```bash
-eventum generate --path generators/windows-dns-server-audit/generator.yml --id windows-dns-server-audit --live-mode true
+uv run --project ../eventum eventum generate --path generators/windows-dns-server-audit/generator.yml --id windows-dns-server-audit --live-mode true
 ```
 
-For a bounded sample, prefix the command with `timeout 2` and set `--live-mode false`; the mode switch alone does not stop a continuous cron generator. The default clock and count live in `generator.yml`.
+For a complete finite capture, copy `generator.yml` next to the original, set `input[0].cron.start` and `end` to a window such as `2026-09-26T00:00:00Z` through `2026-09-26T13:10:00Z`, and run the copied path with `--live-mode false --keep-order true`. This covers two six-hour episodes and repeated maintenance. The mode switch alone does not bound an open-ended cron schedule. Heavy runs share `flock -x /tmp/eventum-generator-heavy.lock`.
 
 ## Sample Output
 
-A complete 259 event copied from an enabled generator run:
+A complete 259 event copied from the final default enabled finite capture:
 
 ```json
 {
-  "@timestamp": "2026-09-25T18:53:12.003000+00:00",
+  "@timestamp": "2026-09-26T06:00:10.003000+00:00",
   "data_stream": {
     "dataset": "microsoft_dnsserver.analytical",
     "namespace": "default",
     "type": "logs"
   },
   "dns": {
-    "id": "51115",
+    "id": "60082",
     "question": {
       "name": "beacon.updates.corp.example",
-      "registered_domain": "corp.example",
-      "top_level_domain": "example",
       "type": "A"
     }
   },
@@ -112,20 +114,20 @@ A complete 259 event copied from an enabled generator run:
     },
     "level": "error"
   },
-  "message": "IGNORED_QUERY: TCP=0; InterfaceIP=10.20.0.53; Source=10.20.4.17; Reason=Policy; QNAME=beacon.updates.corp.example.; QTYPE=1; XID=51115; Zone=corp.example; PolicyName=ShadowIgnore; AdditionalInfo = VirtualizationInstance: .",
+  "message": "IGNORED_QUERY: TCP=0; InterfaceIP=10.20.0.53; Source=10.20.4.17; Reason=Policy; QNAME=beacon.updates.corp.example.; QTYPE=1; XID=60082; Zone=corp.example; PolicyName=QueryFilter-5477cdbf-acff-49fa-9a3d-9b6362defce2; AdditionalInfo = VirtualizationInstance: .",
   "microsoft_dnsserver": {
     "analytical": {
       "additional_info": ".",
       "description": "Ignored query",
       "interface_ip": "10.20.0.53",
-      "policy_name": "ShadowIgnore",
+      "policy_name": "QueryFilter-5477cdbf-acff-49fa-9a3d-9b6362defce2",
       "question_name": "beacon.updates.corp.example.",
       "question_type": "A",
       "reason": "Policy",
       "source": {
         "ip": "10.20.4.17"
       },
-      "xid": "51115",
+      "xid": "60082",
       "zone": "corp.example"
     }
   },
@@ -142,13 +144,13 @@ A complete 259 event copied from an enabled generator run:
     "event_data": {
       "AdditionalInfo": ".",
       "InterfaceIP": "10.20.0.53",
-      "PolicyName": "ShadowIgnore",
+      "PolicyName": "QueryFilter-5477cdbf-acff-49fa-9a3d-9b6362defce2",
       "QNAME": "beacon.updates.corp.example.",
       "QTYPE": "1",
       "Reason": "Policy",
       "Source": "10.20.4.17",
       "TCP": "0",
-      "XID": "51115",
+      "XID": "60082",
       "Zone": "corp.example"
     },
     "flags": [
@@ -177,9 +179,9 @@ A complete 259 event copied from an enabled generator run:
 
 ## References and Limits
 
-- [Microsoft DNS logging and diagnostics](https://learn.microsoft.com/en-us/windows-server/networking/dns/dns-logging-and-diagnostics): Audit IDs 577/580, Analytical IDs 257/259, and separate logging configuration. The table omits 256.
-- [Microsoft DNS policy behavior](https://learn.microsoft.com/en-us/powershell/module/dnsserver/add-dnsserverqueryresolutionpolicy?view=windowsserver2025-ps): `Ignore` drops a matched query without answering it.
-- [Elastic Audit input fixtures](https://github.com/elastic/integrations/blob/main/packages/microsoft_dnsserver/data_stream/audit/_dev/test/pipeline/test-events.json): actual 577 structure and message.
-- [Elastic Analytical ETW input fixtures](https://github.com/elastic/integrations/blob/main/packages/microsoft_dnsserver/data_stream/analytical/_dev/test/pipeline/test-events.json) and [parsed fixtures](https://github.com/elastic/integrations/blob/main/packages/microsoft_dnsserver/data_stream/analytical/_dev/test/pipeline/test-events.json-expected.json): actual 256/257/259 field sets and collector shape.
+- [Microsoft DNS logging and diagnostics](https://learn.microsoft.com/en-us/windows-server/networking/dns/dns-logging-and-diagnostics) applies to Windows Server 2022 and documents Audit 577/580 and Analytical 257/259 messages, separate channels and provider GUID. Its table omits 256.
+- [Microsoft DNS policy behavior](https://learn.microsoft.com/en-us/powershell/module/dnsserver/add-dnsserverqueryresolutionpolicy?view=windowsserver2025-ps) documents server-level FQDN matching, `Ignore` dropping a matched query without response, processing order and policy creation. [Policy removal](https://learn.microsoft.com/en-us/powershell/module/dnsserver/remove-dnsserverqueryresolutionpolicy?view=windowsserver2025-ps) deletes an existing named policy. These cmdlet references are the current documentation, not a version-matched Server 2022 capture.
+- [Microsoft event timestamp schema](https://learn.microsoft.com/en-us/windows/win32/wes/eventschema-timecreated-systempropertiestype-element) defines the event logging `SystemTime`; generated `@timestamp` values are explicitly converted to UTC.
+- Elastic input fixtures pinned at commit `78fd455d22cdb74bd2a8e53249c25cc060f06010`: [Audit](https://github.com/elastic/integrations/blob/78fd455d22cdb74bd2a8e53249c25cc060f06010/packages/microsoft_dnsserver/data_stream/audit/_dev/test/pipeline/test-events.json) and [Analytical](https://github.com/elastic/integrations/blob/78fd455d22cdb74bd2a8e53249c25cc060f06010/packages/microsoft_dnsserver/data_stream/analytical/_dev/test/pipeline/test-events.json). These maintained collector examples establish the selected `event_data` field shapes, numeric-string values and rendered message grammar. They do not establish an exact Windows Server 2022 build.
 
-All fields in the selected 256 (13/13), 257 (20/20), 259 (10/10), and 577 (8/8) native `event_data` structures are emitted. The published 259 examples have `Reason=System` and `PolicyName=NULL`. They do not show a policy-matched 259, so the generated `Reason=Policy`, named policy and `Zone=corp.example` are inferences from the documented `Ignore` behavior and 259 schema. The 580 field names come from the documented event text; a full 580 native sample was unavailable. These details need validation against an actual policy-hit capture before claiming full native fidelity. The output is parsed ECS JSON, with no `event.original` Windows XML or raw ETL bytes.
+All selected native `event_data` fields are emitted: 256 13/13, 257 20/20, 259 10/10 and 577 8/8. A 580 has the documented policy/server message placeholders, but its two generated data names lack a complete captured record. The published 259 examples contain `Reason=System` and `PolicyName=NULL`. Generated `Reason=Policy`, the named policy and authoritative-zone value are inferred for a policy hit, not verified by a matching capture. `ElapsedTime=3` is treated as milliseconds to match the synthetic 3 ms completion timing; the selected fixtures expose the field but do not prove its units. ETW header flags and file/session labels follow the selected collector profile, not a mandatory transport format. Process/thread IDs, agent/enrichment fields and full native XML/ETL bytes are omitted. No complete version-matched policy-create/drop/delete raw capture was obtained, so native raw parity is not established. The PR remains draft for that evidence limit.
