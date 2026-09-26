@@ -15,11 +15,11 @@ The modeled instance has 12 users and 60 files. Existing sessions account for fi
 | `The expiration date ... has been removed` | Public link expiration removal | 3% |
 | `The permissions ... have been changed to "3"` | Public link changed from read-only (1) to read and update (3) | 2% |
 
-These are synthetic selection weights, not measured Nextcloud rates. A selected login emits adjacent attempt/result records with the same request ID and native timestamp; failed results are 12% of routine logins, plus one routine failed login for the target user. Updates select an existing link and occur once per applicable property. The model retains at most 64 links.
+These are synthetic selection weights, not measured Nextcloud rates. A selected login emits adjacent attempt/result records with the same request ID and native timestamp; failed results are 12% of routine logins, plus one routine failed login for the target user. Updates select an existing link and occur once per applicable property. The model retains at most 64 links. The routine counter is bounded to 180 positions, and each episode stores only its current request and link IDs.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), one twelve-record sequence starts after 250 background records: three failed password attempts for `finance_admin`, a fourth attempt with successful login, a read of file ID `84521`, creation of a public link, removal of its expiration date and a permission change from 1 to 3. All requests use the same user identity and remote IP. Each attempt/result pair shares `reqId`; other requests have distinct IDs. The link creation and changes share a link ID, recorded in the creation message and the update request URLs. The expiry message contains the file ID but not the link ID.
+With `anomaly_mode: true` (the default), a twelve-record episode starts after the first hour and repeats every `anomaly_interval_seconds` (3600 seconds by default): three failed password attempts for `finance_admin`, a fourth attempt with successful login, a read of file ID `84521`, creation of a public link, removal of its expiration date and a permission change from 1 to 3. All requests use the same user identity and remote IP. Each attempt/result pair shares `reqId`; other requests have distinct IDs. The link creation and changes share a link ID, recorded in the creation message and the update request URLs. Each episode creates fresh request IDs and a fresh link ID. The expiry message contains the file ID but not the link ID.
 
 Background includes the same user, IP and file, all modeled action types, and ordinary public links for that file. The signal is their order and short interval, not a special event field or exclusive account. `anomaly_mode: false` produces background only. A detection can join failed attempts to the later success by attempted username and IP, then require the file/link actions within a short window. `reqId` joins only events from the same HTTP request; it does not prove a persistent session.
 
@@ -39,7 +39,7 @@ Edit `event.template.params` in `generator.yml`:
 | `anomaly_user`, `anomaly_ip` | `finance_admin`, `10.99.3.51` | User and remote IP used in both background and chain |
 | `anomaly_file`, `anomaly_file_id` | `/finance_admin/files/Finance/Payroll/2026-Q3.xlsx`, `84521` | File used in both background and chain; keep path under `/<anomaly_user>/files/` |
 | `first_share_id` | `32019` | First public-link ID for routine and anomaly links |
-| `anomaly_after_events` | `250` | Number of background records before the one-time chain |
+| `anomaly_interval_seconds` | `3600` | Time between anomaly episode starts; the first follows one interval |
 | `anomaly_mode` | `true` | `false` emits only background |
 
 ### Output Parameters
@@ -58,11 +58,11 @@ For a finite batch, copy `generator.yml` beside the original, add `start` and `e
 
 ## Sample Output
 
-This complete event came from an enabled-mode run after the source and serializer review:
+This complete link-creation event came from the first episode of the final enabled-mode finite run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T00:04:19+00:00",
+  "@timestamp": "2026-09-27T01:00:10+00:00",
   "agent": {
     "name": "cloud-01.corp.example",
     "type": "filebeat"
@@ -77,7 +77,7 @@ This complete event came from an enabled-mode run after the source and serialize
     ],
     "dataset": "nextcloud.audit",
     "kind": "event",
-    "original": "{\"reqId\":\"bY4sfp3P0V99Zwz9kRSa\",\"level\":1,\"time\":\"2026-09-25T00:04:19+00:00\",\"remoteAddr\":\"10.99.3.51\",\"user\":\"finance_admin\",\"app\":\"admin_audit\",\"method\":\"POST\",\"url\":\"/ocs/v2.php/apps/files_sharing/api/v1/shares\",\"scriptName\":\"/ocs/v2.php\",\"message\":\"The file \\\"/finance_admin/files/Finance/Payroll/2026-Q3.xlsx\\\" with ID \\\"84521\\\" has been shared via link with permissions \\\"1\\\" (Share ID: 32034)\",\"userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36\",\"version\":\"35.0.0.10\",\"data\":{\"app\":\"admin_audit\"}}",
+    "original": "{\"reqId\":\"UeTFWOkH2Q0dZKXMqmdZ\",\"level\":1,\"time\":\"2026-09-27T01:00:10+00:00\",\"remoteAddr\":\"10.99.3.51\",\"user\":\"finance_admin\",\"app\":\"admin_audit\",\"method\":\"POST\",\"url\":\"/ocs/v2.php/apps/files_sharing/api/v1/shares\",\"scriptName\":\"/ocs/v2.php\",\"message\":\"The file \\\"/finance_admin/files/Finance/Payroll/2026-Q3.xlsx\\\" with ID \\\"84521\\\" has been shared via link with permissions \\\"1\\\" (Share ID: 32311)\",\"userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36\",\"version\":\"35.0.0.10\",\"data\":{\"app\":\"admin_audit\"}}",
     "outcome": "success",
     "type": [
       "creation"
@@ -100,7 +100,7 @@ This complete event came from an enabled-mode run after the source and serialize
     },
     "level": "info"
   },
-  "message": "The file \"/finance_admin/files/Finance/Payroll/2026-Q3.xlsx\" with ID \"84521\" has been shared via link with permissions \"1\" (Share ID: 32034)",
+  "message": "The file \"/finance_admin/files/Finance/Payroll/2026-Q3.xlsx\" with ID \"84521\" has been shared via link with permissions \"1\" (Share ID: 32311)",
   "nextcloud": {
     "audit": {
       "app": "admin_audit",
@@ -108,12 +108,12 @@ This complete event came from an enabled-mode run after the source and serialize
         "app": "admin_audit"
       },
       "level": 1,
-      "message": "The file \"/finance_admin/files/Finance/Payroll/2026-Q3.xlsx\" with ID \"84521\" has been shared via link with permissions \"1\" (Share ID: 32034)",
+      "message": "The file \"/finance_admin/files/Finance/Payroll/2026-Q3.xlsx\" with ID \"84521\" has been shared via link with permissions \"1\" (Share ID: 32311)",
       "method": "POST",
       "remoteAddr": "10.99.3.51",
-      "reqId": "bY4sfp3P0V99Zwz9kRSa",
+      "reqId": "UeTFWOkH2Q0dZKXMqmdZ",
       "scriptName": "/ocs/v2.php",
-      "time": "2026-09-25T00:04:19+00:00",
+      "time": "2026-09-27T01:00:10+00:00",
       "url": "/ocs/v2.php/apps/files_sharing/api/v1/shares",
       "user": "finance_admin",
       "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
