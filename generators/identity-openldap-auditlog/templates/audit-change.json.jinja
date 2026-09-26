@@ -18,13 +18,18 @@
 {%- set target_uid = 'employee' ~ '%03d'|format(module.rand.number.integer(1, 80)) -%}
 {%- set dn = 'uid=' ~ target_uid ~ ',ou=People,' ~ params.base_dn -%}
 {%- if stage == 'routine' -%}
-  {%- if not shared.get('candidate_done', false) -%}
-    {%- set count = shared.get('routine_count', 0) + 1 -%}
-    {%- if count >= params.anomaly_after_changes -%}
-      {%- do shared.set('routine_count', 0) -%}{%- do shared.set('to_candidate_add', true) -%}
-    {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set count = (shared.get('routine_count', 0) % 1000000) + 1 -%}
+  {%- do shared.set('routine_count', count) -%}
+  {%- if params.anomaly_mode -%}
+    {%- set next_due = shared.get('next_anomaly_epoch', none) -%}
+    {%- if next_due is none -%}
+      {%- do shared.set('next_anomaly_epoch', epoch + params.anomaly_interval_hours * 3600) -%}
+    {%- elif epoch >= next_due -%}
+      {%- do shared.set('next_anomaly_epoch', epoch + params.anomaly_interval_hours * 3600) -%}
+      {%- do shared.set('to_candidate_add', true) -%}
+    {%- endif -%}
   {%- endif -%}
-  {%- set routine_kind = module.rand.weighted_choice(['metadata', 'password', 'member', 'account_add'], [88, 5, 5, 2]) -%}
+  {%- set routine_kind = 'account_add' if count == 30 else module.rand.weighted_choice(['metadata', 'password', 'member', 'account_add'], [88, 5, 5, 2]) -%}
   {%- if routine_kind == 'metadata' -%}
     {%- if module.rand.chance(15) -%}
       {%- set target_uid = module.rand.choice(known_services) -%}
@@ -54,7 +59,8 @@
     {%- set attribute = 'member' -%}{%- set value = member_dn -%}
   {%- else -%}
     {%- set service_seq = (shared.get('service_seq', 0) % 999999) + 1 -%}{%- do shared.set('service_seq', service_seq) -%}
-    {%- set target_uid = 'svc-worker-' ~ '%06d'|format(service_seq) -%}
+    {%- set service_prefix = params.backdoor_uid if count == 30 or module.rand.chance(20) else 'svc-worker' -%}
+    {%- set target_uid = service_prefix ~ '-' ~ '%06d'|format(service_seq) -%}
     {%- set dn = 'uid=' ~ target_uid ~ ',ou=People,' ~ params.base_dn -%}
     {%- set change = 'add' -%}{%- set attribute = 'uid' -%}{%- set value = target_uid -%}
     {%- do known_services.append(target_uid) -%}
@@ -63,17 +69,18 @@
   {%- endif -%}
 {%- elif stage == 'candidate_add' -%}
   {%- set actor_index = 1 -%}{%- set actor = actors[1] -%}{%- set peer_ip = '10.24.1.11' -%}{%- set peer_port = 52111 -%}{%- set conn = 1002 -%}
-  {%- set target_uid = params.backdoor_uid -%}
+  {%- set service_seq = (shared.get('service_seq', 0) % 999999) + 1 -%}{%- do shared.set('service_seq', service_seq) -%}
+  {%- set target_uid = params.backdoor_uid ~ '-' ~ '%06d'|format(service_seq) -%}
+  {%- do shared.set('chain_target_uid', target_uid) -%}
   {%- set dn = 'uid=' ~ target_uid ~ ',ou=People,' ~ params.base_dn -%}
   {%- set change = 'add' -%}{%- set attribute = 'uid' -%}{%- set value = target_uid -%}
   {%- do known_services.append(target_uid) -%}
   {%- if known_services|length > 40 -%}{%- do known_services.pop(0) -%}{%- endif -%}
   {%- do shared.set('known_services', known_services) -%}
-  {%- do shared.set('candidate_done', true) -%}
   {%- if params.anomaly_mode -%}{%- do shared.set('to_group_add', true) -%}{%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
 {%- else -%}
   {%- set actor_index = 1 -%}{%- set actor = actors[1] -%}{%- set peer_ip = '10.24.1.11' -%}{%- set peer_port = 52111 -%}{%- set conn = 1002 -%}
-  {%- set target_uid = params.backdoor_uid -%}
+  {%- set target_uid = shared.get('chain_target_uid') -%}
   {%- set member_dn = 'uid=' ~ target_uid ~ ',ou=People,' ~ params.base_dn -%}
   {%- if stage == 'group_add' -%}
     {%- set dn = 'cn=' ~ params.privileged_group ~ ',ou=Groups,' ~ params.base_dn -%}
@@ -82,6 +89,7 @@
   {%- else -%}
     {%- set dn = member_dn -%}{%- set attribute = 'userPassword' -%}
     {%- do shared.set('to_routine', true) -%}
+    {%- do shared.pop('chain_target_uid', none) -%}
   {%- endif -%}
 {%- endif -%}
 {%- set salt = '%08d'|format(serial) -%}
@@ -92,8 +100,8 @@
 {%- endif -%}
 {%- set prefix = '# ' ~ change ~ ' ' ~ epoch ~ ' ' ~ params.base_dn ~ ' ' ~ actor ~ ' IP=' ~ peer_ip ~ ':' ~ peer_port ~ ' conn=' ~ conn ~ '\ndn: ' ~ dn ~ '\nchangetype: ' ~ change ~ '\n' -%}
 {%- if change == 'add' -%}
-  {%- set cn = 'Service Backup' if stage == 'candidate_add' else 'Service Worker ' ~ '%06d'|format(service_seq) -%}
-  {%- set body = 'objectClass: top\nobjectClass: person\nobjectClass: organizationalPerson\nobjectClass: inetOrgPerson\nuid: ' ~ target_uid ~ '\ncn: ' ~ cn ~ '\nsn: ' ~ ('Backup' if stage == 'candidate_add' else 'Worker') ~ '\nuserPassword: ' ~ hash_value ~ '\nstructuralObjectClass: inetOrgPerson\nentryUUID: ' ~ module.rand.crypto.uuid4() ~ '\ncreatorsName: ' ~ actor ~ '\ncreateTimestamp: ' ~ generalized ~ '\nmodifiersName: ' ~ actor ~ '\nmodifyTimestamp: ' ~ generalized ~ '\nentryCSN: ' ~ csn ~ '\n' -%}
+  {%- set cn = 'Service Account ' ~ '%06d'|format(service_seq) -%}
+  {%- set body = 'objectClass: top\nobjectClass: person\nobjectClass: organizationalPerson\nobjectClass: inetOrgPerson\nuid: ' ~ target_uid ~ '\ncn: ' ~ cn ~ '\nsn: ' ~ 'Service' ~ '\nuserPassword: ' ~ hash_value ~ '\nstructuralObjectClass: inetOrgPerson\nentryUUID: ' ~ module.rand.crypto.uuid4() ~ '\ncreatorsName: ' ~ actor ~ '\ncreateTimestamp: ' ~ generalized ~ '\nmodifiersName: ' ~ actor ~ '\nmodifyTimestamp: ' ~ generalized ~ '\nentryCSN: ' ~ csn ~ '\n' -%}
 {%- else -%}
   {%- set body = operation ~ ': ' ~ attribute ~ '\n' ~ attribute ~ ': ' ~ value ~ '\n-\nreplace: entryCSN\nentryCSN: ' ~ csn ~ '\n-\nreplace: modifiersName\nmodifiersName: ' ~ actor ~ '\n-\nreplace: modifyTimestamp\nmodifyTimestamp: ' ~ generalized ~ '\n-\n' -%}
 {%- endif -%}

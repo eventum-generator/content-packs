@@ -15,9 +15,9 @@ The weights and one-change-per-minute cadence are synthetic workload choices, no
 
 ## Anomaly Chain
 
-After `anomaly_after_changes` ordinary records, `uid=svc-maint` creates `uid=svc-backup`, adds that DN to `cn=directory-admins`, then replaces its `userPassword`. The three successful LDIF records share the actor, originating IP, connection number, target identity, and adjacent minute timestamps. The group record's `member` value points to the new account. A detection can require a new service account to enter the privileged group and have its password rotated within a short window.
+Every `anomaly_interval_hours` (default: 2), `uid=svc-maint` creates a fresh `svc-backup-<sequence>` account, adds that DN to `cn=directory-admins`, then replaces its `userPassword`. The three successful LDIF records share the actor, originating IP, connection number, target identity, and adjacent minute timestamps. The group record's `member` value points to the new account. Each episode uses a distinct account DN. A detection can require a new service account to enter the privileged group and have its password rotated within a short window.
 
-`anomaly_mode` defaults to `true` and emits this chain once. With `false`, the same candidate account is still created as an ordinary change, but the linked membership and password sequence is absent. Background uses the same actor and connection, includes independent account creation, membership changes (including occasional changes to the privileged group), and password rotations. Neither a fixed actor nor an event type identifies anomaly mode by itself. The actor's directory rights and the preexisting `ou=People`, `ou=Groups` and group entries are deployment assumptions for this synthetic instance.
+`anomaly_mode` defaults to `true` and repeats the linked chain every two hours. With `false`, it emits only ordinary changes, including independent account creation, membership changes and password rotations. Background also creates accounts using the same `svc-backup` prefix and sometimes changes the privileged group; it uses the same actor and connection. Neither a fixed actor, name prefix nor event type identifies anomaly mode by itself. The actor's directory rights and the preexisting `ou=People`, `ou=Groups` and group entries are deployment assumptions for this synthetic instance.
 
 ## Parameters
 
@@ -27,15 +27,15 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Purpose |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Include the one-time linked sequence |
-| `anomaly_after_changes` | `60` | Ordinary changes before candidate creation; must be positive |
+| `anomaly_mode` | `true` | Include periodic linked sequences |
+| `anomaly_interval_hours` | `2` | Hours between episode starts; must be positive |
 | `host_name` | `ldap01.corp.example` | Directory server host |
 | `base_dn` | `dc=corp,dc=example` | Backend suffix for native header and DNs |
 | `operator_dn` | `uid=svc-maint,ou=People,dc=corp,dc=example` | Bound administrator used in routine events and the chain; keep it under `base_dn` |
-| `backdoor_uid` | `svc-backup` | New service account present in both modes; keep distinct from existing or routine `svc-worker-*` UIDs |
+| `backdoor_uid` | `svc-backup` | Service-account name prefix used in background and the chain; keep distinct from existing `svc-worker-*` UIDs |
 | `privileged_group` | `directory-admins` | Existing group modified by the chain and sometimes by background |
 
-The three synthetic client IPs, ports and connection numbers are template constants. If `base_dn` changes, update `operator_dn` too. Customization must avoid a preexisting `backdoor_uid`, or the add operation would fail in a real directory.
+The three synthetic client IPs, ports and connection numbers are template constants. If `base_dn` changes, update `operator_dn` too. Customization must avoid a preexisting name in the generated `backdoor_uid-<sequence>` range, or an add operation would fail in a real directory.
 
 ### Output Parameters
 
@@ -49,17 +49,17 @@ From the `content-packs` repository root, a continuous local stream uses:
 uv run --project ../eventum eventum generate --path generators/identity-openldap-auditlog/generator.yml --id openldap-auditlog --live-mode true
 ```
 
-For a finite batch, copy `generator.yml` inside its generator directory, add `start` and `end` to `input[0].cron`, and run the copy with `--live-mode false --keep-order true`. A six-hour inclusive interval produces 361 records with the default one-minute cron and includes the chain.
+For a finite batch, copy `generator.yml` inside its generator directory, add `start` and `end` to `input[0].cron`, and run the copy with `--live-mode false --keep-order true`. A five-hour inclusive interval produces 301 records with the default one-minute cron and includes two complete default episodes.
 
 A collector must join each native block from `# add` or `# modify` through the matching `# end ...` line and the separating blank line before parsing it. These are file records written by `slapo-auditlog`; they have no syslog envelope. The JSON `output/events.json` is Eventum's ECS wrapper, not a native OpenLDAP log file.
 
 ## Sample Output
 
-This complete JSON event is copied from the default anomaly-on finite run. It is synthetic, not captured from a running LDAP server.
+This complete JSON event is copied from the first episode in the five-hour default anomaly-on finite run. It is synthetic, not captured from a running LDAP server.
 
 ```json
 {
-  "@timestamp": "2026-09-25T01:01:00+00:00",
+  "@timestamp": "2026-09-25T02:02:00+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -69,7 +69,7 @@ This complete JSON event is copied from the default anomaly-on finite run. It is
       "iam"
     ],
     "kind": "event",
-    "original": "# modify 1790298060 dc=corp,dc=example uid=svc-maint,ou=People,dc=corp,dc=example IP=10.24.1.11:52111 conn=1002\ndn: cn=directory-admins,ou=Groups,dc=corp,dc=example\nchangetype: modify\nadd: member\nmember: uid=svc-backup,ou=People,dc=corp,dc=example\n-\nreplace: entryCSN\nentryCSN: 20260925010100.000000Z#000062#000#000000\n-\nreplace: modifiersName\nmodifiersName: uid=svc-maint,ou=People,dc=corp,dc=example\n-\nreplace: modifyTimestamp\nmodifyTimestamp: 20260925010100Z\n-\n# end modify 1790298060\n\n",
+    "original": "# modify 1790301720 dc=corp,dc=example uid=svc-maint,ou=People,dc=corp,dc=example IP=10.24.1.11:52111 conn=1002\ndn: cn=directory-admins,ou=Groups,dc=corp,dc=example\nchangetype: modify\nadd: member\nmember: uid=svc-backup-000003,ou=People,dc=corp,dc=example\n-\nreplace: entryCSN\nentryCSN: 20260925020200.000000Z#000123#000#000000\n-\nreplace: modifiersName\nmodifiersName: uid=svc-maint,ou=People,dc=corp,dc=example\n-\nreplace: modifyTimestamp\nmodifyTimestamp: 20260925020200Z\n-\n# end modify 1790301720\n\n",
     "outcome": "success",
     "type": [
       "change"
@@ -85,12 +85,12 @@ This complete JSON event is copied from the default anomaly-on finite run. It is
       "base_dn": "dc=corp,dc=example",
       "change_type": "modify",
       "connection_id": 1002,
-      "entry_csn": "20260925010100.000000Z#000062#000#000000",
+      "entry_csn": "20260925020200.000000Z#000123#000#000000",
       "operation": "add",
       "peer_ip": "10.24.1.11",
       "peer_port": 52111,
       "target_dn": "cn=directory-admins,ou=Groups,dc=corp,dc=example",
-      "value": "uid=svc-backup,ou=People,dc=corp,dc=example"
+      "value": "uid=svc-backup-000003,ou=People,dc=corp,dc=example"
     }
   },
   "related": {
@@ -99,7 +99,7 @@ This complete JSON event is copied from the default anomaly-on finite run. It is
     ],
     "user": [
       "uid=svc-maint,ou=People,dc=corp,dc=example",
-      "uid=svc-backup,ou=People,dc=corp,dc=example"
+      "uid=svc-backup-000003,ou=People,dc=corp,dc=example"
     ]
   },
   "source": {
