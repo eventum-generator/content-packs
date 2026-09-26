@@ -1,164 +1,356 @@
-{# Selected source projection. Native system-event Data is a proven subset, not full raw bytes. #}
+{#- Selected 1C 8.3.27 event-log collector projection. Native system-event Data
+    is a proven subset, not full raw bytes. One source second per tick: a due
+    background job or a random background draw takes the tick first; an
+    anomaly step only uses seconds that background leaves free, so episodes
+    never delay or re-phase background processes. Only the reduction guard
+    below also counts episode failed logins. -#}
 {%- set utc = timestamp.astimezone(module.datetime.timezone.utc).replace(microsecond=0) -%}
-{%- set now = utc.timestamp() -%}
-{%- set interval = [params.anomaly_interval_hours | float, 1.0] | max * 3600 -%}
-{%- set start = shared.get('source_start', now) -%}
-{%- do shared.set('source_start', start) -%}
-{%- set due = shared.get('episode_due', start + interval) -%}
-{%- set phase = shared.get('phase', 'routine') -%}
-{%- set temp = shared.get('temporary_user', none) -%}
-{%- set admin = samples.actors.where(name='admin01').pick() -%}
-{%- set actor = samples.actors.weighted_pick('weight') -%}
-{%- set obj = samples.objects.weighted_pick('weight') -%}
-{%- set kind = 'access' -%}
+{%- set now = utc.timestamp() | int -%}
+{%- set rnd = module.rand -%}
+{%- set num = module.rand.number -%}
+{%- set ln = module.math.log -%}
+{%- set interval = ([params.anomaly_interval_hours | float, 1.0] | max * 3600) | int -%}
+{%- set temp_names = ['svc_audit_01', 'svc_audit_02', 'svc_audit_03', 'svc_audit_04'] -%}
+{%- set payroll = 'InformationRegisters.PayrollAccruals' -%}
+
+{#- One-time inventory and scheduler state. Every later structure is bounded:
+    one slot per job kind and actor, at most four temporary incarnations. -#}
+{%- if not shared.get('ready') -%}
+  {%- set objects = {} -%}
+  {%- for i in range(samples.objects | length) -%}
+    {%- set o = samples.objects[i] -%}
+    {%- do objects.update({o.metadata: {'metadata': o.metadata, 'presentation': o.presentation, 'logged_column': o.logged_column, 'weight': o.weight}}) -%}
+  {%- endfor -%}
+  {%- set staff = {} -%}
+  {%- set lists = {'staff': [], 'acc': [], 'acc_w': [], 'fail': [], 'fail_w': [], 'deny': [], 'deny_w': [], 'admins': [], 'admin_w': []} -%}
+  {%- for i in range(samples.actors | length) -%}
+    {%- set a = samples.actors[i] -%}
+    {%- set allowed = a.read_metadata.split('|') -%}
+    {%- set allowed_w = [] -%}
+    {%- for m in allowed -%}{%- do allowed_w.append(objects[m].weight) -%}{%- endfor -%}
+    {%- do staff.update({a.name: {'id': a.id, 'name': a.name, 'computer': a.computer, 'os_user': a.os_user, 'allowed': allowed, 'allowed_w': allowed_w, 'denied': a.denied_metadata, 'admin': a.role == 'Roles.FullAccess'}}) -%}
+    {%- do lists.staff.append(a.name) -%}
+    {%- do lists.acc.append(a.name) -%}{%- do lists.acc_w.append(a.weight) -%}
+    {%- do lists.fail.append(a.name) -%}{%- do lists.fail_w.append(a.fail_weight) -%}
+    {%- if a.denied_metadata -%}{%- do lists.deny.append(a.name) -%}{%- do lists.deny_w.append(a.weight) -%}{%- endif -%}
+    {%- if a.role == 'Roles.FullAccess' -%}{%- do lists.admins.append(a.name) -%}{%- do lists.admin_w.append(a.weight) -%}{%- endif -%}
+  {%- endfor -%}
+  {#- The window opens mid-stream: most staff already hold a session that
+      began before it, with pre-window numbers and a random residual life. -#}
+  {%- set counters = namespace(s=num.integer(1100, 1600), c=num.integer(250, 450)) -%}
+  {%- set pre = namespace(s=counters.s, c=counters.c) -%}
+  {%- set sessions = {} -%}
+  {%- for name in lists.staff -%}
+    {%- if rnd.chance(0.85) -%}
+      {%- set life = num.lognormal(ln(4200), 0.8) -%}
+      {%- set left = num.floating(0, life) -%}
+      {%- set pre.s = pre.s - num.integer(1, 4) -%}
+      {%- set pre.c = pre.c - num.integer(1, 3) -%}
+      {%- do sessions.update({name: {'s': pre.s, 'c': pre.c, 'start': now - (life - left) | int, 'end': now + ([left, 1] | max) | int}}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.update({'objects': objects, 'staff': staff, 'lists': lists, 'pending': {}, 'sessions': sessions, 'fails': {}, 'noreduce': {}}) -%}
+  {%- do shared.update({'session_counter': counters.s, 'connection_counter': counters.c}) -%}
+  {%- do shared.update({'lc_at': now + (num.exponential(1.0 / 36000)) | int, 'sr_at': now + (num.exponential(1.0 / 86400)) | int}) -%}
+  {%- do shared.update({'episode': none, 'episode_due': now + interval, 'last_ep_admin': none, 'last_ep_name': none}) -%}
+  {%- do shared.set('ready', true) -%}
+{%- endif -%}
+
+{%- set objects = shared.get('objects') -%}
+{%- set staff = shared.get('staff') -%}
+{%- set lists = shared.get('lists') -%}
+{%- set pending = shared.get('pending') -%}
+{%- set sessions = shared.get('sessions') -%}
+{%- set fails = shared.get('fails') -%}
+{%- set ep = shared.get('episode') -%}
+
+{#- Poisson arrivals: temporary-account lifecycles not tied to a login
+    (mean 10 h apart; most start from administrator logins after failed
+    attempts, see below) and standalone old-log reductions (mean one per
+    day). -#}
+{%- if now >= shared.get('lc_at') -%}
+  {%- do shared.set('lc_at', now + ([num.exponential(1.0 / 36000), 1] | max) | int) -%}
+  {%- set busy = [] -%}
+  {%- for k in pending -%}{%- if k.startswith('lc:') -%}{%- do busy.append(k[3:]) -%}{%- endif -%}{%- endfor -%}
+  {%- if ep -%}{%- do busy.append(ep.name) -%}{%- endif -%}
+  {%- set free = temp_names | reject('in', busy) | list -%}
+  {%- if free -%}
+    {%- set name = rnd.choice(free) -%}
+    {%- do pending.update({'lc:' ~ name: {'job': 'lc', 'stage': 'new', 'name': name, 'admin': rnd.weighted_choice(lists.admins, lists.admin_w), 'at': now}}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if now >= shared.get('sr_at') -%}
+  {%- do shared.set('sr_at', now + ([num.exponential(1.0 / 86400), 1] | max) | int) -%}
+  {%- if 'sr' not in pending -%}
+    {%- do pending.update({'sr': {'job': 'op', 'kind': 'reduce', 'actor': rnd.weighted_choice(lists.admins, lists.admin_w), 'at': now}}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Episode arming: due by source time; the first failed attempt follows
+    1-600 s later (more when background holds the seconds) and the next due
+    is counted from it, so starts drift and never catch up. Administrator
+    and temporary name rotate between consecutive episodes. -#}
+{%- set ep_admin = rnd.choice((lists.admins | reject('equalto', shared.get('last_ep_admin')) | list) or lists.admins) if params.anomaly_mode and not ep and now >= shared.get('episode_due') else none -%}
+{#- An episode also waits while its administrator is under a reduction
+    hold from a prefixed deletion, so no background deletion can pair with
+    the episode's reduction. -#}
+{%- if ep_admin and shared.get('noreduce').get(ep_admin, 0) <= now -%}
+  {%- set busy = [] -%}
+  {%- for k in pending -%}{%- if k.startswith('lc:') -%}{%- do busy.append(k[3:]) -%}{%- endif -%}{%- endfor -%}
+  {%- set free = temp_names | reject('in', busy) | reject('equalto', shared.get('last_ep_name')) | list -%}
+  {%- if free -%}
+    {%- set run = namespace(n=4) -%}
+    {%- for _ in range(40) -%}{%- if rnd.chance(0.5) -%}{%- set run.n = run.n + 1 -%}{%- else -%}{%- break -%}{%- endif -%}{%- endfor -%}
+    {%- set ep = {'stage': 'fail', 'left': run.n, 'admin': ep_admin, 'name': rnd.choice(free), 'at': now + num.integer(1, 600), 'started': false} -%}
+    {%- do shared.set('episode', ep) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Tick arbitration: earliest due background job, else a random background
+    draw, else a due anomaly step, else no record in this second. -#}
+{%- set pick = namespace(key=none, at=none) -%}
+{%- for k, a in pending.items() -%}
+  {%- if a.at <= now and (pick.at is none or a.at < pick.at) -%}{%- set pick.key = k -%}{%- set pick.at = a.at -%}{%- endif -%}
+{%- endfor -%}
+{%- set job = none -%}
+{%- set slot = pick.key -%}
+{%- if slot is not none -%}
+  {%- set job = pending.pop(slot) -%}
+{%- elif rnd.chance(0.065) -%}
+  {%- set job = {'job': 'random'} -%}
+{%- elif ep and now >= ep.at -%}
+  {%- set job = {'job': 'ep'} -%}
+{%- endif -%}
+{%- if job is none -%}{{ dispatch.drop() }}{%- endif -%}
+
+{#- Resolve the job into one concrete operation. -#}
+{%- set op = none -%}
+{%- set requeue = slot -%}
+{%- if job.job == 'random' -%}
+  {%- set k = rnd.weighted_choice(['access', 'denied', 'fail', 'update'], [900, 60, 24, 8]) -%}
+  {%- if k == 'access' -%}
+    {%- set op = {'kind': 'access', 'actor': rnd.weighted_choice(lists.acc, lists.acc_w), 'burst': true} -%}
+  {%- elif k == 'denied' -%}
+    {%- set op = {'kind': 'denied', 'actor': rnd.weighted_choice(lists.deny, lists.deny_w)} -%}
+  {%- elif k == 'fail' -%}
+    {%- set op = {'kind': 'fail', 'actor': rnd.weighted_choice(lists.fail, lists.fail_w)} -%}
+  {%- else -%}
+    {%- set a = rnd.weighted_choice(lists.admins, lists.admin_w) -%}
+    {%- set op = {'kind': 'update', 'actor': a, 'target': rnd.choice(lists.staff | reject('equalto', a) | list)} -%}
+  {%- endif -%}
+  {%- set requeue = 'op:' ~ op.actor -%}
+{%- elif job.job in ['op', 'fr'] -%}
+  {%- set op = job -%}
+{%- elif job.job == 'lc' -%}
+  {%- if job.stage == 'new' -%}
+    {%- set op = {'kind': 'new', 'actor': job.admin} -%}
+  {%- elif job.stage == 'tauth' -%}
+    {%- set op = {'kind': 'auth', 'temp': job.temp} -%}
+  {%- elif job.stage == 'read' -%}
+    {%- set op = {'kind': 'access', 'temp': job.temp} -%}
+  {%- elif job.stage == 'delete' -%}
+    {#- While the creator runs an episode, the other administrator removes
+        a prefixed account, so the episode's own reduction cannot close a
+        second chain. -#}
+    {%- set dl = job.deleter -%}
+    {%- if job.prefixed and dl == job.admin and ep and ep.admin == dl -%}
+      {%- set dl = (lists.admins | reject('equalto', dl) | first) or dl -%}
+    {%- endif -%}
+    {%- set op = {'kind': 'delete', 'actor': dl, 'target_temp': job.temp} -%}
+  {%- endif -%}
+{%- elif job.job == 'ep' -%}
+  {%- if ep.stage == 'fail' -%}
+    {%- set op = {'kind': 'fail', 'actor': ep.admin} -%}
+  {%- elif ep.stage == 'auth' -%}
+    {%- set op = {'kind': 'auth', 'actor': ep.admin} -%}
+  {%- elif ep.stage == 'new' -%}
+    {%- set op = {'kind': 'new', 'actor': ep.admin} -%}
+  {%- elif ep.stage == 'tauth' -%}
+    {%- set op = {'kind': 'auth', 'temp': ep.temp} -%}
+  {%- elif ep.stage == 'read' -%}
+    {%- set op = {'kind': 'access', 'temp': ep.temp} -%}
+  {%- elif ep.stage == 'delete' -%}
+    {%- set op = {'kind': 'delete', 'actor': ep.admin, 'target_temp': ep.temp} -%}
+  {%- else -%}
+    {%- set op = {'kind': 'reduce', 'actor': ep.admin} -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set hold_until = shared.get('noreduce').get(op.actor, 0) if job.job == 'op' and op.kind == 'reduce' else 0 -%}
+{%- if hold_until > now -%}
+  {%- do pending.update({slot: dict(job, at=hold_until + ([num.lognormal(ln(120), 0.9), 1] | max) | int)}) -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set kind = 'auth' if op.kind == 'rauth' else op.kind -%}
+{%- set actor = op.temp if op.temp else staff[op.actor] -%}
+
+{#- A selected operation needs a live session of its actor. Without one the
+    actor authenticates now and the operation follows seconds later. An
+    administrator also opens a fresh session for half of its management
+    tasks unless the current one is under two minutes old. -#}
+{%- set sess = sessions.get(actor.name) -%}
+{%- set fresh = kind in ['update', 'new', 'delete', 'reduce'] and sess and now - sess.start >= 120 and rnd.chance(0.5) -%}
+{%- if kind in ['access', 'denied', 'update', 'new', 'delete', 'reduce'] and (not sess or now >= sess.end or fresh) -%}
+  {%- set later = now + ([num.lognormal(ln(10), 0.8), 1] | max) | int -%}
+  {%- if job.job == 'ep' -%}
+    {%- do ep.update({'at': later}) -%}
+  {%- elif job.job == 'lc' -%}
+    {%- do pending.update({slot: dict(job, at=later)}) -%}
+  {%- else -%}
+    {%- do pending.update({requeue: dict(op, job='op', at=later)}) -%}
+  {%- endif -%}
+  {%- set kind = 'auth' -%}
+  {%- set job = {'job': 'gate'} -%}
+{%- endif -%}
+
+{#- Scheduling effects of the emitted operation. -#}
+{%- set retry = ([num.lognormal(ln(12), 0.7), 1] | max) | int -%}
 {%- set synthetic_target = none -%}
+{%- if kind == 'fail' -%}
+  {%- do fails.update({actor.name: (fails.get(actor.name, []) | select('ge', now - 1800) | list) + [now]}) -%}
+{%- endif -%}
+{%- if job.job in ['random', 'fr'] and kind == 'fail' -%}
+  {%- set fr = 'fr:' ~ actor.name -%}
+  {%- if job.job == 'fr' or fr not in pending -%}
+    {%- if rnd.chance(0.5 if actor.admin else 0.4) -%}
+      {%- do pending.update({fr: {'job': 'fr', 'kind': 'fail', 'actor': actor.name, 'at': now + retry}}) -%}
+    {%- elif rnd.chance(0.85) -%}
+      {%- do pending.update({fr: {'job': 'fr', 'kind': 'rauth', 'actor': actor.name, 'at': now + retry}}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- elif job.job == 'fr' and op.kind == 'rauth' and actor.admin and rnd.chance(0.25) -%}
+  {#- An administrator who got in after failed attempts often logged in for
+      a short maintenance session: set up a temporary account, let it check
+      the payroll register, remove it and trim the log. -#}
+  {%- set busy = [] -%}
+  {%- for k in pending -%}{%- if k.startswith('lc:') -%}{%- do busy.append(k[3:]) -%}{%- endif -%}{%- endfor -%}
+  {%- if ep -%}{%- do busy.append(ep.name) -%}{%- endif -%}
+  {%- set free = temp_names | reject('in', busy) | list -%}
+  {%- if free -%}
+    {%- set name = rnd.choice(free) -%}
+    {%- do pending.update({'lc:' ~ name: {'job': 'lc', 'stage': 'new', 'name': name, 'admin': actor.name, 'session': true, 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}}) -%}
+  {%- endif -%}
+{%- elif job.job in ['random', 'op'] and kind == 'access' and op.burst -%}
+  {%- set bk = 'burst:' ~ actor.name -%}
+  {%- if bk not in pending and rnd.chance(0.35) -%}
+    {%- do pending.update({bk: {'job': 'op', 'kind': 'access', 'actor': actor.name, 'burst': true, 'at': now + ([num.lognormal(ln(8), 0.9), 1] | max) | int}}) -%}
+  {%- endif -%}
+{%- elif job.job == 'lc' -%}
+  {%- if job.stage == 'new' -%}
+    {#- The only background guard sits at the chain's threshold and last
+        step: after an account created within 30 minutes of four or more
+        failed logins of its creator (episode attempts included) is deleted
+        by that creator, the creator runs no log reduction for 30 minutes,
+        so the full sequence never completes by coincidence. -#}
+    {%- set prefixed = fails.get(actor.name, []) | select('ge', now - 1800) | list | length >= 4 -%}
+    {%- set synthetic_target = {'name': job.name, 'id': module.uuid.uuid4() | string, 'computer': actor.computer, 'os_user': actor.os_user} -%}
+    {%- do pending.update({slot: dict(job, stage='tauth', temp=synthetic_target, prefixed=prefixed, at=now + ([num.lognormal(ln(60), 1.0) if job.session else num.lognormal(ln(120), 1.3), 1] | max) | int)}) -%}
+  {%- elif job.stage == 'tauth' -%}
+    {%- set reads = ([(num.lognormal(ln(5), 0.8) + 0.5) | round | int, 1] | max) -%}
+    {%- do pending.update({slot: dict(job, stage='read', left=reads, at=now + ([num.lognormal(ln(15), 1.0), 1] | max) | int)}) -%}
+  {%- elif job.stage == 'read' -%}
+    {%- if job.left > 1 -%}
+      {%- do pending.update({slot: dict(job, left=job.left - 1, at=now + ([num.lognormal(ln(15), 1.0), 1] | max) | int)}) -%}
+    {%- else -%}
+      {%- set other = lists.admins | reject('equalto', job.admin) | first -%}
+      {%- set deleter = job.admin if rnd.chance(0.9) else (other or job.admin) -%}
+      {%- set hold = num.lognormal(ln(90), 0.8) if rnd.chance(0.8 if job.session else 0.6) else num.lognormal(ln(2400), 0.9) -%}
+      {%- do pending.update({slot: dict(job, stage='delete', deleter=deleter, at=now + ([hold, 1] | max) | int)}) -%}
+    {%- endif -%}
+  {%- elif job.stage == 'delete' -%}
+    {%- set synthetic_target = job.temp -%}
+    {%- if job.prefixed and op.actor == job.admin -%}
+      {%- do shared.get('noreduce').update({op.actor: now + 1800}) -%}
+    {%- elif rnd.chance(0.85 if job.session else 0.7) -%}
+      {%- do pending.update({'lcr:' ~ job.temp.id: {'job': 'op', 'kind': 'reduce', 'actor': op.actor, 'at': now + ([num.lognormal(ln(120), 0.9), 1] | max) | int}}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- elif job.job == 'ep' -%}
+  {%- if ep.stage == 'fail' -%}
+    {%- if not ep.started -%}
+      {%- do ep.update({'started': true, 'start': now}) -%}
+      {%- do shared.set('episode_due', now + interval) -%}
+    {%- endif -%}
+    {%- if ep.left > 1 -%}
+      {%- do ep.update({'left': ep.left - 1, 'at': now + retry}) -%}
+    {%- else -%}
+      {%- do ep.update({'stage': 'auth', 'at': now + retry}) -%}
+    {%- endif -%}
+  {%- elif ep.stage == 'auth' -%}
+    {%- do ep.update({'stage': 'new', 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}) -%}
+  {%- elif ep.stage == 'new' -%}
+    {%- set synthetic_target = {'name': ep.name, 'id': module.uuid.uuid4() | string, 'computer': actor.computer, 'os_user': actor.os_user} -%}
+    {%- do ep.update({'stage': 'tauth', 'temp': synthetic_target, 'at': now + ([num.lognormal(ln(40), 0.8), 1] | max) | int}) -%}
+  {%- elif ep.stage == 'tauth' -%}
+    {%- set reads = ([(num.lognormal(ln(8), 0.5) + 0.5) | round | int, 1] | max) -%}
+    {%- do ep.update({'stage': 'read', 'left': reads, 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}) -%}
+  {%- elif ep.stage == 'read' -%}
+    {%- if ep.left > 1 -%}
+      {%- do ep.update({'left': ep.left - 1, 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}) -%}
+    {%- else -%}
+      {%- do ep.update({'stage': 'delete', 'at': now + ([num.lognormal(ln(90), 0.8), 1] | max) | int}) -%}
+    {%- endif -%}
+  {%- elif ep.stage == 'delete' -%}
+    {%- set synthetic_target = ep.temp -%}
+    {%- do ep.update({'stage': 'reduce', 'at': now + ([num.lognormal(ln(120), 0.9), 1] | max) | int}) -%}
+  {%- else -%}
+    {%- do shared.update({'episode': none, 'last_ep_admin': ep.admin, 'last_ep_name': ep.name}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Native event body. -#}
 {%- set native_actor = true -%}
-{%- set event_data = none -%}
 {%- set include_data = true -%}
+{%- set event_data = none -%}
 {%- set metadata = '' -%}
 {%- set metadata_presentation = '' -%}
-{%- set event_name = '_$Access$_.Access' -%}
-{%- set presentation = 'Доступ.Доступ' -%}
 {%- set category = ['database'] -%}
 {%- set event_type = ['access'] -%}
 {%- set outcome = 'success' -%}
 {%- set level = 'Information' -%}
 {%- set data_presentation = '' -%}
-{%- set comment = '' -%}
-
-{# One ordinary temporary-user lifecycle finishes before an episode can arm. #}
-{%- if phase == 'routine' -%}
-  {%- set retry = shared.pop('retry_actor', none) -%}
-  {%- if retry -%}
-    {%- set actor = retry -%}
-    {%- set kind = 'authentication' -%}
-  {%- elif params.anomaly_mode and not temp and not shared.get('maintenance_reduce_due',none) and now >= due -%}
-    {%- set phase = 'probe' -%}
-    {%- do shared.set('phase', phase) -%}
-    {%- do shared.set('failures_left', 4) -%}
-    {%- do shared.set('episode_due', now + interval) -%}
-  {%- elif temp and temp.stage == 'created' and now >= temp.next_at -%}
-    {%- set actor = temp -%}
-    {%- set kind = 'authentication' -%}
-    {%- do temp.update({'stage':'authenticated','next_at':now + 600}) -%}
-  {%- elif temp and temp.stage == 'authenticated' and now >= temp.next_at -%}
-    {%- set actor = temp -%}
-    {%- set kind = 'access' -%}
-    {%- set obj = {'metadata':'InformationRegisters.PayrollAccruals','presentation':'Начисления сотрудников','logged_column':'Employee'} -%}
-    {%- do temp.update({'stage':'read','next_at':now + 600}) -%}
-  {%- elif temp and temp.stage == 'read' and now >= temp.next_at -%}
-    {# Session termination is outside the selected output, before native user deletion. #}
-    {%- set actor = admin -%}
-    {%- set kind = 'user_delete' -%}
-    {%- set synthetic_target = temp -%}
-  {%- elif shared.get('maintenance_reduce_due', none) and now >= shared.get('maintenance_reduce_due') -%}
-    {%- set actor = admin -%}
-    {%- set kind = 'log_reduce' -%}
-  {%- elif not temp and now >= shared.get('maintenance_due', start + 7200) -%}
-    {%- set actor = admin -%}
-    {%- set kind = 'user_new' -%}
-  {%- else -%}
-    {%- set kind = module.rand.weighted_choice(['access','denied','failure','user_update'],[90,6,3,1]) -%}
-    {%- if kind == 'user_update' -%}{%- set actor = admin -%}{%- endif -%}
-    {%- if kind == 'failure' -%}{%- do shared.set('retry_actor', actor) -%}{%- endif -%}
-  {%- endif -%}
-{%- endif -%}
-
-{%- if phase == 'probe' -%}
-  {%- set actor = admin -%}
-  {%- set kind = 'failure' -%}
-  {%- set left = shared.get('failures_left') - 1 -%}
-  {%- do shared.set('failures_left', left) -%}
-  {%- if left == 0 -%}{%- do shared.pop('failures_left', none) -%}{%- do shared.set('phase','admin_login') -%}{%- endif -%}
-{%- elif phase == 'admin_login' -%}
-  {%- set actor = admin -%}{%- set kind = 'authentication' -%}
-  {%- do shared.set('phase','user_new') -%}
-{%- elif phase == 'user_new' -%}
-  {%- set actor = admin -%}{%- set kind = 'user_new' -%}
-  {%- do shared.set('phase','temporary_login') -%}
-{%- elif phase == 'temporary_login' -%}
-  {%- set actor = temp -%}{%- set kind = 'authentication' -%}
-  {%- do temp.update({'stage':'authenticated'}) -%}
-  {%- do shared.set('reads_left',12) -%}{%- do shared.set('phase','sensitive_access') -%}
-{%- elif phase == 'sensitive_access' -%}
-  {%- set actor = temp -%}{%- set kind = 'access' -%}
-  {%- set obj = {'metadata':'InformationRegisters.PayrollAccruals','presentation':'Начисления сотрудников','logged_column':'Employee'} -%}
-  {%- set left = shared.get('reads_left') - 1 -%}
-  {%- do shared.set('reads_left',left) -%}
-  {%- if left == 0 -%}{%- do shared.pop('reads_left',none) -%}{%- do shared.set('phase','user_delete') -%}{%- endif -%}
-{%- elif phase == 'user_delete' -%}
-  {%- set actor = admin -%}{%- set kind = 'user_delete' -%}{%- set synthetic_target = temp -%}
-  {%- do shared.set('phase','log_reduce') -%}
-{%- elif phase == 'log_reduce' -%}
-  {%- set actor = admin -%}{%- set kind = 'log_reduce' -%}
-  {%- do shared.set('phase','routine') -%}
-{%- endif -%}
-
-{# Object-level Read permissions are explicit synthetic configuration inventory. #}
-{%- if kind == 'denied' -%}
-  {%- if not actor.denied_metadata -%}{%- set actor = samples.actors.where(name='sales01').pick() -%}{%- endif -%}
-  {%- set obj = samples.objects.where(metadata=actor.denied_metadata).pick() -%}
-{%- elif kind == 'access' and not actor.name.startswith('svc_audit_') and obj.metadata not in actor.read_metadata.split('|') -%}
-  {%- set obj = samples.objects.where(metadata=actor.read_metadata.split('|')[0]).pick() -%}
-{%- endif -%}
-
-{# A selected operation without an existing session emits authentication first.
-   The operation is delayed, not emitted under an unauthenticated synthetic actor. #}
-{%- set session = shared.get('session_' ~ actor.name, 0) -%}
-{%- set connection = shared.get('connection_' ~ actor.name, 0) -%}
-{%- if kind != 'failure' and kind != 'authentication' and (session == 0 or now >= shared.get('session_expiry_' ~ actor.name,0)) -%}
-  {%- if phase != 'routine' -%}{%- do shared.set('phase',phase) -%}{%- endif -%}
-  {%- set kind = 'authentication' -%}
-  {%- set synthetic_target = none -%}
-{%- endif -%}
-
-{%- if kind == 'authentication' -%}
-  {%- set session = shared.get('session_counter',1200) + 1 -%}
-  {%- set connection = shared.get('connection_counter',300) + 1 -%}
-  {%- do shared.update({'session_counter':session,'connection_counter':connection}) -%}
-  {%- do shared.set('session_' ~ actor.name,session) -%}{%- do shared.set('connection_' ~ actor.name,connection) -%}
-  {%- do shared.set('session_expiry_' ~ actor.name,now + 3600) -%}
+{%- set session = sess.s if sess else 0 -%}
+{%- set connection = sess.c if sess else 0 -%}
+{%- if kind == 'auth' -%}
+  {%- set session = shared.get('session_counter') + rnd.weighted_choice([1, 2, 3, 4], [60, 25, 10, 5]) -%}
+  {%- set connection = shared.get('connection_counter') + rnd.weighted_choice([1, 2, 3], [70, 22, 8]) -%}
+  {%- do shared.update({'session_counter': session, 'connection_counter': connection}) -%}
+  {%- do sessions.update({actor.name: {'s': session, 'c': connection, 'start': now, 'end': now + ([num.lognormal(ln(4200), 0.8), 60] | max) | int}}) -%}
   {%- set event_name = '_$Session$_.Authentication' -%}{%- set presentation = 'Сеанс.Аутентификация' -%}
   {%- set category = ['authentication'] -%}{%- set event_type = ['start'] -%}
-  {%- set event_data = {'OSUser':actor.os_user} -%}{%- set data_presentation = 'Аутентификация пользователя' -%}
-{%- elif kind == 'failure' -%}
+  {%- set event_data = {'OSUser': actor.os_user} -%}{%- set data_presentation = 'Аутентификация пользователя' -%}
+{%- elif kind == 'fail' -%}
   {%- set native_actor = false -%}{%- set session = 0 -%}{%- set connection = 0 -%}
   {%- set event_name = '_$Session$_.AuthenticationError' -%}{%- set presentation = 'Сеанс.Ошибка аутентификации' -%}
   {%- set category = ['authentication'] -%}{%- set event_type = ['start'] -%}{%- set outcome = 'failure' -%}
   {%- set level = 'Warning' -%}{%- set include_data = false -%}
-{%- elif kind == 'user_new' -%}
-  {%- if phase == 'routine' -%}{%- do shared.set('maintenance_due',now + 7200) -%}{%- endif -%}
-  {%- set cursor = shared.get('temporary_cursor',0) % 4 -%}
-  {%- do shared.set('temporary_cursor',(cursor + 1) % 4) -%}
-  {%- set temporary = {'name':'svc_audit_%02d' % (cursor + 1),'id':module.uuid.uuid4() | string,'computer':admin.computer,'os_user':admin.os_user,'role':'Roles.FullAccess','stage':'created','next_at':now + 600} -%}
-  {%- do shared.set('temporary_user',temporary) -%}{%- set synthetic_target = temporary -%}
+{%- elif kind == 'new' -%}
   {%- set event_name = '_$User$_.New' -%}{%- set presentation = 'Пользователи.Новый пользователь' -%}
   {%- set category = ['iam'] -%}{%- set event_type = ['creation'] -%}
-  {%- set event_data = {'Roles':['Roles.FullAccess']} -%}
-{%- elif kind == 'user_delete' -%}
-  {%- do shared.pop('session_' ~ synthetic_target.name,none) -%}{%- do shared.pop('connection_' ~ synthetic_target.name,none) -%}
-  {%- do shared.pop('session_expiry_' ~ synthetic_target.name,none) -%}{%- do shared.pop('temporary_user',none) -%}
-  {%- if phase == 'routine' -%}{%- do shared.set('maintenance_reduce_due',now + 600) -%}{%- endif -%}
+  {%- set event_data = {'Roles': ['Roles.FullAccess']} -%}
+{%- elif kind == 'delete' -%}
+  {#- The temporary session ends outside the selected output before deletion. -#}
+  {%- do sessions.pop(op.target_temp.name, none) -%}
   {%- set event_name = '_$User$_.Delete' -%}{%- set presentation = 'Пользователи.Удаление пользователя' -%}
   {%- set category = ['iam'] -%}{%- set event_type = ['deletion'] -%}{%- set include_data = false -%}
-{%- elif kind == 'user_update' -%}
-  {%- set target = samples.actors.where(name='accountant02').pick() -%}{%- set synthetic_target = target -%}
+{%- elif kind == 'update' -%}
+  {%- set synthetic_target = staff[op.target] -%}
   {%- set event_name = '_$User$_.Update' -%}{%- set presentation = 'Пользователи.Изменение пользователя' -%}
-  {%- set category = ['iam'] -%}{%- set event_type = ['change'] -%}
-  {%- set include_data = false -%}
-{%- elif kind == 'log_reduce' -%}
-  {%- do shared.pop('maintenance_reduce_due',none) -%}
+  {%- set category = ['iam'] -%}{%- set event_type = ['change'] -%}{%- set include_data = false -%}
+{%- elif kind == 'reduce' -%}
   {%- set event_name = '_$InfoBase$_.EventLogReduce' -%}{%- set presentation = 'Информационная база.Сокращение журнала регистрации' -%}
   {%- set category = ['configuration'] -%}{%- set event_type = ['deletion'] -%}{%- set include_data = false -%}
 {%- elif kind == 'denied' -%}
+  {%- set obj = objects[actor.denied] -%}
   {%- set event_name = '_$Access$_.AccessDenied' -%}{%- set presentation = 'Доступ.Отказ в доступе' -%}
-  {%- set event_type = ['access','denied'] -%}{%- set outcome = 'failure' -%}{%- set level = 'Warning' -%}
+  {%- set event_type = ['access', 'denied'] -%}{%- set outcome = 'failure' -%}{%- set level = 'Warning' -%}
   {%- set metadata = [obj.metadata] -%}{%- set metadata_presentation = [obj.presentation] -%}
-  {%- set event_data = {'Right':'Read'} -%}
+  {%- set event_data = {'Right': 'Read'} -%}
 {%- else -%}
+  {%- set obj = objects[payroll] if op.temp else objects[rnd.weighted_choice(actor.allowed, actor.allowed_w)] -%}
+  {%- set event_name = '_$Access$_.Access' -%}{%- set presentation = 'Доступ.Доступ' -%}
   {%- set metadata = [obj.metadata] -%}{%- set metadata_presentation = [obj.presentation] -%}
-  {%- set row = {obj.logged_column: ('EMP-%04d' % module.rand.number.integer(1001,1024)) if obj.logged_column == 'Employee' else ('REC-%05d' % module.rand.number.integer(1,5000))} -%}
-  {%- set event_data = {'Data':[row]} -%}{%- set data_presentation = 'Чтение зарегистрированного поля' -%}
+  {%- set row = {obj.logged_column: ('EMP-%04d' % num.integer(1001, 1024)) if obj.logged_column == 'Employee' else ('REC-%05d' % num.integer(1, 5000))} -%}
+  {%- set event_data = {'Data': [row]} -%}{%- set data_presentation = 'Чтение зарегистрированного поля' -%}
 {%- endif -%}
 {
   "@timestamp": {{ utc.isoformat(timespec='seconds') | tojson }},
@@ -176,7 +368,7 @@
     "event_name":{{ event_name | tojson }},"event_presentation":{{ presentation | tojson }},
     {% if native_actor %}"user_id":{{ actor.id | tojson }},"user_name":{{ actor.name | tojson }},{% endif %}
     "computer":{{ actor.computer | tojson }},"metadata_name":{{ metadata | tojson }},"metadata_presentation":{{ metadata_presentation | tojson }},
-    "comment":{{ comment | tojson }},{% if include_data %}"data":{{ event_data | tojson }},"data_presentation":{{ data_presentation | tojson }},{% endif %}
+    "comment":"",{% if include_data %}"data":{{ event_data | tojson }},"data_presentation":{{ data_presentation | tojson }},{% endif %}
     "transaction_status":"NotApplicable","transaction_id":"",
     "connection":{{ connection }},"session":{{ session }},"server_name":{{ params.server_name | tojson }},"port":{{ params.server_port }},"sync_port":{{ params.sync_port }},
     "session_data_separation":{},"session_data_separation_presentation":[]

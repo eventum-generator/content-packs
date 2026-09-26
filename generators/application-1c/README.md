@@ -2,46 +2,69 @@
 
 Generates a selected **1C:Enterprise 8.3.27 event-log collector projection** for a client/server, single-data-area infobase using sequential `.lgf` storage. This is the event log, not the separate technological log. Output is ECS-style JSON with snake_case source fields under `one_c.event_log`. It is not a native XML or `.lgf` export, and has no fabricated `event.original`.
 
-The source inventory has five existing staff accounts, four temporary account names reused after deletion, and five fictional configuration objects. Each new temporary incarnation gets a fresh UUID. The assumed Enterprise thick client keeps its selected connection during one modeled session. Administrator and temporary `Roles.FullAccess` explicitly grant Administration, DataAdministration and Read on this synthetic configuration. Accountant can read all five objects; Sales and Warehouse cannot read the payroll register. These are configured scenario permissions, not privileges inferred from a role name.
+The source inventory has six staff accounts: two accountants, one sales and one warehouse user, and two administrators. There are also four temporary account names that are reused after deletion, and five fictional configuration objects. Each new temporary incarnation gets a fresh UUID and logs in from its creator's workstation. The assumed Enterprise thick client keeps its connection for one modeled session. The administrator and temporary `Roles.FullAccess` roles explicitly grant Administration, DataAdministration and Read on this synthetic configuration. Accountants can read all five objects; Sales and Warehouse cannot read the payroll register. These are configured scenario permissions, not privileges inferred from a role name.
 
 ## Event Types
 
-| System event | Selected behavior | Default enabled capture count |
-|---|---|---:|
-| `_$Access$_.Access` | Successful controlled reads with nested logged rows | 7801 |
-| `_$Access$_.AccessDenied` | Object-level Read permission denial | 500 |
-| `_$Session$_.Authentication` | Successful authentication opens a selected session | 332 |
-| `_$Session$_.AuthenticationError` | Failed attempted identity; no native authenticated UUID is asserted | 285 |
-| `_$User$_.New` | Create one temporary account | 14 |
-| `_$User$_.Update` | Update an existing staff account; unproved native Data omitted | 71 |
-| `_$User$_.Delete` | Delete the previously created temporary incarnation | 14 |
-| `_$InfoBase$_.EventLogReduce` | Reduce pre-existing records older than the assumed cutoff | 14 |
+Shares are measured in the default `anomaly_mode: false` capture (25 h 05 min, 8,660 records). Counts for the paired default `true` capture (8,716 records, two episodes) are shown for comparison.
 
-One reusable Jinja file contains a bounded state machine, emitted through one FSM template entry. One event is selected every ten seconds, with UTC second-resolution source/collector time. Ordinary slot choices use weights Access/Denied/failed-auth/user-update `90:6:3:1`. Session setup, permission checks and maintenance replace some choices, so emitted shares differ. These rates are synthetic workload settings, not vendor production frequencies.
+| System event | Selected behavior | Category | Share (background) | Count (with anomaly) |
+|---|---|---|---:|---:|
+| `_$Access$_.Access` | Successful controlled read with one nested logged row | database / access | 89.02% | 7,754 |
+| `_$Access$_.AccessDenied` | Object-level Read permission denial | database / access, denied | 3.95% | 345 |
+| `_$Session$_.AuthenticationError` | Failed attempt; no native authenticated UUID is asserted | authentication / start (failure) | 3.00% | 251 |
+| `_$Session$_.Authentication` | Successful authentication opens a session | authentication / start | 2.88% | 250 |
+| `_$User$_.Update` | Administrator updates another staff account; unproven native Data omitted | iam / change | 0.55% | 49 |
+| `_$User$_.New` | Administrator creates one temporary account | iam / creation | 0.23% | 24 |
+| `_$User$_.Delete` | Administrator deletes that temporary incarnation | iam / deletion | 0.23% | 24 |
+| `_$InfoBase$_.EventLogReduce` | Administrator reduces records older than the assumed cutoff | configuration / deletion | 0.14% | 19 |
 
-At capture start no modeled session is open. A selected operation first emits authentication when its actor has no current session. Staff sessions last at most one modeled hour, and a new authentication internally closes the previous selected session before allocating fresh global session/connection numbers. Session-end records are outside the selected output because their exact native class/body was not established. Therefore the stream does not itself prove when a session ended. Both modes keep the same source actors, workstation names and individual event classes.
+Captures of 25 h 05 min hold 8,582-9,223 records in both modes, about 350 per hour. Rates are synthetic workload settings, not vendor production frequencies, and they do not vary by time of day.
 
-Ordinary temporary-account maintenance begins about every two hours when its slot is free. The administrator creates an account, it authenticates ten minutes later, makes one payroll read ten minutes after that, then its modeled session closes and the administrator deletes it another ten minutes later. An old-log reduction is eligible ten minutes after deletion. An administrator reauthentication can delay an operation by one tick. The complete ordinary lifecycle finishes before an episode starts. A failed ordinary authentication is followed by successful authentication of the same account on the next tick. No unknown workstation or account-name family labels the mode.
+## Background Model
+
+One template renders every source second in UTC; most seconds produce no record. All background decisions are random draws, with no fixed period, rotation or script. Rates below are measured over four 100-hour background captures (400 hours); distributions over all ten background captures (500 hours).
+
+- **Staff activity.** Each record picks its actor by weight (accountants dominate) and an object the actor may read, or a payroll denial for Sales or Warehouse. About a third of reads start a burst of quick follow-up reads by the same user a few seconds apart.
+- **Sessions.** The capture window opens mid-stream. Most staff already hold a session that began earlier, so their first records reuse pre-window session numbers. A session lasts a random lifetime (median about 70 minutes, lognormal). The next operation after it ends authenticates first, and the operation follows seconds later. Session and connection numbers grow in random steps, because sessions outside the selected output also consume numbers. An administrator also opens a fresh session for half of its management tasks unless its current session is under two minutes old.
+- **Failed logins.** A failed attempt is retried after a few seconds to a minute. A retry fails again with probability 0.5 for administrators and 0.4 for other staff, and a run ends in a successful login 85% of the time. Administrators account for about half of the runs, because they log in to several tools. Measured: about 54 runs of two or more failures a day, 9.2 of four or more, and 6.7 administrator runs of four or more.
+- **Temporary accounts.** A quarter of administrator logins that follow failed attempts open a short maintenance session. In it the administrator creates a temporary account seconds after the login, the account logs in and checks the payroll register, and the account is removed, usually followed by an old-log reduction. Other lifecycles arrive as a Poisson process with a mean spacing of 10 hours. In total there are about 16 lifecycles a day. Measured across all of them:
+  - creation is preceded by three or more of the creator's failed logins within 30 minutes about 7.6 times a day, and by four or more about 4.8 times a day;
+  - the account logs in 3 s to 38 min after creation (median about 1 minute);
+  - it reads the payroll register 1-49 times (median 5), a few seconds to a few minutes apart;
+  - the creator deletes it in 92% of lifecycles, 10 s to 2.9 h after the last read (median about 2 minutes);
+  - lifespans run from 69 s to 3 h (median about 7 minutes), and 73% last under 15 minutes;
+  - 59% of deletions are followed within minutes by a reduction by the same administrator.
+- **Other administration.** Standalone reductions average about one a day, and staff updates about 45 a day.
+
+**Guard.** One background rule keeps ordinary traffic from completing the anomaly by coincidence. It sits at the chain's threshold and last step: when an account created within 30 minutes of four or more of its creator's failed logins is deleted by that creator, the creator runs no log reduction for the next 30 minutes. Failed logins from episodes count too. While an administrator runs an episode, the other administrator deletes such an account instead. An episode waits to start while its administrator is under this hold. All shorter sequences remain in background, including four or more failures, a login, a creation and a deletion of that account by the same administrator. Session termination is outside the selected output, because its native record body was not established, so the stream does not show when a session ended.
 
 ## Anomaly Chain
 
-`anomaly_mode: true` is the default. Every twelve hours of generated source time, when ordinary cleanup is complete:
+`anomaly_mode: true` is the default. `anomaly_mode: false` produces only the background above, with zero complete chains. Each episode is:
 
-1. Four failed attempts use the same administrator and workstation.
-2. A successful administrator authentication precedes creation of one temporary user with the selected `Roles.FullAccess` membership.
-3. That temporary incarnation authenticates, then makes twelve logged payroll reads in its same session/connection.
-4. Its session closes internally before the administrator deletes that exact incarnation.
-5. The administrator reduces old event-log records.
+1. An administrator fails to log in four or more times from its own workstation, a few seconds to a minute apart, then logs in successfully.
+2. Seconds later, that administrator creates a temporary account with the selected `Roles.FullAccess` membership.
+3. The new incarnation logs in, usually within a minute, and reads the payroll register several times in one session.
+4. Its session closes outside the selected output, and the same administrator deletes that exact incarnation, usually within a few minutes.
+5. The same administrator then reduces old event-log records.
 
-The **21 emitted records span 200 seconds** at the shipped cadence. Actor UUIDs, creation/deletion target UUID, session/connection, workstation, infobase and source time support correlation. The target UUID/name on user-management records is explicitly synthetic collector enrichment from the modeled inventory, not a claimed native Data member. Failed authentication exposes only the normalized attempted username from that inventory. Native `user_id` and `user_name` are omitted on failure instead of inventing authenticated attribution; zero session/connection expresses the selected unsuccessful-session model, not verified native failure bytes.
+Every shorter part of this sequence also occurs in background, as described above. What background never contains is the whole ordered sequence joined by one administrator and one incarnation within 30 minutes. Episode timing and counts are drawn within background ranges, not from identical distributions: the temporary login comes sooner (median 40 s), reads are a little more numerous and closer together, and the deletion and reduction always follow within minutes. Episode steps use only seconds that background leaves free, so episodes never delay or re-phase background work. The episode's successful login replaces the administrator's session, as a background retry does.
 
-Twelve reads mean recorded access occurrences. Synthetic employee strings can repeat and do not prove twelve distinct people, returned amounts, exported data or exfiltration. Successful read semantics depend on access auditing configured before capture: the fictional payroll register has a string Employee field and an Amount access field; its Employee value is logged. The other objects have a string RecordKey recorded field. Logged rows encode a 1C ValueTable as a JSON array of row objects. The selected profile does not reproduce a full typed XML serialization.
+Linking fields: `user.name`/`user.id` and `client.address` of the administrator; the incarnation UUID in `user.target.id` on creation and deletion; the temporary account's `user.id`; session/connection numbers; and source time. The target UUID/name on user-management records is synthetic collector enrichment from the inventory, not a claimed native Data member. Failed attempts carry only the attempted username and zero session/connection, not verified native failure bytes. Payroll reads are recorded access occurrences; repeated synthetic employee keys do not prove distinct people, returned amounts or exfiltration.
 
-The next interval resets at the actual first failed attempt. Ordinary sessions/maintenance finish first, so a due episode can wait; there is no catch-up burst or overlapping temporary account. A four-name cursor advances at every ordinary or episode creation; adjacent episodes can reuse a name because ordinary creations also advance it. Each incarnation still has fresh UUID/session values. State retains five staff session slots, one temporary user/session, a four-name cursor and fixed phase/timer/counter slots. No user or session history grows. A finite run may end with one active temporary account or a session, without fabricated final cleanup.
+**Recurrence.** `anomaly_interval_hours` is measured in source time and clamped to at least one hour. The first episode becomes due one interval after the window start. Its first failed attempt follows 1-600 s later, or later still while background occupies the seconds, a temporary name is busy or the administrator is under the guard hold. The next episode is due one interval after that actual first attempt, so start times drift later and never catch up. Consecutive episodes alternate the two administrators, use a different temporary name, and always get a fresh incarnation UUID.
 
-`anomaly_mode: false` retains isolated failures, successful sessions, temporary creation/authentication/read/deletion, user updates, denials and reductions, with zero complete dense sequences. Ordinary maintenance uses the same FullAccess membership, actor/workstation and payroll read, separated by minutes. The injected correlation is distinguished by four failures and twelve dense reads, not a special native marker.
+Measured episodes, with intervals taken between creations:
 
-Detection ideas: correlate four same-administrator/workstation failures followed by success, then a freshly created target UUID with twelve dense payroll accesses in one session. Join creation and deletion of that exact incarnation, followed by old-history reduction. These signals do not establish recent sequence erasure or exfiltration.
+- The default 12 h interval gives two per 25 h 05 min window and eight per 100 h. Creations were 12.02-12.15 h after the window start and 12.05-12.48 h apart.
+- A 6 h interval gives four per 25 h 05 min window and 16 per 100 h, 6.02-6.60 h apart.
+- The minimum 1 h interval gives 22 episodes per 25 h 05 min, 0.99-1.37 h apart.
+- Across 70 episodes: 4-17 failed attempts in the 15 minutes before the login, 3-31 payroll reads, and 220-1,638 s from the first detected failure to the reduction.
+
+**Counts.** At the default interval, episodes add two occurrences a day to each partial step, against the background rates above. Over the pooled 12 h captures (300 h with anomalies, 500 h without), administrator runs of four or more failures occur 7.8 times a day with anomalies against 6.9 without (z 1.0). Creations preceded by four or more creator failures occur 7.4 times a day with anomalies against 4.7 without (z 3.3 over those 800 hours). One week of each mode is expected to give z of about 1.6 for this count. At 6 h the second count rises to about 9 a day, and at 1 h the partial-step counts reveal the mode.
+
+Detection idea: join four or more failures of one administrator, its successful login, a user creation by it within minutes, and the new incarnation's payroll reads. Then join the deletion of that same UUID by the same administrator and a following event-log reduction. These signals do not establish recent-log erasure or exfiltration.
 
 ## Log management assumptions
 
@@ -82,46 +105,96 @@ Edit `event.template.params` in `generator.yml`:
 | `server_port` | `1541` | Main server port |
 | `sync_port` | `1542` | Auxiliary server port |
 | `ecs_version` | `8.11.0` | Normalized ECS context |
-| `anomaly_mode` | `true` | Include recurring dense sequences |
-| `anomaly_interval_hours` | `12` | Positive finite source-time interval, clamped to at least one hour |
+| `anomaly_mode` | `true` | Add recurring anomaly episodes to the background |
+| `anomaly_interval_hours` | `12` | Source-time interval between episodes, clamped to at least one hour |
 
-Keep the ten-second/count-one cadence for documented timings. Actor UUIDs/names, OS accounts, configuration role permissions and metadata/logged column names are in `samples/actors.json` and `samples/objects.json`. All sample records must retain consistent field order, and weight columns must be numeric. Keep the administrator `admin01` and update target `accountant02` names because the source selects those inventory entries. Temporary names remain the fixed four-name family. Custom event parameters change server/collector/infobase context; editing actor/object inventory requires matching configuration permissions and audit setup.
+Keep the one-second, count-one cron cadence: all timings are drawn in source seconds. Actor UUIDs, names, workstations, OS accounts, weights, object permissions and metadata/logged column names are in `samples/actors.json` and `samples/objects.json`. Every record there must keep the same field order, and weights must be numeric. Accounts with `role: Roles.FullAccess` act as administrators. Keep at least two of them so that consecutive episodes can rotate administrators. The four temporary names are fixed in the template. Editing the inventory requires matching configuration permissions and audit setup.
 
 ### Output Parameters
 
-The shipped local `output/events.json` file requires no top-level `${params.*}` or `${secrets.*}` values. Replace the output plugin to send the selected JSON projection to a SIEM. Real XML/.lgf parsing must be tested against an actual native export.
+The shipped `generator.yml` writes JSON Lines to `output/events.json`, so it runs as-is. To deliver to a backend, replace the output with a plugin whose connection values come from top-level placeholders, for example OpenSearch:
+
+```yaml
+output:
+  - opensearch:
+      hosts:
+        - ${params.opensearch_host}
+      username: ${params.opensearch_user}
+      password: ${secrets.opensearch_password}
+      index: ${params.opensearch_index}
+```
+
+| Parameter | Description |
+|---|---|
+| `${params.opensearch_host}` | OpenSearch host URL |
+| `${params.opensearch_user}` | Username for authentication |
+| `${secrets.opensearch_password}` | Password, resolved from the Eventum keyring |
+| `${params.opensearch_index}` | Target index name |
+
+The output carries the selected JSON projection. Parsing real XML or `.lgf` data must be tested against an actual native export.
 
 ## Usage
 
-From the content-packs repository root:
+From the content-packs repository root, run live:
 
 ```bash
-uv run --project ../eventum eventum generate --path generators/application-1c/generator.yml --id one-c --live-mode true
+eventum generate --path generators/application-1c/generator.yml --id one-c --live-mode true --keep-order true
 ```
 
-For a finite sample, copy the config beside the original, set cron `start: 2026-09-25T00:00:00Z` and `end: 2026-09-26T01:05:00Z`, and run that path with `--live-mode false --keep-order true -vv`. Batch mode alone does not bound an open-ended schedule. Serialize heavy commands with `flock -x /tmp/eventum-generator-heavy.lock`. Check nonempty output and errors, because CLI exit 0 alone can still accompany template-render failures.
+For a finite batch, copy `generator.yml` to `generator.batch.yml` beside it and add a window under `input[0].cron`:
+
+```yaml
+start: '2026-09-25T00:00:00+00:00'
+end: '2026-09-26T01:05:00+00:00'
+```
+
+```bash
+eventum generate --path generators/application-1c/generator.batch.yml --id one-c-batch --live-mode false --keep-order true
+```
+
+This window yields about 8,600-9,000 records with two episodes at the default interval. A live run shows only background until the first interval has passed. `--keep-order true` preserves source order through the asynchronous writer. Timestamps are rendered in UTC whatever the CLI time zone. Check that the output is non-empty and that no errors were logged, because the CLI can exit with status 0 after template-render failures.
 
 ## Validation
 
-Four finite 25h05 runs with all event parameter overrides and a minimum-one-hour run completed with exit 0, nonempty 9031-row outputs and no error log. Custom input/CLI Europe/Moscow normalized to UTC. Source/collector shapes, actor permission inventories, session-before-operation gates, temporary incarnations and recurring correlations were checked by a streaming verifier.
+Twenty finite captures were generated from the final source, all with exit status 0 and empty `-vvv` logs:
 
-| Capture | Records | Complete episodes | Temporary create/delete | Peak modeled accounts |
-|---|---:|---:|---|---:|
-| `default_on` | 9031 | 2 | 14/14 | 6 |
-| `default_off` | 9031 | 0 | 12/12 | 6 |
-| `custom_on` | 9031 | 4 | 16/16 | 6 |
-| `custom_off` | 9031 | 0 | 12/12 | 6 |
-| `stress_on` | 9031 | 25 | 37/37 | 6 |
+- four default pairs (`true`/`false`) of 25 h 05 min;
+- two pairs of 25 h 05 min with every event parameter overridden and a 6 h interval, using a Unicode, quote and ampersand infobase name, a `+03:00` window and `--timezone Europe/Moscow`;
+- one 25 h 05 min run at the 1 h minimum;
+- 100-hour captures: two with anomalies at 12 h, one at 6 h, and four without.
 
-Meaningful negative captures reject authentication before temporary creation, reuse of a deleted incarnation UUID, and substitution of an otherwise authorized accountant/session for one dense-chain read. The actual original 189af14 generator ran separately for twenty minutes: 14,412 records created 35 temporary names and deleted none, with about 35-second chains. That fails the current source-time and bounded lifecycle criteria. No obsolete implementation pass is claimed.
+A streaming verifier checks:
+
+- the 23-field source union and per-class field sets;
+- UTC seconds and parameter values;
+- object permissions, and authentication before every operation, with pre-window sessions constant until the next login;
+- monotonic session numbers;
+- the temporary-incarnation lifecycle and bounded state;
+- episode recurrence (on creation times), rotation, causal joins and duplicate chain matches;
+- zero complete chains without anomalies;
+- tolerance comparisons of every background decision between the modes: rates, category mixes, two-sample KS on timing distributions, exact small-sample tests on values beyond the other mode's range, and the rate of creations preceded by one to four creator failures;
+- determinism checks for fixed periods, name rotation, repeated gaps, aligned clocks and constant counter steps, per capture and pooled.
+
+All 20 captures, 21 pairs (8 on/off, 11 off/off, 2 on/on) and 5 pooled comparisons pass. The calibrated `mode_compare.py` comparison returns OK for every default, custom and 100-hour pair (12 h and 6 h) and for the off/off pairs. It fails only the 1 h run, as the counts section expects.
+
+Nine negative inputs are each rejected by their intended check:
+
+- the previous source's captures (fixed 2-hour lifecycle, 10-second clock);
+- background with repeated failures removed;
+- a 20-minute lifespan floor;
+- background without creations after three or more creator failures (the earlier guard);
+- a fixed temporary-name rotation;
+- a mode swapped in both directions;
+- a 6 h capture checked against 12 h;
+- an episode reusing the previous episode's temporary name.
 
 ## Sample Output
 
-This complete synthetic user-creation projection was copied from the first default enabled episode. The target identity is inventory enrichment, and its Role array is only the selected native Data subset:
+This user-creation record is row 4,162 of the default `true` capture, the creation step of its first episode, pretty-printed with non-ASCII characters unescaped. The target identity is inventory enrichment, and its `Roles` array is only the selected native Data subset:
 
 ```json
 {
-  "@timestamp": "2026-09-25T12:00:50+00:00",
+  "@timestamp": "2026-09-25T12:08:13+00:00",
   "ecs": {
     "version": "8.11.0"
   },
@@ -148,8 +221,8 @@ This complete synthetic user-creation projection was copied from the first defau
     "name": "admin01",
     "id": "00000000-0000-0000-0000-000000000105",
     "target": {
-      "name": "svc_audit_02",
-      "id": "74f166bc-7e70-42cb-9bec-2396bca05664"
+      "name": "svc_audit_04",
+      "id": "1c308303-6015-45cd-83cf-960eaf475628"
     }
   },
   "client": {
@@ -158,7 +231,7 @@ This complete synthetic user-creation projection was copied from the first defau
   "related": {
     "user": [
       "admin01",
-      "svc_audit_02"
+      "svc_audit_04"
     ],
     "hosts": [
       "ADM-WS-01"
@@ -168,7 +241,7 @@ This complete synthetic user-creation projection was copied from the first defau
   "one_c": {
     "event_log": {
       "level": "Information",
-      "date": "2026-09-25T12:00:50+00:00",
+      "date": "2026-09-25T12:08:13+00:00",
       "application": "Enterprise",
       "application_presentation": "1C:Enterprise",
       "event_name": "_$User$_.New",
@@ -187,8 +260,8 @@ This complete synthetic user-creation projection was copied from the first defau
       "data_presentation": "",
       "transaction_status": "NotApplicable",
       "transaction_id": "",
-      "connection": 457,
-      "session": 1357,
+      "connection": 596,
+      "session": 1511,
       "server_name": "srvr-1c-01.example.test",
       "port": 1541,
       "sync_port": 1542,
@@ -207,3 +280,12 @@ This complete synthetic user-creation projection was copied from the first defau
 - [Integer-second event-log time presentation](https://1c-dn.com/library/v8update_2756468690_changes_that_affect_system_behavior/) supplies source precision; it does not establish exact XML timezone spelling.
 
 **BLOCKED_RAW_EVIDENCE:** full same 8.3.27 native exports for all selected system classes and complete Data shapes, exact failed-auth attribution/session fields, event-specific levels/translations/comments, native session-end body and live exporter/SIEM parser remain unavailable after bounded source research. This pack accepts selected documented semantics with explicit synthetic inventory/collector encodings. It does not prove full native byte parity, a production configuration, malicious intent, actual privileges from role names, or recent-log erasure. Internal session closure is not an emitted native record. The source XML example and current appendix/developer terminology differ in some naming details; the retained collector field names/compound configuration names are not claimed as an exact current XML serializer.
+
+Synthetic behavior limits:
+
+- Rates are stationary, with no working hours or weekends. At most one record falls in each source second.
+- Temporary accounts always log in from their creator's workstation.
+- Staff sessions end silently after a random lifetime, and pre-window sessions are assumed rather than observed.
+- The random draws have long tails, so individual episodes or lifecycles can be unusually long.
+- Administrator failed logins are frequent by design (about 6.7 runs of four or more a day), so that the chain's first steps occur in background at a comparable rate.
+- Short anomaly intervals make partial-step counts diagnostic, as described in Anomaly Chain.
