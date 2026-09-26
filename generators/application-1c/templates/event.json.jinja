@@ -1,0 +1,184 @@
+{# Selected source projection. Native system-event Data is a proven subset, not full raw bytes. #}
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc).replace(microsecond=0) -%}
+{%- set now = utc.timestamp() -%}
+{%- set interval = [params.anomaly_interval_hours | float, 1.0] | max * 3600 -%}
+{%- set start = shared.get('source_start', now) -%}
+{%- do shared.set('source_start', start) -%}
+{%- set due = shared.get('episode_due', start + interval) -%}
+{%- set phase = shared.get('phase', 'routine') -%}
+{%- set temp = shared.get('temporary_user', none) -%}
+{%- set admin = samples.actors.where(name='admin01').pick() -%}
+{%- set actor = samples.actors.weighted_pick('weight') -%}
+{%- set obj = samples.objects.weighted_pick('weight') -%}
+{%- set kind = 'access' -%}
+{%- set synthetic_target = none -%}
+{%- set native_actor = true -%}
+{%- set event_data = none -%}
+{%- set include_data = true -%}
+{%- set metadata = '' -%}
+{%- set metadata_presentation = '' -%}
+{%- set event_name = '_$Access$_.Access' -%}
+{%- set presentation = 'Доступ.Доступ' -%}
+{%- set category = ['database'] -%}
+{%- set event_type = ['access'] -%}
+{%- set outcome = 'success' -%}
+{%- set level = 'Information' -%}
+{%- set data_presentation = '' -%}
+{%- set comment = '' -%}
+
+{# One ordinary temporary-user lifecycle finishes before an episode can arm. #}
+{%- if phase == 'routine' -%}
+  {%- set retry = shared.pop('retry_actor', none) -%}
+  {%- if retry -%}
+    {%- set actor = retry -%}
+    {%- set kind = 'authentication' -%}
+  {%- elif params.anomaly_mode and not temp and not shared.get('maintenance_reduce_due',none) and now >= due -%}
+    {%- set phase = 'probe' -%}
+    {%- do shared.set('phase', phase) -%}
+    {%- do shared.set('failures_left', 4) -%}
+    {%- do shared.set('episode_due', now + interval) -%}
+  {%- elif temp and temp.stage == 'created' and now >= temp.next_at -%}
+    {%- set actor = temp -%}
+    {%- set kind = 'authentication' -%}
+    {%- do temp.update({'stage':'authenticated','next_at':now + 600}) -%}
+  {%- elif temp and temp.stage == 'authenticated' and now >= temp.next_at -%}
+    {%- set actor = temp -%}
+    {%- set kind = 'access' -%}
+    {%- set obj = {'metadata':'InformationRegisters.PayrollAccruals','presentation':'Начисления сотрудников','logged_column':'Employee'} -%}
+    {%- do temp.update({'stage':'read','next_at':now + 600}) -%}
+  {%- elif temp and temp.stage == 'read' and now >= temp.next_at -%}
+    {# Session termination is outside the selected output, before native user deletion. #}
+    {%- set actor = admin -%}
+    {%- set kind = 'user_delete' -%}
+    {%- set synthetic_target = temp -%}
+  {%- elif shared.get('maintenance_reduce_due', none) and now >= shared.get('maintenance_reduce_due') -%}
+    {%- set actor = admin -%}
+    {%- set kind = 'log_reduce' -%}
+  {%- elif not temp and now >= shared.get('maintenance_due', start + 7200) -%}
+    {%- set actor = admin -%}
+    {%- set kind = 'user_new' -%}
+  {%- else -%}
+    {%- set kind = module.rand.weighted_choice(['access','denied','failure','user_update'],[90,6,3,1]) -%}
+    {%- if kind == 'user_update' -%}{%- set actor = admin -%}{%- endif -%}
+    {%- if kind == 'failure' -%}{%- do shared.set('retry_actor', actor) -%}{%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- if phase == 'probe' -%}
+  {%- set actor = admin -%}
+  {%- set kind = 'failure' -%}
+  {%- set left = shared.get('failures_left') - 1 -%}
+  {%- do shared.set('failures_left', left) -%}
+  {%- if left == 0 -%}{%- do shared.pop('failures_left', none) -%}{%- do shared.set('phase','admin_login') -%}{%- endif -%}
+{%- elif phase == 'admin_login' -%}
+  {%- set actor = admin -%}{%- set kind = 'authentication' -%}
+  {%- do shared.set('phase','user_new') -%}
+{%- elif phase == 'user_new' -%}
+  {%- set actor = admin -%}{%- set kind = 'user_new' -%}
+  {%- do shared.set('phase','temporary_login') -%}
+{%- elif phase == 'temporary_login' -%}
+  {%- set actor = temp -%}{%- set kind = 'authentication' -%}
+  {%- do temp.update({'stage':'authenticated'}) -%}
+  {%- do shared.set('reads_left',12) -%}{%- do shared.set('phase','sensitive_access') -%}
+{%- elif phase == 'sensitive_access' -%}
+  {%- set actor = temp -%}{%- set kind = 'access' -%}
+  {%- set obj = {'metadata':'InformationRegisters.PayrollAccruals','presentation':'Начисления сотрудников','logged_column':'Employee'} -%}
+  {%- set left = shared.get('reads_left') - 1 -%}
+  {%- do shared.set('reads_left',left) -%}
+  {%- if left == 0 -%}{%- do shared.pop('reads_left',none) -%}{%- do shared.set('phase','user_delete') -%}{%- endif -%}
+{%- elif phase == 'user_delete' -%}
+  {%- set actor = admin -%}{%- set kind = 'user_delete' -%}{%- set synthetic_target = temp -%}
+  {%- do shared.set('phase','log_reduce') -%}
+{%- elif phase == 'log_reduce' -%}
+  {%- set actor = admin -%}{%- set kind = 'log_reduce' -%}
+  {%- do shared.set('phase','routine') -%}
+{%- endif -%}
+
+{# Object-level Read permissions are explicit synthetic configuration inventory. #}
+{%- if kind == 'denied' -%}
+  {%- if not actor.denied_metadata -%}{%- set actor = samples.actors.where(name='sales01').pick() -%}{%- endif -%}
+  {%- set obj = samples.objects.where(metadata=actor.denied_metadata).pick() -%}
+{%- elif kind == 'access' and not actor.name.startswith('svc_audit_') and obj.metadata not in actor.read_metadata.split('|') -%}
+  {%- set obj = samples.objects.where(metadata=actor.read_metadata.split('|')[0]).pick() -%}
+{%- endif -%}
+
+{# A selected operation without an existing session emits authentication first.
+   The operation is delayed, not emitted under an unauthenticated synthetic actor. #}
+{%- set session = shared.get('session_' ~ actor.name, 0) -%}
+{%- set connection = shared.get('connection_' ~ actor.name, 0) -%}
+{%- if kind != 'failure' and kind != 'authentication' and (session == 0 or now >= shared.get('session_expiry_' ~ actor.name,0)) -%}
+  {%- if phase != 'routine' -%}{%- do shared.set('phase',phase) -%}{%- endif -%}
+  {%- set kind = 'authentication' -%}
+  {%- set synthetic_target = none -%}
+{%- endif -%}
+
+{%- if kind == 'authentication' -%}
+  {%- set session = shared.get('session_counter',1200) + 1 -%}
+  {%- set connection = shared.get('connection_counter',300) + 1 -%}
+  {%- do shared.update({'session_counter':session,'connection_counter':connection}) -%}
+  {%- do shared.set('session_' ~ actor.name,session) -%}{%- do shared.set('connection_' ~ actor.name,connection) -%}
+  {%- do shared.set('session_expiry_' ~ actor.name,now + 3600) -%}
+  {%- set event_name = '_$Session$_.Authentication' -%}{%- set presentation = 'Сеанс.Аутентификация' -%}
+  {%- set category = ['authentication'] -%}{%- set event_type = ['start'] -%}
+  {%- set event_data = {'OSUser':actor.os_user} -%}{%- set data_presentation = 'Аутентификация пользователя' -%}
+{%- elif kind == 'failure' -%}
+  {%- set native_actor = false -%}{%- set session = 0 -%}{%- set connection = 0 -%}
+  {%- set event_name = '_$Session$_.AuthenticationError' -%}{%- set presentation = 'Сеанс.Ошибка аутентификации' -%}
+  {%- set category = ['authentication'] -%}{%- set event_type = ['start'] -%}{%- set outcome = 'failure' -%}
+  {%- set level = 'Warning' -%}{%- set include_data = false -%}
+{%- elif kind == 'user_new' -%}
+  {%- if phase == 'routine' -%}{%- do shared.set('maintenance_due',now + 7200) -%}{%- endif -%}
+  {%- set cursor = shared.get('temporary_cursor',0) % 4 -%}
+  {%- do shared.set('temporary_cursor',(cursor + 1) % 4) -%}
+  {%- set temporary = {'name':'svc_audit_%02d' % (cursor + 1),'id':module.uuid.uuid4() | string,'computer':admin.computer,'os_user':admin.os_user,'role':'Roles.FullAccess','stage':'created','next_at':now + 600} -%}
+  {%- do shared.set('temporary_user',temporary) -%}{%- set synthetic_target = temporary -%}
+  {%- set event_name = '_$User$_.New' -%}{%- set presentation = 'Пользователи.Новый пользователь' -%}
+  {%- set category = ['iam'] -%}{%- set event_type = ['creation'] -%}
+  {%- set event_data = {'Roles':['Roles.FullAccess']} -%}
+{%- elif kind == 'user_delete' -%}
+  {%- do shared.pop('session_' ~ synthetic_target.name,none) -%}{%- do shared.pop('connection_' ~ synthetic_target.name,none) -%}
+  {%- do shared.pop('session_expiry_' ~ synthetic_target.name,none) -%}{%- do shared.pop('temporary_user',none) -%}
+  {%- if phase == 'routine' -%}{%- do shared.set('maintenance_reduce_due',now + 600) -%}{%- endif -%}
+  {%- set event_name = '_$User$_.Delete' -%}{%- set presentation = 'Пользователи.Удаление пользователя' -%}
+  {%- set category = ['iam'] -%}{%- set event_type = ['deletion'] -%}{%- set include_data = false -%}
+{%- elif kind == 'user_update' -%}
+  {%- set target = samples.actors.where(name='accountant02').pick() -%}{%- set synthetic_target = target -%}
+  {%- set event_name = '_$User$_.Update' -%}{%- set presentation = 'Пользователи.Изменение пользователя' -%}
+  {%- set category = ['iam'] -%}{%- set event_type = ['change'] -%}
+  {%- set include_data = false -%}
+{%- elif kind == 'log_reduce' -%}
+  {%- do shared.pop('maintenance_reduce_due',none) -%}
+  {%- set event_name = '_$InfoBase$_.EventLogReduce' -%}{%- set presentation = 'Информационная база.Сокращение журнала регистрации' -%}
+  {%- set category = ['configuration'] -%}{%- set event_type = ['deletion'] -%}{%- set include_data = false -%}
+{%- elif kind == 'denied' -%}
+  {%- set event_name = '_$Access$_.AccessDenied' -%}{%- set presentation = 'Доступ.Отказ в доступе' -%}
+  {%- set event_type = ['access','denied'] -%}{%- set outcome = 'failure' -%}{%- set level = 'Warning' -%}
+  {%- set metadata = [obj.metadata] -%}{%- set metadata_presentation = [obj.presentation] -%}
+  {%- set event_data = {'Right':'Read'} -%}
+{%- else -%}
+  {%- set metadata = [obj.metadata] -%}{%- set metadata_presentation = [obj.presentation] -%}
+  {%- set row = {obj.logged_column: ('EMP-%04d' % module.rand.number.integer(1001,1024)) if obj.logged_column == 'Employee' else ('REC-%05d' % module.rand.number.integer(1,5000))} -%}
+  {%- set event_data = {'Data':[row]} -%}{%- set data_presentation = 'Чтение зарегистрированного поля' -%}
+{%- endif -%}
+{
+  "@timestamp": {{ utc.isoformat(timespec='seconds') | tojson }},
+  "ecs": {"version": {{ params.ecs_version | tojson }}},
+  "event": {"kind":"event","module":"one_c","dataset":"one_c.event_log","action":{{ event_name | tojson }},"category":{{ category | tojson }},"type":{{ event_type | tojson }},"outcome":{{ outcome | tojson }}},
+  "host":{"name":{{ params.host_name | tojson }}},
+  "service":{"name":{{ params.infobase | tojson }}},
+  "user":{"name":{{ actor.name | tojson }}{% if native_actor %},"id":{{ actor.id | tojson }}{% endif %}{% if synthetic_target %},"target":{"name":{{ synthetic_target.name | tojson }},"id":{{ synthetic_target.id | tojson }}}{% endif %}},
+  "client":{"address":{{ actor.computer | tojson }}},
+  "related":{"user":[{{ actor.name | tojson }}{% if synthetic_target %},{{ synthetic_target.name | tojson }}{% endif %}],"hosts":[{{ actor.computer | tojson }}]},
+  "message":{{ presentation | tojson }},
+  "one_c":{"event_log":{
+    "level":{{ level | tojson }},"date":{{ utc.isoformat(timespec='seconds') | tojson }},
+    "application":"Enterprise","application_presentation":"1C:Enterprise",
+    "event_name":{{ event_name | tojson }},"event_presentation":{{ presentation | tojson }},
+    {% if native_actor %}"user_id":{{ actor.id | tojson }},"user_name":{{ actor.name | tojson }},{% endif %}
+    "computer":{{ actor.computer | tojson }},"metadata_name":{{ metadata | tojson }},"metadata_presentation":{{ metadata_presentation | tojson }},
+    "comment":{{ comment | tojson }},{% if include_data %}"data":{{ event_data | tojson }},"data_presentation":{{ data_presentation | tojson }},{% endif %}
+    "transaction_status":"NotApplicable","transaction_id":"",
+    "connection":{{ connection }},"session":{{ session }},"server_name":{{ params.server_name | tojson }},"port":{{ params.server_port }},"sync_port":{{ params.sync_port }},
+    "session_data_separation":{},"session_data_separation_presentation":[]
+  }}
+}
