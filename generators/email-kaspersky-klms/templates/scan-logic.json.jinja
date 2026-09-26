@@ -1,65 +1,92 @@
-{%- set tick = (shared.get('tick', -1) + 1) % 160 -%}
-{%- do shared.set('tick', tick) -%}
-{%- if params.anomaly_mode and tick == 120 and not shared.get('anomaly_done', false) -%}
-  {%- do shared.set('anomaly_done', true) -%}{%- do shared.set('chain_step', 0) -%}
+{%- macro cef_extension(value) -%}
+{{- value | string | replace('\\', '\\\\') | replace('=', '\\=') | replace('\n', '\\n') | replace('\r', '\\r') -}}
+{%- endmacro -%}
+{%- macro cef_header(value) -%}
+{{- value | string | replace('\\', '\\\\') | replace('|', '\\|') -}}
+{%- endmacro -%}
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = utc.timestamp() -%}
+{%- set interval = ([1, params.anomaly_interval_hours | float] | max) * 3600 -%}
+{%- if shared.get('next_anomaly') is none -%}
+  {%- do shared.set('next_anomaly', now + interval) -%}
+  {%- do shared.set('next_special_failure', now + 1200) -%}
 {%- endif -%}
-{%- set step = shared.get('chain_step', -1) -%}
-{%- set in_chain = step >= 0 -%}
-{%- set special = in_chain or tick in [20, 40, 60, 80, 81] -%}
-{%- set av = (in_chain and step == 3) or tick == 81 -%}
-{%- if not in_chain and not special -%}
-  {%- set av = shared.get('last_message') is not none and module.rand.chance(0.12) -%}
-{%- endif -%}
-{%- if av -%}
-  {%- set message = shared.pop('last_message') -%}
-  {%- set message_id = message[0] -%}
-  {%- set relay_ip = message[1] -%}
-  {%- set sender = message[2] -%}
-  {%- set recipient = message[3] -%}
-  {%- set size = message[4] -%}
+{%- set message = shared.get('pending_message') -%}
+{%- set av = message is not none -%}
+{%- if not av -%}
+  {%- if params.anomaly_mode and shared.get('chain_step') is none and now >= shared.get('next_anomaly') -%}
+    {%- do shared.set('chain_step', 0) -%}
+    {%- do shared.set('next_anomaly', now + interval) -%}
+    {%- do shared.set('next_special_failure', now + 1200) -%}
+  {%- endif -%}
+  {%- set step = shared.get('chain_step') -%}
+  {%- set in_chain = step is not none -%}
+  {%- set failures = shared.get('actor_failures', {}) -%}
+  {%- set target_key = params.unusual_relay_ip ~ ':' ~ params.unusual_sender -%}
+  {%- set special = not in_chain and now >= shared.get('next_special_failure') and now - failures.get(target_key, -1200) >= 1200 -%}
+  {%- set actors = [
+    ['198.51.100.11', 'news@partner.example.test'],
+    ['198.51.100.12', 'alerts@vendor.example.test'],
+    ['198.51.100.13', 'orders@shop.example.test'],
+    [params.unusual_relay_ip, params.unusual_sender]] -%}
+  {%- set actor = actors[3] if in_chain or special else module.rand.weighted_choice(actors, [30, 30, 25, 15]) -%}
+  {%- set relay_ip = actor[0] -%}
+  {%- set sender = actor[1] -%}
+  {%- set recipient = params.target_recipient if in_chain or special else module.rand.choice(['ops@example.test', 'support@example.test', 'sales@example.test', params.target_recipient]) -%}
+  {%- set actor_key = relay_ip ~ ':' ~ sender -%}
+  {%- set failed = in_chain or special or (now - failures.get(actor_key, -1200) >= 1200 and module.rand.chance(0.07)) -%}
+  {%- set verdicts = ['Pass', 'Pass', 'Pass'] -%}
+  {%- if failed -%}
+    {%- set verdicts = ['Fail', 'Fail', 'Fail'] if in_chain or special else module.rand.weighted_choice([['Fail', 'Fail', 'Fail'], ['Fail', 'Pass', 'Pass'], ['Pass', 'Fail', 'Pass']], [35, 35, 30]) -%}
+    {%- do failures.update({actor_key: now}) -%}
+    {%- do shared.set('actor_failures', failures) -%}
+  {%- endif -%}
+  {%- set infected = in_chain and step == 2 -%}
+  {%- if special -%}
+    {%- set cursor = shared.get('special_cursor', 0) -%}
+    {%- set infected = cursor == 3 -%}
+    {%- do shared.set('special_cursor', (cursor + 1) % 4) -%}
+    {%- do shared.set('next_special_failure', now + 1200) -%}
+  {%- elif not in_chain -%}
+    {%- set infected = module.rand.chance(0.08) -%}
+  {%- endif -%}
+  {%- set message = {'id': module.rand.string.hex(16), 'relay': relay_ip, 'sender': sender, 'recipient': recipient,
+    'size': module.rand.number.clamp(module.rand.number.lognormal(10, 1.2) | int, 500, 30000000),
+    'time': utc, 'verdicts': verdicts, 'infected': infected, 'chain_step': step} -%}
+  {%- do shared.set('pending_message', message) -%}
 {%- else -%}
-  {%- set message_id = module.rand.string.hex(16) -%}
-  {%- set relay_ip = params.unusual_relay_ip if special else module.rand.choice(['198.51.100.11', '198.51.100.12', '198.51.100.13']) -%}
-  {%- set sender = params.unusual_sender if special else module.rand.choice(['news@partner.example.test', 'alerts@vendor.example.test', 'orders@shop.example.test']) -%}
-  {%- set recipient = params.target_recipient if special else module.rand.choice(['ops@example.test', 'support@example.test', 'sales@example.test']) -%}
-  {%- set size = module.rand.number.clamp(module.rand.number.lognormal(10, 1.2) | int, 500, 30000000) -%}
-  {%- do shared.set('last_message', [message_id, relay_ip, sender, recipient, size]) -%}
+  {%- set utc = message.time -%}
+  {%- do shared.pop('pending_message') -%}
+  {%- if message.chain_step is not none -%}
+    {%- if message.chain_step == 2 -%}{%- do shared.pop('chain_step') -%}
+    {%- else -%}{%- do shared.set('chain_step', message.chain_step + 1) -%}{%- endif -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set failed = (in_chain and step < 3) or tick in [20, 40, 60, 80] -%}
-{%- if not av and not failed and not special -%}{%- set failed = module.rand.chance(0.07) -%}{%- endif -%}
-{%- set infected = av and (in_chain or tick == 81 or module.rand.chance(0.08)) -%}
+{%- set failed = 'Fail' in message.verdicts -%}
 {%- set class_id = 'LMS_EV_SCAN_LOGIC_AV_STATUS' if av else 'LMS_EV_SCAN_LOGIC_MA_STATUS' -%}
 {%- set name = 'antivirus scan status' if av else 'mail authentication status' -%}
-{%- set act = 'Reject' if infected or failed else 'Skip' -%}
-{%- set status = ('Infected' if infected else 'Clean') if av else ('ViolationFound' if failed else 'ViolationNotFound') -%}
-{%- set fields = ['cs1=' ~ message_id, 'cs1Label=MessageId', 'src=' ~ relay_ip, 'act=' ~ act,
-  'fsize=' ~ size, 'suser=' ~ sender, 'duser=' ~ recipient,
+{%- set act = ('Reject' if message.infected else 'Skip') if av else ('Reject' if failed else 'Skip') -%}
+{%- set status = ('Infected' if message.infected else 'Clean') if av else ('ViolationFound' if failed else 'ViolationNotFound') -%}
+{%- set fields = ['cs1=' ~ cef_extension(message.id), 'cs1Label=MessageId', 'src=' ~ cef_extension(message.relay),
+  'act=' ~ act, 'fsize=' ~ message.size, 'suser=' ~ cef_extension(message.sender), 'duser=' ~ cef_extension(message.recipient),
   'cs2=Default', 'cs2Label=Rules'] -%}
 {%- if not av -%}
-  {%- set verdict = 'Fail' if failed else 'Pass' -%}
-  {%- do fields.extend(['cs4=' ~ verdict, 'cs4Label=SpfVerdict',
-    'cs5=' ~ verdict, 'cs5Label=DkimVerdict',
-    'cs6=' ~ verdict, 'cs6Label=DmarcVerdict']) -%}
+  {%- do fields.extend(['cs4=' ~ message.verdicts[0], 'cs4Label=SpfVerdict',
+    'cs5=' ~ message.verdicts[1], 'cs5Label=DkimVerdict',
+    'cs6=' ~ message.verdicts[2], 'cs6Label=DmarcVerdict']) -%}
 {%- endif -%}
 {%- do fields.append('outcome=' ~ status) -%}
-{%- set raw = timestamp.strftime('%B %d, %Y %H:%M:%S') ~ ' ' ~ params.mail_host
+{%- set raw = utc.strftime('%B %d, %Y %H:%M:%S') ~ ' ' ~ params.mail_host
   ~ ' CEF:0|AO Kaspersky Lab|Kaspersky Linux Mail Security|'
-  ~ params.product_version ~ '|' ~ class_id ~ '|' ~ name ~ '|'
-  ~ ('High' if infected else 'Low') ~ '|' ~ (fields | join(' ')) -%}
+  ~ cef_header(params.product_version) ~ '|' ~ class_id ~ '|' ~ name ~ '|'
+  ~ ('High' if av and message.infected else 'Low') ~ '|' ~ (fields | join(' ')) -%}
 {%- set klms = {'class_id': class_id} -%}
-{%- if not av -%}{%- do klms.update({'spf': verdict, 'dkim': verdict, 'dmarc': verdict}) -%}{%- endif -%}
-{%- set record = {'@timestamp': timestamp.isoformat(),
-  'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'dataset': 'kaspersky.klms',
-    'category': ['malware'] if av else ['email'],
+{%- if not av -%}{%- do klms.update({'spf': message.verdicts[0], 'dkim': message.verdicts[1], 'dmarc': message.verdicts[2]}) -%}{%- endif -%}
+{%- set record = {'@timestamp': utc.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'kaspersky.klms', 'category': ['malware'] if av else ['email'],
     'type': ['info'], 'code': class_id, 'action': act.lower(), 'original': raw},
-  'observer': {'hostname': params.mail_host, 'vendor': 'Kaspersky',
-    'product': 'Kaspersky Linux Mail Security', 'version': params.product_version},
-  'source': {'ip': relay_ip},
-  'email': {'local_id': message_id, 'from': {'address': [sender]}, 'to': {'address': [recipient]}},
+  'observer': {'hostname': params.mail_host, 'vendor': 'Kaspersky', 'product': 'Kaspersky Linux Mail Security', 'version': params.product_version},
+  'source': {'ip': message.relay},
+  'email': {'local_id': message.id, 'from': {'address': [message.sender]}, 'to': {'address': [message.recipient]}},
   'kaspersky': {'klms': klms}} -%}
-{%- if in_chain -%}
-  {%- if step == 3 -%}{%- do shared.pop('chain_step') -%}
-  {%- else -%}{%- do shared.set('chain_step', step + 1) -%}{%- endif -%}
-{%- endif -%}
-{{ record | tojson }}
+{{- record | tojson -}}
