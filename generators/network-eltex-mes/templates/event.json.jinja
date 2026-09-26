@@ -1,0 +1,227 @@
+{# Native bodies follow the unversioned MES23xx/33xx/35xx/MES5324 catalog.
+   Scheduler/inventory are scenario state, never native session IDs or actors. #}
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = utc.timestamp() -%}
+{%- set interval = [params.anomaly_interval_hours | float, 6] | max * 3600 -%}
+{%- if shared.get('inventory') is none -%}
+  {%- set inventory = [] -%}
+  {%- for row in samples.endpoints -%}
+    {%- set ep = {'mac':row.mac, 'vlan':row.vlan, 'port':row.port, 'target':row.target} -%}
+    {%- if loop.index0 == 48 -%}
+      {%- do ep.update({'mac': params.target_mac, 'vlan': params.target_vlan,
+          'port': params.target_port}) -%}
+    {%- endif -%}
+    {%- do inventory.append(ep) -%}
+  {%- endfor -%}
+  {%- set present = {} -%}
+  {%- set ports = {} -%}
+  {%- set speeds = {} -%}
+  {%- for ep in inventory -%}
+    {%- do present.update({loop.index0: true}) -%}
+    {%- do ports.update({ep.port: true}) -%}
+    {%- if ep.target -%}{%- do speeds.update({ep.port: '10G'}) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.update({'inventory': inventory, 'present': present,
+      'ports': ports, 'speeds': speeds, 'receiver': true, 'plan': [],
+      'held': none, 'restore': none, 'session': none,
+      'episode_due': now + interval, 'normal_due': now + 1800,
+      'episode_cursor': 0, 'normal_cursor': 0}) -%}
+{%- endif -%}
+{%- set inventory = shared.get('inventory') -%}
+{%- set present = shared.get('present') -%}
+{%- set ports = shared.get('ports') -%}
+{%- set speeds = shared.get('speeds') -%}
+{%- set actors = [
+    {'user': params.normal_user, 'ip': params.normal_source_ip},
+    {'user': params.unusual_user, 'ip': params.unusual_source_ip}] -%}
+{%- set plan = shared.get('plan') -%}
+{%- set pick = namespace(frame=none, purpose=none, target=none, actor=none,
+    steps=[], preparation=false) -%}
+{%- if not plan -%}
+  {%- set restore = shared.get('restore') -%}
+  {%- if restore is not none and now >= restore.due -%}
+    {%- set pick.purpose = 'recovery' -%}
+    {%- set pick.target = restore.target -%}
+    {%- set pick.actor = 1 - restore.actor -%}
+    {%- set pick.steps = [[0,'accept'],[30,'speed_up'],[60,'up'],
+        [90,'learn'],[120,'receiver_add'],[150,'disconnect']] -%}
+  {%- elif restore is none and params.anomaly_mode
+      and now >= shared.get('episode_due') -%}
+    {%- set cursor = shared.get('episode_cursor') -%}
+    {%- set pick.target = 48 + cursor % 4 -%}
+    {%- set pick.actor = cursor % 2 -%}
+    {%- if not present[pick.target] -%}
+      {%- set pick.preparation = true -%}
+    {%- else -%}
+      {%- set pick.purpose = 'episode' -%}
+      {%- set pick.steps = [[0,'reject'],[30,'reject'],[60,'reject'],
+          [90,'accept'],[120,'speed_down'],[150,'down'],[180,'remove'],
+          [210,'clear'],[240,'receiver_delete'],[270,'disconnect']] -%}
+      {%- do shared.set('episode_cursor', cursor + 1) -%}
+      {%- do shared.set('episode_due', now + interval) -%}
+    {%- endif -%}
+  {%- elif restore is none and now >= shared.get('normal_due')
+      and (not params.anomaly_mode or now + 900 < shared.get('episode_due')) -%}
+    {%- set cursor = shared.get('normal_cursor') -%}
+    {%- set kind = cursor % 4 -%}
+    {%- set pick.target = 48 + (cursor // 4) % 4 -%}
+    {%- set pick.actor = ((cursor // 4) + (cursor % 2)) % 2 -%}
+    {%- if kind == 0 and not present[pick.target] -%}
+      {%- set pick.preparation = true -%}
+    {%- else -%}
+      {%- set pick.purpose = 'ordinary' -%}
+      {%- if kind == 0 -%}
+        {%- set pick.steps = [[0,'accept'],[30,'speed_down'],[60,'down'],
+            [90,'remove'],[390,'speed_up'],[420,'up'],
+            [450,'learn'],[480,'disconnect']] -%}
+      {%- elif kind == 1 -%}
+        {%- set pick.steps = [[0,'accept'],[30,'clear'],[60,'disconnect']] -%}
+      {%- elif kind == 2 -%}
+        {%- set pick.steps = [[0,'accept'],[30,'receiver_delete'],
+            [150,'receiver_add'],[180,'disconnect']] -%}
+      {%- else -%}
+        {%- set pick.steps = [[0,'reject'],[30,'accept'],[60,'disconnect']] -%}
+      {%- endif -%}
+      {%- do shared.set('normal_cursor', cursor + 1) -%}
+      {%- do shared.set('normal_due', now + 1800) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if pick.purpose is not none -%}
+    {%- for row in pick.steps -%}
+      {%- do plan.append({'due': now + row[0], 'op': row[1],
+          'target': pick.target, 'actor': pick.actor, 'purpose': pick.purpose}) -%}
+    {%- endfor -%}
+    {%- if pick.purpose != 'ordinary' or pick.steps[1][1] == 'speed_down' -%}
+      {%- do shared.set('held', pick.target) -%}
+    {%- endif -%}
+  {%- elif pick.preparation -%}
+    {%- set pick.frame = {'op':'learn', 'target':pick.target} -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if plan and now >= plan[0].due -%}
+  {%- set pick.frame = plan.pop(0) -%}
+{%- endif -%}
+{%- if pick.frame is none -%}
+  {%- set eligible = [] -%}
+  {%- for ep in inventory -%}
+    {%- if loop.index0 != shared.get('held') and ports[ep.port] -%}
+      {%- do eligible.append(loop.index0) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set idx = module.rand.choice(eligible) -%}
+  {%- set pick.frame = {'op': 'remove' if present[idx] else 'learn',
+      'target': idx} -%}
+{%- endif -%}
+{%- set frame = pick.frame -%}
+{%- set op = frame.op -%}
+{%- set endpoint = inventory[frame.target] -%}
+{%- set extra = {} -%}
+{%- set details = {} -%}
+{%- set category = ['network'] -%}
+{%- set event_type = ['info'] -%}
+{%- set outcome = 'unknown' -%}
+{%- if op in ['accept','reject','disconnect'] -%}
+  {%- set actor = actors[frame.actor] -%}
+  {%- set component = 'AAA' -%}
+  {%- set severity = 'W' if op == 'reject' else 'I' -%}
+  {%- set mnemonic = {'accept':'CONNECT','reject':'REJECT',
+      'disconnect':'DISCONNECT'}[op] -%}
+  {%- set body = ('https connection for user ' if op == 'disconnect'
+      else 'New https connection for user ') ~ actor.user ~ ', source '
+      ~ actor.ip ~ ' destination ' ~ params.switch_ip -%}
+  {%- if op == 'disconnect' -%}
+    {%- set body = body ~ ' TERMINATED' -%}
+    {%- do shared.set('session', none) -%}
+    {%- if frame.get('purpose') == 'ordinary' -%}
+      {%- do shared.set('held', none) -%}
+    {%- elif frame.get('purpose') == 'recovery' -%}
+      {%- do shared.set('held', none) -%}
+      {%- do shared.set('restore', none) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set body = body ~ ', local user table '
+        ~ ('ACCEPTED.' if op == 'accept' else 'REJECTED.') -%}
+    {%- if op == 'accept' -%}{%- do shared.set('session', frame.actor) -%}{%- endif -%}
+  {%- endif -%}
+  {%- set action = {'accept':'login_accepted','reject':'login_rejected',
+      'disconnect':'session_terminated'}[op] -%}
+  {%- set outcome = 'failure' if op == 'reject' else 'success' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['end'] if op == 'disconnect' else
+      ['start','denied' if op == 'reject' else 'allowed'] -%}
+  {%- do extra.update({'user':{'name':actor.user}, 'source':{'ip':actor.ip},
+      'destination':{'ip':params.switch_ip}}) -%}
+  {%- do details.update({'connection': {'type':'https'}}) -%}
+  {%- if op != 'disconnect' -%}
+    {%- do details.connection.update({'auth_method':'local user table'}) -%}
+  {%- endif -%}
+{%- elif op in ['learn','remove'] -%}
+  {%- set state = 'learnt' if op == 'learn' else 'Removed' -%}
+  {%- set component = 'BRG_MACNTFY' -%}
+  {%- set severity = 'I' -%}
+  {%- set mnemonic = 'MAC_CHANGED' -%}
+  {%- set body = state ~ ' Mac ' ~ endpoint.mac ~ ' on VLAN '
+      ~ endpoint.vlan ~ ' Port ' ~ endpoint.port -%}
+  {%- set action = 'mac_learned' if op == 'learn' else 'mac_removed' -%}
+  {%- do present.update({frame.target: op == 'learn'}) -%}
+  {%- do extra.update({'interface':{'name':endpoint.port},
+      'source':{'mac':endpoint.mac}}) -%}
+  {%- do details.update({'mac_state':state.lower(), 'vlan':{'id':endpoint.vlan}}) -%}
+{%- elif op in ['speed_down','speed_up','down','up'] -%}
+  {%- set component = 'LINK' -%}
+  {%- set event_type = ['change'] -%}
+  {%- do extra.update({'interface':{'name':endpoint.port}}) -%}
+  {%- if op in ['speed_down','speed_up'] -%}
+    {%- set speed = '1G' if op == 'speed_down' else '10G' -%}
+    {%- set severity = 'N' -%}
+    {%- set mnemonic = 'PortConfRecover' -%}
+    {%- set body = 'Port ' ~ endpoint.port ~ ' configured to speed ' ~ speed -%}
+    {%- set action = 'interface_speed_changed' -%}
+    {%- set category = ['configuration','network'] -%}
+    {%- do speeds.update({endpoint.port:speed}) -%}
+    {%- do details.update({'interface':{'speed':speed}}) -%}
+  {%- else -%}
+    {%- set severity = 'W' -%}
+    {%- set mnemonic = 'Down' if op == 'down' else 'Up' -%}
+    {%- set body = endpoint.port -%}
+    {%- set action = 'interface_down' if op == 'down' else 'interface_up' -%}
+    {%- do ports.update({endpoint.port:op == 'up'}) -%}
+    {%- do details.update({'interface':{'state':'down' if op == 'down' else 'up'}}) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set component = 'SYSLOG' -%}
+  {%- set severity = 'N' -%}
+  {%- set category = ['configuration'] -%}
+  {%- if op == 'clear' -%}
+    {%- set mnemonic = 'CLEARLOGGINGFILE' -%}
+    {%- set body = 'clear messages from the logging file.' -%}
+    {%- set action = 'logging_file_cleared' -%}
+    {%- set event_type = ['deletion'] -%}
+  {%- else -%}
+    {%- set adding = op == 'receiver_add' -%}
+    {%- set mnemonic = 'NEWSYSLOGSERVER' if adding else 'NOSYSLOGSERVER' -%}
+    {%- set body = ('configure new syslog server ' if adding
+        else 'delete syslog server ') ~ params.syslog_server_ip -%}
+    {%- set action = 'syslog_server_added' if adding else 'syslog_server_deleted' -%}
+    {%- set event_type = ['creation'] if adding else ['deletion'] -%}
+    {%- do shared.set('receiver', adding) -%}
+    {%- do details.update({'syslog_server':{'ip':params.syslog_server_ip}}) -%}
+    {%- if not adding and frame.get('purpose') == 'episode' -%}
+      {%- do shared.set('restore', {'due':now + 900,
+          'target':frame.target, 'actor':frame.actor}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set raw = component ~ '-' ~ severity ~ '-' ~ mnemonic ~ ': ' ~ body -%}
+{%- set event = {'@timestamp': utc.isoformat(), 'ecs':{'version':'8.17.0'},
+    'event':{'action':action, 'category':category, 'dataset':'eltex.mes.syslog',
+        'kind':'event', 'module':'eltex', 'original':raw,
+        'outcome':outcome, 'type':event_type}, 'message':raw,
+    'log':{'level':{'W':'warning','I':'info','N':'notice'}[severity]},
+    'observer':{'hostname':params.switch_name, 'ip':[params.switch_ip],
+        'name':params.switch_name, 'product':'MES', 'model':'MES5324',
+        'type':'switch', 'vendor':'Eltex'},
+    'eltex':{'mes':{'component':component, 'mnemonic':mnemonic,
+        'severity_code':severity, 'details':details}}} -%}
+{%- do event.update(extra) -%}
+{{ event | tojson }}
