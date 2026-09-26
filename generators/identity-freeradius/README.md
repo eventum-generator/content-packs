@@ -44,20 +44,32 @@ Authentication and accounting therefore go to **two separate files**. A SIEM col
 
 The [tagged 3.2.10 `linelog` configuration](https://github.com/FreeRADIUS/freeradius-server/blob/release_3_2_10/raddb/mods-available/linelog) defines the file destinations and accounting formats; its default authentication formats are shorter. The [tagged default virtual server](https://github.com/FreeRADIUS/freeradius-server/blob/release_3_2_10/raddb/sites-available/default) defines the `post-auth` and `accounting` sections. The [tagged server configuration](https://github.com/FreeRADIUS/freeradius-server/blob/release_3_2_10/raddb/radiusd.conf.in) sets built-in `log.auth` to `no`.
 
-## Behavior and anomaly
+## Event Types
 
-Every 30 seconds the generator emits one record. Routine authentication attempts use a pool of 20 user/station pairs from the parameters and `samples/clients.json`. The same target user and calling station used in the anomaly also make ordinary attempts and sessions in the background. About 70% of routine attempts are accepted and 30% rejected; those are synthetic weights, not measured FreeRADIUS rates. Each accepted attempt is followed by an accounting Start for that user/station. Active sessions stay open for 10, 15, 20, or 30 minutes; a Stop is emitted when a session is due, and `Acct-Session-Time` equals the actual Start-to-Stop elapsed seconds. Pending sessions are bounded by the client pool. An open session at the end of a finite run has no synthetic Stop.
+| Action | Selection or trigger | ECS category |
+| --- | --- | --- |
+| `accept` | 70% of routine authentication choices | `authentication` |
+| `reject` | 30% of routine authentication choices, with target spacing | `authentication` |
+| `connect` | Next tick after an acceptance | `session` |
+| `disconnect` | An active session becomes due | `session` |
 
-When `anomaly_mode` is enabled, one chain starts after at least `anomaly_after_attempts` routine authentication decisions: three consecutive rejects, one accept, then an accounting Start for the configured target user/station. Its Stop occurs at least 15 minutes later and carries the actual elapsed duration. The chain appears only once per generator run. Background rejects for this target are separated by at least 10 minutes, so they do not form the same three-reject sequence. Correlate on user and calling station across auth and accounting lines; the chain has no special marker in the event.
+Every 30-second tick emits at most one record. If all stations have active sessions and no Stop is due, that tick is silent. Routine authentication attempts use a pool of 20 user/station pairs from the parameters and `samples/clients.json`. The same target user and calling station used in the anomaly also make ordinary attempts and sessions in the background. About 70% of routine attempts are accepted and 30% rejected; those are synthetic weights, not measured FreeRADIUS rates. Each accepted attempt is followed by an accounting Start for that user/station. Ordinary sessions are scheduled for 10, 15, 20, or 30 minutes. Servicing other due sessions or an anomaly can delay a Stop; `Acct-Session-Time` equals the actual Start-to-Stop elapsed seconds. Pending sessions are bounded by the client pool. An open session at the end of a finite run has no synthetic Stop.
+
+## Anomaly Chain
+
+With `anomaly_mode: true` (the default), the first chain starts after at least `anomaly_after_attempts` routine authentication decisions. Further chains recur at least `anomaly_interval_seconds` (three hours by default) after the previous start, once the target station is free and the routine trigger conditions hold. Each chain has three consecutive rejects, one accept, then an accounting Start for the configured target user/station. Its Stop occurs at least 15 minutes later and carries the actual elapsed duration. Each episode creates a separate session with its own Start/Stop pair. Background rejects for this target are separated by at least 10 minutes, so they do not form the same three-reject sequence. Correlate on user and calling station across auth and accounting lines; the chain has no special marker in the event. These file formats do not expose `Acct-Session-Id`, so separate sessions are reconstructed from their Start/Stop times. The model allows only one active session per calling station. With `anomaly_mode: false`, only background is generated.
 
 ## Parameters
+
+### Event Parameters
 
 Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `anomaly_mode` | `true` | Emit the one-shot chain |
-| `anomaly_after_attempts` | `250` | Minimum routine authentication decisions before the chain can start |
+| `anomaly_mode` | `true` | Emit recurring chains |
+| `anomaly_after_attempts` | `250` | Minimum routine authentication decisions before the first chain can start |
+| `anomaly_interval_seconds` | `10800` | Minimum time between chain starts; use a positive value above 1800 seconds |
 | `radius_host` | `radius-01` | ECS host enrichment |
 | `nas_client` | `wifi-controller-01` | ECS RADIUS client short-name enrichment |
 | `ordinary_user` | `employee01` | First background user |
@@ -70,24 +82,28 @@ Edit `event.template.params` in `generator.yml`:
 | `unusual_framed_ip` | `10.50.0.46` | Target framed IP |
 | `called_station` | `02-66-77-88-99-AA` | Accounting called station |
 
-Keep station, port, and framed-IP combinations distinct from each other and from `samples/clients.json` when customizing the pool. The shipped output is `output/events.json`; replace the `output` block to send ECS events elsewhere. No credentials are required for the file output.
+Keep station, port, and framed-IP combinations distinct from each other and from `samples/clients.json` when customizing the pool.
+
+### Output Parameters
+
+The shipped output is `output/events.json` and uses no `${params.*}` or `${secrets.*}` placeholders. Replace the `output` block to send ECS events elsewhere. No credentials are required for the file output.
 
 ## Usage
 
 From the content-packs repository root:
 
 ```bash
-eventum generate --path generators/identity-freeradius/generator.yml --id freeradius --live-mode true
+uv run --project ../eventum eventum generate --path generators/identity-freeradius/generator.yml --id freeradius --live-mode true
 ```
 
 For a finite historical validation, copy `generator.yml` alongside the original, set `input[0].cron.start` and `end` in the copy, and run with `--live-mode false --keep-order true`. The default configuration has no end time and is intended to run until stopped.
 
 ## Sample output
 
-This complete event is copied unchanged from the finite default/anomaly-on run. Its matching `Connect` was emitted at `2026-09-25T05:01:00+00:00`.
+This complete event is copied unchanged from the first episode of the final default/anomaly-on run. Its matching `Connect` was emitted at `2026-09-27T05:26:00+00:00`.
 
 ```json
-{"@timestamp": "2026-09-25T05:16:00+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "disconnect", "category": ["session"], "dataset": "freeradius.linelog", "duration": 900000000000, "kind": "event", "module": "freeradius", "original": "Disconnect: [admin01] (did 02-66-77-88-99-AA cli 02-AA-BB-CC-DD-EE port 23 ip 10.50.0.46) 900 seconds", "outcome": "success", "type": ["end"]}, "host": {"name": "radius-01"}, "message": "Disconnect: [admin01] (did 02-66-77-88-99-AA cli 02-AA-BB-CC-DD-EE port 23 ip 10.50.0.46) 900 seconds", "radius": {"acct_session_time": 900, "acct_status_type": "Stop", "called_station_id": "02-66-77-88-99-AA", "calling_station_id": "02-AA-BB-CC-DD-EE", "client_shortname": "wifi-controller-01", "framed_ip_address": "10.50.0.46", "nas_port": 23}, "service": {"name": "radiusd"}, "source": {"ip": "10.50.0.46", "mac": "02-AA-BB-CC-DD-EE"}, "user": {"name": "admin01"}}
+{"@timestamp": "2026-09-27T05:41:00+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "disconnect", "category": ["session"], "dataset": "freeradius.linelog", "duration": 900000000000, "kind": "event", "module": "freeradius", "original": "Disconnect: [admin01] (did 02-66-77-88-99-AA cli 02-AA-BB-CC-DD-EE port 23 ip 10.50.0.46) 900 seconds", "outcome": "success", "type": ["end"]}, "host": {"name": "radius-01"}, "message": "Disconnect: [admin01] (did 02-66-77-88-99-AA cli 02-AA-BB-CC-DD-EE port 23 ip 10.50.0.46) 900 seconds", "radius": {"acct_session_time": 900, "acct_status_type": "Stop", "called_station_id": "02-66-77-88-99-AA", "calling_station_id": "02-AA-BB-CC-DD-EE", "client_shortname": "wifi-controller-01", "framed_ip_address": "10.50.0.46", "nas_port": 23}, "service": {"name": "radiusd"}, "source": {"ip": "10.50.0.46", "mac": "02-AA-BB-CC-DD-EE"}, "user": {"name": "admin01"}}
 ```
 
 This profile is grounded in tagged FreeRADIUS configuration, but no raw capture from a running FreeRADIUS 3.2.10 installation was available. Full native-output fidelity and compatibility with a FreeRADIUS syslog-specific SIEM normalizer remain unverified.
