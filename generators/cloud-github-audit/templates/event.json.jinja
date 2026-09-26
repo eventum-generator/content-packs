@@ -1,108 +1,139 @@
-{%- for mark in ['to_add_member', 'to_elevate_member', 'to_disable_protection', 'to_download_archive', 'to_delete_repo', 'to_routine'] -%}
-  {%- do shared.pop(mark, none) -%}
-{%- endfor -%}
+{%- set event_time = timestamp.astimezone(module.datetime.timezone.utc) + module.datetime.timedelta(milliseconds=module.rand.number.integer(0, 999)) -%}
 {%- set stage = vars.stage -%}
-{%- set actor_ids = {'alice': 32100011, 'bob': 32100012, 'ci-bot': 32100013} -%}
+{%- set interval = ([params.anomaly_interval_hours|float, 6]|max) * 3600 -%}
+{%- if not shared.get('initialized') -%}
+  {%- do shared.update({'initialized': true, 'target_exists': true, 'target_protected': true, 'target_member': none, 'target_id': params.sensitive_repo_id, 'incarnation': 0, 'phase': 0, 'topics': [0, 0, 0], 'org_test_member': false, 'next_episode': event_time + module.datetime.timedelta(seconds=interval)}) -%}
+{%- endif -%}
+{%- set owners = ['alice', 'bob', params.suspicious_actor] -%}
+{%- set actor_ids = {'alice': 32100011, 'bob': 32100012, params.suspicious_actor: params.suspicious_actor_id, params.external_user: params.external_user_id} -%}
+{%- set actor = params.suspicious_actor -%}
+{%- set repo = params.sensitive_repo -%}
+{%- set repo_id = shared.get('target_id') -%}
+{%- set is_org = false -%}
+{%- set old_permission = none -%}
+{%- set new_permission = none -%}
+{%- set topic = none -%}
 {%- if stage == 'routine' -%}
-  {%- set action = module.rand.weighted_choice(['repo.add_topic', 'repo.create', 'repo.download_zip', 'org.add_member'], [60, 15, 20, 5]) -%}
-  {%- set actor = module.rand.choice(['alice', 'bob', 'ci-bot']) -%}
-  {%- set actor_id = actor_ids[actor] -%}
-  {%- set repo = params.org ~ '/' ~ module.rand.choice(['api-gateway', 'billing-web', 'infra-modules', 'auth-service']) -%}
-  {%- set repo_id = {'api-gateway': 111001, 'billing-web': 111002, 'infra-modules': 111003, 'auth-service': 111004}[repo.split('/')[-1]] -%}
-  {%- if action == 'repo.create' -%}
-    {%- set created = shared.get('created_repos', 0) + 1 -%}
-    {%- do shared.set('created_repos', created) -%}
-    {%- set repo = params.org ~ '/sandbox-' ~ created -%}
-    {%- set repo_id = 200000 + created -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- if params.anomaly_mode and event_time >= shared.get('next_episode') and shared.get('target_exists') and shared.get('target_protected') and shared.get('target_member') is none and not shared.get('protection_pending') -%}
+    {%- do shared.set('to_attack', true) -%}
+    {%- do dispatch.drop() -%}
   {%- endif -%}
-  {%- set n = shared.get('routine_count', 0) + 1 -%}
-  {%- if n >= 400 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}
-      {%- set cycle = shared.get('attack_cycle', 0) + 1 -%}
-      {%- do shared.set('attack_cycle', cycle) -%}
-      {%- do shared.set('attack_repo', params.sensitive_repo ~ '-' ~ cycle) -%}
-      {%- do shared.set('attack_repo_id', params.sensitive_repo_id + cycle) -%}
-      {%- do shared.set('to_add_member', true) -%}
-    {%- endif -%}
-  {%- else -%}
-    {%- do shared.set('routine_count', n) -%}
-  {%- endif -%}
-{%- else -%}
-  {%- set actor = params.suspicious_actor -%}
-  {%- set actor_id = params.suspicious_actor_id -%}
-  {%- set repo = shared.get('attack_repo') -%}
-  {%- set repo_id = shared.get('attack_repo_id') -%}
-  {%- if stage == 'add_member' -%}
+  {%- set phase = (shared.get('phase') % 72) + 1 -%}
+  {%- do shared.set('phase', phase) -%}
+  {%- set action = none -%}
+  {%- if not shared.get('target_exists') and event_time >= shared.get('restore_after') -%}
+    {%- set action = 'repo.create' -%}
+  {%- elif shared.get('protection_pending') -%}
+    {%- set action = 'protected_branch.create' -%}
+  {%- elif phase == 6 and shared.get('target_exists') and shared.get('target_member') is none -%}
     {%- set action = 'repo.add_member' -%}
-    {%- do shared.set('to_elevate_member', true) -%}
-  {%- elif stage == 'elevate_member' -%}
+  {%- elif phase == 12 and shared.get('target_exists') and shared.get('target_member') == 'write' -%}
     {%- set action = 'repo.update_member' -%}
-    {%- do shared.set('to_disable_protection', true) -%}
-  {%- elif stage == 'disable_protection' -%}
+  {%- elif phase == 18 and shared.get('target_exists') and shared.get('target_protected') -%}
     {%- set action = 'protected_branch.destroy' -%}
-    {%- do shared.set('to_download_archive', true) -%}
-  {%- elif stage == 'download_archive' -%}
+  {%- elif phase == 24 and shared.get('target_exists') -%}
     {%- set action = 'repo.download_zip' -%}
-    {%- do shared.set('to_delete_repo', true) -%}
-  {%- else -%}
+    {%- if shared.get('target_member') is not none -%}{%- set actor = params.external_user -%}{%- endif -%}
+  {%- elif phase == 30 and shared.get('target_exists') and shared.get('target_member') is not none -%}
+    {%- set action = 'repo.remove_member' -%}
+  {%- elif phase == 36 and shared.get('target_exists') -%}
     {%- set action = 'repo.destroy' -%}
-    {%- do shared.set('to_routine', true) -%}
+  {%- elif phase == 48 and not shared.get('org_test_member') -%}
+    {%- set action = 'org.add_member' -%}
+    {%- set is_org = true -%}
+  {%- elif phase == 60 and shared.get('org_test_member') -%}
+    {%- set action = 'org.remove_member' -%}
+    {%- set is_org = true -%}
   {%- endif -%}
+  {%- if action is none -%}
+    {%- set index = module.rand.number.integer(0, 2) -%}
+    {%- set repo = params.org ~ '/' ~ ['api-gateway', 'billing-web', 'infra-modules'][index] -%}
+    {%- set repo_id = 111001 + index -%}
+    {%- set actor = module.rand.weighted_choice(owners + [params.external_user], [30, 25, 25, 20]) -%}
+    {%- if actor != params.external_user and module.rand.chance(0.2) -%}
+      {%- set bit_index = module.rand.number.integer(0, 2) -%}
+      {%- set mask = 2 ** bit_index -%}
+      {%- set flags = shared.get('topics') -%}
+      {%- set present = (flags[index] // mask) % 2 == 1 -%}
+      {%- set action = 'repo.remove_topic' if present else 'repo.add_topic' -%}
+      {%- set topic = ['security', 'backend', 'infra'][bit_index] -%}
+      {%- set updated = flags[index] - mask if present else flags[index] + mask -%}
+      {%- do shared.set('topics', flags[:index] + [updated] + flags[index+1:]) -%}
+    {%- else -%}
+      {%- set action = 'repo.download_zip' -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- elif stage == 'add_member' -%}
+  {%- set action = 'repo.add_member' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- do shared.set('next_episode', event_time + module.datetime.timedelta(seconds=interval)) -%}
+{%- elif stage == 'elevate_member' -%}
+  {%- set action = 'repo.update_member' -%}
+{%- elif stage == 'disable_protection' -%}
+  {%- set action = 'protected_branch.destroy' -%}
+{%- elif stage == 'download_archive' -%}
+  {%- set action = 'repo.download_zip' -%}
+  {%- set actor = params.external_user -%}
+{%- else -%}
+  {%- set action = 'repo.destroy' -%}
 {%- endif -%}
-{%- set document_id = module.rand.string.letters(20) -%}
-{%- set native = {
-    '@timestamp': (timestamp.timestamp() * 1000)|int,
-    '_document_id': document_id,
-    'action': action, 'actor': actor, 'actor_id': actor_id,
-    'created_at': (timestamp.timestamp() * 1000)|int,
-    'org': params.org, 'org_id': params.org_id,
-    'repo': repo, 'repo_id': repo_id,
-    'visibility': 'private'
-} -%}
-{%- if action == 'repo.add_member' or action == 'repo.update_member' -%}
-  {%- do native.update({'user': params.external_user, 'user_id': params.external_user_id}) -%}
-  {%- if action == 'repo.add_member' -%}
-    {%- do native.update({'permission': 'write'}) -%}
-  {%- else -%}
-    {%- do native.update({'old_repo_permission': 'write', 'new_repo_permission': 'admin'}) -%}
-  {%- endif -%}
+{%- if action == 'repo.create' -%}
+  {%- set incarnation = shared.get('incarnation') % 1000000000 + 1 -%}
+  {%- set repo_id = params.sensitive_repo_id + incarnation -%}
+  {%- do shared.update({'incarnation': incarnation, 'target_id': repo_id, 'target_exists': true, 'target_protected': false, 'target_member': none, 'protection_pending': true}) -%}
+  {%- do shared.pop('restore_after', none) -%}
+{%- elif action == 'protected_branch.create' -%}
+  {%- do shared.set('target_protected', true) -%}
+  {%- do shared.pop('protection_pending', none) -%}
 {%- elif action == 'protected_branch.destroy' -%}
-  {%- do native.update({'name': 'main', 'admin_enforced': true}) -%}
-{%- elif action == 'repo.add_topic' -%}
-  {%- do native.update({'topic': module.rand.choice(['security', 'backend', 'infra'])}) -%}
-{%- elif action == 'repo.create' -%}
-  {%- do native.update({'operation_type': 'create'}) -%}
-{%- elif action == 'org.add_member' -%}
-  {%- set member_no = shared.get('new_members', 0) + 1 -%}
-  {%- do shared.set('new_members', member_no) -%}
-  {%- do native.update({'user': 'new-hire-' ~ member_no,
-                         'user_id': 32100099 + member_no,
-                         'permission': 'member'}) -%}
+  {%- do shared.set('target_protected', false) -%}
+{%- elif action == 'repo.add_member' -%}
+  {%- do shared.set('target_member', 'write') -%}
+{%- elif action == 'repo.update_member' -%}
+  {%- set old_permission = shared.get('target_member') -%}
+  {%- set new_permission = 'admin' -%}
+  {%- do shared.set('target_member', new_permission) -%}
+{%- elif action == 'repo.remove_member' -%}
+  {%- do shared.set('target_member', none) -%}
+{%- elif action == 'repo.destroy' -%}
+  {%- do shared.update({'target_exists': false, 'target_protected': false, 'target_member': none, 'restore_after': event_time + module.datetime.timedelta(hours=1)}) -%}
+{%- elif action in ['org.add_member', 'org.remove_member'] -%}
+  {%- do shared.set('org_test_member', action == 'org.add_member') -%}
 {%- endif -%}
-{%- set related_users = [actor, native.user] if native.user is defined else [actor] -%}
-{%- set category = action.split('.')[0] -%}
-{%- set doc = {
-    '@timestamp': timestamp.isoformat(),
-    'agent': {'ephemeral_id': params.collector_ephemeral_id,
-              'id': params.collector_id, 'name': 'github-audit-collector',
-              'type': 'filebeat', 'version': params.collector_version},
-    'data_stream': {'dataset': 'github.audit', 'namespace': 'default', 'type': 'logs'},
-    'ecs': {'version': '8.17.0'},
-    'elastic_agent': {'id': params.collector_id, 'snapshot': false,
-                      'version': params.collector_version},
-    'event': {'action': action, 'agent_id_status': 'verified',
-              'category': ['configuration', 'web'],
-              'created': timestamp.isoformat(), 'dataset': 'github.audit',
-              'id': document_id, 'ingested': timestamp.isoformat(),
-              'kind': 'event', 'module': 'github',
-              'original': native|tojson,
-              'type': ['access'] if action == 'repo.download_zip' else ['change']},
-    'github': {'category': category, 'org': params.org,
-               'repo': repo, 'visibility': 'private'},
-    'input': {'type': 'httpjson'},
-    'related': {'user': related_users},
-    'tags': ['forwarded', 'github-audit', 'preserve_original_event'],
-    'user': {'name': actor}
-} -%}
+{%- set document_id = module.base64.urlsafe_b64encode(module.uuid.uuid4().bytes).decode().rstrip('=') -%}
+{%- set native = {'@timestamp': (event_time.timestamp()*1000)|int, '_document_id': document_id, 'created_at': (event_time.timestamp()*1000)|int, 'action': action, 'actor': actor, 'actor_id': actor_ids[actor], 'org': params.org, 'org_id': params.org_id} -%}
+{%- if not is_org -%}
+  {%- do native.update({'repo': repo, 'repo_id': repo_id, 'public_repo': false}) -%}
+  {%- if action not in ['repo.add_topic', 'repo.remove_topic', 'protected_branch.create', 'protected_branch.destroy'] -%}{%- do native.update({'visibility': 'private'}) -%}{%- endif -%}
+{%- endif -%}
+{%- if action in ['repo.add_member', 'repo.update_member', 'repo.remove_member'] -%}
+  {%- do native.update({'user': params.external_user, 'user_id': params.external_user_id}) -%}
+  {%- if action == 'repo.add_member' -%}{%- do native.update({'permission': 'write'}) -%}
+  {%- elif action == 'repo.update_member' -%}{%- do native.update({'old_repo_permission': old_permission, 'new_repo_permission': new_permission}) -%}{%- endif -%}
+{%- elif action.startswith('protected_branch.') -%}
+  {%- do native.update({'name': 'main', 'admin_enforced': true}) -%}
+{%- elif topic is not none -%}
+  {%- do native.update({'topic': topic}) -%}
+{%- elif is_org -%}
+  {%- do native.update({'user': 'new-hire-test', 'user_id': 32100099}) -%}
+{%- endif -%}
+{%- set github = {} -%}
+{%- for key, value in native.items() -%}
+  {%- if key not in ['@timestamp', 'created_at', '_document_id', 'action', 'actor', 'user'] -%}
+    {%- do github.update({key: value|string if key in ['actor_id', 'org_id', 'repo_id', 'user_id'] else value}) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- do github.update({'category': action.split('.')[0]}) -%}
+{%- set users = [actor, actor_ids[actor]|string] -%}
+{%- set user = {'name': actor, 'id': actor_ids[actor]|string} -%}
+{%- if native.user is defined -%}
+  {%- do user.update({'target': {'name': native.user, 'id': native.user_id|string}}) -%}
+  {%- if is_org -%}{%- do user.target.update({'group': {'name': params.org}}) -%}{%- endif -%}
+  {%- do users.extend([native.user, native.user_id|string]) -%}
+{%- endif -%}
+{%- set event_type = ['creation'] if '.add' in action or '.create' in action else ['deletion'] if '.remove' in action else ['change'] -%}
+{%- if is_org -%}{%- set event_type = ['group', 'user'] + event_type -%}{%- endif -%}
+{%- set doc = {'@timestamp': event_time.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.11.0'}, 'agent': {'id': params.collector_id, 'ephemeral_id': params.collector_ephemeral_id, 'name': 'github-audit-collector', 'type': 'filebeat', 'version': params.collector_version}, 'elastic_agent': {'id': params.collector_id, 'snapshot': false, 'version': params.collector_version}, 'data_stream': {'dataset': 'github.audit', 'namespace': 'default', 'type': 'logs'}, 'event': {'action': action, 'agent_id_status': 'verified', 'category': ['configuration', 'web', 'iam'] if is_org else ['configuration', 'web'], 'type': event_type, 'created': event_time.isoformat(timespec='milliseconds'), 'ingested': event_time.isoformat(timespec='milliseconds'), 'dataset': 'github.audit', 'module': 'github', 'kind': 'event', 'id': document_id, 'original': native|tojson}, 'github': github, 'input': {'type': 'httpjson'}, 'related': {'user': users}, 'user': user, 'tags': ['forwarded', 'github-audit', 'preserve_original_event']} -%}
+{%- if is_org -%}{%- do doc.update({'group': {'name': params.org}}) -%}{%- endif -%}
 {{- doc|tojson -}}
