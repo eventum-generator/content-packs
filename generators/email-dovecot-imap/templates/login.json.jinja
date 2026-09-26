@@ -1,0 +1,89 @@
+{%- set stage = vars.stage -%}
+{%- if stage == 'routine' -%}
+  {%- set interval = [params.anomaly_interval_events, 1] | max -%}
+  {%- set n = (shared.get('routine_count', 0) % (interval * 100)) + 1 -%}
+  {%- do shared.set('routine_count', n) -%}
+  {%- set names = ['alice', 'bob', 'carol', 'david', 'elena',
+      'fatima', 'george', 'hana', 'ivan', 'julia', 'karim',
+      'lena', 'maria', 'nikolai', 'olga', 'pavel', 'rachel',
+      'sergey', 'tanya', 'victor'] -%}
+  {%- set user = names[n % (names | length)] ~ '@' ~ params.mail_domain -%}
+  {%- set client = '198.51.100.' ~ (30 + (n % 20)) if n % 7 == 0
+      else '10.20.10.' ~ (11 + (n % 20)) -%}
+  {%- set pair = (n // 61) % 2 -%}
+  {%- set pair_user = params.target_user if pair == 0
+      else params.alternate_target_user -%}
+  {%- set pair_ip = params.suspicious_client_ip if pair == 0
+      else params.alternate_client_ip -%}
+  {%- if n % 17 == 0 -%}
+    {%- set user = pair_user -%}
+  {%- endif -%}
+  {%- if n % 23 == 0 -%}
+    {%- set client = pair_ip -%}
+  {%- endif -%}
+  {%- if n % 61 == 0 -%}
+    {%- set user = pair_user -%}
+    {%- set client = pair_ip -%}
+  {%- endif -%}
+  {%- set protocol = 'pop3' if n % 9 == 0 or n % 488 in [183, 244] else 'imap' -%}
+  {%- set result = 'failure' if protocol == 'imap'
+      and (n % 16 == 0 or n % 244 in [61, 122]) else 'success' -%}
+  {%- if params.anomaly_mode and n % interval == 0 -%}
+    {%- set episode = (shared.get('episode_index', 0) % 2) + 1 -%}
+    {%- do shared.set('episode_index', episode) -%}
+    {%- do shared.set('episode_user', params.target_user
+        if episode == 1 else params.alternate_target_user) -%}
+    {%- do shared.set('episode_ip', params.suspicious_client_ip
+        if episode == 1 else params.alternate_client_ip) -%}
+    {%- do shared.set('start_anomaly', true) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- do shared.pop('start_anomaly', none) -%}
+  {%- set user = shared.get('episode_user') -%}
+  {%- set client = shared.get('episode_ip') -%}
+  {%- set protocol = 'pop3' if stage == 'pop3_success' else 'imap' -%}
+  {%- set result = 'failure' if stage.startswith('failed_')
+      else 'success' -%}
+{%- endif -%}
+{%- set session_id = module.base64.b64encode(
+    module.os.urandom(12)).decode('ascii') -%}
+{%- set details = 'user=<' ~ user ~ '>, method=PLAIN, rip=' ~ client
+    ~ ', lip=' ~ params.local_ip -%}
+{%- if result == 'success' -%}
+  {%- set mpid = module.rand.number.integer(10000, 65000) -%}
+  {%- set body = protocol ~ '-login: Login: ' ~ details
+      ~ ', mpid=' ~ mpid ~ ', TLS, session=<' ~ session_id ~ '>' -%}
+{%- else -%}
+  {%- set body = protocol ~ '-login: Disconnected: Connection closed '
+      ~ '(auth failed, 1 attempts in 2 secs): ' ~ details
+      ~ ', TLS, session=<' ~ session_id ~ '>' -%}
+{%- endif -%}
+{%- set syslog_time = timestamp.strftime('%b') ~ ' '
+    ~ ('%2d' | format(timestamp.day))
+    ~ timestamp.strftime(' %H:%M:%S') -%}
+{%- set original = syslog_time ~ ' ' ~ params.host_name
+    ~ ' dovecot: ' ~ body -%}
+{%- set native = {'protocol': protocol, 'login_result': result,
+    'method': 'PLAIN', 'session': session_id, 'tls': true} -%}
+{%- if result == 'success' -%}
+  {%- do native.update({'mpid': mpid}) -%}
+{%- else -%}
+  {%- do native.update({'disconnect_reason': 'Connection closed',
+      'auth_attempts': 1, 'auth_duration_seconds': 2}) -%}
+{%- endif -%}
+{%- set record = {
+    '@timestamp': timestamp.isoformat(),
+    'ecs': {'version': '8.17.0'},
+    'event': {'kind': 'event', 'category': ['authentication'],
+        'type': ['start'] if result == 'success' else ['denied'],
+        'action': 'login-' ~ result, 'outcome': result,
+        'original': original},
+    'host': {'name': params.host_name, 'ip': [params.local_ip]},
+    'service': {'name': 'dovecot', 'type': protocol},
+    'user': {'name': user},
+    'source': {'ip': client},
+    'destination': {'ip': params.local_ip},
+    'related': {'ip': [client, params.local_ip], 'user': [user]},
+    'dovecot': native
+} -%}
+{{ record | tojson }}
