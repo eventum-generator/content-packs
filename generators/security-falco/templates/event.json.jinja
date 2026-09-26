@@ -1,0 +1,104 @@
+{# Falco alert subset. Internal unobserved process exits clean bounded contexts.
+   Rule outputs come from stable rules5.2.0; JSON envelope from Falco0.45.0. #}
+{%- from 'templates/_base.json.jinja' import render with context -%}
+{%- set tick = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set candidate = tick + module.datetime.timedelta(milliseconds=module.rand.number.integer(0,999)) -%}
+{%- set now = (candidate.replace(microsecond=0).timestamp() | int) * 1000000000 + candidate.microsecond * 1000 -%}
+{%- set interval = [params.anomaly_interval_hours | float, 1] | max * 3600 * 1000000000 -%}
+{%- if shared.get('inventory') is none -%}
+  {%- set inventory = [] -%}
+  {%- set pid_counters = {} -%}
+  {%- set shells = {} -%}
+  {%- set clocks = {} -%}
+  {%- set visits = {} -%}
+  {%- for row in samples.pods -%}
+    {%- set pod = {'container_id':row.container_id,'container_name':row.container_name,
+        'pod_name':row.pod_name,'namespace':row.namespace,'pod_ip':row.pod_ip,
+        'image_repository':row.image.rsplit(':',1)[0],
+        'image_tag':row.image.rsplit(':',1)[1], 'node':row.node,
+        'node_id':row.node_id,'node_ip':row.node_ip,'node_mac':row.node_mac,'uid':row.uid} -%}
+    {%- do inventory.append(pod) -%}
+    {%- set pid = pid_counters.get(pod.node,100000) + 1 -%}
+    {%- do pid_counters.update({pod.node:pid}) -%}
+    {%- do shells.update({loop.index0:{'pid':pid,'start':now-600000000000,
+        'expires':now+1200000000000,'tty':34816 + loop.index0 % 5}}) -%}
+    {%- do clocks.update({loop.index0:now-600000000000}) -%}
+    {%- do visits.update({loop.index0:0}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'inventory':inventory,'pids':pid_counters,
+      'shells':shells,'clocks':clocks,'visits':visits,'trace':none,
+      'episode_cursor':0,'episode_due':now+interval,'offsets':{},'shim_start':now-86400000000000}) -%}
+{%- endif -%}
+{%- set inventory = shared.get('inventory') -%}
+{%- set clocks = shared.get('clocks') -%}
+{%- set shells = shared.get('shells') -%}
+{%- set visits = shared.get('visits') -%}
+{%- set pids = shared.get('pids') -%}
+{%- set trace = shared.get('trace') -%}
+{%- set choice = namespace(index=none,kind=none,source=candidate,ns=now) -%}
+{%- if trace is none and params.anomaly_mode and now >= shared.get('episode_due') -%}
+  {%- set target = shared.get('episode_cursor') -%}
+  {%- if now-clocks[target] >= 600000000000 -%}
+    {%- set trace = {'target':target,'step':0,'source':candidate,'ns':now} -%}
+    {%- do shared.set('trace',trace) -%}
+    {%- do shared.set('episode_cursor',(target+11) % 50) -%}
+    {%- do shared.set('episode_due',now+interval) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if trace is not none -%}
+  {%- set choice.index = trace.target -%}
+  {%- set choice.kind = ['shell','read','api'][trace.step] -%}
+  {%- set choice.source = trace.source + module.datetime.timedelta(seconds=trace.step*60) -%}
+  {%- set choice.ns = trace.ns + trace.step*60000000000 -%}
+{%- else -%}
+  {%- set eligible = [] -%}
+  {%- for pod in inventory -%}
+    {%- if now-clocks[loop.index0] >= 600000000000
+        and not (params.anomaly_mode and now >= shared.get('episode_due')
+            and loop.index0 == shared.get('episode_cursor')) -%}
+      {%- do eligible.append(loop.index0) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set choice.index = module.rand.choice(eligible) -%}
+  {%- set visit = visits[choice.index] -%}
+  {%- set choice.kind = module.rand.weighted_choice(['shell','read','api'],[6,3,1]) -%}
+  {%- if visit % 6 == 5 -%}{%- set choice.kind = 'api' -%}{%- endif -%}
+  {%- if shells[choice.index].expires <= choice.ns -%}{%- set choice.kind = 'shell' -%}{%- endif -%}
+  {%- do visits.update({choice.index:(visit+1) % 6}) -%}
+{%- endif -%}
+{%- set pod = inventory[choice.index] -%}
+{%- set pid = pids[pod.node] + 1 -%}
+{# At wrap, skip every live shell PID on this node plus the current trace PID.
+   50 fixed slots bound work and prevent live-context reuse. #}
+{%- if pid > 2000000 -%}{%- set pid = 100000 -%}{%- endif -%}
+{%- set live = [] -%}
+{%- for slot in shells.values() -%}
+  {%- if slot.expires > choice.ns -%}{%- do live.append(slot.pid) -%}{%- endif -%}
+{%- endfor -%}
+{%- set alloc = namespace(pid=pid) -%}
+{%- for unused in range(51) -%}
+  {%- if alloc.pid in live -%}
+    {%- set alloc.pid = alloc.pid+1 -%}
+    {%- if alloc.pid > 2000000 -%}{%- set alloc.pid = 100000 -%}{%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set pid = alloc.pid -%}
+{%- do pids.update({pod.node:pid}) -%}
+{%- set start = choice.ns-20000000 -%}
+{%- if choice.kind == 'shell' -%}
+  {# New selected terminal replaces the previous context after its unlogged exit. #}
+  {%- set shell = {'pid':pid,'start':start,'expires':choice.ns+1800000000000,
+      'tty':34816+module.rand.number.integer(0,4)} -%}
+  {%- do shells.update({choice.index:shell}) -%}
+  {%- set parent = {'pid':50000+choice.index,'start':shared.get('shim_start'),
+      'name':'containerd-shim'} -%}
+{%- else -%}
+  {%- set shell = shells[choice.index] -%}
+  {%- set parent = {'pid':shell.pid,'start':shell.start,'name':'bash'} -%}
+{%- endif -%}
+{%- do clocks.update({choice.index:choice.ns}) -%}
+{{- render(pod,choice.kind,choice.source,choice.ns,pid,start,parent,shell.tty) -}}
+{%- if trace is not none -%}
+  {%- if trace.step == 2 -%}{%- do shared.set('trace',none) -%}
+  {%- else -%}{%- do trace.update({'step':trace.step+1}) -%}{%- endif -%}
+{%- endif -%}

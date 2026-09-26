@@ -1,0 +1,106 @@
+{# Tagged Falco0.45.0 JSON / rules5.2.0 output plus documented append_output.
+   Collector metadata is synthetic; process start dates convert native ns to ISO. #}
+{%- macro render(pod, kind, source_time, ns, pid, start, parent, tty) -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set event_time = source_time.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '000Z' -%}
+{%- set output_time = source_time.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '000+0000' -%}
+{%- set start_time = module.datetime.datetime.fromtimestamp(start // 1000000000,utc) + module.datetime.timedelta(microseconds=(start % 1000000000) // 1000) -%}
+{%- set parent_time = module.datetime.datetime.fromtimestamp(parent.start // 1000000000,utc) + module.datetime.timedelta(microseconds=(parent.start % 1000000000) // 1000) -%}
+{%- if kind == 'shell' -%}
+  {%- set rule = 'Terminal shell in container' -%}
+  {%- set priority = 'Notice' -%}
+  {%- set rule_tags = ['T1059','container','maturity_stable','mitre_execution','shell'] -%}
+  {%- set evt_type = 'execve' -%}{%- set evt_category = 'process' -%}
+  {%- set category = ['process'] -%}{%- set event_type = ['start'] -%}
+  {%- set name = 'bash' -%}{%- set exe = '/usr/bin/bash' -%}
+  {%- set cmd = module.rand.choice(['bash','bash -l']) -%}
+  {%- set extra = {'evt.arg.flags':'EXE_WRITABLE'} -%}
+  {%- set body = 'A shell was spawned in a container with an attached terminal | evt_type=' ~ evt_type -%}
+{%- elif kind == 'read' -%}
+  {%- set rule = 'Read sensitive file untrusted' -%}
+  {%- set priority = 'Warning' -%}
+  {%- set rule_tags = ['T1555','container','filesystem','host','maturity_stable','mitre_credential_access'] -%}
+  {%- set evt_type = 'openat' -%}{%- set evt_category = 'file' -%}
+  {%- set category = ['file'] -%}{%- set event_type = ['access'] -%}
+  {%- set name = 'python3' -%}{%- set exe = '/usr/bin/python3.10' -%}
+  {%- set cmd = module.rand.choice(['python3 /opt/maintenance/check_users.py','python3 /opt/maintenance/check_shadow.py']) -%}
+  {%- set fd = module.rand.number.integer(3,9) -%}
+  {%- set extra = {'fd.name':'/etc/shadow','fd.type':'file','fd.typechar':'f','fd.num':fd,
+      'evt.is_open_read':true,'evt.rawres':fd,'evt.failed':false,
+      'proc.aname[2]':'containerd-shim','proc.aname[3]':'containerd','proc.aname[4]':'systemd'} -%}
+  {%- set body = 'Sensitive file opened for reading by non-trusted program | file=/etc/shadow gparent=containerd-shim ggparent=containerd gggparent=systemd evt_type=' ~ evt_type -%}
+{%- else -%}
+  {%- set rule = 'Contact K8S API Server From Container' -%}
+  {%- set priority = 'Notice' -%}
+  {%- set rule_tags = ['T1565','container','k8s','maturity_stable','mitre_discovery','network'] -%}
+  {%- set evt_type = 'connect' -%}{%- set evt_category = 'net' -%}
+  {%- set category = ['network'] -%}{%- set event_type = ['connection'] -%}
+  {%- set name = 'curl' -%}{%- set exe = '/usr/bin/curl' -%}
+  {%- set cmd = module.rand.choice(['curl -ks https://kubernetes.default.svc.cluster.local/api','curl -ks https://kubernetes.default.svc.cluster.local/version']) -%}
+  {%- set port = module.rand.number.integer(32768,60999) -%}
+  {%- set connection = pod.pod_ip ~ ':' ~ port ~ '->' ~ params.api_server_ip ~ ':443' -%}
+  {%- set extra = {'fd.name':connection,'fd.lport':port,'fd.rport':443,
+      'fd.lip':pod.pod_ip,'fd.rip':params.api_server_ip,'fd.sip':params.api_server_ip,
+      'fd.sip.name':'kubernetes.default.svc.cluster.local','fd.type':'ipv4','fd.typechar':'4','fd.l4proto':'tcp'} -%}
+  {%- set body = 'Unexpected connection to K8s API Server from container | connection=' ~ connection ~ ' lport=' ~ port ~ ' rport=443 fd_type=ipv4 fd_proto=tcp evt_type=' ~ evt_type -%}
+{%- endif -%}
+{%- set body = body ~ ' user=' ~ pod.uid ~ ' user_uid=0 user_loginuid=-1 process=' ~ name ~ ' proc_exepath=' ~ exe ~ ' parent=' ~ parent.name ~ ' command=' ~ cmd ~ ' terminal=' ~ tty -%}
+{%- if kind == 'shell' -%}{%- set body = body ~ ' exe_flags=EXE_WRITABLE' -%}{%- endif -%}
+{%- set body = body ~ ' container_id=' ~ pod.container_id ~ ' container_name=' ~ pod.container_name -%}
+{%- set text = output_time ~ ': ' ~ priority ~ ' ' ~ body -%}
+{%- set fields = {'container.id':pod.container_id,'container.name':pod.container_name,
+    'container.image.repository':pod.image_repository,'container.image.tag':pod.image_tag,
+    'evt.time.iso8601':ns,'evt.type':evt_type,'evt.category':evt_category,
+    'k8s.ns.name':pod.namespace,'k8s.pod.name':pod.pod_name,
+    'proc.cmdline':cmd,'proc.exepath':exe,'proc.name':name,'proc.pname':parent.name,
+    'proc.tty':tty,'proc.pid':pid,'proc.ppid':parent.pid,'proc.pid.ts':start,'proc.ppid.ts':parent.start,
+    'user.loginuid':-1,'user.name':pod.uid,'user.uid':0} -%}
+{%- do fields.update(extra) -%}
+{%- set native = {'hostname':pod.node,'output':text,'output_fields':fields,'priority':priority,
+    'rule':rule,'source':'syscall','tags':rule_tags,'time':event_time} -%}
+{%- set raw = module.json.dumps(native,ensure_ascii=False,sort_keys=True,separators=(',',':')) -%}
+{# Pinned Elastic dot-expansion paths, with preservation enabled. #}
+{%- set parsed = {'container':{'id':pod.container_id,'name':pod.container_name,'image':{'repository':pod.image_repository,'tag':pod.image_tag}},
+    'evt':{'time':{'iso8601':ns // 1000000},'type':evt_type,'category':evt_category},
+    'k8s':{'ns':{'name':pod.namespace},'pod':{'name':pod.pod_name}},
+    'process':{'pid':pid,'parent':{'pid':parent.pid}},
+    'proc':{'cmdline':cmd,'exepath':exe,'name':name,'pname':parent.name,'tty':tty,'pid':{'ts':start},'ppid':{'ts':parent.start}},
+    'user':{'loginuid':-1,'name':pod.uid,'uid':'0'}} -%}
+{%- if kind == 'read' -%}
+  {%- do parsed.update({'fd':{'name':'/etc/shadow','type':'file','typechar':'f','num':fd},
+      'evt':{'time':{'iso8601':ns // 1000000},'type':evt_type,'category':evt_category,'is_open_read':true,'rawres':fd,'failed':false}}) -%}
+{%- elif kind == 'api' -%}
+  {%- do parsed.update({'fd':{'name':connection,'lport':port,'rport':443,'type':'ipv4','typechar':'4','l4proto':'tcp','sip':{'name':'kubernetes.default.svc.cluster.local'}},
+      'source':{'ip':pod.pod_ip},'destination':{'ip':params.api_server_ip},
+      'server':{'ip':params.api_server_ip}}) -%}
+{%- endif -%}
+{%- set offsets = shared.get('offsets') -%}
+{%- set size = (raw.encode('utf-8') | length)+1 -%}
+{%- set offset = offsets.get(pod.node,0) -%}
+{%- if offset+size > 104857600 -%}{%- set offset = 0 -%}{%- endif -%}
+{%- do offsets.update({pod.node:offset+size}) -%}
+{%- set event = {'@timestamp':source_time.isoformat(timespec='milliseconds'),
+    'agent':{'ephemeral_id':pod.node_id,'id':pod.node_id,'name':'elastic-agent-' ~ pod.node,'type':'filebeat','version':params.agent_version},
+    'container':{'id':pod.container_id,'name':pod.container_name},
+    'data_stream':{'dataset':'falco.alerts','namespace':params.data_stream_namespace,'type':'logs'},
+    'ecs':{'version':params.ecs_version},
+    'elastic_agent':{'id':pod.node_id,'snapshot':false,'version':params.agent_version},
+    'event':{'agent_id_status':'verified','category':category,'dataset':'falco.alerts','ingested':source_time.isoformat(timespec='milliseconds'),
+      'kind':'alert','original':raw,'provider':'syscall','severity':47,'timezone':'+00:00','type':event_type},
+    'falco':{'hostname':pod.node,'output':text,'output_fields':parsed,'priority':priority,'rule':rule,'source':'syscall','tags':rule_tags,'time':event_time},
+    'host':{'architecture':'x86_64','containerized':true,'hostname':pod.node,'id':pod.node_id,'ip':[pod.node_ip],'mac':[pod.node_mac],'name':pod.node,
+      'os':{'codename':'jammy','family':'debian','kernel':'5.15.0-91-generic','name':'Ubuntu','platform':'ubuntu','type':'linux','version':'22.04'}},
+    'falco.container.mounts':none,'input':{'type':'log'},'log':{'file':{'path':params.log_path},'offset':offset},
+    'message':rule,'observer':{'hostname':pod.node,'product':'falco','type':'sensor','vendor':'sysdig'},
+    'process':{'command_line':cmd,'executable':exe,'name':name,'pid':pid,'start':start_time.isoformat(timespec='milliseconds'),
+      'parent':{'name':parent.name,'pid':parent.pid,'start':parent_time.isoformat(timespec='milliseconds')},'user':{'id':'0','name':pod.uid}},
+    'related':{'hosts':[pod.node]},'rule':{'name':rule},'tags':['preserve_original_event','preserve_falco_fields'],
+    'threat.technique.id':[rule_tags[0]],'orchestrator':{'namespace':pod.namespace,'resource':{'name':pod.pod_name,'type':'pod'}}} -%}
+{%- if kind == 'read' -%}{%- do event.update({'file':{'path':'/etc/shadow','type':'file'}}) -%}
+{%- elif kind == 'api' -%}
+  {%- do event.update({'source':{'ip':pod.pod_ip,'address':pod.pod_ip,'port':port},
+      'destination':{'ip':params.api_server_ip,'address':params.api_server_ip,'port':443},
+      'server':{'ip':params.api_server_ip,'address':params.api_server_ip,'domain':'kubernetes.default.svc.cluster.local'}}) -%}
+{%- endif -%}
+{{- event | tojson -}}
+{%- endmacro -%}
