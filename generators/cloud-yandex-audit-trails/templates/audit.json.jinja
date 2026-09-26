@@ -1,13 +1,49 @@
 {%- set step = vars.step -%}
+{%- set now = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set accounts = shared.get('accounts', {}) -%}
+{%- set keys = shared.get('keys', {}) -%}
+{%- set bindings = shared.get('bindings', {}) -%}
+{%- set vms = shared.get('vms', {}) -%}
+{%- set selected_id = none -%}
+{%- set cleanup_binding_id = none -%}
 {%- if step == 'routine' -%}
   {%- do shared.pop('to_anomaly', none) -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- do shared.set('routine_count', count if count < params.anomaly_interval_events else params.anomaly_interval_events) -%}
-  {%- if params.anomaly_mode and not shared.get('anomaly_done', false) and count >= params.anomaly_interval_events -%}
-    {%- do shared.set('anomaly_done', true) -%}
-    {%- do shared.set('to_anomaly', true) -%}
+  {%- if shared.get('next_anomaly_at') is none -%}
+    {%- do shared.set('next_anomaly_at', now + module.datetime.timedelta(hours=params.anomaly_interval_hours)) -%}
   {%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['CreateInstance', 'UpdateInstance', 'CreateServiceAccount', 'UpdateFolderAccessBindings', 'CreateAccessKey'], [2, 88, 3, 4, 3]) -%}
+  {%- if params.anomaly_mode and now >= shared.get('next_anomaly_at') and accounts | length < 48 -%}
+    {%- do shared.set('to_anomaly', true) -%}
+    {%- do shared.set('next_anomaly_at', now + module.datetime.timedelta(hours=params.anomaly_interval_hours)) -%}
+  {%- endif -%}
+  {%- set due_accounts = [] -%}{%- set due_keys = [] -%}{%- set due_vms = [] -%}
+  {%- for account_id, account in accounts.items() -%}
+    {%- if (now - account.created_at).total_seconds() >= 172800 -%}{%- do due_accounts.append(account_id) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- for account_id, key in keys.items() -%}
+    {%- if (now - key.created_at).total_seconds() >= 86400 -%}{%- do due_keys.append(account_id) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- for vm_id, vm in vms.items() -%}
+    {%- if (now - vm.created_at).total_seconds() >= 21600 -%}{%- do due_vms.append(vm_id) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if due_accounts or accounts | length >= 47 -%}
+    {%- set selected_id = due_accounts[0] if due_accounts else (accounts.keys() | list)[0] -%}
+    {%- if selected_id in keys -%}
+      {%- set kind = 'DeleteAccessKey' -%}
+    {%- elif bindings.get(selected_id) -%}
+      {%- set kind = 'UpdateFolderAccessBindings' -%}
+      {%- set cleanup_binding_id = selected_id -%}
+    {%- else -%}
+      {%- set kind = 'DeleteServiceAccount' -%}
+    {%- endif -%}
+  {%- elif due_keys -%}
+    {%- set kind = 'DeleteAccessKey' -%}
+    {%- set selected_id = due_keys[0] -%}
+  {%- elif due_vms or vms | length >= 8 -%}
+    {%- set kind = 'DeleteInstance' -%}
+    {%- set selected_id = due_vms[0] if due_vms else (vms.keys() | list)[0] -%}
+  {%- else -%}
+    {%- set kind = module.rand.weighted_choice(['CreateInstance', 'UpdateInstance', 'CreateServiceAccount', 'UpdateFolderAccessBindings', 'CreateAccessKey'], [2, 88, 3, 4, 3]) -%}
+  {%- endif -%}
 {%- else -%}
   {%- set kind = {'create_account': 'CreateServiceAccount', 'grant_role': 'UpdateFolderAccessBindings', 'create_key': 'CreateAccessKey'}[step] -%}
 {%- endif -%}
@@ -16,7 +52,34 @@
 {%- set subject_id = params.anomaly_subject_id if is_second_actor else params.normal_subject_id -%}
 {%- set subject_name = params.anomaly_subject_name if is_second_actor else params.normal_subject_name -%}
 {%- set source_ip = params.anomaly_source_ip if is_second_actor else params.normal_source_ip -%}
-{%- set service = 'iam' if kind in ['CreateServiceAccount', 'CreateAccessKey'] else ('resourcemanager' if kind == 'UpdateFolderAccessBindings' else 'compute') -%}
+{%- if kind in ['UpdateFolderAccessBindings', 'CreateAccessKey'] -%}
+  {%- if cleanup_binding_id is not none -%}
+    {%- set service_account_id = cleanup_binding_id -%}
+    {%- set service_account_name = accounts[cleanup_binding_id].name -%}
+  {%- elif is_chain -%}
+    {%- set service_account_id = shared.get('chain_sa_id') -%}
+    {%- set service_account_name = shared.get('chain_sa_name') -%}
+  {%- else -%}
+    {%- set eligible = [] -%}
+    {%- for index in range(samples.service_accounts | length) -%}
+      {%- set account = samples.service_accounts[index] -%}
+      {%- do eligible.append({'id': account.id, 'name': account.name}) -%}
+    {%- endfor -%}
+    {%- for account_id, account in accounts.items() -%}
+      {%- if (now - account.created_at).total_seconds() >= 21600 -%}
+        {%- do eligible.append({'id': account_id, 'name': account.name}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set account = module.rand.choice(eligible) -%}
+    {%- set service_account_id = account.id -%}
+    {%- set service_account_name = account.name -%}
+    {%- if kind == 'CreateAccessKey' and service_account_id in keys -%}
+      {%- set kind = 'DeleteAccessKey' -%}
+      {%- set selected_id = service_account_id -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set service = 'iam' if kind in ['CreateServiceAccount', 'DeleteServiceAccount', 'CreateAccessKey', 'DeleteAccessKey'] else ('resourcemanager' if kind == 'UpdateFolderAccessBindings' else 'compute') -%}
 {%- set event_id = module.rand.crypto.uuid4() | string -%}
 {%- set request_id = module.rand.crypto.uuid4() | string -%}
 {%- if kind == 'CreateInstance' -%}
@@ -26,7 +89,8 @@
   {%- set disk_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
   {%- set instance_id = 'fhm' ~ id_hex[:17] -%}
   {%- set instance_name = 'ci-job-' ~ ('%05d' % vm_count) -%}
-  {%- set octet3 = 20 + (vm_count // 200) -%}
+  {%- set zone = module.rand.choice(['ru-central1-a', 'ru-central1-b', 'ru-central1-d']) -%}
+  {%- set octet3 = {'ru-central1-a': 20, 'ru-central1-b': 21, 'ru-central1-d': 22}[zone] -%}
   {%- set octet4 = 20 + (vm_count % 200) -%}
   {%- set instance_ip = '10.60.' ~ octet3 ~ '.' ~ octet4 -%}
   {%- set mac_address = '02:00:00:%02x:%02x:%02x' % ((vm_count // 65536) % 256, (vm_count // 256) % 256, vm_count % 256) -%}
@@ -34,52 +98,64 @@
   {%- if module.rand.chance(0.3) -%}
     {%- do primary_v4_address.update({'one_to_one_nat': {'address': '203.0.113.' ~ (20 + (vm_count % 200)), 'ip_version': 'IPV4'}}) -%}
   {%- endif -%}
-  {%- set details = {'instance_id': instance_id, 'instance_name': instance_name, 'zone_id': module.rand.choice(['ru-central1-a', 'ru-central1-b', 'ru-central1-d']), 'platform_id': 'standard-v3', 'metadata_keys': ['ssh-keys', 'user-data'], 'network_settings': {'type': 'STANDARD'}, 'placement_policy': {}, 'os': {'type': 'LINUX'}, 'product_ids': ['fd8j7i4d1e3f9a5b2c6d'], 'resources': {'memory': '4294967296', 'cores': '2', 'core_fraction': '100'}, 'boot_disk': {'mode': 'READ_WRITE', 'device_name': instance_name ~ '-boot', 'auto_delete': true, 'disk_id': 'epd' ~ disk_hex[:17]}, 'network_interfaces': [{'index': '0', 'mac_address': mac_address, 'subnet_id': 'e9b0ba6b3ff9de4bb42d', 'primary_v4_address': primary_v4_address}], 'fqdn': instance_id ~ '.auto.internal'} -%}
+  {%- set subnet = {'ru-central1-a': 'e9b0ba6b3ff9de4bb42d', 'ru-central1-b': 'e2l1ca7c4aa0ef5cc53e', 'ru-central1-d': 'fl82db8d5bb1fa6dd64f'}[zone] -%}
+  {%- set details = {'instance_id': instance_id, 'instance_name': instance_name, 'zone_id': zone, 'platform_id': 'standard-v3', 'metadata_keys': ['ssh-keys', 'user-data'], 'network_settings': {'type': 'STANDARD'}, 'placement_policy': {}, 'os': {'type': 'LINUX'}, 'product_ids': ['fd8j7i4d1e3f9a5b2c6d'], 'resources': {'memory': '4294967296', 'cores': '2', 'core_fraction': '100'}, 'boot_disk': {'mode': 'READ_WRITE', 'device_name': instance_name ~ '-boot', 'auto_delete': true, 'disk_id': 'epd' ~ disk_hex[:17]}, 'network_interfaces': [{'index': '0', 'mac_address': mac_address, 'subnet_id': subnet, 'primary_v4_address': primary_v4_address}], 'fqdn': instance_id ~ '.auto.internal'} -%}
+  {%- do vms.update({instance_id: {'name': instance_name, 'created_at': now}}) -%}
 {%- elif kind == 'UpdateInstance' -%}
-  {%- set instance = samples.instances.pick() -%}
+  {%- set available = [] -%}
+  {%- for index in range(samples.instances | length) -%}
+    {%- set instance = samples.instances[index] -%}{%- do available.append({'id': instance.id, 'name': instance.name}) -%}
+  {%- endfor -%}
+  {%- for vm_id, vm in vms.items() -%}{%- do available.append({'id': vm_id, 'name': vm.name}) -%}{%- endfor -%}
+  {%- set instance = module.rand.choice(available) -%}
   {%- set release_no = module.rand.number.integer(100, 999) -%}
   {%- set details = {'instance_id': instance.id, 'instance_name': instance.name, 'labels': {'deployment': 'rollout-' ~ release_no}, 'update_mask': 'labels'} -%}
+{%- elif kind == 'DeleteInstance' -%}
+  {%- set instance = vms.pop(selected_id) -%}
+  {%- set details = {'instance_id': selected_id, 'instance_name': instance.name} -%}
 {%- elif kind == 'CreateServiceAccount' -%}
-  {%- set sa_count = (shared.get('new_sa_count', 0) % 999999) + 1 -%}
-  {%- do shared.set('new_sa_count', sa_count) -%}
   {%- set id_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
   {%- set service_account_id = 'aje' ~ id_hex[:17] -%}
-  {%- set service_account_name = params.service_account_prefix ~ '-' ~ ('%06d' % sa_count) -%}
+  {%- set service_account_name = params.service_account_prefix ~ '-' ~ id_hex[:17] -%}
+  {%- do accounts.update({service_account_id: {'name': service_account_name, 'created_at': now}}) -%}
   {%- if is_chain -%}
     {%- do shared.set('chain_sa_id', service_account_id) -%}
     {%- do shared.set('chain_sa_name', service_account_name) -%}
   {%- endif -%}
   {%- set details = {'service_account_id': service_account_id, 'service_account_name': service_account_name, 'description': 'Maintenance automation', 'labels': {'team': 'infra'}, 'status': 'ACTIVE'} -%}
+{%- elif kind == 'DeleteServiceAccount' -%}
+  {%- set account = accounts.pop(selected_id) -%}
+  {%- do keys.pop(selected_id, none) -%}
+  {%- do bindings.pop(selected_id, none) -%}
+  {%- set details = {'service_account_id': selected_id, 'service_account_name': account.name} -%}
 {%- elif kind == 'UpdateFolderAccessBindings' -%}
-  {%- if is_chain -%}
-    {%- set service_account_id = shared.get('chain_sa_id') -%}
-    {%- set service_account_name = shared.get('chain_sa_name') -%}
-    {%- set role_id = 'editor' -%}
-  {%- else -%}
-    {%- set account = samples.service_accounts.pick() -%}
-    {%- set service_account_id = account.id -%}
-    {%- set service_account_name = account.name -%}
-    {%- set role_id = module.rand.choice(['viewer', 'editor']) -%}
-  {%- endif -%}
-  {%- set details = {'folder_id': params.folder_id, 'folder_name': 'production', 'access_binding_deltas': [{'action': 'ADD', 'access_binding': {'role_id': role_id, 'subject_id': service_account_id, 'subject_type': 'SERVICE_ACCOUNT', 'subject_name': service_account_name}}]} -%}
+  {%- set role_id = bindings[cleanup_binding_id][0] if cleanup_binding_id is not none else ('editor' if is_chain else module.rand.choice(['viewer', 'editor'])) -%}
+  {%- set roles = bindings.get(service_account_id, []) -%}
+  {%- set binding_action = 'REMOVE' if role_id in roles else 'ADD' -%}
+  {%- if binding_action == 'ADD' -%}{%- do roles.append(role_id) -%}{%- else -%}{%- do roles.remove(role_id) -%}{%- endif -%}
+  {%- if roles -%}{%- do bindings.update({service_account_id: roles}) -%}{%- else -%}{%- do bindings.pop(service_account_id, none) -%}{%- endif -%}
+  {%- set details = {'folder_id': params.folder_id, 'folder_name': 'production', 'access_binding_deltas': [{'action': binding_action, 'access_binding': {'role_id': role_id, 'subject_id': service_account_id, 'subject_type': 'SERVICE_ACCOUNT', 'subject_name': service_account_name}}]} -%}
 {%- elif kind == 'CreateAccessKey' -%}
-  {%- if is_chain -%}
-    {%- set service_account_id = shared.pop('chain_sa_id') -%}
-    {%- set service_account_name = shared.pop('chain_sa_name') -%}
-  {%- else -%}
-    {%- set account = samples.service_accounts.pick() -%}
-    {%- set service_account_id = account.id -%}
-    {%- set service_account_name = account.name -%}
-  {%- endif -%}
   {%- set access_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
   {%- set key_hex = module.rand.crypto.uuid4() | string | replace('-', '') -%}
-  {%- set details = {'service_account_id': service_account_id, 'service_account_name': service_account_name, 'access_key_id': 'aje' ~ access_hex[:17], 'key_id': 'YC' ~ key_hex[:23], 'description': 'Maintenance automation', 'created_at': timestamp.isoformat()} -%}
+  {%- set access_key_id = 'aje' ~ access_hex[:17] -%}
+  {%- set key_id = 'YC' ~ key_hex[:23] -%}
+  {%- do keys.update({service_account_id: {'access_key_id': access_key_id, 'key_id': key_id, 'name': service_account_name, 'created_at': now}}) -%}
+  {%- set details = {'service_account_id': service_account_id, 'service_account_name': service_account_name, 'access_key_id': access_key_id, 'key_id': key_id, 'description': 'Maintenance automation', 'created_at': now.isoformat()} -%}
+  {%- if is_chain -%}{%- do shared.pop('chain_sa_id') -%}{%- do shared.pop('chain_sa_name') -%}{%- endif -%}
+{%- else -%}
+  {%- set key = keys.pop(selected_id) -%}
+  {%- set details = {'access_key_id': key.access_key_id, 'service_account_id': selected_id, 'service_account_name': key.name} -%}
 {%- endif -%}
-{%- set native = {'event_id': event_id, 'event_source': service, 'event_type': 'yandex.cloud.audit.' ~ service ~ '.' ~ kind, 'event_time': timestamp.isoformat(), 'authentication': {'authenticated': true, 'subject_type': 'FEDERATED_USER_ACCOUNT', 'subject_id': subject_id, 'subject_name': subject_name, 'federation_id': 'bpffd0b1506f5e3af1f1', 'federation_name': 'contoso', 'federation_type': 'PRIVATE_FEDERATION'}, 'authorization': {'authorized': true}, 'resource_metadata': {'path': [{'resource_type': 'organization-manager.organization', 'resource_id': params.organization_id, 'resource_name': 'contoso-org'}, {'resource_type': 'resource-manager.cloud', 'resource_id': params.cloud_id, 'resource_name': 'contoso-cloud'}, {'resource_type': 'resource-manager.folder', 'resource_id': params.folder_id, 'resource_name': 'production'}]}, 'request_metadata': {'remote_address': source_ip, 'user_agent': 'yc/0.157', 'request_id': request_id}, 'event_status': 'DONE', 'details': details} -%}
+{%- do shared.set('accounts', accounts) -%}
+{%- do shared.set('keys', keys) -%}
+{%- do shared.set('bindings', bindings) -%}
+{%- do shared.set('vms', vms) -%}
+{%- set native = {'event_id': event_id, 'event_source': service, 'event_type': 'yandex.cloud.audit.' ~ service ~ '.' ~ kind, 'event_time': now.isoformat(), 'authentication': {'authenticated': true, 'subject_type': 'FEDERATED_USER_ACCOUNT', 'subject_id': subject_id, 'subject_name': subject_name, 'federation_id': 'bpffd0b1506f5e3af1f1', 'federation_name': 'contoso', 'federation_type': 'PRIVATE_FEDERATION'}, 'authorization': {'authorized': true}, 'resource_metadata': {'path': [{'resource_type': 'organization-manager.organization', 'resource_id': params.organization_id, 'resource_name': 'contoso-org'}, {'resource_type': 'resource-manager.cloud', 'resource_id': params.cloud_id, 'resource_name': 'contoso-cloud'}, {'resource_type': 'resource-manager.folder', 'resource_id': params.folder_id, 'resource_name': 'production'}]}, 'request_metadata': {'remote_address': source_ip, 'user_agent': 'yc/0.157', 'request_id': request_id}, 'event_status': 'DONE', 'details': details} -%}
 {
-  "@timestamp": {{ timestamp.isoformat() | tojson }},
+  "@timestamp": {{ now.isoformat() | tojson }},
   "ecs": {"version": "8.17.0"},
-  "event": {"kind": "event", "module": "yandex_cloud", "dataset": "yandex_cloud.audit", "id": {{ event_id | tojson }}, "action": {{ kind | tojson }}, "category": {{ (['iam'] if service in ['iam', 'resourcemanager'] else ['configuration']) | tojson }}, "type": ["change"], "outcome": "success", "original": {{ native | tojson | tojson }}},
+  "event": {"kind": "event", "module": "yandex_cloud", "dataset": "yandex_cloud.audit", "id": {{ event_id | tojson }}, "action": {{ kind | tojson }}, "category": {{ (['iam'] if service in ['iam', 'resourcemanager'] else ['configuration']) | tojson }}, "type": {{ (['creation'] if kind.startswith('Create') else (['deletion'] if kind.startswith('Delete') else ['change'])) | tojson }}, "outcome": "success", "original": {{ native | tojson | tojson }}},
   "source": {"ip": {{ source_ip | tojson }}},
   "user": {"id": {{ subject_id | tojson }}, "name": {{ subject_name | tojson }}},
   "related": {"ip": [{{ source_ip | tojson }}], "user": [{{ subject_name | tojson }}]},
