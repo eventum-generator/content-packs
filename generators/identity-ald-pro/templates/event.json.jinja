@@ -1,0 +1,228 @@
+{# One bounded session trace fits in the 30-record minute bucket. #}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set bucket = timestamp.astimezone(utc) -%}
+{%- set base = bucket.timestamp() -%}
+{%- set actor_dn = 'uid=' ~ params.compromised_user ~ ',cn=users,cn=accounts,' ~ params.base_dn -%}
+{%- set member_dn = 'uid=' ~ params.added_user ~ ',cn=users,cn=accounts,' ~ params.base_dn -%}
+{%- set group_dn = 'cn=' ~ params.privileged_group ~ ',cn=groups,cn=accounts,' ~ params.base_dn -%}
+{%- set rule_dn = 'ipauniqueid=' ~ params.sudo_rule_uuid ~ ',cn=sudorules,cn=sudo,' ~ params.base_dn -%}
+{%- set interval = [params.anomaly_interval_hours | float, 6] | max * 3600 -%}
+{%- set cache = shared.get('ticket_cache', {}) -%}
+{%- set plan = shared.get('plan', []) -%}
+{%- set ns = namespace(row=shared.get('bucket_row', 0), phase=shared.get('episode_phase', 0)) -%}
+{%- if shared.get('bucket') != base -%}
+  {%- if plan -%}{{ dispatch.exhaust() }}{%- endif -%}
+  {%- do shared.set('bucket', base) -%}
+  {%- do shared.set('clock', base) -%}
+  {%- set ns.row = 0 -%}
+{%- endif -%}
+
+{%- macro session(user, ip, changes, episode=false) -%}
+  {%- set conn = shared.get('conn_counter', 100000) + 1 -%}
+  {%- do shared.set('conn_counter', conn) -%}
+  {%- set actor = 'uid=' ~ user ~ ',cn=users,cn=accounts,' ~ params.base_dn -%}
+  {%- set common = {'user': user, 'ip': ip, 'conn': conn, 'actor': actor} -%}
+  {%- set clock = namespace(us=module.rand.number.integer(0,10000)) -%}
+  {%- do plan.append(dict(common, kind='as_issue', at=base + clock.us / 1000000, authtime=base | int)) -%}
+  {%- set clock.us = clock.us + 10000 -%}
+  {%- do plan.append(dict(common, kind='tgs_issue', at=base + clock.us / 1000000, authtime=base | int, service='ldap/' ~ params.dc_host)) -%}
+  {%- set clock.us = clock.us + 10000 -%}
+  {%- do plan.append(dict(common, kind='connection', at=base + clock.us / 1000000)) -%}
+  {%- set clock.us = clock.us + 2000 -%}
+  {%- do plan.append(dict(common, kind='tls', at=base + clock.us / 1000000)) -%}
+  {%- for op, median in [(0,16000),(1,3000),(2,6000)] -%}
+    {%- set clock.us = clock.us + 1000 -%}
+    {%- set duration = module.rand.number.clamp(module.rand.number.lognormal(module.math.log(median),0.35),500,50000) | int -%}
+    {%- set wait = module.rand.number.clamp(module.rand.number.exponential(1 / 200),1,duration // 4) | int -%}
+    {%- do plan.append(dict(common, kind='bind', op=op, at=base + clock.us / 1000000)) -%}
+    {%- set clock.us = clock.us + duration -%}
+    {%- do plan.append(dict(common, kind='bind_result', op=op, at=base + clock.us / 1000000, err=0 if op == 2 else 14, duration=duration, wait=wait)) -%}
+  {%- endfor -%}
+  {%- for change in changes -%}
+    {%- set clock.us = clock.us + 1000 -%}
+    {%- set duration = module.rand.number.clamp(module.rand.number.lognormal(module.math.log(20000),0.45),1000,100000) | int -%}
+    {%- set wait = module.rand.number.clamp(module.rand.number.exponential(1 / 200),1,duration // 4) | int -%}
+    {%- set op = 3 + loop.index0 -%}
+    {%- set fields = dict(common, target=change.target, attribute=change.attribute, change=change.change, value=change.value, op=op) -%}
+    {%- do plan.append(dict(fields, kind='mod', at=base + clock.us / 1000000)) -%}
+    {%- set clock.us = clock.us + duration -%}
+    {%- do plan.append(dict(fields, kind='mod_result', at=base + clock.us / 1000000, duration=duration, wait=wait)) -%}
+    {%- set clock.us = clock.us + 1000 -%}
+    {%- do plan.append(dict(fields, kind='audit', at=base + clock.us / 1000000)) -%}
+  {%- endfor -%}
+  {%- set clock.us = clock.us + 1000 -%}
+  {%- do plan.append(dict(common, kind='unbind', at=base + clock.us / 1000000, op=3 + changes | length)) -%}
+  {%- set clock.us = clock.us + 1000 -%}
+  {%- do plan.append(dict(common, kind='disconnect', at=base + clock.us / 1000000, op=3 + changes | length, episode_end=episode)) -%}
+{%- endmacro -%}
+
+{%- if ns.row == 0 -%}
+  {%- set member = shared.get('member_present', false) -%}
+  {%- set sudo = shared.get('sudo_all', false) -%}
+  {%- set next_episode = shared.get('next_episode', base + interval) -%}
+  {%- do shared.set('next_episode', next_episode) -%}
+  {%- if params.anomaly_mode and ns.phase == 0 and base >= next_episode and not member and not sudo -%}
+    {%- set ns.phase = 1 -%}
+    {%- do shared.set('next_episode', base + interval) -%}
+  {%- endif -%}
+  {%- if ns.phase in [1, 2, 3, 4] -%}
+    {%- set victims = [samples.principals[0].name, samples.principals[1].name, 'svc_backup', params.compromised_user] -%}
+    {%- do plan.append({'kind': 'preauth_failed', 'user': victims[ns.phase - 1], 'ip': params.attack_ip, 'at': base}) -%}
+    {%- set ns.phase = ns.phase + 1 -%}
+  {%- elif ns.phase == 5 -%}
+    {%- do session(params.compromised_user, params.attack_ip, [
+      {'target': group_dn, 'attribute': 'member', 'change': 'add', 'value': member_dn},
+      {'target': rule_dn, 'attribute': 'cmdCategory', 'change': 'replace', 'value': 'all'}], true) -%}
+    {%- set ns.phase = 6 -%}
+  {%- else -%}
+    {%- set user = module.rand.choice([params.compromised_user, params.routine_admin]) -%}
+    {%- set ip = module.rand.choice([params.attack_ip, params.admin_ip]) -%}
+    {%- set changes = [] -%}
+    {%- if member and base >= shared.get('member_due', base + 3600) -%}
+      {%- do changes.append({'target': group_dn, 'attribute': 'member', 'change': 'delete', 'value': member_dn}) -%}
+    {%- endif -%}
+    {%- if sudo and base >= shared.get('sudo_due', base + 3600) -%}
+      {%- do changes.append({'target': rule_dn, 'attribute': 'cmdCategory', 'change': 'delete', 'value': 'all'}) -%}
+    {%- endif -%}
+    {%- if changes -%}
+      {%- do session(user, ip, changes) -%}
+    {%- elif (not params.anomaly_mode or base < next_episode) and (not member or not sudo) and module.rand.chance(0.12) -%}
+      {%- set group_change = not member and (sudo or module.rand.chance(0.5)) -%}
+      {%- if group_change -%}
+        {%- do changes.append({'target': group_dn, 'attribute': 'member', 'change': 'add', 'value': member_dn}) -%}
+      {%- else -%}
+        {%- do changes.append({'target': rule_dn, 'attribute': 'cmdCategory', 'change': 'replace', 'value': 'all'}) -%}
+      {%- endif -%}
+      {%- do session(user, ip, changes) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- do shared.set('episode_phase', ns.phase) -%}
+{%- if plan -%}
+  {%- set row = plan.pop(0) -%}
+{%- else -%}
+  {%- if module.rand.chance(0.2) -%}
+    {%- set user = module.rand.choice([params.compromised_user, params.routine_admin, params.added_user]) -%}
+    {%- set ip = module.rand.choice([params.attack_ip, params.admin_ip]) -%}
+    {%- set service = 'ldap/' ~ params.dc_host -%}
+  {%- else -%}
+    {%- set user = samples.principals.pick() -%}
+    {%- set ip = user.ip -%}
+    {%- set service = user.service -%}
+    {%- set user = user.name -%}
+  {%- endif -%}
+  {%- set at = shared.get('clock', base) + 1 -%}
+  {%- set key = user ~ '|' ~ ip -%}
+  {%- set authtime = cache.get(key) -%}
+  {%- if ns.phase == 0 and module.rand.chance(0.06) and at - shared.get('last_background_failure', base - 600) >= 600 -%}
+    {%- set kind = 'preauth_failed' -%}
+    {%- do shared.set('last_background_failure', at) -%}
+  {%- elif authtime is none or at - authtime >= 28800 or module.rand.chance(0.4) -%}
+    {%- set kind = 'as_issue' -%}
+    {%- set authtime = at | int -%}
+  {%- else -%}
+    {%- set kind = 'tgs_issue' -%}
+  {%- endif -%}
+  {%- set row = {'kind': kind, 'user': user, 'ip': ip, 'at': at, 'authtime': authtime, 'service': service} -%}
+{%- endif -%}
+{%- do shared.set('plan', plan) -%}
+{%- do shared.set('clock', row.at) -%}
+{%- do shared.set('bucket_row', ns.row + 1) -%}
+{%- set time = module.datetime.datetime.fromtimestamp(row.at, utc) -%}
+{%- set kind = row.kind -%}
+{%- set body = {'@timestamp': time.isoformat(), 'ecs': {'version': params.ecs_version}, 'host': {'name': params.dc_host}, 'event': {'kind': 'event', 'module': 'aldpro'}, 'related': {'user': [row.user]}, 'user': {'name': row.user, 'domain': params.realm}} -%}
+{%- set raw = '' -%}
+{%- if kind in ['as_issue', 'tgs_issue', 'preauth_failed'] -%}
+  {%- do body.update({'@timestamp': time.replace(microsecond=0).isoformat()}) -%}
+  {%- set principal = row.user ~ '@' ~ params.realm -%}
+  {%- set request = 'TGS_REQ' if kind == 'tgs_issue' else 'AS_REQ' -%}
+  {%- set service = (row.service if kind == 'tgs_issue' else 'krbtgt/' ~ params.realm) ~ '@' ~ params.realm -%}
+  {%- set status = 'PREAUTH_FAILED' if kind == 'preauth_failed' else 'ISSUE' -%}
+  {%- set raw = time.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.dc_host ~ ' krb5kdc[2611]: ' ~ request ~ ' (2 etypes {aes256-cts-hmac-sha1-96(18), aes128-cts-hmac-sha1-96(17)}) ' ~ row.ip ~ ': ' ~ status ~ ': ' -%}
+  {%- if kind == 'preauth_failed' -%}
+    {%- set raw = raw ~ principal ~ ' for ' ~ service ~ ', Preauthentication failed' -%}
+  {%- else -%}
+    {%- set raw = raw ~ 'authtime ' ~ row.authtime ~ ', etypes {rep=aes256-cts-hmac-sha1-96(18), tkt=aes256-cts-hmac-sha1-96(18), ses=aes256-cts-hmac-sha1-96(18)}, ' ~ principal ~ ' for ' ~ service -%}
+    {%- if kind == 'as_issue' -%}
+      {%- if cache | length >= 48 and row.user ~ '|' ~ row.ip not in cache -%}{{ dispatch.exhaust() }}{%- endif -%}
+      {%- do cache.update({row.user ~ '|' ~ row.ip: row.authtime}) -%}
+      {%- do shared.set('ticket_cache', cache) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set fields = {'request': request, 'result': status, 'client_ip': row.ip, 'principal': principal, 'service': service, 'etypes': [18,17]} -%}
+  {%- if kind != 'preauth_failed' -%}{%- do fields.update({'authtime': row.authtime}) -%}{%- endif -%}
+  {%- do body.update({'process': {'name':'krb5kdc','pid':2611}, 'source': {'ip':row.ip}, 'log': {'file': {'path':'/var/log/auth.log'}}, 'aldpro': {'krb5kdc':fields}}) -%}
+  {%- do body.related.update({'ip':[row.ip]}) -%}
+  {%- do body.event.update({'dataset':'aldpro.krb5kdc','action':status,'category':['authentication'],'type':['denied'] if kind == 'preauth_failed' else ['allowed'],'outcome':'failure' if kind == 'preauth_failed' else 'success'}) -%}
+{%- elif kind == 'audit' -%}
+  {%- do body.update({'@timestamp': time.replace(microsecond=0).isoformat()}) -%}
+  {%- set usn = shared.get('entryusn',100000) + 1 -%}
+  {%- do shared.set('entryusn',usn) -%}
+  {%- set local_time = time.strftime('%Y%m%d%H%M%S') -%}
+  {%- set modify_time = time.strftime('%Y%m%d%H%M%SZ') -%}
+  {%- set raw = 'time: ' ~ local_time ~ '\ndn: ' ~ row.target ~ '\nresult: 0\nchangetype: modify\n' ~ row.change ~ ': ' ~ row.attribute ~ '\n' ~ row.attribute ~ ': ' ~ row.value ~ '\n-\nreplace: modifiersname\nmodifiersname: ' ~ row.actor ~ '\n-\nreplace: modifytimestamp\nmodifytimestamp: ' ~ modify_time ~ '\n-\nreplace: entryusn\nentryusn: ' ~ usn ~ '\n-\n\n' -%}
+  {%- set fields = {'time':local_time,'dn':row.target,'result':0,'changetype':'modify','attribute_operation':row.change,'attribute':row.attribute,'attribute_value':row.value,'modifiersname':row.actor,'modifytimestamp':modify_time,'entryusn':usn,'object_name':params.privileged_group if row.attribute == 'member' else params.sudo_rule} -%}
+  {%- do body.update({'log': {'file': {'path':'/var/log/dirsrv/slapd-' ~ params.directory_instance ~ '/audit'}},'aldpro': {'dirsrv': {'audit':fields}}}) -%}
+  {%- do body.event.update({'dataset':'aldpro.dirsrv_audit','action':row.change ~ '-' ~ row.attribute,'category':['iam'],'type':['change'],'outcome':'success'}) -%}
+  {%- if row.attribute == 'member' -%}
+    {%- do body.related.user.append(params.added_user) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set stamp = time.strftime('%d/%b/%Y:%H:%M:%S.') ~ '%09d' % (time.microsecond * 1000) ~ ' +0000' -%}
+  {%- set prefix = '[' ~ stamp ~ '] conn=' ~ row.conn ~ ' ' -%}
+  {%- set fields = {'conn':row.conn} -%}
+  {%- set auth = kind in ['bind','bind_result'] -%}
+  {%- if kind == 'connection' -%}
+    {%- set raw = prefix ~ 'fd=168 slot=168 SSL connection from ' ~ row.ip ~ ' to ' ~ params.dc_ip -%}
+    {%- do fields.update({'operation':'connection','fd':168,'slot':168,'source_ip':row.ip,'destination_ip':params.dc_ip}) -%}
+  {%- elif kind == 'tls' -%}
+    {%- set raw = prefix ~ 'TLS1.3 128-bit AES-GCM' -%}
+    {%- do fields.update({'operation':'TLS','tls_version':'1.3','cipher':'AES-GCM','bits':128}) -%}
+  {%- else -%}
+    {%- set prefix = prefix ~ 'op=' ~ row.op ~ ' ' -%}
+    {%- do fields.update({'op':row.op}) -%}
+    {%- if kind == 'bind' -%}
+      {%- set raw = prefix ~ 'BIND dn="" method=sasl version=3 mech=GSSAPI' -%}
+      {%- do fields.update({'operation':'BIND','dn':'','method':'sasl','version':3,'mech':'GSSAPI'}) -%}
+    {%- elif kind == 'mod' -%}
+      {%- set raw = prefix ~ 'MOD dn="' ~ row.target ~ '"' -%}
+      {%- do fields.update({'operation':'MOD','dn':row.target}) -%}
+    {%- elif kind in ['bind_result','mod_result'] -%}
+      {%- set err = row.err if kind == 'bind_result' else 0 -%}
+      {%- set tag = 97 if kind == 'bind_result' else 103 -%}
+      {%- set wait = '%.9f' % (row.wait / 1000000) -%}
+      {%- set duration = '%.9f' % (row.duration / 1000000) -%}
+      {%- set optime = '%.9f' % ((row.duration - row.wait) / 1000000) -%}
+      {%- set raw = prefix ~ 'RESULT err=' ~ err ~ ' tag=' ~ tag ~ ' nentries=0 wtime=' ~ wait ~ ' optime=' ~ optime ~ ' etime=' ~ duration -%}
+      {%- if err == 14 -%}
+        {%- set raw = raw ~ ', SASL bind in progress' -%}
+      {%- elif tag == 97 -%}
+        {%- set raw = raw ~ ' dn="' ~ row.actor ~ '"' -%}
+      {%- endif -%}
+      {%- do fields.update({'operation':'RESULT','err':err,'tag':tag,'nentries':0,'wtime':row.wait / 1000000,'optime':(row.duration - row.wait) / 1000000,'etime':row.duration / 1000000}) -%}
+      {%- if err == 0 and tag == 97 -%}{%- do fields.update({'dn':row.actor}) -%}{%- endif -%}
+      {%- if kind == 'mod_result' -%}
+        {%- if row.attribute == 'member' -%}
+          {%- do shared.set('member_present',row.change != 'delete') -%}
+          {%- do shared.set('member_due',row.at + 3600) -%}
+        {%- else -%}
+          {%- do shared.set('sudo_all',row.change != 'delete') -%}
+          {%- do shared.set('sudo_due',row.at + 3600) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- elif kind == 'unbind' -%}
+      {%- set raw = prefix ~ 'UNBIND' -%}
+      {%- do fields.update({'operation':'UNBIND'}) -%}
+    {%- else -%}
+      {%- set raw = prefix ~ 'fd=168 Disconnect - Cleanly Closed Connection - U1' -%}
+      {%- do fields.update({'operation':'Disconnect','fd':168,'reason':'U1'}) -%}
+      {%- if row.episode_end -%}{%- do shared.set('episode_phase',0) -%}{%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- do body.update({'source': {'ip':row.ip},'log': {'file': {'path':'/var/log/dirsrv/slapd-' ~ params.directory_instance ~ '/access'}},'aldpro': {'dirsrv': {'access':fields}}}) -%}
+  {%- do body.related.update({'ip':[row.ip]}) -%}
+  {%- do body.event.update({'dataset':'aldpro.dirsrv_access','action':kind,'category':['authentication'] if auth else (['iam'] if kind in ['mod','mod_result'] else ['network']),'type':['change'] if kind == 'mod_result' else ['info'],'outcome':'success' if kind in ['mod_result'] or (kind == 'bind_result' and row.err == 0) else 'unknown'}) -%}
+{%- endif -%}
+{%- do body.event.update({'original':raw}) -%}
+{%- do body.update({'message':raw}) -%}
+{{ body | tojson }}
