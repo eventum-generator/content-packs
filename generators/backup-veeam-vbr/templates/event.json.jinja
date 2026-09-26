@@ -1,0 +1,120 @@
+{%- set step = vars.step -%}
+{%- set interval_seconds = [params.anomaly_interval_hours, 1] | max * 3600 -%}
+{%- set next_episode_at = shared.get('next_episode_at') -%}
+{%- if next_episode_at is none -%}
+  {%- set next_episode_at = timestamp.timestamp() + interval_seconds -%}
+  {%- do shared.set('next_episode_at', next_episode_at) -%}
+{%- endif -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_anomaly', none) -%}
+  {%- set count = (shared.get('routine_count', 0) % 240) + 1 -%}
+  {%- do shared.set('routine_count', count) -%}
+  {%- set tick = (shared.get('routine_tick', 0) % 24) + 1 -%}
+  {%- do shared.set('routine_tick', tick) -%}
+  {%- set cycle = ((tick - 1) // 6) -%}
+  {%- set phase = ((tick - 1) % 6) -%}
+  {%- set username = params.anomaly_user if cycle % 2 else params.normal_user -%}
+  {%- set source_ip = params.anomaly_source_ip if cycle % 2 else params.normal_source_ip -%}
+  {%- set job_names = ['Production VMs', 'Infrastructure VMs', 'File servers', 'Application VMs'] -%}
+  {%- set job_ids = ['c4415b30-de82-4403-8816-ea66636356e8', '27183841-c916-40fe-9170-cd2aebfa7a61', '191e9d52-7e65-4c42-9d13-2f4b29ff2971', 'e150449d-a6c2-4cd6-8d76-94481fe60c86'] -%}
+  {%- set job_name = job_names[cycle] -%}
+  {%- set job_id = job_ids[cycle] -%}
+  {%- if count % 120 == 0 and shared.get('point_present', false)
+      and shared.get('point_completed', false) -%}
+    {%- set kind = 'restore' -%}
+  {%- elif count == 162 and not shared.get('secondary_point_removed', false) -%}
+    {%- set kind = 'restore' -%}
+    {%- set username = params.anomaly_user -%}
+    {%- do shared.set('secondary_point_removed', true) -%}
+  {%- elif count == 198 and not shared.get('secondary_repository_removed', false) -%}
+    {%- set kind = 'repository' -%}
+    {%- set username = params.anomaly_user -%}
+    {%- do shared.set('secondary_repository_removed', true) -%}
+  {%- else -%}
+    {%- set kind = ['job_start', 'point_created', 'job_finish', 'denied', 'granted', 'granted'][phase] -%}
+  {%- endif -%}
+  {%- if params.anomaly_mode and timestamp.timestamp() >= next_episode_at
+      and phase == 5 and kind == 'granted' and shared.get('point_present', false)
+      and shared.get('point_completed', false) -%}
+    {%- do shared.set('next_episode_at', timestamp.timestamp() + interval_seconds) -%}
+    {%- do shared.set('to_anomaly', true) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set kind = {'failed_one': 'denied', 'failed_two': 'denied', 'authorized': 'granted', 'restore_delete': 'restore'}[step] -%}
+  {%- set username = params.anomaly_user -%}
+  {%- set source_ip = params.anomaly_source_ip -%}
+{%- endif -%}
+{%- set qualified_user = params.user_domain ~ '\\' ~ username -%}
+{%- set event_id = {'denied': 44002, 'granted': 44003, 'job_start': 110, 'job_finish': 190, 'point_created': 10010, 'restore': 10050, 'repository': 28200}[kind] -%}
+{%- set event_action = {'denied': 'authorization_denied', 'granted': 'authorization_granted', 'job_start': 'backup_job_started', 'job_finish': 'backup_job_finished', 'point_created': 'restore_point_created', 'restore': 'restore_point_deleted', 'repository': 'backup_repository_deleted'}[kind] -%}
+{%- set severity = 'warning' if kind in ['denied', 'restore', 'repository'] else 'info' -%}
+{%- set app = 'Veeam_Security' if kind in ['denied', 'granted'] else 'Veeam_MP' -%}
+{%- if kind == 'job_start' -%}
+  {%- set session_id = module.rand.crypto.uuid4() | string -%}
+  {%- do shared.set('job_session_id', session_id) -%}
+  {%- set description = "Backup job '" ~ job_name ~ "' has been started by user " ~ qualified_user ~ '.' -%}
+{%- elif kind == 'point_created' -%}
+  {%- set point_id = module.rand.crypto.uuid4() | string -%}
+  {%- do shared.set('last_point_id', point_id) -%}
+  {%- do shared.set('point_present', true) -%}
+  {%- do shared.set('point_completed', false) -%}
+  {%- do shared.set('last_point_created', timestamp.strftime('%m/%d/%Y %H:%M:%S')) -%}
+  {%- set description = "VM '" ~ params.vm_name ~ "' restore point has been created." -%}
+{%- elif kind == 'job_finish' -%}
+  {%- do shared.set('point_completed', true) -%}
+  {%- set description = "Backup job '" ~ job_name ~ "' finished with Success. All objects have been backed up successfully." -%}
+{%- elif kind == 'denied' -%}
+  {%- set description = 'Authorization request was denied: an authentication has failed.' -%}
+{%- elif kind == 'granted' -%}
+  {%- set description = 'Authorization was successful.' -%}
+{%- elif kind == 'restore' -%}
+  {%- set description = "Restore point for VM '" ~ params.vm_name ~ "' has been removed by user " ~ qualified_user ~ '.' -%}
+{%- else -%}
+  {%- set description = 'Backup repository ' ~ params.repository_name ~ ' has been deleted.' -%}
+{%- endif -%}
+{%- set attrs = {} -%}
+{%- if kind in ['denied', 'granted'] -%}
+  {%- do attrs.update({'SourceIpAddress': source_ip, 'ClientId': 'veeam-backup-web-ui', 'FriendlyName': username, 'Subject': 'UID-' ~ username, 'ResourceId': 'veeam-gateway-api-service', 'RedirectUri': '/'}) -%}
+  {%- if kind == 'denied' -%}
+    {%- do attrs.update({'Reason': '1'}) -%}
+  {%- endif -%}
+{%- elif kind in ['job_start', 'job_finish'] -%}
+  {%- do attrs.update({'JobSessionID': shared.get('job_session_id'), 'JobID': job_id}) -%}
+  {%- if kind == 'job_finish' -%}
+    {%- do attrs.update({'JobResult': '0'}) -%}
+  {%- endif -%}
+  {%- do attrs.update({'JobType': '0', 'Platform': '0'}) -%}
+  {%- if kind == 'job_start' -%}
+    {%- do attrs.update({'Flags': '1'}) -%}
+  {%- else -%}
+    {%- do attrs.update({'WillBeRetried': 'False', 'JobName': job_name}) -%}
+  {%- endif -%}
+  {%- do attrs.update({'SourceType': '2'}) -%}
+{%- elif kind in ['point_created', 'restore'] -%}
+  {%- set retired_point = kind == 'restore' and step == 'routine' and count == 162 -%}
+  {%- set point_id = params.retired_point_id if retired_point else shared.get('last_point_id') -%}
+  {%- set point_date = (timestamp - module.datetime.timedelta(days=14)).strftime('%m/%d/%Y %H:%M:%S') if retired_point else shared.get('last_point_created') -%}
+  {%- set repo_id = params.repository_id if retired_point else params.active_repository_id -%}
+  {%- if kind == 'restore' and not retired_point -%}
+    {%- do shared.set('point_present', false) -%}
+  {%- endif -%}
+  {%- do attrs.update({'OibID': point_id, 'OriginalOibID': point_id, 'VmRef': 'vm-02', 'VmName': params.vm_name, 'ServerName': params.hypervisor_server, 'DateTime': point_date, 'IsCorrupted': 'False', 'Platform': '0', 'StorageSize': '13873971200', 'RepositoryID': repo_id, 'IsFull': 'True', 'UserFullInfo': '<ModifiedUserInfo fullName="' ~ ('SYSTEM' if kind == 'point_created' else qualified_user) ~ '" loginType="0" />'}) -%}
+{%- else -%}
+  {%- do attrs.update({'RepositoryID': params.repository_id, 'Type': '0', 'RepositoryName': params.repository_name, 'ChangesXML': '<changes><object id="' ~ params.repository_id ~ '" name="' ~ params.repository_name ~ '" /></changes>', 'UserName': qualified_user, 'UserFullInfo': '<ModifiedUserInfo fullName="' ~ qualified_user ~ '" loginType="0" />'}) -%}
+{%- endif -%}
+{%- do attrs.update({'VbrHostName': params.server_fqdn, 'VbrVersion': params.version, 'Version': '1', 'Description': description}) -%}
+{%- set parts = [] -%}
+{%- for key, value in attrs.items() -%}
+  {%- do parts.append(key ~ '="' ~ value ~ '"') -%}
+{%- endfor -%}
+{%- set original = '1 ' ~ timestamp.isoformat() ~ ' ' ~ params.server_name ~ ' ' ~ app ~ ' - - [origin enterpriseId="31023"] [categoryId=0 instanceId=' ~ event_id ~ ' ' ~ parts | join(' ') ~ ']' -%}
+{
+  "@timestamp": {{ timestamp.isoformat() | tojson }},
+  "ecs": {"version": "8.17.0"},
+  "event": {"kind": "event", "module": "veeam", "dataset": "veeam.vbr.syslog", "code": {{ event_id | string | tojson }}, "category": {{ (['authentication'] if kind in ['denied', 'granted'] else ['configuration'] if kind == 'repository' else ['file'] if kind in ['point_created', 'restore'] else ['process']) | tojson }}, "action": {{ event_action | tojson }}, "type": {{ (['denied'] if kind == 'denied' else ['allowed'] if kind == 'granted' else ['start'] if kind == 'job_start' else ['end'] if kind == 'job_finish' else ['creation'] if kind == 'point_created' else ['deletion']) | tojson }}, "outcome": {{ ('failure' if kind == 'denied' else 'success') | tojson }}, "original": {{ original | tojson }}},
+  "message": {{ description | tojson }},
+  "host": {"name": {{ params.server_name | tojson }}},
+  {% if kind in ['denied', 'granted'] %}"source": {"ip": {{ source_ip | tojson }}}, {% endif %}
+  {% if kind in ['denied', 'granted', 'job_start', 'restore', 'repository'] %}"user": {"name": {{ username | tojson }}}, {% endif %}
+  "veeam": {"event_id": {{ event_id }}, "app": {{ app | tojson }}, "severity": {{ severity | tojson }}, "enterprise_id": 31023, "category_id": 0, "parameters": {{ attrs | tojson }}}
+}
