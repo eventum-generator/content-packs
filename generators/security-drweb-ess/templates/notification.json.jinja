@@ -1,96 +1,215 @@
-{%- set now = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{#- One render per 10 s input tick. A render either delivers one due
+    notification, starts one workflow or is dropped, so arrivals follow a
+    random process instead of a fixed grid. -#}
+{%- set tick = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = tick + module.datetime.timedelta(seconds=module.rand.number.integer(0, 9)) -%}
 {%- set clock = now.timestamp() -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- if not module.math.isfinite(interval) or interval < 6 or interval > 8760 -%}
   {{- module.builtins.float('anomaly_interval_hours must be between 6 and 8760') -}}
 {%- endif -%}
+{%- set chain = ['block', 'preventive', 'threat', 'scan', 'auth', 'duplicate'] -%}
+{%- set executables = [0, 1, 3, 4] -%}
+{%- set retention = 72 * 3600 -%}
+{#- Longer than the 5700 s chain detection window, re-armed by every
+    block of a guarded copy, so ordinary traffic cannot complete a chain. -#}
+{%- set guard_window = 5760 -%}
 {%- if not shared.get('stations') -%}
   {%- set fleet = [] -%}
   {%- for row in samples.stations -%}
-    {%- do fleet.append(dict(station=dict(id=row.id, name=row.name, ip=row.ip, user=row.user), quarantine=[], pid=2400)) -%}
+    {%- do fleet.append(dict(station=dict(id=row.id, name=row.name, ip=row.ip, user=row.user), weight=module.rand.number.lognormal(0, 0.4), quarantine=[], reserved=0, scanning=false, guard_until=0)) -%}
   {%- endfor -%}
-  {%- do shared.update(dict(stations=fleet, queue=[], ordinary_cursor=0, episode_cursor=0, next_episode=clock + interval * 3600)) -%}
+  {%- do shared.update(dict(stations=fleet, pending=[], backlog=0, expiry=none, next_episode=clock + interval * 3600, recent=[], last_object=-1)) -%}
 {%- endif -%}
 {%- set fleet = shared.get('stations') -%}
-{# Selected external administrator task completes deletion after 72h. No
-   notification of its activity is invented in this selected output. #}
-{%- for state in fleet -%}
-  {%- set retained = [] -%}
-  {%- for entry in state.quarantine -%}
-    {%- if clock - entry.moved_at < 72 * 3600 -%}
-      {%- do retained.append(entry) -%}
-    {%- endif -%}
+{%- set pending = shared.get('pending') -%}
+{#- Selected external administrator task completes deletion 72 h after
+    receipt. No notification of its activity is invented. -#}
+{%- if shared.get('expiry') is not none and clock >= shared.get('expiry') -%}
+  {%- set soonest = namespace(value=none) -%}
+  {%- for state in fleet -%}
+    {%- set retained = [] -%}
+    {%- for entry in state.quarantine -%}
+      {%- if clock - entry.moved_at < retention -%}
+        {%- do retained.append(entry) -%}
+        {%- if soonest.value is none or entry.moved_at + retention < soonest.value -%}
+          {%- set soonest.value = entry.moved_at + retention -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do state.update(dict(quarantine=retained)) -%}
   {%- endfor -%}
-  {%- do state.update(dict(quarantine=retained)) -%}
+  {%- do shared.set('expiry', soonest.value) -%}
+{%- endif -%}
+{#- Ordinary workflow starts arrive independently of everything else; a
+    start that meets a busy render waits in a small backlog. -#}
+{%- if module.rand.chance(0.0339) -%}
+  {%- do shared.set('backlog', [shared.get('backlog') + 1, 24] | min) -%}
+{%- endif -%}
+{%- set pick = namespace(index=-1, due=none) -%}
+{%- for entry in pending -%}
+  {%- if entry.due <= clock and (pick.due is none or entry.due < pick.due) -%}
+    {%- set pick.index = loop.index0 -%}
+    {%- set pick.due = entry.due -%}
+  {%- endif -%}
 {%- endfor -%}
-{%- set queue = shared.get('queue') -%}
-{%- if not queue -%}
-  {%- set choice = namespace(index=-1, dense=false) -%}
-  {%- if params.anomaly_mode and clock >= shared.get('next_episode') -%}
-    {%- for offset in range(fleet | length) -%}
-      {%- set index = (shared.get('episode_cursor') + offset) % (fleet | length) -%}
-      {%- if fleet[index].quarantine | length < 4 -%}
-        {%- set choice.index = index -%}
-        {%- set choice.dense = true -%}
-        {%- do shared.set('episode_cursor', (index + 1) % (fleet | length)) -%}
-        {%- do shared.set('next_episode', clock + interval * 3600) -%}
-        {%- break -%}
+{%- set sel = namespace(item=none) -%}
+{%- if pick.index >= 0 -%}
+  {%- set sel.item = pending.pop(pick.index) -%}
+{%- elif shared.get('backlog') > 0 -%}
+  {%- do shared.set('backlog', shared.get('backlog') - 1) -%}
+  {%- set workflow = module.rand.weighted_choice(['clean', 'block', 'infected', 'preventive', 'update', 'auth', 'duplicate', 'near'], [135, 47, 15, 25, 15, 20, 10, 20]) -%}
+  {%- if workflow == 'clean' -%}
+    {%- set steps = ['scan'] -%}
+  {%- elif workflow == 'infected' -%}
+    {%- set steps = ['threat', 'scan'] -%}
+  {%- elif workflow == 'auth' -%}
+    {%- set steps = ['auth', 'duplicate'] if module.rand.chance(0.45) else ['auth'] -%}
+  {%- elif workflow == 'near' -%}
+    {#- A contiguous proper part of the chain, as unrelated activity. The
+        two five-step parts together contain every shorter part, so they
+        dominate; ordinary parts outnumber episodes at any interval. -#}
+    {%- set span = module.rand.weighted_choice([[0, 5], [1, 6], [0, 2], [0, 4], [1, 4], [1, 5], [2, 5], [2, 6]], [7, 7, 1, 1, 1, 1, 1, 1]) -%}
+    {%- set steps = chain[span[0]:span[1]] -%}
+  {%- else -%}
+    {%- set steps = [workflow] -%}
+  {%- endif -%}
+  {%- set later_threat = 'threat' in steps and steps[0] != 'threat' -%}
+  {%- set auth_like = 'auth' in steps or 'duplicate' in steps -%}
+  {%- set guarded_part = workflow == 'near' and steps[0] == 'block' and 'scan' in steps -%}
+  {%- set noisy = [] -%}
+  {%- if guarded_part -%}
+    {#- A block-started part that reaches the detection must not meet a
+        connection notification already scheduled on its station. -#}
+    {%- for entry in pending -%}
+      {%- if entry.kind in ['auth', 'duplicate'] or 'auth' in entry.rest or 'duplicate' in entry.rest -%}
+        {%- do noisy.append(entry.context.index) -%}
       {%- endif -%}
     {%- endfor -%}
   {%- endif -%}
-  {%- set workflow = 'episode' if choice.dense else module.rand.weighted_choice(['clean', 'block', 'infected', 'preventive', 'update', 'auth'], [48, 18, 15, 8, 6, 5]) -%}
-  {%- if choice.index < 0 -%}
-    {%- set choice.index = shared.get('ordinary_cursor') -%}
-    {%- do shared.set('ordinary_cursor', (choice.index + 1) % (fleet | length)) -%}
-    {%- if workflow == 'infected' and fleet[choice.index].quarantine | length >= 4 -%}
-      {# Defer this incoming infected copy until a later eligible workflow.
-         A clean targeted run is emitted instead; fresh entries are retained. #}
-      {%- set workflow = 'clean' -%}
+  {%- set candidates = [] -%}
+  {%- set weights = [] -%}
+  {%- for state in fleet -%}
+    {%- if not (steps[0] in ['scan', 'threat'] and state.scanning)
+          and not ('threat' in steps and (state.quarantine | length) + state.reserved >= 4)
+          and not (auth_like and state.guard_until > clock)
+          and not (guarded_part and loop.index0 in noisy) -%}
+      {%- do candidates.append(loop.index0) -%}
+      {%- do weights.append(state.weight) -%}
     {%- endif -%}
+  {%- endfor -%}
+  {%- if candidates -%}
+    {%- set index = module.rand.weighted_choice(candidates, weights) -%}
+    {%- set state = fleet[index] -%}
+    {%- set context = dict(index=index, infected=0) -%}
+    {%- if steps[0] == 'block' -%}
+      {%- set source = samples.objects[module.rand.choice(executables)] -%}
+      {%- set age = module.rand.number.triangular(0, 1800, 120) | int -%}
+    {%- elif 'threat' in steps -%}
+      {%- set source = samples.objects[module.rand.number.integer(0, (samples.objects | length) - 1)] -%}
+      {%- set age = module.rand.number.triangular(0, 7200, 900) | int -%}
+    {%- endif -%}
+    {%- if steps[0] == 'block' or 'threat' in steps -%}
+      {%- set path = module.pathlib.PureWindowsPath(source.path) -%}
+      {%- set introduced = now - module.datetime.timedelta(seconds=age) -%}
+      {%- do context.update(dict(obj=dict(path=(path.parent / (path.stem ~ '_' ~ introduced.strftime('%Y%m%d_%H%M%S') ~ path.suffix)) | string, threat=source.threat, kind=source.kind, sha256=source.sha256))) -%}
+    {%- endif -%}
+    {%- if 'threat' in steps -%}
+      {%- do context.update(dict(infected=1)) -%}
+    {%- endif -%}
+    {%- if later_threat -%}
+      {%- do state.update(dict(reserved=state.reserved + 1)) -%}
+      {%- do context.update(dict(reserved=true)) -%}
+    {%- endif -%}
+    {%- if guarded_part -%}
+      {#- An unrelated connection pair on this station would complete the
+          chain; ordinary connection noise avoids it for the chain window. -#}
+      {%- do context.update(dict(guard=true)) -%}
+    {%- endif -%}
+    {%- set sel.item = dict(kind=steps[0], rest=steps[1:], context=context) -%}
   {%- endif -%}
-  {%- set state = fleet[choice.index] -%}
-  {%- set station = state.station -%}
-  {%- set context = dict(station=station, index=choice.index) -%}
-  {%- if workflow in ['episode', 'block', 'infected'] -%}
-    {%- set object_index = module.rand.choice([0, 1, 3, 4]) if workflow in ['episode', 'block'] else module.rand.number.integer(0, (samples.objects | length) - 1) -%}
+{%- elif params.anomaly_mode and clock >= shared.get('next_episode') and module.rand.chance(0.025) -%}
+  {%- set candidates = [] -%}
+  {%- for state in fleet -%}
+    {%- set index = loop.index0 -%}
+    {%- if not state.scanning and (state.quarantine | length) + state.reserved < 4
+          and state.guard_until <= clock
+          and state.station.id not in shared.get('recent') -%}
+      {%- do candidates.append(index) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if candidates -%}
+    {%- set index = module.rand.choice(candidates) -%}
+    {%- set state = fleet[index] -%}
+    {%- set object_index = module.rand.choice(executables | reject('equalto', shared.get('last_object')) | list) -%}
     {%- set source = samples.objects[object_index] -%}
     {%- set path = module.pathlib.PureWindowsPath(source.path) -%}
-    {%- set copy_path = (path.parent / (path.stem ~ '_' ~ now.strftime('%Y%m%d_%H%M%S') ~ path.suffix)) | string -%}
-    {%- do context.update(dict(obj=dict(path=copy_path, threat=source.threat, kind=source.kind, sha256=source.sha256))) -%}
-  {%- endif -%}
-  {%- if workflow in ['episode', 'preventive'] -%}
-    {%- do state.update(dict(pid=2400 + (state.pid - 2400 + 97) % 9601)) -%}
-    {%- do context.update(dict(pid=state.pid)) -%}
-  {%- endif -%}
-  {%- if workflow in ['episode', 'infected', 'clean'] -%}
-    {%- set scanned = module.rand.number.clamp(module.rand.number.lognormal(8.4, 0.55) | int, 800, 20000) | int -%}
-    {%- set speed = module.rand.number.clamp(module.rand.number.lognormal(10.3, 0.35) | int, 8000, 85000) | int -%}
-    {%- do context.update(dict(scanned=scanned, speed=speed, infected=0 if workflow == 'clean' else 1)) -%}
-  {%- endif -%}
-  {%- if workflow == 'episode' -%}
-    {%- for kind in ['block', 'preventive', 'threat', 'scan', 'auth', 'duplicate'] -%}
-      {%- do queue.append(dict(kind=kind, context=context)) -%}
-    {%- endfor -%}
-  {%- elif workflow == 'infected' -%}
-    {%- for kind in ['threat', 'scan'] -%}
-      {%- do queue.append(dict(kind=kind, context=context)) -%}
-    {%- endfor -%}
-  {%- elif workflow == 'auth' -%}
-    {%- do queue.append(dict(kind='auth', context=context)) -%}
-    {%- set other_index = (choice.index + 1) % (fleet | length) -%}
-    {%- do queue.append(dict(kind='duplicate', context=dict(station=fleet[other_index].station, index=other_index))) -%}
-    {%- do shared.set('ordinary_cursor', (other_index + 1) % (fleet | length)) -%}
-  {%- else -%}
-    {%- do queue.append(dict(kind='scan' if workflow == 'clean' else workflow, context=context)) -%}
+    {%- set introduced = now - module.datetime.timedelta(seconds=module.rand.number.triangular(0, 1800, 120) | int) -%}
+    {%- set context = dict(index=index, infected=1, reserved=true, obj=dict(path=(path.parent / (path.stem ~ '_' ~ introduced.strftime('%Y%m%d_%H%M%S') ~ path.suffix)) | string, threat=source.threat, kind=source.kind, sha256=source.sha256)) -%}
+    {%- do state.update(dict(reserved=state.reserved + 1)) -%}
+    {%- set recent = (shared.get('recent') + [state.station.id])[-3:] -%}
+    {%- do shared.update(dict(recent=recent, last_object=object_index, next_episode=clock + interval * 3600)) -%}
+    {%- set sel.item = dict(kind='block', rest=chain[1:], context=context) -%}
   {%- endif -%}
 {%- endif -%}
-{%- set item = queue.pop(0) -%}
+{%- if sel.item is none -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set item = sel.item -%}
 {%- set ctx = item.context -%}
-{%- set station = ctx.station -%}
+{%- set state = fleet[ctx.index] -%}
+{%- set station = state.station -%}
+{%- if item.kind == 'threat' and state.scanning -%}
+  {#- Another Scanner run on this station has not completed yet. -#}
+  {%- do item.update(dict(due=clock + 30)) -%}
+  {%- do pending.append(item) -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- if item.kind == 'block' and ctx.guard -%}
+  {%- do state.update(dict(guard_until=[state.guard_until, clock + guard_window] | max)) -%}
+{%- endif -%}
 {%- if item.kind == 'threat' -%}
-  {# The targeted Scanner response removes this new file copy from its
-     original path. Its following completion accounts for this one move. #}
-  {%- do fleet[ctx.index].quarantine.append(dict(path=ctx.obj.path, moved_at=clock)) -%}
+  {#- The targeted Scanner response removes this file copy from its
+      original path; its completion accounts for this one move. -#}
+  {%- if ctx.reserved -%}
+    {%- do state.update(dict(reserved=state.reserved - 1)) -%}
+  {%- endif -%}
+  {%- do state.quarantine.append(dict(path=ctx.obj.path, moved_at=clock)) -%}
+  {%- do state.update(dict(scanning=true)) -%}
+  {%- if shared.get('expiry') is none or clock + retention < shared.get('expiry') -%}
+    {%- do shared.set('expiry', clock + retention) -%}
+  {%- endif -%}
+  {%- set stale = [] -%}
+  {%- for entry in pending -%}
+    {%- if entry.kind == 'block' and entry.context.index == ctx.index and entry.context.obj.path == ctx.obj.path -%}
+      {%- do stale.append(entry) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- for entry in stale -%}
+    {%- do pending.remove(entry) -%}
+  {%- endfor -%}
+{%- elif item.kind == 'scan' and ctx.infected -%}
+  {%- do state.update(dict(scanning=false)) -%}
+{%- endif -%}
+{#- Repeated launch attempts, reconnects and update retries of the same
+    station follow each notification of these classes wherever it occurs. -#}
+{%- set retry = {'block': [0.35, 3, 120, 15], 'auth': [0.35, 20, 600, 90], 'update': [0.4, 300, 3600, 900], 'duplicate': [0.12, 30, 600, 120]}.get(item.kind) -%}
+{%- if retry and module.rand.chance(retry[0]) -%}
+  {%- do pending.append(dict(kind=item.kind, rest=[], context=ctx, due=clock + module.rand.number.triangular(retry[1], retry[2], retry[3]))) -%}
+{%- endif -%}
+{%- if item.rest -%}
+  {%- set gap = {'block': [60, 1200, 300], 'preventive': [120, 1500, 480], 'threat': [30, 720, 120], 'scan': [60, 1200, 360], 'auth': [18, 600, 120]}[item.kind] -%}
+  {%- do pending.append(dict(kind=item.rest[0], rest=item.rest[1:], context=ctx, due=clock + module.rand.number.triangular(gap[0], gap[1], gap[2]))) -%}
+{%- endif -%}
+{%- if item.kind in ['block', 'preventive'] -%}
+  {%- set station_delay = module.rand.number.triangular(1, 25, 2) | int -%}
+{%- endif -%}
+{%- if item.kind == 'preventive' -%}
+  {%- set pid = 4 * module.rand.number.integer(300, 4500) -%}
+{%- endif -%}
+{%- if item.kind == 'scan' -%}
+  {%- set scanned = (module.rand.number.lognormal(8.4, 0.55) | int) + 1 -%}
+  {%- set speed = (module.rand.number.lognormal(10.3, 0.35) | int) + 1 -%}
 {%- endif -%}
 {%- set templates = {'block': 'app-block', 'preventive': 'preventive-allowed', 'threat': 'threat-detected', 'scan': 'scan-stats', 'update': 'update-error', 'auth': 'station-auth-fail', 'duplicate': 'station-duplicate'} -%}
 {%- include 'templates/' ~ templates[item.kind] ~ '.json.jinja' -%}
