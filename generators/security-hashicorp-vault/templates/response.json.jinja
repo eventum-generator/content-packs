@@ -1,6 +1,10 @@
-{%- from 'templates/_base.json.jinja' import render, hmac with context -%}
+{%- from 'templates/_base.json.jinja' import render, hmac, nano, rfc3339, renew_sleep with context -%}
+{%- set E9 = 1000000000 -%}
 {%- set flow = shared.get('current') -%}
-{%- set now = flow.now + module.datetime.timedelta(milliseconds=50) -%}
+{#- Handling latency: median 0.4 ms for an ACL denial, 1-3 ms otherwise. -#}
+{%- set median = dict(read=1.6, list=2.1, lookup=0.9, renew=3.2, delete=0.4)[flow.kind] -%}
+{%- set latency = (module.rand.number.lognormal(module.math.log(median), 0.6) * 1000000) | int + 1 -%}
+{%- set now = flow.now + latency -%}
 {%- set person = shared.get('identities')[flow.index] -%}
 {%- set response = dict(mount_class=flow.request.mount_class, mount_point=flow.request.mount_point, mount_type=flow.request.mount_type) -%}
 {%- set response_request = dict(flow.request) -%}
@@ -12,7 +16,7 @@
   {%- do response.update(dict(data=dict(error=hmac(flow.error)))) -%}
 {%- elif flow.kind == 'read' -%}
   {%- set source = samples.secrets[flow.secret_index] -%}
-  {%- set metadata = dict(created_time=hmac(shared.get('provisioned')), custom_metadata=none, deletion_time=hmac(''), destroyed=false, version=1) -%}
+  {%- set metadata = dict(created_time=hmac(shared.get('created')[flow.secret_index]), custom_metadata=none, deletion_time=hmac(''), destroyed=false, version=1) -%}
   {%- do response.update(dict(data=dict(data=dict(value=hmac(source.value)), metadata=metadata))) -%}
 {%- elif flow.kind == 'list' -%}
   {%- set keys = [] -%}
@@ -25,18 +29,20 @@
   {%- for key in keys | sort -%}{%- do hashed_keys.append(hmac(key)) -%}{%- endfor -%}
   {%- do response.update(dict(data=dict(keys=hashed_keys))) -%}
 {%- elif flow.kind == 'lookup' -%}
-  {%- set data = dict(accessor=hmac(person.accessor), creation_time=person.issue.timestamp() | int, creation_ttl=86400, display_name=hmac('userpass-' ~ person.actor), entity_id=hmac(person.entity), expire_time=module.datetime.datetime.fromtimestamp(person.expires, module.datetime.timezone.utc).isoformat().replace('+00:00','Z'), explicit_max_ttl=0, id=hmac(person.token), issue_time=person.issue.isoformat().replace('+00:00','Z'), meta=dict(username=hmac(person.actor)), num_uses=0, orphan=true, path=hmac('auth/userpass/login/' ~ person.actor), period=86400, policies=[hmac('default'), hmac('training-reader')], renewable=true, ttl=(person.expires - flow.now.timestamp()) | int, type=hmac('service')) -%}
+  {%- set data = dict(accessor=hmac(person.accessor), creation_time=person.issue // E9, creation_ttl=86400, display_name=hmac('userpass-' ~ person.actor), entity_id=hmac(person.entity), expire_time=nano(person.expires), explicit_max_ttl=0, id=hmac(person.token), issue_time=nano(person.issue), meta=dict(username=hmac(person.actor)), num_uses=0, orphan=true, path=hmac('auth/userpass/login/' ~ person.actor), period=86400, policies=[hmac('default'), hmac('training-reader')], renewable=true, ttl=(person.expires - flow.now) // E9, type=hmac('service')) -%}
   {%- if person.last_renewal -%}
-    {%- do data.update(dict(last_renewal=person.last_renewal.isoformat().replace('+00:00','Z'), last_renewal_time=person.last_renewal.timestamp() | int)) -%}
+    {%- do data.update(dict(last_renewal=nano(person.last_renewal), last_renewal_time=person.last_renewal // E9)) -%}
   {%- endif -%}
   {%- do response.update(dict(data=data)) -%}
 {%- elif flow.kind == 'renew' -%}
-  {%- set renewed_auth = dict(accessor=hmac(person.accessor), client_token=hmac(person.token), display_name='userpass-' ~ person.actor, entity_id=person.entity, metadata=dict(username=person.actor), policies=['default', 'training-reader'], token_policies=['default', 'training-reader'], token_issue_time=person.issue.isoformat().replace('+00:00','Z'), token_ttl=86400, token_type='service') -%}
+  {%- set renewed_auth = dict(accessor=hmac(person.accessor), client_token=hmac(person.token), display_name='userpass-' ~ person.actor, entity_id=person.entity, metadata=dict(username=person.actor), policies=['default', 'training-reader'], token_policies=['default', 'training-reader'], token_issue_time=rfc3339(person.issue), token_ttl=86400, token_type='service') -%}
   {%- do response.update(dict(auth=renewed_auth)) -%}
-  {%- do person.update(dict(expires=now.timestamp() + 86400, renew_due=now.timestamp() + 43200, last_renewal=now)) -%}
+  {#- The lease is extended while the request is handled. -#}
+  {%- set renewed = flow.now + latency * 4 // 5 -%}
+  {%- do person.update(dict(expires=renewed + 86400 * E9, renew_due=now + (renew_sleep() | int), last_renewal=renewed)) -%}
 {%- endif -%}
 {%- set native = dict(auth=flow.auth) -%}
 {%- if flow.denied -%}{%- do native.update(dict(error=flow.error)) -%}{%- endif -%}
-{%- do native.update(dict(request=response_request, response=response, time=now.isoformat().replace('+00:00','Z'), type='response')) -%}
-{{- render(native, person.actor, person.ip) -}}
+{%- do native.update(dict(request=response_request, response=response, time=nano(now), type='response')) -%}
+{{- render(native, person.actor, person.ip, person.port, now) -}}
 {%- do shared.pop('current') -%}
