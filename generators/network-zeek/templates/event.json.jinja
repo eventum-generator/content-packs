@@ -1,0 +1,201 @@
+{# Zeek protocol logs complete before delayed connection summaries. #}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set clock = timestamp.astimezone(utc).timestamp() -%}
+{%- set pending = shared.get('pending', []) -%}
+{%- set cache = shared.get('dns_cache', {}) -%}
+{%- set clients = ([params.suspicious_client_ip] + params.client_ips) | unique | list -%}
+{%- if not shared.get('profile_checked', false) -%}
+  {%- if clients | length > 32 or clients | length < 2 -%}{{ dispatch.exhaust() }}{%- endif -%}
+  {%- for ip in clients -%}
+    {%- if module.ipaddress.ip_address(ip) not in module.ipaddress.ip_network('10.0.0.0/8') -%}{{ dispatch.exhaust() }}{%- endif -%}
+  {%- endfor -%}
+  {%- for ip in [params.dns_server_ip,params.suspicious_ip] -%}
+    {%- if module.ipaddress.ip_address(ip).version != 4 -%}{{ dispatch.exhaust() }}{%- endif -%}
+  {%- endfor -%}
+  {%- for name in [params.suspicious_name,params.internal_domain] -%}
+    {%- if name | length > 100 -%}{{ dispatch.exhaust() }}{%- endif -%}
+    {%- for label in name.split('.') -%}
+      {%- if label | length > 63 or not module.re.fullmatch('[a-z0-9](?:[a-z0-9-]*[a-z0-9])?',label) -%}{{ dispatch.exhaust() }}{%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- do shared.set('profile_checked', true) -%}
+{%- endif -%}
+{%- set interval = [params.anomaly_interval_hours | float, 6] | max * 3600 -%}
+{%- if shared.get('bucket') != clock -%}
+  {%- do shared.set('bucket', clock) -%}
+  {%- set count = shared.get('flow_counter', 0) + 1 -%}
+  {%- do shared.set('flow_counter', count) -%}
+  {%- set next_episode = shared.get('next_episode', clock + interval) -%}
+  {%- do shared.set('next_episode', next_episode) -%}
+  {%- set phase = shared.get('phase', 0) -%}
+  {%- if params.anomaly_mode and phase == 0 and clock >= next_episode -%}
+    {%- set phase = 1 -%}
+    {%- do shared.set('phase_due', clock) -%}
+    {%- do shared.set('next_episode', clock + interval) -%}
+    {%- do shared.set('episode_name', 'node-' ~ '%08x' | format(count) ~ '.' ~ params.suspicious_name) -%}
+  {%- endif -%}
+  {%- set episode_flow = params.anomaly_mode and phase > 0 and clock >= shared.get('phase_due', clock) -%}
+  {%- set src = params.suspicious_client_ip if episode_flow else module.rand.choice(clients) -%}
+  {%- set entry = cache.get(src) -%}
+  {%- set protocol = 'dns' if not entry or clock >= entry.expires else module.rand.weighted_choice(['dns','ssl','http'],[45,40,15]) -%}
+  {%- if episode_flow -%}
+    {%- set protocol = 'dns' if phase in [1,7] else ('http' if phase == 8 else 'ssl') -%}
+  {%- endif -%}
+  {%- set uid = 'C' ~ module.rand.string.letters(5) ~ '%012x' | format(count) -%}
+  {%- set src_port = 32768 + count % 28232 -%}
+  {%- set f = namespace(name='', dst=params.dns_server_ip, dest_port=53, orig=0, resp=0, duration=0, proto_ts=clock, ready=clock, native={}, request='', response='') -%}
+  {%- if protocol == 'dns' -%}
+    {%- set ok = episode_flow or module.rand.chance(0.96) -%}
+    {%- set pinned = phase > 0 and src == params.suspicious_client_ip -%}
+    {%- set f.name = shared.get('episode_name') if episode_flow or pinned else module.rand.choice([
+      'node-' ~ '%08x' | format(count) ~ '.' ~ params.suspicious_name,
+      'portal.example.net', 'db.' ~ params.internal_domain, 'mail.example.net']) -%}
+    {%- if not ok -%}{%- set f.name = 'missing.' ~ params.internal_domain -%}{%- endif -%}
+    {%- set answer = params.suspicious_ip if f.name.endswith('.' ~ params.suspicious_name) else ('10.20.0.15' if f.name == 'db.' ~ params.internal_domain else ('203.0.113.25' if f.name == 'portal.example.net' else '203.0.113.42')) -%}
+    {%- set ttl = module.rand.choice([1800,3600,7200]) -%}
+    {%- set rtt_us = module.rand.number.clamp(module.rand.number.lognormal(module.math.log(12000),0.5),1000,120000) | int -%}
+    {%- set f.duration = rtt_us / 1000000 -%}
+    {%- set f.ready = clock + f.duration -%}
+    {# One question; compressed A answer or uncompressed authority SOA. #}
+    {%- set f.orig = 18 + f.name | length -%}
+    {%- set f.resp = f.orig + (16 if ok else 3 * params.internal_domain | length + 50) -%}
+    {%- set f.native = {'ts':clock,'uid':uid,'id.orig_h':src,'id.orig_p':src_port,'id.resp_h':f.dst,'id.resp_p':53,
+      'proto':'udp','trans_id':module.rand.number.integer(0,65535)} -%}
+    {%- if ok -%}{%- do f.native.update({'rtt':f.duration}) -%}{%- endif -%}
+    {%- do f.native.update({'query':f.name,
+      'qclass':1,'qclass_name':'C_INTERNET','qtype':1,'qtype_name':'A','rcode':0 if ok else 3,
+      'rcode_name':'NOERROR' if ok else 'NXDOMAIN','AA':false,'TC':false,'RD':true,'RA':ok,'Z':0}) -%}
+    {%- if ok -%}
+      {%- do f.native.update({'answers':[answer],'TTLs':[ttl | float]}) -%}
+      {%- do cache.update({src:{'name':f.name,'ip':answer,'expires':f.ready + ttl,'at':f.ready}}) -%}
+    {%- endif -%}
+    {%- do f.native.update({'rejected':false}) -%}
+    {%- set conn_ready = clock + 10 -%}
+    {%- set orig_pkts = 1 -%}{%- set resp_pkts = 1 -%}
+    {%- set orig_ip_bytes = f.orig + 28 -%}{%- set resp_ip_bytes = f.resp + 28 -%}
+  {%- else -%}
+    {%- set entry = cache.get(src) -%}
+    {%- if not entry or clock >= entry.expires -%}{{ dispatch.exhaust() }}{%- endif -%}
+    {%- set f.name = entry.name -%}{%- set f.dst = entry.ip -%}
+    {%- set connect_us = module.rand.number.clamp(module.rand.number.lognormal(module.math.log(25000),0.4),1000,180000) | int -%}
+    {%- set f.proto_ts = clock + connect_us / 1000000 -%}
+    {%- if protocol == 'http' -%}
+      {%- set f.dest_port = 80 -%}
+      {%- set method = 'POST' if episode_flow else module.rand.weighted_choice(['GET','POST'],[75,25]) -%}
+      {%- set uri = '/upload' if method == 'POST' else module.rand.choice(['/health','/index.html','/api/items']) -%}
+      {%- set status = 200 if method == 'POST' else module.rand.weighted_choice([200,304,404],[88,9,3]) -%}
+      {%- if status == 404 -%}{%- set uri = '/missing.json' -%}{%- endif -%}
+      {%- set content_type = 'text/html' if uri == '/index.html' and status == 200 else 'application/json' -%}
+      {%- set message = 'OK' if status == 200 else ('Not Modified' if status == 304 else 'Not Found') -%}
+      {%- set body = module.rand.number.integer(250000,2000000) if method == 'POST' else 0 -%}
+      {%- set response_body = 0 if status == 304 else (module.rand.number.integer(20,160) if method == 'POST' else (256 if status == 404 else {'/health':200,'/index.html':14000,'/api/items':8400}[uri])) -%}
+      {%- set f.request = method ~ ' ' ~ uri ~ ' HTTP/1.1\r\nHost: ' ~ f.name ~ '\r\nUser-Agent: curl/8.5.0\r\nConnection: close\r\n' -%}
+      {%- if status == 304 -%}{%- set f.request = f.request ~ 'If-None-Match: "v1"\r\n' -%}{%- endif -%}
+      {%- if body > 0 -%}{%- set f.request = f.request ~ 'Content-Type: application/octet-stream\r\nContent-Length: ' ~ body ~ '\r\n' -%}{%- endif -%}
+      {%- set f.request = f.request ~ '\r\n' -%}
+      {# Receive the request body before creating response headers. #}
+      {%- set f.orig = f.request | length + body -%}
+      {%- set processing_us = module.rand.number.integer(10000,120000) -%}
+      {%- set link_mbps = module.rand.number.integer(10,40) -%}
+      {%- set header_at = f.proto_ts + (f.orig * 8 / link_mbps + processing_us) / 1000000 -%}
+      {%- set date = module.datetime.datetime.fromtimestamp(header_at,utc).strftime('%a, %d %b %Y %H:%M:%S GMT') -%}
+      {%- set f.response = 'HTTP/1.1 ' ~ status ~ ' ' ~ message ~ '\r\nDate: ' ~ date ~ '\r\nConnection: close\r\n' -%}
+      {%- if method == 'GET' and status in [200,304] -%}{%- set f.response = f.response ~ 'ETag: "v1"\r\n' -%}{%- endif -%}
+      {%- if status != 304 -%}{%- set f.response = f.response ~ 'Content-Type: ' ~ content_type ~ '\r\nContent-Length: ' ~ response_body ~ '\r\n' -%}{%- endif -%}
+      {%- set f.response = f.response ~ '\r\n' -%}
+      {%- set f.orig = f.request | length + body -%}
+      {%- set f.resp = f.response | length + response_body -%}
+      {# Selected uncompressed Content-Length messages, 10-40 Mbit/s link. #}
+      {%- set transaction_us = processing_us + ((f.orig + f.resp) * 8 / link_mbps) | int -%}
+      {%- set f.ready = f.proto_ts + transaction_us / 1000000 -%}
+      {%- set f.native = {'ts':f.proto_ts,'uid':uid,'id.orig_h':src,'id.orig_p':src_port,'id.resp_h':f.dst,'id.resp_p':80,
+        'trans_depth':1,'method':method,'host':f.name,'uri':uri,'version':'1.1','user_agent':'curl/8.5.0',
+        'request_body_len':body,'response_body_len':response_body,'status_code':status,'status_msg':message,'tags':[]} -%}
+      {%- if body > 0 -%}{%- do f.native.update({'orig_fuids':['FO' ~ module.rand.string.letters(4) ~ '%012x' | format(count)],'orig_mime_types':['application/octet-stream']}) -%}{%- endif -%}
+      {%- if response_body > 0 -%}{%- do f.native.update({'resp_fuids':['FR' ~ module.rand.string.letters(4) ~ '%012x' | format(count)],'resp_mime_types':[content_type]}) -%}{%- endif -%}
+    {%- else -%}
+      {%- set f.dest_port = 443 -%}
+      {%- set handshake_us = module.rand.number.integer(20000,150000) -%}
+      {%- set f.ready = f.proto_ts + handshake_us / 1000000 -%}
+      {# No PSK, HRR or compatibility CCS. Only C/S visible before encrypted records. #}
+      {%- set f.native = {'ts':f.proto_ts,'uid':uid,'id.orig_h':src,'id.orig_p':src_port,'id.resp_h':f.dst,'id.resp_p':443,
+        'version':'TLSv13','cipher':module.rand.choice(['TLS_AES_128_GCM_SHA256','TLS_AES_256_GCM_SHA384']),
+        'curve':'x25519','server_name':f.name,'resumed':false,'established':true,'ssl_history':'Cs'} -%}
+      {%- set f.orig = module.rand.number.integer(600,5000) -%}
+      {%- set f.resp = module.rand.number.integer(3500,14000) -%}
+    {%- endif -%}
+    {# FIN in both directions, then trailing ACK excluded from conn.duration. #}
+    {%- set productive_end = (f.ready if protocol == 'http' else f.ready + module.rand.number.integer(10000,400000) / 1000000) + 1000 / 1000000 -%}
+    {%- set f.duration = ((productive_end - clock) * 1000000) | round | int / 1000000 -%}
+    {%- set conn_ready = clock + f.duration + 5 -%}
+    {%- set orig_segments = (f.orig + 1447) // 1448 -%}{%- set resp_segments = (f.resp + 1447) // 1448 -%}
+    {%- set orig_pkts = orig_segments + (resp_segments + 1) // 2 + 4 -%}
+    {%- set resp_pkts = resp_segments + (orig_segments + 1) // 2 + 3 -%}
+    {%- set orig_ip_bytes = f.orig + 60 + 52 * (orig_pkts - 1) -%}
+    {%- set resp_ip_bytes = f.resp + 60 + 52 * (resp_pkts - 1) -%}
+  {%- endif -%}
+  {%- set conn = {'ts':clock,'uid':uid,'id.orig_h':src,'id.orig_p':src_port,'id.resp_h':f.dst,'id.resp_p':f.dest_port,
+    'proto':'udp' if protocol == 'dns' else 'tcp','service':protocol,'duration':f.duration,
+    'orig_bytes':f.orig,'resp_bytes':f.resp,'conn_state':'SF','local_orig':true,
+    'local_resp':f.dst.startswith('10.'),'missed_bytes':0,'history':'Dd' if protocol == 'dns' else 'ShADadFf',
+    'orig_pkts':orig_pkts,'orig_ip_bytes':orig_ip_bytes,'resp_pkts':resp_pkts,'resp_ip_bytes':resp_ip_bytes,'ip_proto':17 if protocol == 'dns' else 6} -%}
+  {%- do pending.append({'dataset':protocol,'ready':f.ready,'native':f.native}) -%}
+  {%- do pending.append({'dataset':'connection','ready':conn_ready,'native':conn}) -%}
+  {%- if episode_flow -%}
+    {%- do shared.set('phase', phase + 1 if phase < 8 else 0) -%}
+    {%- do shared.set('phase_due', clock + 120) -%}
+  {%- else -%}{%- do shared.set('phase', phase) -%}{%- endif -%}
+  {%- if pending | length > 20 or cache | length > clients | length -%}{{ dispatch.exhaust() }}{%- endif -%}
+  {%- do shared.set('dns_cache', cache) -%}
+{%- endif -%}
+{%- set pending = pending | sort(attribute='ready') -%}
+{%- do shared.set('pending', pending) -%}
+{%- if not pending or pending[0].ready > clock -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set record = pending.pop(0) -%}
+{%- set native = record.native -%}
+{%- set protocol = record.dataset -%}
+{%- set dataset = 'zeek.' ~ protocol -%}
+{%- set at = module.datetime.datetime.fromtimestamp(native.ts,utc).isoformat(timespec='microseconds') -%}
+{%- set read_at = timestamp.astimezone(utc).isoformat(timespec='microseconds') -%}
+{%- set native_parts = [] -%}
+{%- for key, value in native.items() -%}{%- do native_parts.append((key | tojson) ~ ':' ~ (value | tojson)) -%}{%- endfor -%}
+{%- set raw = '{' ~ native_parts | join(',') ~ '}' -%}
+{%- set doc = {'@timestamp':at,'ecs':{'version':'8.17.0'},
+  'agent':{'type':'filebeat','name':params.sensor_name,'id':params.sensor_id,'ephemeral_id':params.sensor_ephemeral_id,'version':params.sensor_version},
+  'observer':{'name':params.sensor_name,'product':'Zeek','type':'ids','version':'8.0.0'},'host':{'name':params.sensor_name},
+  'data_stream':{'type':'logs','dataset':dataset,'namespace':'default'},
+  'event':{'kind':'event','category':['network'],'type':['connection','protocol','info'],'dataset':dataset,'module':'zeek',
+    'id':native.uid,'created':read_at,'ingested':read_at,'original':raw},'message':raw,
+  'source':{'address':native['id.orig_h'],'ip':native['id.orig_h'],'port':native['id.orig_p']},
+  'destination':{'address':native['id.resp_h'],'ip':native['id.resp_h'],'port':native['id.resp_p']},
+  'network':{'transport':'udp' if protocol == 'dns' or (protocol == 'connection' and native.proto == 'udp') else 'tcp'},
+  'related':{'ip':[native['id.orig_h'],native['id.resp_h']]},'tags':['zeek-' ~ protocol],
+  'log':{'file':{'path':'/opt/zeek/logs/current/' ~ ('conn' if protocol == 'connection' else protocol) ~ '.log'}},
+  'input':{'type':'filestream'},'zeek':{'session_id':native.uid}} -%}
+{%- set parsed = {} -%}
+{%- for key,value in native.items() if key not in ['ts','uid','id.orig_h','id.orig_p','id.resp_h','id.resp_p'] -%}{%- do parsed.update({key:value}) -%}{%- endfor -%}
+{%- if protocol == 'connection' -%}
+  {%- do parsed.update({'state':parsed.pop('conn_state'),'state_message':'Normal establishment and termination.'}) -%}
+  {%- do doc.source.update({'bytes':native.orig_bytes,'packets':native.orig_pkts}) -%}
+  {%- do doc.destination.update({'bytes':native.resp_bytes,'packets':native.resp_pkts}) -%}
+  {%- do doc.network.update({'bytes':native.orig_bytes+native.resp_bytes,'packets':native.orig_pkts+native.resp_pkts,'protocol':native.service}) -%}
+  {%- do doc.event.update({'duration':(native.duration * 1000000000) | round | int,'type':['connection','end'],'outcome':'success'}) -%}
+{%- elif protocol == 'dns' -%}
+  {%- do doc.network.update({'protocol':'dns'}) -%}
+  {%- set dns = {'id':native.trans_id | string,'type':'answer','question':{'name':native.query,'type':'A','class':'IN'},'response_code':native.rcode_name,'header_flags':['RD','RA'] if native.RA else ['RD']} -%}
+  {%- if native.rcode == 0 -%}
+    {%- do dns.update({'resolved_ip':native.answers,'answers':[{'name':native.query,'type':'A','class':'IN','data':native.answers[0],'ttl':native.TTLs[0] | int}]}) -%}
+  {%- endif -%}
+  {%- do parsed.update({'trans_id':native.trans_id | string}) -%}
+  {%- do doc.update({'dns':dns}) -%}{%- do doc.event.update({'outcome':'success' if native.rcode == 0 else 'failure'}) -%}
+{%- elif protocol == 'http' -%}
+  {%- do doc.network.update({'protocol':'http'}) -%}
+  {%- do doc.event.update({'action':native.method,'category':['network','web'],'outcome':'success' if native.status_code < 400 else 'failure'}) -%}
+  {%- do doc.update({'http':{'version':'1.1','request':{'method':native.method,'body':{'bytes':native.request_body_len}},'response':{'status_code':native.status_code,'body':{'bytes':native.response_body_len}}},
+    'url':{'domain':native.host,'original':native.uri,'path':native.uri},'user_agent':{'original':native.user_agent,'name':'curl','version':'8.5.0'}}) -%}
+{%- else -%}
+  {%- do doc.network.update({'protocol':'tls'}) -%}
+  {%- do doc.update({'tls':{'version':'1.3','version_protocol':'tls','cipher':native.cipher,'curve':native.curve,'resumed':false,'established':true,'client':{'server_name':native.server_name}}}) -%}
+{%- endif -%}
+{%- do doc.zeek.update({protocol:parsed}) -%}
+{{- doc | tojson -}}
