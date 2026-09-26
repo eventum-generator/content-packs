@@ -1,0 +1,506 @@
+{#- One-minute scheduler tick. Ordinary work arrives as independent tasks
+    (a Poisson process with a daily profile); every step of every task,
+    and every step of an anomaly episode, waits in one queue ordered by
+    due time. A tick emits at most one due step, else it is dropped. -#}
+{%- set tick = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set ev = (tick.timestamp() * 1000 + module.rand.number.integer(0, 59999)) / 1000 -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set owners = ['alice', 'bob', params.suspicious_actor] -%}
+{%- set members = ['carol', 'dmitri'] -%}
+{%- set exts = [params.external_user, 'vendor-qa', 'contract-sre'] -%}
+{%- set actor_ids = {'alice': 32100011, 'bob': 32100012, params.suspicious_actor: params.suspicious_actor_id, 'carol': 32100013, 'dmitri': 32100014, params.external_user: params.external_user_id, 'vendor-qa': 98234611, 'contract-sre': 98234612, 'new-hire-test': 32100099} -%}
+{%- set persistent = [params.org ~ '/api-gateway', params.org ~ '/billing-web', params.org ~ '/infra-modules'] -%}
+{%- set disposable = [params.sensitive_repo, params.org ~ '/ci-sandbox-drill', params.org ~ '/docs-preview-drill'] -%}
+{%- set topic_pool = ['security', 'backend', 'infra', 'payments', 'terraform', 'ci'] -%}
+{%- set interval = ([params.anomaly_interval_hours|float, 6]|max) * 3600 -%}
+{%- set window = 1800 -%}
+{#- Relative task-start weights per day, and the UTC hour profile. -#}
+{%- set task_kinds = ['dl', 'topic', 'grant', 'perm', 'revoke', 'hotfix', 'onboard', 'teardown', 'short'] -%}
+{%- set task_weights = [120, 6, 9, 3, 1.5, 4, 3.5, 4.5, 2.5] -%}
+{%- set hour_weight = [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.8, 0.8, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.9, 0.9, 0.9, 0.5, 0.5, 0.5] -%}
+{%- set starts_per_minute = (task_weights|sum) / 1440 / 0.954 -%}
+{%- if not shared.get('st') -%}
+  {%- set base = params.sensitive_repo_id -%}
+  {%- set repos = {} -%}
+  {%- for name in persistent -%}
+    {%- do repos.update({name: {'kind': 'p', 'id': 111001 + loop.index0, 'exists': true, 'protected': true, 'collab': {params.external_user: ['read', 0]}, 'topics': [['backend'], ['backend', 'payments'], ['infra', 'terraform']][loop.index0], 'busy': none}}) -%}
+  {%- endfor -%}
+  {%- do repos[persistent[1]].collab.update({'vendor-qa': ['write', 0]}) -%}
+  {%- for name in disposable -%}
+    {%- do repos.update({name: {'kind': 'd', 'id': [base, base - 4187203, base - 1093318][loop.index0], 'exists': true, 'protected': true, 'collab': {}, 'topics': [], 'busy': none}}) -%}
+  {%- endfor -%}
+  {%- set poll_s = 120 -%}
+  {%- do shared.set('st', {'repos': repos, 'queue': [{'due': ev + 21600 * module.rand.number.lognormal(0, 0.8), 'k': 'org'}], 'serial': 1, 'org_member': false, 'mem': {}, 'last_id': base, 'last_id_t': ev, 'ep': {'due': ev + interval, 'plan': none, 'active': false, 'last': [none, none, none]}, 'poll': {'s': poll_s, 'phase': module.rand.number.floating(0, poll_s), 'k': -1, 'lat': 0, 'last': 0}}) -%}
+{%- endif -%}
+{%- set st = shared.get('st') -%}
+
+{#- Queue helpers. -#}
+{%- macro push(item) -%}{%- if st.queue|length < 96 -%}{%- do st.queue.append(item) -%}{%- endif -%}{%- endmacro -%}
+{%- macro emit(res, action, actor, repo=none, user=none, perm=none, old=none, new=none, topic=none) -%}
+  {%- do res.update({'action': action, 'actor': actor, 'repo': repo, 'user': user, 'perm': perm, 'old': old, 'new': new, 'topic': topic}) -%}
+{%- endmacro -%}
+{%- macro grant(res, owner, user, repo, perm) -%}
+  {%- set serial = st.serial -%}
+  {%- do st.update({'serial': st.serial % 1000000000 + 1}) -%}
+  {%- do st.repos[repo].collab.update({user: [perm, serial]}) -%}
+  {%- do emit(res, 'repo.add_member', owner, repo, user, perm) -%}
+  {%- do res.update({'serial': serial}) -%}
+{%- endmacro -%}
+{%- macro change(res, owner, user, repo, new) -%}
+  {%- set entry = st.repos[repo].collab[user] -%}
+  {%- do emit(res, 'repo.update_member', owner, repo, user, none, entry[0], new) -%}
+  {%- do st.repos[repo].collab.update({user: [new, entry[1]]}) -%}
+{%- endmacro -%}
+{%- macro destroy(res, owner, repo) -%}
+  {%- do st.repos[repo].update({'exists': false, 'protected': false, 'collab': {}, 'busy': none}) -%}
+  {%- do st.mem.pop(repo, none) -%}
+  {%- do emit(res, 'repo.destroy', owner, repo) -%}
+  {%- do push({'due': ev + 9000 * module.rand.number.lognormal(0, 0.7), 'k': 'mk', 'r': repo}) -%}
+{%- endmacro -%}
+{#- Background guard: would a destroy of repo by owner complete the
+    ordered anomaly shape inside the correlation window? Writes the
+    earliest contributing grant time into out.t1, or leaves it none. -#}
+{%- macro completes_shape(out, owner, repo) -%}
+  {%- for a in st.mem.get(repo, []) -%}
+    {%- if a[1] == 'repo.add_member' and a[2] == owner and a[6] == 'write' and ev - a[0] <= window -%}
+      {%- set ns = namespace(stage=1) -%}
+      {%- for e in st.mem.get(repo, []) -%}
+        {%- if e[0] > a[0] -%}
+          {%- if ns.stage == 1 and e[1] == 'repo.update_member' and e[2] == owner and e[3] == a[3] and e[4] == 'write' and e[5] == 'admin' -%}{%- set ns.stage = 2 -%}
+          {%- elif ns.stage == 2 and e[1] == 'protected_branch.destroy' and e[2] == owner -%}{%- set ns.stage = 3 -%}
+          {%- elif ns.stage == 3 and e[1] == 'repo.download_zip' and e[2] == a[3] -%}{%- set ns.stage = 4 -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if ns.stage == 4 and out.t1 is none -%}{%- do out.update({'t1': a[0]}) -%}{%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- macro readable(out, actor) -%}
+  {%- for name, r in st.repos.items() -%}
+    {%- if r.exists and (actor not in exts or actor in r.collab) -%}{%- do out.append(name) -%}{%- endif -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- macro start_teardown(res, owner, repo) -%}
+  {%- set r = st.repos[repo] -%}
+  {%- set token = 'td' ~ st.serial -%}
+  {%- do st.update({'serial': st.serial % 1000000000 + 1}) -%}
+  {%- do r.update({'busy': token}) -%}
+  {#- Revoke some collaborators first, then remove protection and/or
+      take a backup archive in either order, then delete. -#}
+  {%- set plan = [] -%}
+  {%- for user in r.collab|list -%}{%- if module.rand.chance(0.5) -%}{%- do plan.append(['rm', user]) -%}{%- endif -%}{%- endfor -%}
+  {%- set late = [] -%}
+  {%- if r.protected and module.rand.chance(0.75) -%}{%- do late.append(['pbd', none]) -%}{%- endif -%}
+  {%- if module.rand.chance(0.65) -%}{%- do late.append(['zip', none]) -%}{%- endif -%}
+  {%- set plan = plan + (module.rand.shuffle(late) if late else []) + [['destroy', none]] -%}
+  {%- do run({'k': 'td_step', 'o': owner, 'r': repo, 'id': r.id, 'plan': plan, 'i': 0, 'token': token}, res) -%}
+{%- endmacro -%}
+
+{#- Execute one queued step. Sets res.action when it emits a record;
+    an invalid step (its state changed meanwhile) emits nothing. -#}
+{%- macro run(it, res) -%}
+  {%- set k = it.k -%}
+  {%- if k == 'start' -%}
+    {%- set kind = module.rand.weighted_choice(task_kinds, task_weights) -%}
+    {%- set owner = module.rand.choice(owners) -%}
+    {%- set free = [] -%}
+    {%- for name, r in st.repos.items() -%}{%- if r.exists and r.busy is none -%}{%- do free.append(name) -%}{%- endif -%}{%- endfor -%}
+    {%- set pairs = [] -%}
+    {%- for name in free -%}{%- for user in exts -%}{%- if user not in st.repos[name].collab -%}{%- do pairs.append([name, user]) -%}{%- endif -%}{%- endfor -%}{%- endfor -%}
+    {%- set held = [] -%}
+    {%- for name in free -%}{%- for user in st.repos[name].collab -%}{%- do held.append([name, user]) -%}{%- endfor -%}{%- endfor -%}
+    {%- set prot = [] -%}{%- set dprot = [] -%}{%- set dfree = [] -%}
+    {%- for name in free -%}
+      {%- if st.repos[name].protected -%}{%- do prot.append(name) -%}{%- endif -%}
+      {%- if st.repos[name].kind == 'd' -%}{%- do dfree.append(name) -%}{%- if st.repos[name].protected -%}{%- do dprot.append(name) -%}{%- endif -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set dpairs = [] -%}{%- set dfree_pairs = [] -%}
+    {%- for pair in pairs -%}
+      {%- if pair[0] in dprot -%}{%- do dpairs.append(pair) -%}{%- endif -%}
+      {%- if pair[0] in dfree -%}{%- do dfree_pairs.append(pair) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if kind == 'topic' -%}
+      {%- do run({'k': 'topic', 'o': owner, 'r': module.rand.choice(persistent), 'left': module.rand.weighted_choice([1, 2, 3], [5, 3, 2])}, res) -%}
+    {%- elif kind == 'grant' and pairs -%}
+      {%- set pair = module.rand.choice(pairs) -%}
+      {%- set perm = module.rand.weighted_choice(['read', 'write', 'admin'], [35, 45, 20]) -%}
+      {%- do grant(res, owner, pair[1], pair[0], perm) -%}
+      {%- set rid = st.repos[pair[0]].id -%}
+      {%- if module.rand.chance(0.35) -%}{%- do push({'due': ev + 150 * module.rand.number.lognormal(0, 0.9), 'k': 'upd', 'o': owner, 'x': pair[1], 'r': pair[0], 'id': rid, 's': res.serial, 'new': none}) -%}{%- endif -%}
+      {%- if module.rand.chance(0.45) -%}{%- do push({'due': ev + 1500 * module.rand.number.lognormal(0, 1.2), 'k': 'gdl', 'x': pair[1], 'r': pair[0], 'id': rid, 's': res.serial}) -%}{%- endif -%}
+      {%- do push({'due': ev + (21600 * module.rand.number.lognormal(0, 0.8) if module.rand.chance(0.7) else 108000 * module.rand.number.lognormal(0, 0.7)), 'k': 'rm', 'o': module.rand.choice(owners), 'x': pair[1], 'r': pair[0], 'id': rid, 's': res.serial}) -%}
+      {%- if st.repos[pair[0]].kind == 'd' and module.rand.chance(0.25) -%}{%- do push({'due': ev + 360 * module.rand.number.lognormal(0, 0.7), 'k': 'td', 'o': owner, 'r': pair[0], 'id': rid, 'n': 0}) -%}{%- endif -%}
+    {%- elif kind == 'perm' and held -%}
+      {%- set pair = module.rand.choice(held) -%}
+      {%- set entry = st.repos[pair[0]].collab[pair[1]] -%}
+      {%- do change(res, owner, pair[1], pair[0], module.rand.choice(['read', 'write', 'admin']|reject('equalto', entry[0])|list)) -%}
+      {%- if module.rand.chance(0.4) -%}{%- do push({'due': ev + 14400 * module.rand.number.lognormal(0, 0.8), 'k': 'upd', 'o': module.rand.choice(owners), 'x': pair[1], 'r': pair[0], 'id': st.repos[pair[0]].id, 's': entry[1], 'new': none}) -%}{%- endif -%}
+    {%- elif kind == 'revoke' and held -%}
+      {%- set pair = module.rand.choice(held) -%}
+      {%- do st.repos[pair[0]].collab.pop(pair[1]) -%}
+      {%- do emit(res, 'repo.remove_member', owner, pair[0], pair[1]) -%}
+    {%- elif kind == 'hotfix' and prot -%}
+      {%- set repo = module.rand.choice(prot) -%}
+      {%- set token = 'hf' ~ st.serial -%}
+      {%- do st.update({'serial': st.serial % 1000000000 + 1}) -%}
+      {%- do st.repos[repo].update({'busy': token}) -%}
+      {%- set users = st.repos[repo].collab|list -%}
+      {%- set helper = module.rand.choice(users) if users else none -%}
+      {%- set step = {'k': 'hf', 'o': owner, 'r': repo, 'id': st.repos[repo].id, 'x': helper, 'token': token, 'i': 0} -%}
+      {%- if helper is none or not module.rand.chance(0.65) -%}{%- do step.update({'i': 1}) -%}{%- endif -%}
+      {%- do run(step, res) -%}
+    {%- elif kind == 'onboard' and dpairs -%}
+      {%- set pair = module.rand.choice(dpairs) -%}
+      {%- set token = 'ob' ~ st.serial -%}
+      {%- do st.update({'serial': st.serial % 1000000000 + 1}) -%}
+      {%- do st.repos[pair[0]].update({'busy': token}) -%}
+      {%- do run({'k': 'ob', 'o': owner, 'x': pair[1], 'r': pair[0], 'id': st.repos[pair[0]].id, 'token': token, 'i': 0, 's': none}, res) -%}
+    {%- elif kind == 'short' and dfree_pairs -%}
+      {#- Short-lived sandbox collaboration: grant, optional permission
+          correction, archive and/or protection change, then deletion. -#}
+      {%- set pair = module.rand.choice(dfree_pairs) -%}
+      {%- set token = 'sc' ~ st.serial -%}
+      {%- do st.update({'serial': st.serial % 1000000000 + 1}) -%}
+      {%- do st.repos[pair[0]].update({'busy': token}) -%}
+      {%- do run({'k': 'sc', 'o': owner, 'x': pair[1], 'r': pair[0], 'id': st.repos[pair[0]].id, 'token': token, 'i': 0, 's': none, 'perm': module.rand.weighted_choice(['read', 'write', 'admin'], [25, 60, 15]), 'zip_first': module.rand.chance(0.5)}, res) -%}
+    {%- elif kind == 'teardown' and dfree -%}
+      {%- do start_teardown(res, owner, module.rand.choice(dfree)) -%}
+    {%- else -%}
+      {%- set actor = module.rand.weighted_choice(owners + members + exts, [12, 12, 12, 20, 20, 10, 8, 6]) -%}
+      {%- set can = [] -%}{%- do readable(can, actor) -%}
+      {%- if not can -%}{%- set actor = owner -%}{%- set can = [] -%}{%- do readable(can, actor) -%}{%- endif -%}
+      {%- if can -%}
+        {%- do emit(res, 'repo.download_zip', actor, module.rand.choice(can)) -%}
+        {%- if module.rand.chance(0.3) -%}{%- do push({'due': ev + 90 * module.rand.number.lognormal(0, 1.0), 'k': 'dl', 'a': actor, 'n': 2, 'last': res.repo}) -%}{%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif k == 'dl' -%}
+    {%- set can = [] -%}{%- do readable(can, it.a) -%}
+    {%- if can -%}
+      {%- set others = can|reject('equalto', it['last'])|list -%}
+      {%- set repo = it['last'] if (it['last'] in can and (not others or module.rand.chance(0.2))) else module.rand.choice(others) -%}
+      {%- do emit(res, 'repo.download_zip', it.a, repo) -%}
+      {%- if it.n < 3 and module.rand.chance(0.25) -%}{%- do push({'due': ev + 90 * module.rand.number.lognormal(0, 1.0), 'k': 'dl', 'a': it.a, 'n': it.n + 1, 'last': repo}) -%}{%- endif -%}
+    {%- endif -%}
+  {%- elif k == 'topic' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- set topic = module.rand.choice(topic_pool) -%}
+    {%- if topic in r.topics -%}
+      {%- do r.topics.remove(topic) -%}{%- do emit(res, 'repo.remove_topic', it.o, it.r, topic=topic) -%}
+    {%- else -%}
+      {%- do r.topics.append(topic) -%}{%- do emit(res, 'repo.add_topic', it.o, it.r, topic=topic) -%}
+    {%- endif -%}
+    {%- if it.left > 1 -%}{%- do push({'due': ev + 40 * module.rand.number.lognormal(0, 0.8), 'k': 'topic', 'o': it.o, 'r': it.r, 'left': it.left - 1}) -%}{%- endif -%}
+  {%- elif k in ['upd', 'gdl', 'rm'] -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- set entry = r.collab.get(it.x) if r.exists and r.id == it.id else none -%}
+    {%- if entry is not none and entry[1] == it.s -%}
+      {%- if r.busy is not none and k != 'gdl' -%}
+        {%- if k == 'rm' -%}{%- do push(dict(it, due=ev + 600 * module.rand.number.lognormal(0, 0.5))) -%}{%- endif -%}
+      {%- elif k == 'upd' -%}
+        {%- if entry[0] == 'write' -%}{%- set new = 'admin' if module.rand.chance(0.6) else 'read' -%}
+        {%- elif entry[0] == 'read' -%}{%- set new = 'write' if module.rand.chance(0.8) else 'admin' -%}
+        {%- else -%}{%- set new = 'write' if module.rand.chance(0.85) else 'read' -%}{%- endif -%}
+        {%- do change(res, it.o, it.x, it.r, new) -%}
+      {%- elif k == 'gdl' -%}
+        {%- do emit(res, 'repo.download_zip', it.x, it.r) -%}
+      {%- else -%}
+        {%- do r.collab.pop(it.x) -%}
+        {%- do emit(res, 'repo.remove_member', it.o, it.r, it.x) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif k == 'hf' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if r.exists and r.id == it.id and r.busy == it.token -%}
+      {%- if it.i == 0 and it.x in r.collab and r.collab[it.x][0] != 'admin' -%}
+        {%- do change(res, it.o, it.x, it.r, 'write' if r.collab[it.x][0] == 'read' else 'admin') -%}
+        {%- do push(dict(it, due=ev + 180 * module.rand.number.lognormal(0, 0.8), i=1)) -%}
+      {%- elif it.i <= 1 and r.protected -%}
+        {%- do r.update({'protected': false}) -%}
+        {%- do emit(res, 'protected_branch.destroy', it.o, it.r) -%}
+        {%- do push({'due': ev + 2100 * module.rand.number.lognormal(0, 0.9), 'k': 'pbc', 'o': it.o, 'r': it.r, 'id': it.id}) -%}
+        {%- if module.rand.chance(0.6) -%}
+          {%- do push(dict(it, due=ev + 180 * module.rand.number.lognormal(0, 0.8), i=2)) -%}
+        {%- else -%}
+          {%- do r.update({'busy': none}) -%}
+        {%- endif -%}
+      {%- elif it.i == 2 -%}
+        {%- do r.update({'busy': none}) -%}
+        {%- do emit(res, 'repo.download_zip', it.x if it.x in r.collab else it.o, it.r) -%}
+      {%- else -%}
+        {%- do r.update({'busy': none}) -%}
+      {%- endif -%}
+    {%- elif r.busy == it.token -%}
+      {%- do r.update({'busy': none}) -%}
+    {%- endif -%}
+  {%- elif k == 'ob' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if r.exists and r.id == it.id and r.busy == it.token -%}
+      {%- set gap = 240 * module.rand.number.lognormal(0, 0.8) -%}
+      {%- if it.i == 0 -%}
+        {%- do grant(res, it.o, it.x, it.r, 'write') -%}
+        {%- do push({'due': ev + (21600 * module.rand.number.lognormal(0, 0.8) if module.rand.chance(0.7) else 108000 * module.rand.number.lognormal(0, 0.7)), 'k': 'rm', 'o': module.rand.choice(owners), 'x': it.x, 'r': it.r, 'id': it.id, 's': res.serial}) -%}
+        {%- if module.rand.chance(0.4) -%}{%- do push({'due': ev + 360 * module.rand.number.lognormal(0, 0.7), 'k': 'td', 'o': it.o, 'r': it.r, 'id': it.id, 'n': 0}) -%}{%- endif -%}
+        {%- if module.rand.chance(0.8) -%}
+          {%- do push(dict(it, i=1, s=res.serial, due=ev + 150 * module.rand.number.lognormal(0, 0.9))) -%}
+        {%- else -%}
+          {%- do push(dict(it, i=2, s=res.serial, due=ev + gap)) -%}
+        {%- endif -%}
+      {%- elif it.i == 1 -%}
+        {%- if it.x in r.collab and r.collab[it.x][0] == 'write' -%}{%- do change(res, it.o, it.x, it.r, 'admin') -%}{%- endif -%}
+        {%- do push(dict(it, i=2, due=ev + gap)) -%}
+      {%- elif it.i == 2 -%}
+        {%- if r.protected and module.rand.chance(0.85) -%}
+          {%- do r.update({'protected': false}) -%}
+          {%- do emit(res, 'protected_branch.destroy', it.o, it.r) -%}
+          {%- if module.rand.chance(0.9) -%}{%- do push({'due': ev + 7200 * module.rand.number.lognormal(0, 0.8), 'k': 'pbc', 'o': module.rand.choice(owners), 'r': it.r, 'id': it.id}) -%}{%- endif -%}
+        {%- endif -%}
+        {%- do push(dict(it, i=3, due=ev + gap)) -%}
+      {%- else -%}
+        {%- do r.update({'busy': none}) -%}
+        {%- if it.x in r.collab and module.rand.chance(0.75) -%}{%- do emit(res, 'repo.download_zip', it.x, it.r) -%}{%- endif -%}
+      {%- endif -%}
+    {%- elif r.busy == it.token -%}
+      {%- do r.update({'busy': none}) -%}
+    {%- endif -%}
+  {%- elif k == 'sc' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if r.exists and r.id == it.id and r.busy == it.token -%}
+      {%- set gap = 240 * module.rand.number.lognormal(0, 0.8) -%}
+      {%- set held = r.collab.get(it.x) -%}
+      {%- set step = ['grant', 'correct', 'zip' if it.zip_first else 'pbd', 'pbd' if it.zip_first else 'zip', 'destroy'][it.i] -%}
+      {%- if step == 'grant' -%}
+        {%- do grant(res, it.o, it.x, it.r, it.perm) -%}
+        {%- do push(dict(it, i=1, s=res.serial, due=ev + 150 * module.rand.number.lognormal(0, 0.9))) -%}
+      {%- elif step == 'destroy' -%}
+        {%- set out = {'t1': none} -%}
+        {%- do completes_shape(out, it.o, it.r) -%}
+        {%- if out.t1 is none -%}
+          {%- do destroy(res, it.o, it.r) -%}
+        {%- else -%}
+          {%- do push(dict(it, due=out.t1 + window + 180 * module.rand.number.lognormal(0, 0.8))) -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- if step == 'correct' and held is not none and module.rand.chance(0.35) -%}
+          {%- if held[0] == 'write' -%}{%- set new = 'admin' if module.rand.chance(0.6) else 'read' -%}
+          {%- elif held[0] == 'read' -%}{%- set new = 'write' if module.rand.chance(0.8) else 'admin' -%}
+          {%- else -%}{%- set new = 'write' -%}{%- endif -%}
+          {%- do change(res, it.o, it.x, it.r, new) -%}
+        {%- elif step == 'zip' and held is not none and module.rand.chance(0.6) -%}
+          {%- do emit(res, 'repo.download_zip', it.x, it.r) -%}
+        {%- elif step == 'pbd' and r.protected and module.rand.chance(0.3) -%}
+          {%- do r.update({'protected': false}) -%}
+          {%- do emit(res, 'protected_branch.destroy', it.o, it.r) -%}
+        {%- endif -%}
+        {%- do push(dict(it, i=it.i + 1, due=ev + (300 * module.rand.number.lognormal(0, 0.8) if it.i == 3 else gap))) -%}
+      {%- endif -%}
+    {%- elif r.busy == it.token -%}
+      {%- do r.update({'busy': none}) -%}
+    {%- endif -%}
+  {%- elif k == 'td' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if r.exists and r.id == it.id -%}
+      {%- if r.busy is none -%}{%- do start_teardown(res, it.o, it.r) -%}
+      {%- elif it.n < 4 -%}{%- do push(dict(it, n=it.n + 1, due=ev + 180 * module.rand.number.lognormal(0, 0.6))) -%}{%- endif -%}
+    {%- endif -%}
+  {%- elif k == 'td_step' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if r.exists and r.id == it.id and r.busy == it.token -%}
+      {%- set step = it.plan[it.i] -%}
+      {%- set gap = 210 * module.rand.number.lognormal(0, 0.8) -%}
+      {%- if step[0] == 'destroy' -%}
+        {%- set out = {'t1': none} -%}
+        {%- do completes_shape(out, it.o, it.r) -%}
+        {%- if out.t1 is none -%}
+          {%- do destroy(res, it.o, it.r) -%}
+        {%- else -%}
+          {%- do push(dict(it, due=out.t1 + window + 180 * module.rand.number.lognormal(0, 0.8))) -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- if step[0] == 'pbd' and r.protected -%}
+          {%- do r.update({'protected': false}) -%}
+          {%- do emit(res, 'protected_branch.destroy', it.o, it.r) -%}
+        {%- elif step[0] == 'rm' and step[1] in r.collab -%}
+          {%- do r.collab.pop(step[1]) -%}
+          {%- do emit(res, 'repo.remove_member', it.o, it.r, step[1]) -%}
+        {%- elif step[0] == 'zip' -%}
+          {%- set users = r.collab|list -%}
+          {%- do emit(res, 'repo.download_zip', module.rand.choice(users) if users and module.rand.chance(0.5) else it.o, it.r) -%}
+        {%- endif -%}
+        {%- do push(dict(it, i=it.i + 1, due=ev + gap)) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif k == 'mk' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if not r.exists -%}
+      {%- set hours = (ev - st.last_id_t) / 3600 -%}
+      {%- set rid = st.last_id + (hours * module.rand.number.floating(8000, 14000))|int + module.rand.number.integer(1, 500) -%}
+      {%- do st.update({'last_id': rid, 'last_id_t': ev}) -%}
+      {%- do r.update({'exists': true, 'protected': false, 'collab': {}, 'id': rid, 'busy': none}) -%}
+      {%- set owner = module.rand.choice(owners) -%}
+      {%- do emit(res, 'repo.create', owner, it.r) -%}
+      {%- do push({'due': ev + (240 * module.rand.number.lognormal(0, 0.8) if module.rand.chance(0.85) else 10800 * module.rand.number.lognormal(0, 0.7)), 'k': 'pbc', 'o': owner, 'r': it.r, 'id': rid}) -%}
+    {%- endif -%}
+  {%- elif k == 'pbc' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if r.exists and r.id == it.id and not r.protected -%}
+      {%- if r.busy is not none -%}
+        {%- do push(dict(it, due=ev + 600 * module.rand.number.lognormal(0, 0.5))) -%}
+      {%- else -%}
+        {%- do r.update({'protected': true}) -%}
+        {%- do emit(res, 'protected_branch.create', it.o, it.r) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif k == 'org' -%}
+    {%- do st.update({'org_member': not st.org_member}) -%}
+    {%- do emit(res, 'org.add_member' if st.org_member else 'org.remove_member', module.rand.choice(owners), user='new-hire-test') -%}
+    {%- do push({'due': ev + (32400 if st.org_member else 21600) * module.rand.number.lognormal(0, 0.8), 'k': 'org'}) -%}
+  {%- elif k == 'ep' -%}
+    {%- set r = st.repos[it.r] -%}
+    {%- if r.exists and r.id == it.id and r.busy == it.token -%}
+      {%- if it.i == 0 -%}
+        {%- do grant(res, it.o, it.x, it.r, 'write') -%}
+        {%- do st.ep.update({'due': ev + interval}) -%}
+      {%- elif it.i == 1 -%}
+        {%- do change(res, it.o, it.x, it.r, 'admin') -%}
+      {%- elif it.i == 2 -%}
+        {%- do r.update({'protected': false}) -%}
+        {%- do emit(res, 'protected_branch.destroy', it.o, it.r) -%}
+      {%- elif it.i == 3 -%}
+        {%- do emit(res, 'repo.download_zip', it.x, it.r) -%}
+      {%- else -%}
+        {%- do destroy(res, it.o, it.r) -%}
+        {%- do st.ep.update({'active': false}) -%}
+      {%- endif -%}
+      {%- if it.i < 4 -%}{%- do push(dict(it, i=it.i + 1, due=ev + it.gaps[it.i])) -%}{%- endif -%}
+    {%- else -%}
+      {%- do st.ep.update({'active': false}) -%}
+      {%- if r.busy == it.token -%}{%- do r.update({'busy': none}) -%}{%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Arrivals: independent ordinary task starts, then a due episode. -#}
+{%- set hour = module.datetime.datetime.fromtimestamp(ev, utc).hour -%}
+{%- if module.rand.chance(starts_per_minute * hour_weight[hour]) -%}{%- do push({'due': ev, 'k': 'start'}) -%}{%- endif -%}
+{#- Once an episode is due, its start is drawn over the following
+    min(interval, 24 h) from the daily profile of ordinary task starts
+    (15-minute slots weighted by the hour profile, uniform inside a
+    slot); it begins on the first eligible minute from that time. -#}
+{%- if params.anomaly_mode and not st.ep.active and ev >= st.ep.due and st.ep.plan is none -%}
+  {%- set slots = ([interval, 86400]|min / 900)|int -%}
+  {%- set weights = [] -%}
+  {%- for i in range(slots) -%}
+    {%- do weights.append(hour_weight[module.datetime.datetime.fromtimestamp(st.ep.due + i * 900, utc).hour]) -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(range(slots)|list, weights) -%}
+  {%- do st.ep.update({'plan': st.ep.due + slot * 900 + module.rand.number.floating(0, 900)}) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and not st.ep.active and st.ep.plan is not none and ev >= st.ep.plan -%}
+  {%- set cands = [] -%}
+  {%- for name in disposable -%}
+    {%- set r = st.repos[name] -%}
+    {%- if r.exists and r.protected and r.busy is none -%}
+      {%- for owner in owners -%}{%- for user in exts -%}
+        {%- if user not in r.collab -%}{%- do cands.append([owner, user, name]) -%}{%- endif -%}
+      {%- endfor -%}{%- endfor -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- Rotate: prefer candidates that differ from the previous episode in
+      owner, collaborator and repository; never repeat all three. -#}
+  {%- set by_score = [[], [], [], []] -%}
+  {%- for c in cands -%}
+    {%- set score = (c[0] != st.ep['last'][0])|int + (c[1] != st.ep['last'][1])|int + (c[2] != st.ep['last'][2])|int -%}
+    {%- do by_score[score].append(c) -%}
+  {%- endfor -%}
+  {%- set pool = by_score[3] or by_score[2] or by_score[1] -%}
+  {%- if pool -%}
+    {%- set c = module.rand.choice(pool) -%}
+    {%- set token = 'ep' ~ st.serial -%}
+    {%- do st.update({'serial': st.serial % 1000000000 + 1}) -%}
+    {%- do st.repos[c[2]].update({'busy': token}) -%}
+    {#- Step gaps use the ordinary correction and teardown think times,
+        redrawn so that the ordered shape fits its correlation window. -#}
+    {%- set ns = namespace(gaps=[]) -%}
+    {%- for attempt in range(50) -%}
+      {%- if not ns.gaps -%}
+        {%- set g = [150 * module.rand.number.lognormal(0, 0.9)] + [210 * module.rand.number.lognormal(0, 0.8), 210 * module.rand.number.lognormal(0, 0.8), 210 * module.rand.number.lognormal(0, 0.8)] -%}
+        {%- if g|sum <= 1500 -%}{%- set ns.gaps = g -%}{%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if not ns.gaps -%}{%- set ns.gaps = [150, 210, 210, 210] -%}{%- endif -%}
+    {%- do st.ep.update({'active': true, 'last': c, 'plan': none}) -%}
+    {%- do push({'due': ev, 'k': 'ep', 'o': c[0], 'x': c[1], 'r': c[2], 'id': st.repos[c[2]].id, 'token': token, 'i': 0, 'gaps': ns.gaps}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Serve the earliest due step that is still valid. -#}
+{%- set res = {'action': none} -%}
+{%- for it in st.queue|sort(attribute='due') -%}
+  {%- if res.action is none and it.due <= ev -%}
+    {%- do st.queue.remove(it) -%}
+    {%- do run(it, res) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if res.action is none -%}{%- do dispatch.drop() -%}{%- endif -%}
+
+{#- Correlation memory of the disposable repositories. -#}
+{%- if res.repo in disposable and res.action in ['repo.add_member', 'repo.update_member', 'protected_branch.destroy', 'repo.download_zip'] -%}
+  {%- set kept = [] -%}
+  {%- for e in st.mem.get(res.repo, []) -%}{%- if ev - e[0] <= window -%}{%- do kept.append(e) -%}{%- endif -%}{%- endfor -%}
+  {%- do kept.append([ev, res.action, res.actor, res.user, res.old, res.new, res.perm]) -%}
+  {%- do st.mem.update({res.repo: kept[-16:]}) -%}
+{%- endif -%}
+
+{#- Render the native object and its ECS projection. -#}
+{%- set action = res.action -%}
+{%- set actor = res.actor -%}
+{%- set is_org = action.startswith('org.') -%}
+{%- set event_time = module.datetime.datetime.fromtimestamp(ev, utc) -%}
+{%- set poll = st.poll -%}
+{%- set k = ((ev - poll.phase) // poll.s)|int + 1 -%}
+{%- if k != poll.k -%}
+  {%- do poll.update({'k': k, 'lat': module.rand.number.floating(0.25, 2.5), 'last': 0}) -%}
+{%- endif -%}
+{%- set created = [poll.phase + k * poll.s + poll.lat + module.rand.number.floating(0.002, 0.02), poll['last'] + module.rand.number.floating(0.001, 0.015)]|max -%}
+{%- do poll.update({'last': created}) -%}
+{%- set created_iso = module.datetime.datetime.fromtimestamp(((created * 1000)|round|int) / 1000, utc).isoformat(timespec='milliseconds') -%}
+{%- set ingested_iso = module.datetime.datetime.fromtimestamp((created + module.rand.number.floating(0.4, 3.5))|int, utc).isoformat(timespec='seconds') -%}
+{%- set epoch_ms = (ev * 1000)|round|int -%}
+{%- set document_id = module.base64.urlsafe_b64encode(module.uuid.uuid4().bytes).decode().rstrip('=') -%}
+{%- set native = {'@timestamp': epoch_ms, '_document_id': document_id, 'created_at': epoch_ms, 'action': action, 'actor': actor, 'actor_id': actor_ids[actor], 'org': params.org, 'org_id': params.org_id} -%}
+{%- if not is_org -%}
+  {%- do native.update({'repo': res.repo, 'repo_id': st.repos[res.repo].id, 'public_repo': false}) -%}
+  {%- if action not in ['repo.add_topic', 'repo.remove_topic', 'protected_branch.create', 'protected_branch.destroy'] -%}{%- do native.update({'visibility': 'private'}) -%}{%- endif -%}
+{%- endif -%}
+{%- if action in ['repo.add_member', 'repo.update_member', 'repo.remove_member'] -%}
+  {%- do native.update({'user': res.user, 'user_id': actor_ids[res.user]}) -%}
+  {%- if action == 'repo.add_member' -%}{%- do native.update({'permission': res.perm}) -%}
+  {%- elif action == 'repo.update_member' -%}{%- do native.update({'old_repo_permission': res.old, 'new_repo_permission': res.new}) -%}{%- endif -%}
+{%- elif action.startswith('protected_branch.') -%}
+  {%- do native.update({'name': 'main', 'admin_enforced': true}) -%}
+{%- elif res.topic is not none -%}
+  {%- do native.update({'topic': res.topic}) -%}
+{%- elif is_org -%}
+  {%- do native.update({'user': res.user, 'user_id': actor_ids[res.user]}) -%}
+{%- endif -%}
+{%- set github = {} -%}
+{%- for key, value in native.items() -%}
+  {%- if key not in ['@timestamp', 'created_at', '_document_id', 'action', 'actor', 'user'] -%}
+    {%- do github.update({key: value|string if key in ['actor_id', 'org_id', 'repo_id', 'user_id'] else value}) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- do github.update({'category': action.split('.')[0]}) -%}
+{%- set users = [actor, actor_ids[actor]|string] -%}
+{%- set user = {'name': actor, 'id': actor_ids[actor]|string} -%}
+{%- if native.user is defined -%}
+  {%- do user.update({'target': {'name': native.user, 'id': native.user_id|string}}) -%}
+  {%- if is_org -%}{%- do user.target.update({'group': {'name': params.org}}) -%}{%- endif -%}
+  {%- do users.extend([native.user, native.user_id|string]) -%}
+{%- endif -%}
+{%- set event_type = ['creation'] if '.add' in action or '.create' in action else ['deletion'] if '.remove' in action else ['change'] -%}
+{%- if is_org -%}{%- set event_type = ['group', 'user'] + event_type -%}{%- endif -%}
+{%- set doc = {'@timestamp': event_time.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.11.0'}, 'agent': {'id': params.collector_id, 'ephemeral_id': params.collector_ephemeral_id, 'name': 'github-audit-collector', 'type': 'filebeat', 'version': params.collector_version}, 'elastic_agent': {'id': params.collector_id, 'snapshot': false, 'version': params.collector_version}, 'data_stream': {'dataset': 'github.audit', 'namespace': 'default', 'type': 'logs'}, 'event': {'action': action, 'agent_id_status': 'verified', 'category': ['configuration', 'web', 'iam'] if is_org else ['configuration', 'web'], 'type': event_type, 'created': created_iso, 'ingested': ingested_iso, 'dataset': 'github.audit', 'module': 'github', 'kind': 'event', 'id': document_id, 'original': native|tojson}, 'github': github, 'input': {'type': 'httpjson'}, 'related': {'user': users}, 'user': user, 'tags': ['forwarded', 'github-audit', 'preserve_original_event']} -%}
+{%- if is_org -%}{%- do doc.update({'group': {'name': params.org}}) -%}{%- endif -%}
+{{- doc|tojson -}}
