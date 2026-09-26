@@ -1,0 +1,103 @@
+{%- set step = vars.step -%}
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set source_ip = module.rand.choice(['10.20.1.23', '10.20.1.45', '10.20.2.18', '10.20.2.44', '192.0.2.36', params.anomaly_source_ip]) -%}
+{%- set user_name = '-' -%}
+{%- set method = 'GET' -%}
+{%- set path = '/Default.htm' -%}
+{%- set query = '-' -%}
+{%- set status = 200 -%}
+{%- set sub_status = 0 -%}
+{%- set win32_status = 0 -%}
+{%- set time_taken = module.rand.number.integer(3, 160) -%}
+{%- set user_agent_log = module.rand.choice([
+    'Mozilla/5.0+(Windows+NT+10.0;+WOW64;+Trident/7.0;+Touch;+rv:11.0)+like+Gecko',
+    'Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64)+AppleWebKit/537.36+(KHTML,+like+Gecko)+Chrome/91.0.4472.124+Safari/537.36'
+  ]) -%}
+{%- set referer = '-' -%}
+{%- set kind = step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_anomaly', none) -%}
+  {%- set phase = shared.get('routine_count', 0) + 1 -%}
+  {%- do shared.set('routine_count', 0 if phase >= 2880 else phase) -%}
+  {%- if params.anomaly_mode -%}
+    {%- set interval = [params.anomaly_interval_hours | float, 0.5] | max * 3600 -%}
+    {%- set now = utc.timestamp() -%}
+    {%- set due = shared.get('next_anomaly_epoch', now + interval) -%}
+    {%- if now >= due -%}
+      {%- do shared.set('to_anomaly', true) -%}
+      {%- do shared.set('next_anomaly_epoch', now + interval) -%}
+    {%- else -%}
+      {%- do shared.set('next_anomaly_epoch', due) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if phase == 600 -%}
+    {%- set kind = 'probe_one' -%}
+  {%- elif phase == 1200 -%}
+    {%- set kind = 'probe_two' -%}
+  {%- elif phase == 1800 -%}
+    {%- set kind = 'denied' -%}
+  {%- elif phase == 2400 -%}
+    {%- set kind = 'download' -%}
+  {%- else -%}
+    {%- set kind = module.rand.weighted_choice(
+      ['page', 'asset', 'api', 'missing', 'admin_directory'],
+      [50, 32, 12, 5, 1]
+    ) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if kind == 'asset' -%}
+  {%- set path = module.rand.choice(['/DeptLogo.gif', '/styles/site.css', '/scripts/site.js']) -%}
+  {%- set referer = 'https://intranet.contoso.example/Default.htm' -%}
+{%- elif kind == 'api' -%}
+  {%- set path = '/api/status' -%}
+  {%- set query = 'site=main' -%}
+  {%- set user_agent_log = 'curl/8.5.0' -%}
+{%- elif kind == 'missing' -%}
+  {%- set path = '/favicon-old.ico' -%}
+  {%- set status = 404 -%}
+  {%- set win32_status = 2 -%}
+{%- elif kind == 'admin_directory' -%}
+  {%- set path = '/admin/' -%}
+  {%- set status = 403 -%}
+  {%- set sub_status = 14 -%}
+{%- elif kind in ['probe_one', 'probe_two', 'denied', 'download'] -%}
+  {%- set source_ip = params.anomaly_source_ip -%}
+  {%- set user_agent_log = 'curl/8.5.0' -%}
+  {%- if kind == 'probe_one' -%}
+    {%- set path = '/backup/' -%}
+    {%- set status = 404 -%}
+    {%- set win32_status = 2 -%}
+  {%- elif kind == 'probe_two' -%}
+    {%- set path = '/admin/' -%}
+    {%- set status = 403 -%}
+    {%- set sub_status = 14 -%}
+  {%- elif kind == 'denied' -%}
+    {%- set path = '/exports/' -%}
+    {%- set status = 403 -%}
+    {%- set sub_status = 14 -%}
+  {%- else -%}
+    {%- set path = '/exports/payroll.csv' -%}
+    {%- set user_name = params.anomaly_user -%}
+    {%- set time_taken = module.rand.number.integer(30, 500) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set fields = [
+  utc.strftime('%Y-%m-%d'), utc.strftime('%H:%M:%S'),
+  params.server_ip, method, path, query, params.server_port,
+  user_name, source_ip, user_agent_log, referer, status,
+  sub_status, win32_status, time_taken
+] -%}
+{%- set original = fields | join(' ') -%}
+{
+  "@timestamp": {{ utc.isoformat() | tojson }},
+  "ecs": {"version": "8.17.0"},
+  "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": {{ ('success' if status < 400 else 'failure') | tojson }}, "duration": {{ time_taken * 1000000 }}, "original": {{ original | tojson }}},
+  "host": {"name": {{ params.server_name | tojson }}, "ip": {{ params.server_ip | tojson }}},
+  "source": {"ip": {{ source_ip | tojson }}},
+  "destination": {"ip": {{ params.server_ip | tojson }}, "port": {{ params.server_port }}},
+  "http": {"request": {"method": {{ method | tojson }}}, "response": {"status_code": {{ status }}}},
+  "url": {"path": {{ path | tojson }}{% if query != '-' %}, "query": {{ query | tojson }}{% endif %}},
+  "user_agent": {"original": {{ user_agent_log.replace('+', ' ') | tojson }}},
+  "iis": {"access": {"sub_status": {{ sub_status }}, "win32_status": {{ win32_status }}}}
+  {%- if user_name != '-' %}, "user": {"name": {{ user_name | tojson }}}{% endif %}
+}
