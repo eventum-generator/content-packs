@@ -1,56 +1,159 @@
-{%- for key in ['to_failed_login', 'to_successful_login', 'to_log_change', 'to_key_add', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
 {%- set stage = vars.stage -%}
-{%- set user = module.rand.choice(['ops-admin', 'net-admin', 'helpdesk-admin']) -%}
-{%- set client = module.rand.choice(['10.20.10.11', '10.20.10.12', '10.20.10.13']) -%}
-{%- set kind = module.rand.weighted_choice(['login_success', 'login_failure', 'settings_change'], [84, 12, 4]) -%}
+{%- set target = {'user': params.admin_user,
+    'client_ip': params.suspicious_client_ip} -%}
 {%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 50 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('failed_count', 0) -%}{%- do shared.set('to_failed_login', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-{%- elif stage == 'failed_login' -%}
-  {%- set user = params.admin_user -%}{%- set client = params.suspicious_client_ip -%}{%- set kind = 'login_failure' -%}
-  {%- set count = shared.get('failed_count', 0) + 1 -%}
-  {%- if count >= 4 -%}{%- do shared.set('failed_count', 0) -%}{%- do shared.set('to_successful_login', true) -%}{%- else -%}{%- do shared.set('failed_count', count) -%}{%- endif -%}
-{%- elif stage == 'successful_login' -%}
-  {%- set user = params.admin_user -%}{%- set client = params.suspicious_client_ip -%}{%- set kind = 'login_success' -%}{%- do shared.set('to_log_change', true) -%}
-{%- elif stage == 'log_change' -%}
-  {%- set user = params.admin_user -%}{%- set kind = 'log_change' -%}{%- do shared.set('to_key_add', true) -%}
+  {%- do shared.pop('start_anomaly', none) -%}
+  {%- set routine_count = shared.get('routine_count', 0) + 1 -%}
+  {%- do shared.set('routine_count', routine_count) -%}
+  {%- set choice = module.rand.number.integer(0, samples.admins | length) -%}
+  {%- if choice == 0 -%}
+    {%- set actor = target -%}
+  {%- else -%}
+    {%- set row = samples.admins[choice - 1] -%}
+    {%- set actor = {'user': row.user, 'client_ip': row.client_ip} -%}
+  {%- endif -%}
+  {%- set kind = module.rand.weighted_choice(
+      ['login_success', 'login_failure', 'account_settings',
+       'cluster_parameter', 'log_change', 'key_add'],
+      [45, 10, 20, 15, 7, 3]) -%}
+  {%- if routine_count in [12, 27, 43, 58] -%}
+    {%- set actor = target -%}
+    {%- set kind = {12: 'login_success', 27: 'login_failure',
+        43: 'log_change', 58: 'key_add'}[routine_count] -%}
+  {%- endif -%}
+  {%- if actor.user == target.user and kind == 'login_failure' -%}
+    {%- set last_failure = shared.get('last_target_failure') -%}
+    {%- if routine_count != 27 and last_failure is not none and
+        (timestamp - last_failure).total_seconds() < 1800 -%}
+      {%- set kind = 'login_success' -%}
+    {%- else -%}
+      {%- do shared.set('last_target_failure', timestamp) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if params.anomaly_mode and routine_count >=
+      shared.get('next_anomaly_at', params.anomaly_after_events) -%}
+    {%- do shared.set('next_anomaly_at',
+        routine_count + params.anomaly_interval_events) -%}
+    {%- do shared.set('start_anomaly', true) -%}
+  {%- endif -%}
 {%- else -%}
-  {%- set user = params.admin_user -%}{%- set kind = 'key_add' -%}{%- do shared.set('to_routine', true) -%}
+  {%- set actor = target -%}
+  {%- if stage.startswith('reject_') -%}
+    {%- set kind = 'login_failure' -%}
+    {%- if stage == 'reject_4' -%}
+      {%- do shared.set('last_target_failure', timestamp) -%}
+    {%- endif -%}
+  {%- elif stage == 'accept' -%}
+    {%- set kind = 'login_success' -%}
+  {%- elif stage == 'log_change' -%}
+    {%- set kind = 'log_change' -%}
+  {%- else -%}
+    {%- set kind = 'key_add' -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set audit_timestamp = timestamp.isoformat().replace('+00:00', 'Z') -%}
-{%- set origin = '[timeQuality tzKnown="1"][origin swVersion="' ~ params.software_version ~ '" software="PolicyManager" ip="' ~ params.node_ip ~ '" enterpriseId="1.3.6.1.4.1.14823"]' -%}
+{%- set audit_dt = timestamp.replace(
+    microsecond=module.rand.number.integer(0, 999) * 1000) -%}
+{%- set export_dt = audit_dt + module.datetime.timedelta(
+    seconds=module.rand.number.integer(6, 30),
+    milliseconds=module.rand.number.integer(0, 999)) -%}
+{%- set audit_time = audit_dt.isoformat(timespec='milliseconds').replace('+00:00', 'Z') -%}
+{%- set export_time = export_dt.isoformat(timespec='milliseconds').replace('+00:00', 'Z') -%}
+{%- set pid = shared.get('process_id') -%}
+{%- if pid is none -%}
+  {%- set pid = module.rand.number.integer(10000, 60000) -%}
+  {%- do shared.set('process_id', pid) -%}
+{%- endif -%}
+{%- set message_index = shared.get('message_index') -%}
+{%- if message_index is none -%}
+  {%- set message_index = module.rand.number.integer(10, 70) -%}
+{%- endif -%}
+{%- do shared.set('message_index', ((message_index - 1 + module.rand.number.integer(1, 3)) % 999999) + 1) -%}
+{%- set message_id = message_index ~ '-1-0' -%}
+{%- set origin = '[timeQuality tzKnown="1"][origin swVersion="'
+    ~ params.software_version ~ '" software="PolicyManager" ip="'
+    ~ params.node_ip ~ '" enterpriseId="1.3.6.1.4.1.14823"]' -%}
 {%- if kind == 'login_success' -%}
-  {%- set category = 'Logged in' -%}{%- set action = 'None' -%}{%- set level = 'INFO' -%}
-  {%- set description = 'User: ' ~ user ~ '\\nRole: Super Administrator\\nAuthentication Source: Policy Manager Local Admin Users\\nSession ID: ' ~ module.rand.string.hex(32) ~ '\\nClient IP Address: ' ~ client ~ '\\nSession Inactive Expiry Time: 359 mins' -%}
+  {%- set native_category = 'Logged in' -%}
+  {%- set native_action = 'None' -%}
+  {%- set level = 'INFO' -%}
+  {%- set description = 'User: ' ~ actor.user ~ '\\nRole: Super Administrator'
+      ~ '\\nAuthentication Source: Policy Manager Local Admin Users'
+      ~ '\\nSession ID: ' ~ module.rand.string.hex(32)
+      ~ '\\nClient IP Address: ' ~ actor.client_ip
+      ~ '\\nSession Inactive Expiry Time: 359 mins' -%}
 {%- elif kind == 'login_failure' -%}
-  {%- set category = 'Login Failed' -%}{%- set action = 'None' -%}{%- set level = 'WARN' -%}
-  {%- set description = 'User: ' ~ user ~ '\\nClient IP Address: ' ~ client -%}
-{%- elif kind == 'settings_change' -%}
-  {%- set category = 'Account Settings' -%}{%- set action = 'MODIFY' -%}{%- set entity_name = 'Admin Users' -%}
+  {%- set native_category = 'Login Failed' -%}
+  {%- set native_action = 'None' -%}
+  {%- set level = 'WARN' -%}
+  {%- set description = 'User: ' ~ actor.user
+      ~ '\\nClient IP Address: ' ~ actor.client_ip -%}
+{%- elif kind == 'account_settings' -%}
+  {%- set native_category = 'Account Settings' -%}
+  {%- set native_action = 'MODIFY' -%}
+  {%- set entity_name = 'Admin Users' -%}
+{%- elif kind == 'cluster_parameter' -%}
+  {%- set native_category = 'Cluster-wide Parameter' -%}
+  {%- set native_action = 'MODIFY' -%}
+  {%- set entity_name = module.rand.choice([
+      'Disable TLSv1.3 support',
+      'Automatically check for available Software Updates',
+      'CLI Session Idle Timeout']) -%}
 {%- elif kind == 'log_change' -%}
-  {%- set category = 'Log Service Configuration' -%}{%- set action = 'MODIFY' -%}{%- set entity_name = 'Admin server' -%}
+  {%- set native_category = 'Log Service Configuration' -%}
+  {%- set native_action = 'MODIFY' -%}
+  {%- set entity_name = 'Admin server' -%}
 {%- else -%}
-  {%- set category = 'SSH Public Key' -%}{%- set action = 'ADD' -%}{%- set entity_name = 'root@cp-node' -%}
+  {%- set native_category = 'SSH Public Key' -%}
+  {%- set native_action = 'ADD' -%}
+  {%- set entity_name = 'root@cp-node' -%}
 {%- endif -%}
 {%- if kind in ['login_success', 'login_failure'] -%}
-  {%- set detail = 'eventId="3003" Action="' ~ action ~ '" Category="' ~ category ~ '" Description="' ~ description ~ '" Level="' ~ level ~ '" Component="Policy Manager UI"' -%}
+  {%- set event_id = 3003 -%}
+  {%- set detail = 'eventId="3003" Action="None" Category="'
+      ~ native_category ~ '" Description="' ~ description
+      ~ '" Level="' ~ level ~ '" Component="Policy Manager UI"' -%}
 {%- else -%}
-  {%- set detail = 'eventId="3001" Action="' ~ action ~ '" Category="' ~ category ~ '" User="' ~ user ~ '" EntityName="' ~ entity_name ~ '"' -%}
+  {%- set event_id = 3001 -%}
+  {%- set detail = 'eventId="3001" Action="' ~ native_action
+      ~ '" Category="' ~ native_category ~ '" User="'
+      ~ actor.user ~ '" EntityName="' ~ entity_name ~ '"' -%}
 {%- endif -%}
-{%- set original = audit_timestamp ~ ' ' ~ params.node_ip ~ ' ClearPass 18202 34-1-0 ' ~ origin ~ '[clearPass@14823 ' ~ detail ~ ' CppmNode.CPPM-Node="' ~ params.node_ip ~ '" Timestamp="' ~ audit_timestamp ~ '"]' -%}
-{%- set event_meta = {'kind': 'event', 'category': ['authentication'] if kind in ['login_success', 'login_failure'] else ['configuration'], 'type': ['start'] if kind == 'login_success' else ['denied'] if kind == 'login_failure' else ['creation'] if kind == 'key_add' else ['change'], 'action': kind.replace('_', '-'), 'original': original} -%}
-{%- if kind in ['login_success', 'login_failure'] -%}{%- do event_meta.update({'outcome': 'success' if kind == 'login_success' else 'failure'}) -%}{%- endif -%}
-{%- set event = {
-  '@timestamp': timestamp.isoformat(),
-  'ecs': {'version': '8.17.0'},
-  'event': event_meta,
-  'host': {'name': params.node_ip, 'ip': [params.node_ip]},
-  'user': {'name': user},
-  'related': {'user': [user]},
-  'clearpass': {'event_id': 3003 if kind in ['login_success', 'login_failure'] else 3001, 'action': action, 'category': category, 'entity_name': entity_name if kind not in ['login_success', 'login_failure'] else none, 'component': 'Policy Manager UI' if kind in ['login_success', 'login_failure'] else none, 'software_version': params.software_version}
-} -%}
-{%- if kind in ['login_success', 'login_failure'] -%}{%- do event.update({'source': {'ip': client}}) -%}{%- do event.related.update({'ip': [client]}) -%}{%- endif -%}
+{%- set original = '<' ~ params.syslog_priority ~ '>1 '
+    ~ export_time ~ ' ' ~ params.node_ip ~ ' ClearPass ' ~ pid ~ ' '
+    ~ message_id ~ ' ' ~ origin ~ '[clearPass@14823 ' ~ detail
+    ~ ' CppmNode.CPPM-Node="' ~ params.node_ip
+    ~ '" Timestamp="' ~ audit_time ~ '"]' -%}
+{%- set event_meta = {'kind': 'event', 'dataset': 'clearpass.audit',
+    'category': ['authentication'] if kind in ['login_success', 'login_failure']
+        else ['configuration'],
+    'type': ['start'] if kind == 'login_success' else ['denied']
+        if kind == 'login_failure' else ['creation'] if kind == 'key_add'
+        else ['change'],
+    'action': kind.replace('_', '-'), 'original': original} -%}
+{%- if kind in ['login_success', 'login_failure'] -%}
+  {%- do event_meta.update({'outcome': 'success' if kind == 'login_success'
+      else 'failure'}) -%}
+{%- endif -%}
+{%- set clearpass = {'event_id': event_id, 'action': native_action,
+    'category': native_category, 'software_version': params.software_version,
+    'audit_timestamp': audit_time, 'export_timestamp': export_time,
+    'process_id': pid, 'message_id': message_id,
+    'syslog_priority': params.syslog_priority} -%}
+{%- if kind in ['login_success', 'login_failure'] -%}
+  {%- do clearpass.update({'description': description,
+      'level': level, 'component': 'Policy Manager UI'}) -%}
+{%- else -%}
+  {%- do clearpass.update({'entity_name': entity_name}) -%}
+{%- endif -%}
+{%- set event = {'@timestamp': audit_time,
+    'ecs': {'version': '8.17.0'},
+    'event': event_meta,
+    'host': {'name': params.node_ip, 'ip': [params.node_ip]},
+    'user': {'name': actor.user},
+    'related': {'user': [actor.user]},
+    'clearpass': clearpass} -%}
+{%- if kind in ['login_success', 'login_failure'] -%}
+  {%- do event.update({'source': {'ip': actor.client_ip}}) -%}
+  {%- do event.related.update({'ip': [actor.client_ip]}) -%}
+{%- endif -%}
 {{- event | tojson -}}
