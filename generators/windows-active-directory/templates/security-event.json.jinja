@@ -1,4 +1,14 @@
 {%- set phase = vars.phase -%}
+{%- set cycle_index = shared.get('cycle_index', 1) -%}
+{%- set target = shared.get('cycle_target') -%}
+{%- if target is none -%}
+  {%- set target = {
+    'name': params.attack_member ~ '_' ~ ('%03d' | format(cycle_index * 2 - 1)),
+    'rid': params.attack_member_rid + (cycle_index - 1) * 2,
+    'guid': params.attack_object_guid if cycle_index == 1
+      else '{' ~ module.rand.crypto.uuid4() ~ '}'} -%}
+  {%- do shared.set('cycle_target', target) -%}
+{%- endif -%}
 {%- set user_row = samples.users.pick() -%}
 {%- set service_row = samples.services.pick() -%}
 {%- set source_ip = user_row.ip -%}
@@ -13,36 +23,39 @@
   {%- do shared.set('normal_count', normal_count) -%}
   {%- set code = module.rand.weighted_choice(
     ['4768', '4769', '4776', '4771'], [48, 44, 6, 2]) -%}
-  {%- if normal_count == 40 and not shared.get('normal_admin_done', false) -%}
+  {%- if normal_count == 40 -%}
     {%- do shared.set('normal_admin_logon_id',
       '0x' ~ module.rand.string.hex(6)) -%}
     {%- set code = '4728' -%}
     {%- set user_row = samples.users[3] -%}
     {%- set routine_admin = true -%}
-  {%- elif normal_count == 100 and not shared.get('normal_admin_done', false) -%}
+  {%- elif normal_count == 100 -%}
     {%- do shared.set('normal_change_guid',
       '{' ~ module.rand.crypto.uuid4() ~ '}') -%}
     {%- set code = '5136' -%}
     {%- set user_row = samples.users[3] -%}
     {%- set routine_admin = true -%}
     {%- set routine_admin_old = true -%}
-  {%- elif normal_count == 101 and not shared.get('normal_admin_done', false) -%}
+  {%- elif normal_count == 101 -%}
     {%- set code = '5136' -%}
     {%- set user_row = samples.users[3] -%}
     {%- set routine_admin = true -%}
-    {%- do shared.set('normal_admin_done', true) -%}
   {%- elif normal_count % 23 == 0 -%}
     {%- set user_row = samples.users[3] -%}
     {%- set source_ip = params.attack_ip -%}
   {%- endif -%}
-  {%- if normal_count >= 250 and params.anomaly_mode
-    and not shared.get('attack_done', false) -%}
+  {%- set cycle_length = [params.anomaly_after_events if cycle_index == 1
+    else params.anomaly_interval_events, 102] | max -%}
+  {%- if normal_count >= cycle_length -%}
     {%- do shared.set('normal_count', 0) -%}
-    {%- do shared.set('to_spray', true) -%}
-  {%- else -%}
-    {%- if normal_count >= 1800 -%}
-      {%- do shared.set('normal_count', 0) -%}
+    {%- if params.anomaly_mode -%}
+      {%- do shared.set('to_spray', true) -%}
+    {%- else -%}
+      {%- do shared.set('cycle_index', cycle_index + 1) -%}
+      {%- do shared.pop('cycle_target') -%}
+      {%- do shared.set('to_baseline', true) -%}
     {%- endif -%}
+  {%- else -%}
     {%- do shared.set('to_baseline', true) -%}
   {%- endif -%}
 {%- elif phase in ['pause_tgs', 'pause_admin'] -%}
@@ -106,7 +119,8 @@
     {%- do shared.set('change_guid',
       '{' ~ module.rand.crypto.uuid4() ~ '}') -%}
   {%- else -%}
-    {%- do shared.set('attack_done', true) -%}
+    {%- do shared.set('cycle_index', cycle_index + 1) -%}
+    {%- do shared.pop('cycle_target') -%}
   {%- endif -%}
 {%- endif -%}
 {%- set user_sid = params.domain_sid ~ '-' ~ user_row.rid -%}
@@ -207,10 +221,11 @@
   {%- set task = 'Security Group Management' -%}
   {%- set category = ['iam'] -%}
   {%- set event_types = ['group', 'change'] -%}
-  {%- set member_name = 'breakglass.ops' if routine_admin
-    else params.attack_member -%}
-  {%- set member_rid = 2501 if routine_admin
-    else params.attack_member_rid -%}
+  {%- set member_name = params.attack_member ~ '_'
+    ~ ('%03d' | format(cycle_index * 2)) if routine_admin
+    else target.name -%}
+  {%- set member_rid = target.rid + 1 if routine_admin
+    else target.rid -%}
   {%- set member_sid = params.domain_sid ~ '-' ~ member_rid -%}
   {%- set group_sid = params.domain_sid ~ '-512' -%}
   {%- set logon_id = shared.get('normal_admin_logon_id') if routine_admin
@@ -244,19 +259,17 @@
     else 'Value Added' -%}
   {%- set attribute_value = 'cifs/filesrv01.' ~ params.dns_domain
     if phase == 'delegation_old' else 'ldap/' ~ params.dc_host -%}
-  {%- set object_name = params.attack_member -%}
-  {%- set object_guid = params.attack_object_guid -%}
+  {%- set object_name = target.name -%}
+  {%- set object_guid = target.guid -%}
   {%- set correlation_id = shared.get('change_guid') -%}
   {%- set logon_id = shared.get('attack_logon_id') -%}
   {%- if routine_admin -%}
-    {%- set object_name = 'svc_backup' -%}
-    {%- set object_guid = '{90972fa9-956e-40ee-99d2-11fa199a311b}' -%}
     {%- set correlation_id = shared.get('normal_change_guid') -%}
     {%- set logon_id = shared.get('normal_admin_logon_id') -%}
     {%- set operation = 'Value Deleted' if routine_admin_old
       else 'Value Added' -%}
     {%- set attribute_value = 'cifs/backup01.' ~ params.dns_domain
-      if routine_admin_old else 'cifs/backup02.' ~ params.dns_domain -%}
+      if routine_admin_old else 'cifs/filesrv01.' ~ params.dns_domain -%}
   {%- endif -%}
   {%- do event_data.update({
     'AppCorrelationID': '-',

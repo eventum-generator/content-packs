@@ -4,7 +4,7 @@ Generates Windows Security events from one Active Directory domain controller as
 
 ## Event types
 
-The default is a small synthetic controller emitting one event per second. The authentication weights are illustrative, not a measured production distribution; real ratios depend on workload and audit policy. The background also contains one legitimate administrative maintenance sequence, so neither event 4728 nor 5136 alone identifies the attack. The incident sequence occurs once in anomaly mode.
+The default is a small synthetic controller emitting one event per second. The authentication weights are illustrative, not a measured production distribution; real ratios depend on workload and audit policy. Each cycle includes legitimate administrative maintenance, so neither event 4728 nor 5136 alone identifies the incident. Anomaly mode repeats the correlated sequence after configurable periods of ordinary traffic.
 
 | Event ID | Action | Ordinary authentication weight | Additional use | ECS category |
 |---|---|---:|---|---|
@@ -12,16 +12,20 @@ The default is a small synthetic controller emitting one event per second. The a
 | 4769 | Kerberos service ticket issued | 44% | Three RC4 service-account tickets | `authentication` |
 | 4776 | NTLM credential validated | 6% | Background only | `authentication` |
 | 4771 | Kerberos pre-authentication failed | 2% | Four-account password spray | `authentication` |
-| 4728 | Member added to Domain Admins | one maintenance event | One attacker-controlled member added | `iam` |
-| 5136 | Directory attribute modified | one maintenance pair | One attack delete/add pair | `iam`, `configuration` |
+| 4728 | Member added to Domain Admins | One approved addition per cycle | One additional member per episode | `iam` |
+| 5136 | Directory attribute modified | One maintenance pair per cycle | One additional delete/add pair per episode | `iam`, `configuration` |
 
 ## Anomaly Chain
 
-After 250 ordinary events, four 4771 failures target distinct accounts from `10.99.4.22` at one-second intervals. The last account, `helpdesk.admin`, then obtains a 4768 TGT. After 30 seconds of background traffic it requests three RC4 service tickets for distinct service accounts. Another 90 seconds of background traffic precedes a 4728 addition of `svc_sync` to Domain Admins and a 5136 delete/add pair changing that account's `msDS-AllowedToDelegateTo` list from `cifs/filesrv01.contoso.local` to `ldap/dc01.contoso.local`. The first failure and last change are about 130 seconds apart. The chain runs once; normal traffic continues afterward.
+`anomaly_mode` defaults to `true`. After 3,600 ordinary events, four 4771 failures target distinct accounts from `10.99.4.22` at one-second intervals. The last account, `helpdesk.admin`, obtains a 4768 TGT. After 30 ordinary events it requests three RC4 tickets for distinct service accounts. Another 90 ordinary events precede a 4728 Domain Admins addition and a 5136 delete/add pair replacing that target's `msDS-AllowedToDelegateTo` value from `cifs/filesrv01.contoso.local` to `ldap/dc01.contoso.local`. The first failure and last change are 130 seconds apart.
 
-Correlate 4771 failures by source IP and distinct user, then join the successful 4768 and subsequent 4769 events by source IP, account, and a bounded time window. Join 4728 and 5136 by `SubjectUserSid` and `SubjectLogonId`; join the 5136 value pair by `OpCorrelationID` and object GUID. Event 4768 does not contain a logon ID, so its connection to the later directory changes is temporal and account-based, not an ID equality. The source IP also occurs in benign authentication traffic. A one-off approved Domain Admins addition and delegation edit appear in both modes, on different objects; alerting on event ID, actor, or IP alone is insufficient.
+After the episode, another 3,600 ordinary events precede the next one. At one event per second, episode starts are about 1 hour and 2 minutes apart. Each cycle uses another pre-existing service account, with a new name and RID; its object GUID stays fixed within the cycle. Episode logon IDs and change-correlation GUIDs are new. The first two targets are `svc_sync_001` and `svc_sync_003`; approved group additions use `svc_sync_002` and `svc_sync_004`. No membership is added twice. The model assumes these accounts already exist and do not belong to Domain Admins before their addition.
 
-Set `anomaly_mode: false` to emit only the ordinary traffic and the one-off approved maintenance. It never emits the four-account spray, the RC4 sweep, or the `svc_sync` privilege/delegation changes.
+Ordinary delegation maintenance touches the same object later used by the episode. It first replaces `cifs/backup01.contoso.local` with `cifs/filesrv01.contoso.local`, establishing the value subsequently removed by the correlated change. The same actor, source IP, service-account family, event types and RC4 tickets also appear in the background. A target name or event ID alone does not label the incident.
+
+Correlate distinct 4771 users by IP, then join the 4768 success and 4769 sweep by IP, account and time. Join 4728 and 5136 by `SubjectUserSid` and `SubjectLogonId`, and the 5136 pair by `OpCorrelationID` and object GUID. Event 4768 does not contain a logon ID, so its connection to administrative activity is temporal and account-based. Changing `msDS-AllowedToDelegateTo` alone is not asserted to enable delegation.
+
+`anomaly_mode: false` emits ordinary traffic and recurring approved maintenance, without the correlated spray/TGT/RC4 sweep/group/delegation episode. Four finite 2.5-hour default/custom runs produced 9,001 records each: two complete episodes in each anomaly run and zero in each background run.
 
 Validation covers 258 of 263 field paths in six Elastic System Security expected-event fixtures (98.1%). The five omitted paths are `log.file.path`, which points to Elastic's local XML fixture files rather than a live Windows Event Log source. Microsoft Security event XML is the source for the native `winlog.event_data` values; this generator emits normalized ECS JSON, not raw XML.
 
@@ -44,10 +48,12 @@ Edit `event.template.params` in `generator.yml` to change the synthetic domain.
 | `dc_ephemeral_id` | `943942bd-09ec-48aa-957d-2f12ecb83866` | Collector session ID |
 | `agent_version` | `8.17.0` | Filebeat version |
 | `attack_ip` | `10.99.4.22` | Shared bastion address used by the chain and some ordinary authentications |
-| `attack_member` | `svc_sync` | Account added to Domain Admins and modified |
-| `attack_member_rid` | `2108` | RID of that account |
-| `attack_object_guid` | `{62ae5b92-0fab-4f0d-9393-1cfab99c9742}` | Stable directory object GUID |
-| `anomaly_mode` | `true` | Emit the linked intrusion chain; `false` emits only routine events |
+| `attack_member` | `svc_sync` | Prefix for pre-existing service accounts in both modes; cycle targets receive numeric suffixes |
+| `attack_member_rid` | `2108` | First target RID; later account RIDs increase without reuse |
+| `attack_object_guid` | `{62ae5b92-0fab-4f0d-9393-1cfab99c9742}` | First target GUID; later objects get new GUIDs, stable within their cycle |
+| `anomaly_mode` | `true` | Emit periodic linked episodes; `false` emits only routine events |
+| `anomaly_after_events` | `3600` | Ordinary records before the first episode |
+| `anomaly_interval_events` | `3600` | Ordinary records between episodes; both timing values are clamped to at least 102 for complete maintenance |
 
 The user and service pools are in `samples/users.json` and `samples/services.json`. Change those files when changing account names, RIDs, or service accounts; `helpdesk.admin` is the fourth user and the compromise target.
 
@@ -74,23 +80,38 @@ output:
 
 ## Usage
 
-Run from the `content-packs` root. Live mode emits one event per second. Sample mode advances simulated ticks as fast as the process can render, so bound its run time.
+From the `content-packs` root, create a finite configuration and generate a 2.5-hour batch:
 
 ```bash
-# Bounded batch sample
-timeout 2 eventum generate --path generators/windows-active-directory/generator.yml --id ad --live-mode false
+uv run --project ../eventum python - <<'PYCODE'
+from pathlib import Path
+p = Path("generators/windows-active-directory")
+source = (p / "generator.yml").read_text()
+finite = source.replace(
+    "      count: 1\n",
+    '      count: 1\n      start: "2026-09-25T00:00:00+00:00"\n'
+    '      end: "2026-09-25T02:30:00+00:00"\n',
+    1,
+)
+(p / "generator.batch.yml").write_text(finite)
+PYCODE
+flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/windows-active-directory/generator.batch.yml --id ad --live-mode false --keep-order true
+rm generators/windows-active-directory/generator.batch.yml
+```
 
-# Continuous live stream
-eventum generate --path generators/windows-active-directory/generator.yml --id ad --live-mode true
+For continuous generation at one event per second:
+
+```bash
+uv run --project ../eventum eventum generate --path generators/windows-active-directory/generator.yml --id ad --live-mode true --keep-order true
 ```
 
 ## Sample output
 
-This complete 4728 event was copied from the post-review anomaly-mode run:
+This complete synthetic ECS 4728 event was copied from the first validated periodic episode. It is normalized output, not raw Windows XML:
 
 ```json
 {
-  "@timestamp": "2026-09-25T16:38:19+00:00",
+  "@timestamp": "2026-09-25T01:02:08+00:00",
   "agent": {
     "ephemeral_id": "943942bd-09ec-48aa-957d-2f12ecb83866",
     "id": "a51465f9-72f4-4761-89bb-55de00ec6701",
@@ -110,7 +131,7 @@ This complete 4728 event was copied from the post-review anomaly-mode run:
     "kind": "event",
     "outcome": "success",
     "provider": "Microsoft-Windows-Security-Auditing",
-    "sequence": 900379,
+    "sequence": 903729,
     "type": [
       "group",
       "change"
@@ -134,7 +155,7 @@ This complete 4728 event was copied from the post-review anomaly-mode run:
   "related": {
     "user": [
       "helpdesk.admin",
-      "svc_sync"
+      "svc_sync_001"
     ]
   },
   "user": {
@@ -149,17 +170,17 @@ This complete 4728 event was copied from the post-review anomaly-mode run:
         "name": "Domain Admins"
       },
       "id": "S-1-5-21-3457937927-2839227994-823803824-2108",
-      "name": "svc_sync"
+      "name": "svc_sync_001"
     }
   },
   "winlog": {
     "channel": "Security",
     "computer_name": "dc01.contoso.local",
     "event_data": {
-      "MemberName": "CN=svc_sync,CN=Users,DC=contoso,DC=local",
+      "MemberName": "CN=svc_sync_001,CN=Users,DC=contoso,DC=local",
       "MemberSid": "S-1-5-21-3457937927-2839227994-823803824-2108",
       "SubjectDomainName": "CONTOSO",
-      "SubjectLogonId": "0x9648a9",
+      "SubjectLogonId": "0x2d0be9",
       "SubjectUserName": "helpdesk.admin",
       "SubjectUserSid": "S-1-5-21-3457937927-2839227994-823803824-1114",
       "TargetDomainName": "CONTOSO",
@@ -172,21 +193,21 @@ This complete 4728 event was copied from the post-review anomaly-mode run:
     ],
     "level": "information",
     "logon": {
-      "id": "0x9648a9"
+      "id": "0x2d0be9"
     },
     "opcode": "Info",
     "outcome": "success",
     "process": {
       "pid": 516,
       "thread": {
-        "id": 8007
+        "id": 5529
       }
     },
     "provider_guid": "{54849625-5478-4994-a5ba-3e3b0328c30d}",
     "provider_name": "Microsoft-Windows-Security-Auditing",
-    "record_id": "900379",
+    "record_id": "903729",
     "task": "Security Group Management",
-    "time_created": "2026-09-25T16:38:19+00:00",
+    "time_created": "2026-09-25T01:02:08+00:00",
     "version": 0
   }
 }
