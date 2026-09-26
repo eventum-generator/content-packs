@@ -38,13 +38,13 @@ AUDIT POLICY ORA_ACCOUNT_MGMT;
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`. After 250 ordinary rows, one eight-row sequence occurs:
+`anomaly_mode` defaults to `true`. After `anomaly_after_events` routine rows (250 by default), the generator starts an eight-row episode. Another episode starts after every `anomaly_interval_events` emitted rows (4,320 by default, about 12 hours at the shipped ten-second cadence):
 
 1. Four `LOGON` failures (`RETURN_CODE=1017`) for the configured administrator from one client host. Each failed connection has its own `SESSIONID`.
 2. A successful `LOGON` by the same account and host creates a new session.
 3. That session reads `FINANCE.PAYROLL`, grants `PAYROLL_READ` to the configured user, then logs off. Its `SESSIONID` is stable and its `ENTRY_ID` and `STATEMENT_ID` advance from 1 to 4.
 
-A detection can correlate the four failures with the later successful session, sensitive read, and role assignment. The same account, host, table, role, grantee, actions, and an isolated failed login also occur in background traffic. Background events do not reproduce the complete ordered sequence. With `anomaly_mode: false`, only background is generated. The chain runs once per generator instance, not every 250 rows.
+If an ordinary session for that administrator and host is open at a scheduled start, a routine `LOGOFF` closes it first; the episode starts on the next row. Each episode's successful login receives a distinct `SESSIONID`, and the hours-long gap separates episodes without adding a synthetic marker to the Oracle projection. A detection can correlate the failed logons with the later successful session, sensitive read and role grant. The same account, host, table, role, grantee, actions and an isolated failed login also occur in background traffic, but not as the complete ordered episode. With `anomaly_mode: false`, only background is generated.
 
 ## Parameters
 
@@ -54,7 +54,9 @@ Edit `event.template.params` in `generator.yml`:
 
 | Name | Default | Purpose |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Include the one-shot chain |
+| `anomaly_mode` | `true` | Include recurring episodes |
+| `anomaly_after_events` | `250` | Routine rows before the first episode |
+| `anomaly_interval_events` | `4320` | Emitted rows between episode starts, about 12 hours by default; use a positive value greater than eight |
 | `database_id` | `3459081234` | Synthetic numeric `DBID` |
 | `target_user` | `FINANCE_DBA` | Administrator account used in background and chain |
 | `attacker_host` | `wkst-091.corp.example` | Client host used in background and chain |
@@ -69,18 +71,18 @@ The shipped pack writes `output/events.json` and needs no credentials. To send i
 From the `content-packs` repository:
 
 ```bash
-uv run --project ../eventum eventum generate --path generators/database-oracle-unified-audit/generator.yml --id oracle-audit --live-mode false
+flock -x /tmp/eventum-generator-heavy.lock timeout 3s uv run --project ../eventum eventum generate --path generators/database-oracle-unified-audit/generator.yml --id oracle-audit-sample --live-mode false
 uv run --project ../eventum eventum generate --path generators/database-oracle-unified-audit/generator.yml --id oracle-audit --live-mode true
 ```
 
-The first command generates as fast as possible until stopped; the second follows the one-event-per-second cron schedule. Results are written as JSON Lines to `output/events.json`.
+The first command generates a short sample quickly; exit code `124` from `timeout` is expected. The second runs continuously at one event every ten seconds. Results are written as JSON Lines to `output/events.json`.
 
 ## Sample Output
 
-This complete row is copied from a 721-row default-parameter run. It is row 7 of the one-shot sequence:
+This complete row is copied from a 9,361-row, 26-hour run with the shipped default parameters. It is the role grant in the first episode:
 
 ```json
-{"ACTION_NAME": "GRANT", "AUDIT_TYPE": "Standard", "CLIENT_PROGRAM_NAME": "sqlplus@wkst-091.corp.example (TNS V1-V3)", "CURRENT_USER": "FINANCE_DBA", "DBID": 3459081234, "DBUSERNAME": "FINANCE_DBA", "ENTRY_ID": 3, "EVENT_TIMESTAMP": "2026-09-26 00:04:16.000000", "EVENT_TIMESTAMP_UTC": "2026-09-26 00:04:16.000000", "INSTANCE_ID": 1, "OBJECT_NAME": null, "OBJECT_SCHEMA": null, "OS_USERNAME": "ops", "RETURN_CODE": 0, "ROLE": "PAYROLL_READ", "SESSIONID": 100056, "SQL_BINDS": null, "SQL_TEXT": "GRANT PAYROLL_READ TO REPORT_USER", "STATEMENT_ID": 3, "TARGET_USER": "REPORT_USER", "UNIFIED_AUDIT_POLICIES": "ORA_ACCOUNT_MGMT", "USERHOST": "wkst-091.corp.example"}
+{"ACTION_NAME": "GRANT", "AUDIT_TYPE": "Standard", "CLIENT_PROGRAM_NAME": "sqlplus@wkst-091.corp.example (TNS V1-V3)", "CURRENT_USER": "FINANCE_DBA", "DBID": 3459081234, "DBUSERNAME": "FINANCE_DBA", "ENTRY_ID": 3, "EVENT_TIMESTAMP": "2026-09-26 00:42:40.000000", "EVENT_TIMESTAMP_UTC": "2026-09-26 00:42:40.000000", "INSTANCE_ID": 1, "OBJECT_NAME": null, "OBJECT_SCHEMA": null, "OS_USERNAME": "ops", "RETURN_CODE": 0, "ROLE": "PAYROLL_READ", "SESSIONID": 100049, "SQL_BINDS": null, "SQL_TEXT": "GRANT PAYROLL_READ TO REPORT_USER", "STATEMENT_ID": 3, "TARGET_USER": "REPORT_USER", "UNIFIED_AUDIT_POLICIES": "ORA_ACCOUNT_MGMT", "USERHOST": "wkst-091.corp.example"}
 ```
 
 ## Projection and Limits
