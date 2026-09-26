@@ -1,0 +1,189 @@
+{%- from 'templates/_base.json.jinja' import render, hmac, nano, rfc3339, renew_sleep, payroll_run with context -%}
+{%- set E9 = 1000000000 -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- if not module.math.isfinite(interval) or interval < 6 or interval > 8760 -%}
+  {{- module.builtins.float('anomaly_interval_hours must be between 6 and 8760') -}}
+{%- endif -%}
+{%- set interval_ns = (interval * 3600 * E9) | int -%}
+{#- One operation per 30-second input tick, at a random instant inside it. -#}
+{%- set tick_ns = (timestamp.timestamp() | round | int) * E9 -%}
+{%- set now = tick_ns + module.rand.number.integer(0, 29499999999) -%}
+{%- if not shared.get('identities') -%}
+  {%- set people = [
+    dict(actor='svc-api', ip='10.20.8.12', entity='49263c43-35ab-4df6-a747-1715203590ba'),
+    dict(actor='svc-billing', ip='10.20.8.31', entity='09ae6e74-f30a-4713-83a5-c8be3496bdbe'),
+    dict(actor='alice', ip='10.20.9.18', entity='e60a5c72-a56d-4ff4-b16a-45c3bceea453'),
+    dict(actor=params.suspicious_actor, ip=params.suspicious_ip, entity='96fa6c68-63af-43dc-a9ea-f59556f4b5ea')
+  ] -%}
+  {%- for person in people -%}
+    {#- Logged in before the window, inside its first renewal sleep. -#}
+    {%- set issue = now - module.rand.number.integer(600, 60000) * E9 - module.rand.number.integer(0, E9 - 1) -%}
+    {%- do person.update(dict(token='s.synthetic-service-' ~ loop.index, accessor='synthetic-accessor-' ~ loop.index, issue=issue, expires=issue + 86400 * E9, renew_due=issue + (renew_sleep() | int), last_renewal=none, port=module.rand.number.integer(32768, 60999), last_op=none, payroll=[])) -%}
+  {%- endfor -%}
+  {%- set created = [] -%}
+  {%- for secret in samples.secrets -%}
+    {%- do created.append(nano(now - module.rand.number.integer(86400, 30 * 86400) * E9 - module.rand.number.integer(0, E9 - 1))) -%}
+  {%- endfor -%}
+  {%- do shared.update(dict(identities=people, created=created, next_episode=tick_ns + interval_ns, episode=none, last_episode_actor=-1, last_episode_first=-1, batches=[], delete_backlog=0, retries=[], device_salt='6e3d1588-aaf1-47ec-b267-29419a7c30e1', log_offset=0)) -%}
+{%- endif -%}
+{%- set people = shared.get('identities') -%}
+{%- set batches = shared.get('batches') -%}
+{%- set retries = shared.get('retries') -%}
+{#- Payroll reads per actor in the last 420 s; three of them before an
+    ordinary denied audit DELETE would form the episode shape. -#}
+{%- for person in people -%}
+  {%- set recent = [] -%}
+  {%- for at in person.payroll -%}{%- if now - at <= 420 * E9 -%}{%- do recent.append(at) -%}{%- endif -%}{%- endfor -%}
+  {%- do person.update(dict(payroll=recent)) -%}
+{%- endfor -%}
+{#- Background processes draw identically in both modes. -#}
+{%- if module.rand.chance(0.0028) -%}
+  {%- do shared.set('delete_backlog', shared.get('delete_backlog') + 1) -%}
+{%- endif -%}
+{%- if module.rand.chance(0.0042) and batches | length < 3 -%}
+  {%- set busy = batches | map(attribute='index') | list -%}
+  {%- set free = namespace(indexes=[], weights=[]) -%}
+  {%- for weight in [35, 30, 20, 15] -%}
+    {%- if loop.index0 not in busy -%}
+      {%- set free.indexes = free.indexes + [loop.index0] -%}
+      {%- set free.weights = free.weights + [weight] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if free.indexes -%}
+    {%- set length = [40, 2 + (module.rand.number.lognormal(1.6, 0.75) | int)] | min -%}
+    {%- do batches.append(dict(index=module.rand.weighted_choice(free.indexes, free.weights), paths=module.json.loads(payroll_run(length, -1)), position=0)) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if params.anomaly_mode and not shared.get('episode') and tick_ns >= shared.get('next_episode') -%}
+  {%- set busy = batches | map(attribute='index') | list -%}
+  {%- set eligible = [] -%}
+  {%- for person in people -%}
+    {%- if loop.index0 != shared.get('last_episode_actor') and loop.index0 not in busy -%}{%- do eligible.append(loop.index0) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if eligible -%}
+    {%- set paths = module.json.loads(payroll_run(10, shared.get('last_episode_first'))) -%}
+    {%- do shared.set('episode', dict(index=module.rand.choice(eligible), paths=paths, position=0)) -%}
+    {%- do shared.set('last_episode_first', paths[0] - 12) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set selected = namespace(index=-1, kind='', secret_index=-1, origin='') -%}
+{#- 1. Token renewal falls due. -#}
+{%- set due = namespace(index=-1, at=0) -%}
+{%- for person in people -%}
+  {%- if person.renew_due <= now and (due.index < 0 or person.renew_due < due.at) -%}
+    {%- set due.index = loop.index0 -%}{%- set due.at = person.renew_due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if due.index >= 0 -%}
+  {%- set selected.index = due.index -%}{%- set selected.kind = 'renew' -%}
+{%- endif -%}
+{#- 2. A retry of an ordinary denied audit DELETE. -#}
+{%- if selected.index < 0 -%}
+  {%- for retry in retries | sort(attribute='due') -%}
+    {%- if selected.index < 0 and retry.due <= now -%}
+      {%- do retries.remove(retry) -%}
+      {%- if people[retry.index].payroll | length < 3 -%}
+        {%- set selected.index = retry.index -%}{%- set selected.kind = 'delete' -%}{%- set selected.origin = 'ordinary' -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{#- 3. A new ordinary denied audit DELETE attempt. -#}
+{%- if selected.index < 0 and shared.get('delete_backlog') > 0 -%}
+  {%- do shared.set('delete_backlog', shared.get('delete_backlog') - 1) -%}
+  {%- set open = namespace(indexes=[], weights=[]) -%}
+  {%- for weight in [30, 25, 25, 20] -%}
+    {%- if people[loop.index0].payroll | length < 3 -%}
+      {%- set open.indexes = open.indexes + [loop.index0] -%}
+      {%- set open.weights = open.weights + [weight] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if open.indexes -%}
+    {%- set selected.index = module.rand.weighted_choice(open.indexes, open.weights) -%}{%- set selected.kind = 'delete' -%}{%- set selected.origin = 'ordinary' -%}
+  {%- endif -%}
+{%- endif -%}
+{#- 4. The next read of a running payroll batch. -#}
+{%- if selected.index < 0 -%}
+  {%- for batch in batches -%}
+    {%- if selected.index < 0 and module.rand.chance(0.8) -%}
+      {%- set selected.index = batch.index -%}{%- set selected.kind = 'read' -%}
+      {%- set selected.secret_index = batch.paths[batch.position] -%}
+      {%- do batch.update(dict(position=batch.position + 1)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set running = [] -%}
+  {%- for batch in batches -%}{%- if batch.position < batch.paths | length -%}{%- do running.append(batch) -%}{%- endif -%}{%- endfor -%}
+  {%- do shared.set('batches', running) -%}
+{%- endif -%}
+{#- 5. The next step of an episode, paced like a batch. -#}
+{%- set episode = shared.get('episode') -%}
+{%- if selected.index < 0 and episode and module.rand.chance(0.8) -%}
+  {%- set selected.index = episode.index -%}
+  {%- if episode.position < 10 -%}
+    {%- set selected.kind = 'read' -%}
+    {%- set selected.secret_index = episode.paths[episode.position] -%}
+    {%- if episode.position == 0 -%}
+      {%- do shared.set('next_episode', now + interval_ns) -%}
+      {%- do shared.set('last_episode_actor', episode.index) -%}
+    {%- endif -%}
+    {%- do episode.update(dict(position=episode.position + 1)) -%}
+  {%- else -%}
+    {%- set selected.kind = 'delete' -%}{%- set selected.origin = 'episode' -%}
+    {%- do shared.set('episode', none) -%}
+  {%- endif -%}
+{%- endif -%}
+{#- 6. An independent single operation. -#}
+{%- if selected.index < 0 -%}
+  {%- set selected.index = module.rand.weighted_choice([0, 1, 2, 3], [45, 25, 20, 10]) -%}
+  {%- set selected.kind = module.rand.weighted_choice(['read', 'list', 'lookup'], [78, 11, 11]) -%}
+  {%- if selected.kind == 'read' -%}
+    {%- set selected.secret_index = module.rand.number.integer(12, 51) if module.rand.chance(0.35) else module.rand.number.integer(0, 11) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set person = people[selected.index] -%}
+{%- if selected.origin == 'ordinary' and module.rand.chance(0.35) -%}
+  {%- do retries.append(dict(index=selected.index, due=now + (module.rand.number.lognormal(3.8, 0.7) * E9) | int)) -%}
+{%- endif -%}
+{#- A pooled client connection closes after 90 s idle. -#}
+{%- if person.last_op is none or now - person.last_op > 90 * E9 -%}
+  {%- do person.update(dict(port=module.rand.number.integer(32768, 60999))) -%}
+{%- endif -%}
+{%- do person.update(dict(last_op=now)) -%}
+{%- set denied = selected.kind == 'delete' -%}
+{%- if selected.kind == 'read' -%}
+  {%- set relative = samples.secrets[selected.secret_index].path -%}
+  {%- set path = params.secret_mount ~ '/data/' ~ relative -%}
+  {%- set operation = 'read' -%}
+  {%- if selected.secret_index >= 12 -%}{%- do person.payroll.append(now) -%}{%- endif -%}
+{%- elif selected.kind == 'list' -%}
+  {%- set relative = module.rand.choice(['app', 'billing', 'payroll']) -%}
+  {%- set path = params.secret_mount ~ '/metadata/' ~ relative -%}
+  {%- set operation = 'list' -%}
+{%- elif selected.kind in ['lookup', 'renew'] -%}
+  {%- set path = 'auth/token/' ~ ('lookup-self' if selected.kind == 'lookup' else 'renew-self') -%}
+  {%- set operation = 'read' if selected.kind == 'lookup' else 'update' -%}
+{%- else -%}
+  {%- set path = 'sys/audit/file' -%}
+  {%- set operation = 'delete' -%}
+{%- endif -%}
+{%- set token = hmac(person.token) -%}
+{%- set accessor = hmac(person.accessor) -%}
+{%- set policies = ['default', 'training-reader'] -%}
+{%- set results = dict(allowed=not denied) -%}
+{%- if not denied -%}
+  {%- set policy_name = 'default' if selected.kind in ['lookup', 'renew'] else 'training-reader' -%}
+  {# Preserve newAuth make(len)+append behavior in tagged v1.18.0. #}
+  {%- do results.update(dict(granting_policies=[dict(type=''), dict(name=policy_name, namespace_id='root', type='acl')])) -%}
+{%- endif -%}
+{%- set auth = dict(accessor=accessor, client_token=token, display_name='userpass-' ~ person.actor, entity_id=person.entity, metadata=dict(username=person.actor), policies=policies, policy_results=results, token_policies=policies, token_issue_time=rfc3339(person.issue), token_ttl=86400, token_type='service') -%}
+{%- set mount = dict(accessor='kv_78c4bc20', class='secret', point=params.secret_mount ~ '/', type='kv') if selected.kind in ['read', 'list'] else (dict(accessor='auth_token_1684c220', class='auth', point='auth/token/', type='token') if not denied else dict(accessor='system_55b7b520', class='secret', point='sys/', type='system')) -%}
+{%- set request = dict(client_id=person.entity, client_token=token, client_token_accessor=accessor, id=module.rand.crypto.uuid4(), mount_class=mount.class, mount_point=mount.point, mount_type=mount.type, namespace=dict(id='root'), operation=operation, path=path, remote_address=person.ip, remote_port=person.port, request_uri='/v1/' ~ module.urllib.parse.quote(path, safe='/')) -%}
+{# Update existence checking routes renew-self before request auditing.
+   Read/list/lookup gain this accessor only after their successful route. #}
+{%- if selected.kind == 'renew' -%}{%- do request.update(dict(mount_accessor=mount.accessor)) -%}{%- endif -%}
+{%- set error = '1 error occurred:\n\t* permission denied\n\n' -%}
+{%- set native = dict(auth=auth) -%}
+{%- if denied -%}{%- do native.update(dict(error=error)) -%}{%- endif -%}
+{%- do native.update(dict(request=request, time=nano(now), type='request')) -%}
+{%- do shared.set('current', dict(auth=auth, request=request, index=selected.index, kind=selected.kind, secret_index=selected.secret_index, relative=relative if relative is defined else '', denied=denied, error=error, now=now, mount_accessor=mount.accessor)) -%}
+{{- render(native, person.actor, person.ip, person.port, now) -}}

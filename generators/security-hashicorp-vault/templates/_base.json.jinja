@@ -1,0 +1,75 @@
+{%- macro hmac(value) -%}
+{{- 'hmac-sha256:' ~ module.hmac.new(shared.get('device_salt').encode(), value.encode(), module.hashlib.sha256).hexdigest() -}}
+{%- endmacro -%}
+{#- Clocks are integer Unix nanoseconds. -#}
+{%- macro rfc3339(ns) -%}
+{{- module.datetime.datetime.fromtimestamp(ns // 1000000000, module.datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ') -}}
+{%- endmacro -%}
+{#- Go time.RFC3339Nano: nine digits with trailing zeros trimmed. -#}
+{%- macro nano(ns) -%}
+{%- set fraction = ns % 1000000000 -%}
+{{- module.datetime.datetime.fromtimestamp(ns // 1000000000, module.datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') -}}
+{%- if fraction -%}{{- ('.' ~ ('%09d' | format(fraction))).rstrip('0') -}}{%- endif -%}Z
+{%- endmacro -%}
+{%- macro millis(ns) -%}
+{{- module.datetime.datetime.fromtimestamp(ns // 1000000000, module.datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S') ~ '.' ~ ('%03d' | format(ns % 1000000000 // 1000000)) ~ 'Z' -}}
+{%- endmacro -%}
+{#- LifetimeWatcher: 2/3 of the 24 h lease plus 1/3 of a grace drawn
+    from [10%, 20%) of it, redrawn for every cycle. -#}
+{%- macro renew_sleep() -%}
+{%- set lease = 86400000000000 -%}
+{{- lease * 2 // 3 + (lease // 10 + module.rand.number.integer(0, lease // 10 - 1)) // 3 -}}
+{%- endmacro -%}
+{#- Payroll inventory indexes 12..51 for one batch or episode: an
+    ascending employee range or a random distinct subset. -#}
+{%- macro payroll_run(length, avoid) -%}
+{%- set first = namespace(value=avoid) -%}
+{%- for attempt in range(8) -%}
+  {%- if first.value == avoid -%}{%- set first.value = module.rand.number.integer(0, 39) -%}{%- endif -%}
+{%- endfor -%}
+{%- set run = [] -%}
+{%- if module.rand.chance(0.6) -%}
+  {%- for step in range(length) -%}{%- do run.append(12 + (first.value + step) % 40) -%}{%- endfor -%}
+{%- else -%}
+  {%- do run.append(12 + first.value) -%}
+  {%- for index in module.random.sample(range(40), 40) -%}
+    {%- if run | length < length and index != first.value -%}{%- do run.append(12 + index) -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{{- run | tojson -}}
+{%- endmacro -%}
+{%- macro render(native, actor, ip, port, at) -%}
+{%- set offset = shared.get('log_offset') -%}
+{%- set serialized = module.json.dumps(native, ensure_ascii=false, separators=(',', ':')) -%}
+{%- do shared.set('log_offset', offset + (serialized.encode('utf-8') | length) + 1) -%}
+{%- set failure = native.error is defined -%}
+{%- set parsed = dict(native) -%}
+{%- do parsed.pop('time') -%}
+{%- set lag = (module.rand.number.lognormal(1.1, 0.8) * 1000000000) | int -%}
+{%- set types = ['info', 'end'] if native.request.operation == 'delete' else (['info'] if native.request.operation == 'update' else ['info', 'start']) -%}
+{%- set doc = {
+    '@timestamp': millis(at),
+    'agent': {'ephemeral_id': params.collector_ephemeral_id, 'id': params.collector_id,
+              'name': params.vault_host, 'type': 'filebeat', 'version': params.collector_version},
+    'data_stream': {'dataset': 'hashicorp_vault.audit', 'namespace': 'default', 'type': 'logs'},
+    'ecs': {'version': '8.17.0'},
+    'elastic_agent': {'id': params.collector_id, 'snapshot': false, 'version': params.collector_version},
+    'event': {'action': native.request.operation, 'agent_id_status': 'verified',
+              'category': ['authentication'], 'dataset': 'hashicorp_vault.audit',
+              'id': native.request.id, 'ingested': rfc3339(at + lag),
+              'kind': 'event', 'original': serialized,
+              'outcome': 'failure' if failure else 'success', 'type': types},
+    'hashicorp_vault': {'audit': parsed},
+    'host': {'architecture': 'x86_64', 'containerized': false,
+             'hostname': params.vault_host, 'id': 'f25e61f1c11d44bd9aee4a28a664ec18',
+             'ip': [params.vault_ip], 'mac': ['02-42-0A-14-02-12'], 'name': params.vault_host,
+             'os': {'codename': 'bookworm', 'family': 'debian', 'kernel': '6.1.0',
+                    'name': 'Debian', 'platform': 'debian', 'type': 'linux', 'version': '12'}},
+    'input': {'type': 'filestream'},
+    'log': {'file': {'path': '/var/log/vault/audit.json'}, 'offset': offset},
+    'tags': ['hashicorp-vault-audit'], 'source': {'ip': ip, 'port': port},
+    'related': {'ip': [ip], 'user': [actor]}, 'user': {'name': actor}
+} -%}
+{%- if failure -%}{%- do doc.update(dict(message=native.error)) -%}{%- endif -%}
+{{- doc | tojson -}}
+{%- endmacro -%}
