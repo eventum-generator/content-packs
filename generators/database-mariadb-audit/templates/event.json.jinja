@@ -1,70 +1,308 @@
-{%- set step = vars.step -%}
-{%- if step == 'normal_connect' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- set count = shared.get('routine_sessions', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_sessions -%}
-    {%- do shared.set('routine_sessions', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_sessions', count) -%}{%- endif -%}
+{# One MariaDB 11.4.4 instance, server_audit FILE records. Discrete-event model: one input tick per second, idle ticks are dropped. #}
+{%- set poll = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = poll.timestamp() | int -%}
+{%- set dbas = params.dba_accounts -%}
+{%- set dels = params.delegated_accounts -%}
+{%- set stables = params.sensitive_tables -%}
+{%- set ndb = params.normal_database -%}
+{%- set sdb = params.sensitive_database -%}
+{%- if not shared.get('initialized', false) -%}
+  {%- if params.anomaly_mode is not boolean or params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean -%}
+    {{- module.builtins.int('MariaDB requires boolean anomaly_mode and numeric interval hours') -}}
+  {%- endif -%}
+  {%- if not module.math.isfinite(params.anomaly_interval_hours) or not 6 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- module.builtins.int('MariaDB interval hours must be finite in [6,8760]') -}}
+  {%- endif -%}
+  {%- for pool, low, high in [(dbas, 1, 4), (dels, 1, 4), (stables, 1, 8)] -%}
+    {%- if pool is string or pool is mapping or pool is not sequence or not low <= pool | length <= high -%}
+      {{- module.builtins.int('MariaDB pools need 1-4 DBA accounts, 1-4 delegated accounts and 1-8 sensitive tables') -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if dbas | length < 2 and stables | length < 2 -%}
+    {{- module.builtins.int('MariaDB episode variation requires two or more DBA accounts or sensitive tables') -}}
+  {%- endif -%}
+  {%- for account in dbas + dels -%}
+    {%- if account is not mapping or account.user is not defined or account.ip is not defined -%}
+      {{- module.builtins.int('MariaDB pool accounts require user and ip keys') -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set accounts = [{'user':params.normal_user, 'ip':params.normal_ip}] + dbas + dels -%}
+  {%- for name in accounts | map(attribute='user') | list + stables + [ndb, sdb] -%}
+    {%- if name is not string or not module.re.fullmatch('[a-z][a-z0-9_]{0,31}', name) -%}
+      {{- module.builtins.int('MariaDB accounts and database/table names require bounded lowercase ASCII identifiers') -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if accounts | map(attribute='user') | unique | list | length != accounts | length or stables | unique | list | length != stables | length or ndb == sdb or 'mysql' in [ndb, sdb] -%}
+    {{- module.builtins.int('MariaDB accounts, sensitive tables and application/sensitive/system schemas must be distinct') -}}
+  {%- endif -%}
+  {%- if params.db_host is not string or not module.re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', params.db_host) -%}
+    {{- module.builtins.int('MariaDB db_host requires bounded ASCII hostname') -}}
+  {%- endif -%}
+  {%- for address in [params.db_ip] + accounts | map(attribute='ip') | list -%}
+    {%- if address is not string or module.ipaddress.ip_address(address).version != 4 -%}
+      {{- module.builtins.int('MariaDB selected profile requires IPv4 addresses') -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if accounts | map(attribute='ip') | unique | list | length != accounts | length or not 1 <= samples.tables | length <= 100 -%}
+    {{- module.builtins.int('MariaDB requires one distinct client IP per account and bounded nonempty table pool') -}}
+  {%- endif -%}
+  {%- set names = [] -%}
+  {%- for row in samples.tables -%}
+    {%- if not module.re.fullmatch('orders_[0-9]{2}', row.table) or row.table in names -%}
+      {{- module.builtins.int('MariaDB sample tables require unique orders_NN names') -}}
+    {%- endif -%}
+    {%- do names.append(row.table) -%}
+  {%- endfor -%}
+  {%- set actors = [] -%}
+  {%- for i in range(3) -%}
+    {%- do actors.append({'kind':'pool', 'user':params.normal_user, 'ip':params.normal_ip, 'cid':none, 'db':'', 'mode':'idle', 'next':now + module.rand.number.integer(0, 30), 'expire':0, 'left':0}) -%}
+  {%- endfor -%}
+  {%- for account in dbas -%}
+    {%- do actors.append({'kind':'dba', 'user':account.user, 'ip':account.ip, 'cid':none, 'db':'', 'mode':'idle', 'next':now + (module.rand.number.exponential(1 / 1800) | int), 'expire':0, 'left':0}) -%}
+  {%- endfor -%}
+  {%- for account in dels -%}
+    {%- do actors.append({'kind':'dlg', 'user':account.user, 'ip':account.ip, 'cid':none, 'db':'', 'mode':'idle', 'next':now + (module.rand.number.exponential(1 / 2400) | int), 'expire':0, 'left':0}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized':true, 'q':[], 'actors':actors, 'ctr':{'cid':1000, 'qid':2000}, 'last_fail':{}, 'grant':none, 'maint':{'phase':'idle', 'next':now + ([(module.rand.number.exponential(1 / 2400) + module.rand.number.exponential(1 / 2400)) | int, 18000] | min), 'x':none, 'y':none, 'table':none, 'episode':false, 'fails':0, 'reads':0, 'prev':none, 'prev_episode':none}, 'next_due':now + (params.anomaly_interval_hours * 3600) | int}) -%}
 {%- endif -%}
-{%- set conn = shared.get('active_connection', 0) -%}
-{%- if step in ['normal_connect','fail_1','fail_2','fail_3','attack_connect','delegated_connect'] -%}
-  {%- set conn = (shared.get('connection_counter', 1000) % 2147483647) + 1 -%}
-  {%- do shared.set('connection_counter', conn) -%}
-  {%- if step in ['normal_connect','attack_connect','delegated_connect'] -%}{%- do shared.set('active_connection', conn) -%}{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set ctr = shared.get('ctr') -%}
+{%- set last_fail = shared.get('last_fail') -%}
+{%- set actors = shared.get('actors') -%}
+{%- set maint = shared.get('maint') -%}
+
+{%- macro push(t, user, ip, cid, qid, op, db, obj, rc) -%}
+  {%- do q.append({'t':t, 'username':user, 'ip':ip, 'connectionid':cid, 'queryid':qid, 'operation':op, 'database':db, 'object':obj, 'retcode':rc}) -%}
+{%- endmacro -%}
+
+{%- macro fail(t, a) -%}
+  {%- do ctr.update({'cid':ctr.cid + 1}) -%}
+  {%- do push(t, a.user, a.ip, ctr.cid, 0, 'FAILED_CONNECT', '', '', 1045) -%}
+  {%- do push(t, a.user, a.ip, ctr.cid, 0, 'DISCONNECT', '', '', 0) -%}
+  {%- do last_fail.update({a.user:t}) -%}
+{%- endmacro -%}
+
+{%- macro connect(t, a, db) -%}
+  {%- do ctr.update({'cid':ctr.cid + 1}) -%}
+  {%- do a.update({'cid':ctr.cid, 'db':db}) -%}
+  {%- do push(t, a.user, a.ip, a.cid, 0, 'CONNECT', db, '', 0) -%}
+{%- endmacro -%}
+
+{%- macro quit(t, a) -%}
+  {#- COM_QUIT consumes a query id before the connection closes. -#}
+  {%- do ctr.update({'qid':ctr.qid + 1}) -%}
+  {%- do push(t, a.user, a.ip, a.cid, 0, 'DISCONNECT', a.db, '', 0) -%}
+  {%- do a.update({'cid':none, 'db':''}) -%}
+{%- endmacro -%}
+
+{%- macro stmt(t, a, kind, table) -%}
+  {%- do ctr.update({'qid':ctr.qid + 1}) -%}
+  {%- set s = namespace(sql='', code=0, tables=[], tdb=ndb, op='READ') -%}
+  {%- set app = samples.tables[module.rand.number.integer(0, (samples.tables | length) - 1)].table -%}
+  {%- set app = app if a.db == ndb else ndb ~ '.' ~ app -%}
+  {%- set target = sdb ~ '.' ~ table -%}
+  {%- set grant = shared.get('grant') -%}
+  {%- set granted = grant is not none and grant.user == a.user and grant.table == table -%}
+  {%- if kind == 'app_select' -%}
+    {%- set s.sql = 'SELECT order_id, status, total FROM ' ~ app ~ ' WHERE order_id = ' ~ module.rand.number.integer(1, 20000) -%}
+    {%- set s.tables = [app.split('.')[-1]] -%}
+  {%- elif kind == 'report' -%}
+    {%- set s.sql = 'SELECT status, COUNT(*) FROM ' ~ app ~ ' GROUP BY status' -%}
+    {%- set s.tables = [app.split('.')[-1]] -%}
+  {%- elif kind == 'app_update' -%}
+    {%- set s.sql = 'UPDATE ' ~ app ~ " SET status = '" ~ module.rand.choice(['paid', 'shipped', 'cancelled']) ~ "' WHERE order_id = " ~ module.rand.number.integer(1, 20000) -%}
+    {%- set s.tables = [app.split('.')[-1]] -%}
+    {%- set s.op = 'WRITE' -%}
+  {%- elif kind == 'app_insert' -%}
+    {%- set s.sql = 'INSERT INTO ' ~ app ~ " (customer_id, status, total) VALUES (" ~ module.rand.number.integer(1, 9000) ~ ", 'open', " ~ ('%.2f' | format(module.rand.number.floating(5, 900))) ~ ')' -%}
+    {%- set s.tables = [app.split('.')[-1]] -%}
+    {%- set s.op = 'WRITE' -%}
+  {%- elif kind == 'typo' -%}
+    {%- set s.sql = module.rand.choice(['SELEC order_id FROM ' ~ app ~ ' WHERE order_id = ' ~ module.rand.number.integer(1, 20000), 'SELECT order_id, status FORM ' ~ app, 'UPDTE ' ~ app ~ " SET status = 'paid' WHERE order_id = " ~ module.rand.number.integer(1, 20000)]) -%}
+    {%- set s.code = 1064 -%}
+  {%- elif kind == 'sens_select' -%}
+    {%- set s.sql = module.rand.choice(['SELECT * FROM ' ~ target ~ ' LIMIT 100', 'SELECT * FROM ' ~ target ~ ' WHERE employee_id = ' ~ module.rand.number.integer(1, 800)]) if a.kind == 'dba' else 'SELECT * FROM ' ~ target ~ ' LIMIT 100' -%}
+    {%- if a.kind == 'dba' or granted -%}
+      {%- set s.tables = [table] -%}
+      {%- set s.tdb = sdb -%}
+    {%- else -%}
+      {%- set s.code = 1142 -%}
+    {%- endif -%}
+  {%- elif kind == 'sens_update' -%}
+    {%- if a.kind != 'dba' -%}{{- module.builtins.int('MariaDB sensitive update requires a DBA') -}}{%- endif -%}
+    {%- set s.sql = 'UPDATE ' ~ target ~ ' SET last_reviewed = CURRENT_DATE WHERE employee_id = ' ~ module.rand.number.integer(1, 800) -%}
+    {%- set s.tables = [table] -%}
+    {%- set s.tdb = sdb -%}
+    {%- set s.op = 'WRITE' -%}
+  {%- elif kind in ['grant', 'revoke'] -%}
+    {%- set y = actors[maint.y] -%}
+    {%- if (kind == 'grant' and grant is not none) or (kind == 'revoke' and (grant is none or grant.user != y.user or grant.table != table or y.cid is not none)) -%}
+      {{- module.builtins.int('MariaDB grant/revoke lifecycle precondition failed') -}}
+    {%- endif -%}
+    {%- set s.sql = ('GRANT SELECT ON ' if kind == 'grant' else 'REVOKE SELECT ON ') ~ target ~ (' TO ' if kind == 'grant' else ' FROM ') ~ "'" ~ y.user ~ "'@'" ~ y.ip ~ "'" -%}
+    {%- set s.tables = ['tables_priv', 'global_priv'] if kind == 'grant' else ['tables_priv', 'columns_priv', 'global_priv'] -%}
+    {%- set s.tdb = 'mysql' -%}
+    {%- set s.op = 'WRITE' -%}
+    {%- do shared.set('grant', {'user':y.user, 'table':table} if kind == 'grant' else none) -%}
+  {%- endif -%}
+  {%- if s.sql.encode('utf-8') | length > 512 -%}{{- module.builtins.int('MariaDB selected SQL exceeds nontruncating byte ceiling') -}}{%- endif -%}
+  {%- for tb in s.tables -%}
+    {%- do push(t, a.user, a.ip, a.cid, ctr.qid, s.op, s.tdb, tb, none) -%}
+  {%- endfor -%}
+  {%- do push(t, a.user, a.ip, a.cid, ctr.qid, 'QUERY', a.db, s.sql, s.code) -%}
+{%- endmacro -%}
+
+{%- macro ln(median, sigma) -%}{{- [1, module.rand.number.lognormal(module.math.log(median), sigma) | round | int] | max -}}{%- endmacro -%}
+
+{%- macro think(mean) -%}{{- [1, module.rand.number.exponential(1 / mean) | round | int] | max -}}{%- endmacro -%}
+
+{#- Credential failures: a first attempt fails with probability p0, each retry fails again with probability 0.4. Human logins retry up to five times and sometimes give up; maintenance logins stop at two failures. -#}
+{%- macro miss(p) -%}{{- 'y' if module.rand.number.floating(0, 1) < p else '' -}}{%- endmacro -%}
+
+{%- if not q -%}
+  {%- set pick = namespace(i=-1, t=0) -%}
+  {%- for a in actors -%}
+    {%- if a.mode != 'maint' and (pick.i < 0 or a.next < pick.t) -%}
+      {%- set pick.i = loop.index0 -%}
+      {%- set pick.t = a.next -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set ma = maint.next <= pick.t -%}
+  {%- set t = maint.next if ma else pick.t -%}
+  {%- if t <= now and ma -%}
+    {%- set ph = maint.phase -%}
+    {%- set x = actors[maint.x] if maint.x is not none else none -%}
+    {%- set y = actors[maint.y] if maint.y is not none else none -%}
+    {%- if ph == 'idle' -%}
+      {%- set episode = params.anomaly_mode and t >= shared.get('next_due') -%}
+      {%- set cand = [] -%}
+      {#- Maintenance never starts right after the DBA's own credential failures (both modes), so ordinary failure runs cannot join a grant cycle. -#}
+      {%- for xi in range(actors | length) if actors[xi].kind == 'dba' and actors[xi].mode == 'idle' and t - last_fail.get(actors[xi].user, t - 86400) >= 1800 -%}
+        {%- for yi in range(actors | length) if actors[yi].kind == 'dlg' and actors[yi].mode == 'idle' -%}
+          {%- for tb in stables if not episode or [actors[xi].user, tb] != maint.prev_episode -%}
+            {%- do cand.append([xi, yi, tb]) -%}
+          {%- endfor -%}
+        {%- endfor -%}
+      {%- endfor -%}
+      {%- if not cand -%}
+        {%- do maint.update({'next':t + think(60) | int}) -%}
+      {%- else -%}
+        {%- set c = module.rand.choice(cand) -%}
+        {%- do actors[c[0]].update({'mode':'maint'}) -%}
+        {%- do actors[c[1]].update({'mode':'maint'}) -%}
+        {%- do maint.update({'phase':'dba_login', 'next':t, 'x':c[0], 'y':c[1], 'table':c[2], 'episode':episode, 'fails':(3 if module.rand.number.floating(0, 1) < 0.7 else 4) if episode else 0, 'mfails':0}) -%}
+        {%- if episode -%}
+          {%- do maint.update({'prev_episode':[actors[c[0]].user, c[2]]}) -%}
+          {%- do shared.set('next_due', t + (params.anomaly_interval_hours * 3600) | int) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- elif ph == 'dba_login' -%}
+      {%- if maint.fails > 0 -%}
+        {%- do fail(t, x) -%}
+        {%- do maint.update({'fails':maint.fails - 1, 'next':t + ln(8, 0.5) | int}) -%}
+      {%- elif not maint.episode and maint.get('mfails', 0) < 2 and miss(0.10 if maint.get('mfails', 0) == 0 else 0.4) -%}
+        {%- do fail(t, x) -%}
+        {%- do maint.update({'mfails':maint.get('mfails', 0) + 1, 'next':t + ln(8, 0.5) | int}) -%}
+      {%- else -%}
+        {%- do connect(t, x, sdb) -%}
+        {%- do maint.update({'phase':'grant', 'mfails':0, 'next':t + ln(25, 0.9) | int}) -%}
+      {%- endif -%}
+    {%- elif ph == 'grant' -%}
+      {%- do stmt(t, x, 'grant', maint.table) -%}
+      {%- do maint.update({'phase':'dlg_login', 'next':t + ln(120, 0.6) | int}) -%}
+    {%- elif ph in ['dlg_login', 'deny_login'] -%}
+      {%- if maint.get('mfails', 0) < 2 and miss(0.08 if maint.get('mfails', 0) == 0 else 0.4) -%}
+        {%- do fail(t, y) -%}
+        {%- do maint.update({'mfails':maint.get('mfails', 0) + 1, 'next':t + ln(8, 0.5) | int}) -%}
+      {%- else -%}
+        {%- do connect(t, y, sdb if ph == 'dlg_login' else ndb) -%}
+        {%- do maint.update({'phase':'dlg_read' if ph == 'dlg_login' else 'deny_query', 'mfails':0, 'reads':1 + ([module.rand.number.exponential(1) | int, 4] | min), 'next':t + ln(25, 0.9) | int}) -%}
+      {%- endif -%}
+    {%- elif ph in ['dlg_read', 'deny_query'] -%}
+      {%- do stmt(t, y, 'sens_select', maint.table) -%}
+      {%- do maint.update({'reads':maint.reads - 1, 'next':t + ln(25, 0.9) | int}) -%}
+      {%- if ph == 'deny_query' or maint.reads <= 0 -%}
+        {%- do maint.update({'phase':'dlg_quit' if ph == 'dlg_read' else 'deny_quit'}) -%}
+      {%- endif -%}
+    {%- elif ph == 'dlg_quit' -%}
+      {%- do quit(t, y) -%}
+      {%- do maint.update({'phase':'revoke', 'next':t + ln(45, 0.6) | int}) -%}
+    {%- elif ph == 'revoke' -%}
+      {%- do stmt(t, x, 'revoke', maint.table) -%}
+      {%- do maint.update({'phase':'dba_quit', 'next':t + ln(25, 0.9) | int}) -%}
+    {%- elif ph == 'dba_quit' -%}
+      {%- do quit(t, x) -%}
+      {%- do x.update({'mode':'idle', 'next':[x.next, t + ln(300, 0.6) | int] | max}) -%}
+      {%- do maint.update({'phase':'deny_login', 'next':t + ln(200, 0.7) | int}) -%}
+    {%- elif ph == 'deny_quit' -%}
+      {%- do quit(t, y) -%}
+      {%- do y.update({'mode':'idle', 'next':[y.next, t + ln(300, 0.6) | int] | max}) -%}
+      {%- do maint.update({'phase':'idle', 'x':none, 'y':none, 'episode':false, 'next':t + ([(module.rand.number.exponential(1 / 2400) + module.rand.number.exponential(1 / 2400)) | int, 18000] | min)}) -%}
+    {%- endif -%}
+  {%- elif t <= now -%}
+    {%- set a = actors[pick.i] -%}
+    {%- if a.kind == 'pool' -%}
+      {%- if a.cid is none -%}
+        {%- if miss(0.004) -%}
+          {%- do fail(t, a) -%}
+          {%- do a.update({'next':t + ln(3, 0.5) | int}) -%}
+        {%- else -%}
+          {%- do connect(t, a, ndb) -%}
+          {%- do a.update({'expire':t + ln(1800, 0.4) | int, 'next':t + think(28) | int}) -%}
+        {%- endif -%}
+      {%- elif t >= a.expire -%}
+        {%- do quit(t, a) -%}
+        {%- do a.update({'next':t + (module.rand.number.exponential(1 / 1.5) | round | int)}) -%}
+      {%- else -%}
+        {%- do stmt(t, a, module.rand.weighted_choice({'app_select':65, 'app_update':25, 'app_insert':10}), none) -%}
+        {%- do a.update({'next':t + think(28) | int}) -%}
+      {%- endif -%}
+    {%- elif a.mode in ['idle', 'retry'] -%}
+      {%- set db = a.get('retry_db', ndb) if a.mode == 'retry' else (sdb if a.kind == 'dba' and module.rand.number.floating(0, 1) < 0.4 else ndb) -%}
+      {%- if a.get('tries', 0) < 5 and miss((0.10 if a.kind == 'dba' else 0.08) if a.mode == 'idle' else 0.4) -%}
+        {%- do fail(t, a) -%}
+        {%- if miss(0.12) -%}
+          {%- do a.update({'mode':'idle', 'tries':0, 'next':t + ln(1500, 0.8) | int}) -%}
+        {%- else -%}
+          {%- do a.update({'mode':'retry', 'retry_db':db, 'tries':a.get('tries', 0) + 1, 'next':t + ln(8, 0.5) | int}) -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- do connect(t, a, db) -%}
+        {%- do a.update({'mode':'session', 'tries':0, 'left':1 + ([module.rand.number.exponential(1 / 2.5) | int, 19] | min), 'next':t + ln(25, 0.9) | int}) -%}
+      {%- endif -%}
+    {%- elif a.left > 0 -%}
+      {%- if a.kind == 'dba' and a.db == sdb -%}
+        {%- set kind = module.rand.weighted_choice({'sens_select':60, 'sens_update':35, 'typo':5}) -%}
+      {%- elif a.kind == 'dba' -%}
+        {%- set kind = module.rand.weighted_choice({'app_select':35, 'app_update':15, 'sens_select':20, 'sens_update':15, 'report':10, 'typo':5}) -%}
+      {%- else -%}
+        {%- set kind = module.rand.weighted_choice({'report':55, 'app_select':35, 'sens_select':6, 'typo':4}) -%}
+      {%- endif -%}
+      {%- do stmt(t, a, kind, module.rand.choice(stables)) -%}
+      {%- do a.update({'left':a.left - 1, 'next':t + ln(25, 0.9) | int}) -%}
+    {%- else -%}
+      {%- do quit(t, a) -%}
+      {%- do a.update({'mode':'idle', 'next':t + ln(1800 if a.kind == 'dba' else 2400, 1.0) | int}) -%}
+    {%- endif -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set actor = params.normal_user -%}{%- set src = params.normal_ip -%}
-{%- set operation = 'CONNECT' -%}{%- set retcode = 0 -%}
-{%- set database = '' -%}{%- set object = '' -%}{%- set query_id = 0 -%}
-{%- set event_category = ['authentication'] -%}{%- set event_type = ['start'] -%}
-{%- set action = 'connect' -%}
-{%- if step == 'normal_query' -%}
-  {%- set table = samples.tables.pick() -%}
-  {%- do shared.set('normal_database', table.database) -%}
-  {%- do shared.set('normal_table', table.table) -%}
-  {%- set query_id = (shared.get('query_counter', 2000) % 2147483647) + 1 -%}
-  {%- do shared.set('query_counter', query_id) -%}{%- do shared.set('active_query', query_id) -%}
-  {%- set operation = 'QUERY' -%}{%- set database = table.database -%}
-  {%- set object = "'" ~ table.query ~ "'" -%}
-  {%- set event_category = ['database'] -%}{%- set event_type = ['info'] -%}{%- set action = 'query' -%}
-{%- elif step == 'normal_table' -%}
-  {%- set operation = 'READ' -%}{%- set database = shared.get('normal_database') -%}
-  {%- set object = shared.get('normal_table') -%}{%- set query_id = shared.get('active_query') -%}
-  {%- set event_category = ['database'] -%}{%- set event_type = ['access'] -%}{%- set action = 'table-read' -%}
-{%- elif step == 'normal_disconnect' -%}
-  {%- set operation = 'DISCONNECT' -%}{%- set event_type = ['end'] -%}{%- set action = 'disconnect' -%}
-{%- elif step in ['fail_1','fail_2','fail_3'] -%}
-  {%- set actor = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
-  {%- set operation = 'FAILED_CONNECT' -%}{%- set retcode = 1045 -%}
-  {%- set event_type = ['denied'] -%}{%- set action = 'failed-connect' -%}
-{%- elif step == 'attack_connect' -%}
-  {%- set actor = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
-{%- elif step == 'delegated_connect' -%}
-  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
-{%- elif step == 'grant_query' -%}
-  {%- set actor = params.anomaly_user -%}{%- set src = params.anomaly_ip -%}
-  {%- set query_id = (shared.get('query_counter', 2000) % 2147483647) + 1 -%}{%- do shared.set('query_counter', query_id) -%}
-  {%- set operation = 'QUERY' -%}{%- set database = 'payroll' -%}
-  {%- set object = "'GRANT SELECT ON payroll.* TO \'" ~ params.delegated_user ~ "\'@\'%\''" -%}
-  {%- set event_category = ['iam','database'] -%}{%- set event_type = ['change'] -%}{%- set action = 'grant-query' -%}
-{%- elif step == 'sensitive_query' -%}
-  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
-  {%- set query_id = (shared.get('query_counter', 2000) % 2147483647) + 1 -%}
-  {%- do shared.set('query_counter', query_id) -%}{%- do shared.set('active_query', query_id) -%}
-  {%- set operation = 'QUERY' -%}{%- set database = 'payroll' -%}
-  {%- set object = "'SELECT * FROM salaries'" -%}
-  {%- set event_category = ['database'] -%}{%- set event_type = ['info'] -%}{%- set action = 'query' -%}
-{%- elif step == 'sensitive_table' -%}
-  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
-  {%- set operation = 'READ' -%}{%- set database = 'payroll' -%}
-  {%- set object = 'salaries' -%}{%- set query_id = shared.get('active_query') -%}
-  {%- set event_category = ['database'] -%}{%- set event_type = ['access'] -%}{%- set action = 'table-read' -%}
-{%- elif step == 'attack_disconnect' -%}
-  {%- set actor = params.delegated_user -%}{%- set src = params.anomaly_ip -%}
-  {%- set operation = 'DISCONNECT' -%}{%- set event_type = ['end'] -%}{%- set action = 'disconnect' -%}
+{%- if not q or q[0].t > now -%}
+  {%- do dispatch.drop() -%}
 {%- endif -%}
-{%- set record = timestamp.strftime('%Y%m%d %H:%M:%S') ~ ',' ~ params.db_host ~ ',' ~ actor ~ ',' ~ src ~ ',' ~ conn ~ ',' ~ query_id ~ ',' ~ operation ~ ',' ~ database ~ ',' ~ object ~ ',' ~ retcode -%}
-{%- set original = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.db_host ~ ' mysql-server_auditing: ' ~ record -%}
-{%- set audit = {'serverhost':params.db_host,'username':actor,'host':src,'connectionid':conn,'queryid':query_id,'operation':operation,'database':database,'object':object,'retcode':retcode} -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':event_category,'dataset':'mariadb.audit','kind':'event','original':original,'outcome':'failure' if retcode else 'success','type':event_type},'host':{'name':params.db_host,'ip':[params.db_ip]},'log':{'syslog':{'appname':'mysql-server_auditing'}},'mariadb':{'audit':audit},'message':record,'observer':{'hostname':params.db_host,'ip':params.db_ip,'product':'MariaDB','type':'database','vendor':'MariaDB'},'related':{'ip':[src],'user':[actor]},'source':{'ip':src},'tags':['mariadb-audit','preserve_original_event'],'user':{'name':actor}} -%}
+{%- set head = q.pop(0) -%}
+{%- if q | length > 4 or last_fail | length > 9 or actors | length > 11 -%}
+  {{- module.builtins.int('MariaDB bounded state exceeded selected profile') -}}
+{%- endif -%}
+{%- set record = {'time':module.datetime.datetime.fromtimestamp(head.t, module.datetime.timezone.utc), 'username':head.username, 'ip':head.ip, 'connectionid':head.connectionid, 'queryid':head.queryid, 'operation':head.operation, 'database':head.database, 'object':head.object, 'retcode':head.retcode} -%}
+{%- set native_time = record.time.strftime('%Y%m%d %H:%M:%S') -%}
+{%- set object_wire = record.object -%}
+{%- if record.operation == 'QUERY' -%}
+  {%- set object_wire = "'" ~ record.object | replace('\\','\\\\') | replace("'","\\'") | replace('\b','\\b') | replace('\t','\\t') | replace('\n','\\n') | replace('\f','\\f') | replace('\r','\\r') ~ "'" -%}
+{%- endif -%}
+{%- set original = native_time ~ ',' ~ params.db_host ~ ',' ~ record.username ~ ',' ~ record.ip ~ ',' ~ record.connectionid ~ ',' ~ record.queryid ~ ',' ~ record.operation ~ ',' ~ record.database ~ ',' ~ object_wire ~ ',' ~ ('' if record.retcode is none else record.retcode) -%}
+{%- set category = ['authentication'] if record.operation in ['CONNECT','FAILED_CONNECT','DISCONNECT'] else ['database','iam'] if record.operation == 'QUERY' and record.object.startswith(('GRANT ','REVOKE ')) else ['database'] -%}
+{%- set event_type = ['start'] if record.operation in ['CONNECT','FAILED_CONNECT'] else ['end'] if record.operation == 'DISCONNECT' else ['error'] if record.retcode == 1064 else ['access'] if record.operation in ['READ','WRITE'] or record.object.startswith('SELECT ') else ['change'] -%}
+{%- set action = 'table-read-lock' if record.operation == 'READ' else 'table-write-lock' if record.operation == 'WRITE' else record.operation.lower().replace('_','-') -%}
+{%- set audit = {'timestamp':native_time,'serverhost':params.db_host,'username':record.username,'host':record.ip,'connectionid':record.connectionid,'queryid':record.queryid,'operation':record.operation,'database':record.database,'object':record.object,'retcode':record.retcode} -%}
+{%- set out = {'@timestamp':record.time.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':category,'dataset':'mariadb.audit','kind':'event','original':original,'outcome':'unknown' if record.retcode is none else 'failure' if record.retcode else 'success','type':event_type,'created':poll.isoformat(),'ingested':poll.isoformat()},'host':{'name':params.db_host,'ip':[params.db_ip]},'log':{'file':{'path':'/var/log/mariadb/server_audit.log'}},'mariadb':{'audit':audit},'message':original,'observer':{'hostname':params.db_host,'ip':[params.db_ip],'product':'MariaDB Community Server','type':'database','vendor':'MariaDB','version':'11.4.4'},'service':{'type':'mariadb','version':'11.4.4'},'related':{'ip':[record.ip],'user':[record.username]},'source':{'ip':record.ip},'tags':['mariadb-audit','preserve_original_event'],'user':{'name':record.username}} -%}
 {{- out | tojson -}}
