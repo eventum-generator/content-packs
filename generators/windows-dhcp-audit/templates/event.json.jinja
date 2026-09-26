@@ -1,0 +1,177 @@
+{%- set timestamp = timestamp.astimezone(module.datetime.timezone.utc) + module.datetime.timedelta(seconds=module.rand.number.integer(0, 59)) -%}
+{%- set renew_minutes = [240, params.lease_renew_minutes | int] | max -%}
+{%- set interval_seconds = ([1, params.anomaly_interval_hours | float] | max) * 3600 -%}
+{%- set step = vars.step -%}
+{%- set leases = shared.get('leases', {}) -%}
+{%- if not shared.get('initialized') -%}
+  {%- for i in range((samples.clients|length)) -%}
+    {%- set row = samples.clients[i] -%}
+    {%- set initial_due = timestamp + module.datetime.timedelta(minutes=(i * renew_minutes // (samples.clients|length)) + 1) -%}
+    {%- set row_client_id = params.anomaly_client_id if row.anomaly_target else row.client_id -%}
+    {%- set row_ip = params.anomaly_base_ip if row.anomaly_target else row.ip -%}
+    {%- set release_minutes = module.rand.number.integer(120, 1440) if row.mobile else module.rand.number.integer(1440, 10080) -%}
+    {%- do leases.update({row_client_id: {'active': true, 'ip': row_ip, 'next_ip_index': 0, 'next_due': initial_due, 'expires_at': initial_due + module.datetime.timedelta(minutes=renew_minutes), 'next_release': timestamp + module.datetime.timedelta(minutes=release_minutes)}}) -%}
+  {%- endfor -%}
+  {%- do shared.set('leases', leases) -%}
+  {%- do shared.set('anomaly_next_due', timestamp.timestamp() + interval_seconds) -%}
+  {%- do shared.set('initialized', true) -%}
+{%- endif -%}
+{%- set kind = step -%}
+{%- set hostname = params.anomaly_hostname -%}
+{%- set client_id = params.anomaly_client_id -%}
+{%- set episode_ips = shared.get('episode_ips', params.anomaly_ips) -%}
+{%- set ip = episode_ips[2] -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- set pending = shared.get('pending_dns') -%}
+  {%- if not pending -%}
+    {%- for expired_id in leases -%}
+      {%- set expired = leases[expired_id] -%}
+      {%- if expired.active and timestamp >= expired.expires_at -%}
+        {%- do leases.update({expired_id: {'active': false, 'ip': expired.ip, 'next_ip_index': (expired.next_ip_index + 1) % 4 if expired_id == params.anomaly_client_id else 0, 'next_due': timestamp, 'expires_at': none, 'next_release': none}}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set target_lease = leases[params.anomaly_client_id] -%}
+  {%- if params.anomaly_mode and timestamp.timestamp() >= shared.get('anomaly_next_due') and not pending and target_lease.active and target_lease.expires_at > timestamp + module.datetime.timedelta(minutes=2) -%}
+    {%- set available = namespace(ips=[]) -%}
+    {%- for address in [params.anomaly_base_ip] + params.anomaly_ips -%}
+      {%- if address != target_lease.ip -%}{%- do available.ips.append(address) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set cursor = shared.get('episode_cursor', 0) -%}
+    {%- do shared.set('episode_ips', available.ips[cursor:] + available.ips[:cursor]) -%}
+    {%- do shared.set('episode_cursor', (cursor + 1) % 3) -%}
+    {%- do shared.set('to_attack', true) -%}
+    {%- do dispatch.drop() -%}
+  {%- endif -%}
+  {%- if pending -%}
+    {%- set hostname = pending.hostname -%}
+    {%- set client_id = pending.client_id -%}
+    {%- set ip = pending.ip -%}
+    {%- set timestamp = pending.next_time -%}
+    {%- if pending.phase == 'request' -%}
+      {%- set kind = 'dns_request' -%}
+      {%- do shared.set('pending_dns', {'phase': 'result', 'hostname': hostname, 'client_id': client_id, 'ip': ip, 'next_time': timestamp + module.datetime.timedelta(seconds=module.rand.number.integer(1, 8))}) -%}
+    {%- else -%}
+      {%- set kind = 'dns_failed' if module.rand.chance(0.05) else 'dns_success' -%}
+      {%- do shared.pop('pending_dns') -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set selected = namespace(client=none, due=none) -%}
+    {%- for i in range((samples.clients|length)) -%}
+      {%- set candidate = samples.clients[i] -%}
+      {%- set candidate_id = params.anomaly_client_id if candidate.anomaly_target else candidate.client_id -%}
+      {%- set candidate_lease = leases[candidate_id] -%}
+      {%- set candidate_due = candidate_lease.next_release if candidate_lease.active and candidate_lease.next_release < candidate_lease.next_due else candidate_lease.next_due -%}
+      {%- if timestamp >= candidate_due and (selected.due is none or candidate_due < selected.due) -%}
+        {%- set selected.client = candidate -%}
+        {%- set selected.due = candidate_due -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if selected.client is none -%}{%- do dispatch.drop() -%}{%- endif -%}
+    {%- set client = selected.client -%}
+    {%- set hostname = params.anomaly_hostname if client.anomaly_target else client.hostname -%}
+    {%- set client_id = params.anomaly_client_id if client.anomaly_target else client.client_id -%}
+    {%- set lease = leases[client_id] -%}
+    {%- if not lease.active -%}
+      {%- set kind = 'assign' -%}
+      {%- set address_index = lease.next_ip_index -%}
+      {%- set ip = ([params.anomaly_base_ip] + params.anomaly_ips)[address_index] if client.anomaly_target else client.ip -%}
+      {%- set release_minutes = module.rand.number.integer(120, 1440) if client.mobile else module.rand.number.integer(1440, 10080) -%}
+      {%- do leases.update({client_id: {'active': true, 'ip': ip, 'next_ip_index': address_index, 'next_due': timestamp + module.datetime.timedelta(minutes=renew_minutes), 'expires_at': timestamp + module.datetime.timedelta(minutes=2 * renew_minutes), 'next_release': timestamp + module.datetime.timedelta(minutes=release_minutes)}}) -%}
+    {%- else -%}
+      {%- set ip = lease.ip -%}
+      {%- set kind = 'release' if timestamp >= lease.next_release else 'renew' -%}
+      {%- if kind == 'release' -%}
+        {%- set reconnect_minutes = module.rand.number.integer(30, 180) -%}
+        {%- do leases.update({client_id: {'active': false, 'ip': ip, 'next_ip_index': (lease.next_ip_index + 1) % 4 if client_id == params.anomaly_client_id else 0, 'next_due': timestamp + module.datetime.timedelta(minutes=reconnect_minutes), 'expires_at': none, 'next_release': none}}) -%}
+      {%- else -%}
+        {%- do leases.update({client_id: {'active': true, 'ip': ip, 'next_ip_index': lease.next_ip_index, 'next_due': timestamp + module.datetime.timedelta(minutes=renew_minutes), 'expires_at': timestamp + module.datetime.timedelta(minutes=2 * renew_minutes), 'next_release': lease.next_release}}) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if kind in ['assign', 'renew'] and module.rand.chance(0.3 if kind == 'assign' else 0.05) -%}
+      {%- do shared.set('pending_dns', {'phase': 'request', 'hostname': hostname, 'client_id': client_id, 'ip': ip, 'next_time': timestamp + module.datetime.timedelta(seconds=module.rand.number.integer(1, 8))}) -%}
+    {%- endif -%}
+    {%- do shared.set('leases', leases) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- if step == 'release_current' -%}
+    {%- set ip = leases[client_id].ip -%}
+    {%- do shared.set('anomaly_next_due', timestamp.timestamp() + interval_seconds) -%}
+  {%- elif step in ['lease_1', 'release_1'] -%}
+    {%- set ip = episode_ips[0] -%}
+  {%- elif step in ['lease_2', 'release_2'] -%}
+    {%- set ip = episode_ips[1] -%}
+  {%- endif -%}
+  {%- if step in ['dns_request', 'dns_failed'] -%}
+    {%- set timestamp = shared.get('anomaly_last_timestamp') + module.datetime.timedelta(seconds=module.rand.number.integer(1, 8)) -%}
+    {%- do shared.set('anomaly_last_timestamp', timestamp) -%}
+  {%- endif -%}
+  {%- if step in ['release_current', 'release_1', 'release_2'] -%}
+    {%- do leases.update({client_id: {'active': false, 'ip': ip, 'next_ip_index': (leases[client_id].next_ip_index + 1) % 4, 'next_due': timestamp + module.datetime.timedelta(minutes=60), 'expires_at': none, 'next_release': none}}) -%}
+  {%- elif step in ['lease_1', 'lease_2', 'lease_3'] -%}
+    {%- set address_index = ([params.anomaly_base_ip] + params.anomaly_ips).index(ip) -%}
+    {%- do leases.update({client_id: {'active': true, 'ip': ip, 'next_ip_index': address_index, 'next_due': timestamp + module.datetime.timedelta(minutes=renew_minutes), 'expires_at': timestamp + module.datetime.timedelta(minutes=2 * renew_minutes), 'next_release': timestamp + module.datetime.timedelta(minutes=module.rand.number.integer(120, 1440))}}) -%}
+    {%- if step == 'lease_3' -%}{%- do shared.set('anomaly_last_timestamp', timestamp) -%}{%- endif -%}
+  {%- elif step == 'dns_failed' -%}
+    {%- do shared.pop('episode_ips') -%}
+    {%- do shared.pop('anomaly_last_timestamp') -%}
+  {%- endif -%}
+  {%- do shared.set('leases', leases) -%}
+{%- endif -%}
+{%- set code = '10' -%}
+{%- set label = 'Assign' -%}
+{%- set action = 'dhcp-new' -%}
+{%- set reason = 'A new IP address was leased to a client.' -%}
+{%- set outcome = 'success' -%}
+{%- if kind in ['release', 'release_current', 'release_1', 'release_2'] -%}
+  {%- set code = '12' -%}
+  {%- set label = 'Release' -%}
+  {%- set action = 'dhcp-release' -%}
+  {%- set reason = 'A lease was released by a client.' -%}
+{%- elif kind == 'renew' -%}
+  {%- set code = '11' -%}
+  {%- set label = 'Renew' -%}
+  {%- set action = 'dhcp-renew' -%}
+  {%- set reason = 'A lease was renewed by a client.' -%}
+{%- elif kind == 'dns_request' -%}
+  {%- set code = '30' -%}
+  {%- set label = 'DNS Update Request' -%}
+  {%- set action = 'dhcp-dns-update' -%}
+  {%- set reason = 'DNS update request to the named DNS server.' -%}
+{%- elif kind == 'dns_success' -%}
+  {%- set code = '32' -%}
+  {%- set label = 'DNS Update Successful' -%}
+  {%- set action = 'dhcp-dns-update' -%}
+  {%- set reason = 'DNS update successful.' -%}
+{%- elif kind == 'dns_failed' -%}
+  {%- set code = '31' -%}
+  {%- set label = 'DNS Update Failed' -%}
+  {%- set action = 'dhcp-dns-update' -%}
+  {%- set reason = 'DNS update failed.' -%}
+  {%- set outcome = 'failure' -%}
+{%- endif -%}
+{%- set dns = code in ['30', '31', '32'] -%}
+{%- set vendor = code in ['10', '11'] -%}
+{%- set txid = '0' if dns else (module.rand.number.integer(1, 4294967295) | string) -%}
+{%- set result = '6' if dns else '0' -%}
+{%- set error = '10054' if code == '31' else '0' -%}
+{%- set date = timestamp.strftime('%m/%d/%y') -%}
+{%- set time = timestamp.strftime('%H:%M:%S') -%}
+{%- set line = [code, date, time, label, ip, hostname, '' if dns else client_id, '', txid, result, '', '', '', '0x4D53465420352E30' if vendor else '', 'MSFT 5.0' if vendor else '', '', '', '', error] | join(',') -%}
+{%- set day = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'][timestamp.weekday()] -%}
+{%- set path = 'C:\\Windows\\System32\\Dhcp\\DhcpSrvLog-' ~ day ~ '.log' -%}
+{%- set offset = shared.get('offset', 0) if shared.get('log_date') == date else 0 -%}
+{%- do shared.set('offset', offset + line|length + 2) -%}
+{%- do shared.set('log_date', date) -%}
+{%- set source = {'address': hostname, 'domain': hostname, 'ip': ip} -%}
+{%- if not dns -%}
+  {%- set mac = client_id[0:2] ~ '-' ~ client_id[2:4] ~ '-' ~ client_id[4:6] ~ '-' ~ client_id[6:8] ~ '-' ~ client_id[8:10] ~ '-' ~ client_id[10:12] -%}
+  {%- do source.update({'mac': mac}) -%}
+{%- endif -%}
+{%- set dhcp = {'transaction_id': txid, 'result': result, 'result_description': 'No Quarantine Information' if dns else 'NoQuarantine', 'dns_error_code': error} -%}
+{%- if vendor -%}
+  {%- do dhcp.update({'vendor': {'hex': '0x4D53465420352E30', 'string': 'MSFT 5.0'}}) -%}
+{%- endif -%}
+{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':['network'],'code':code,'agent_id_status':'verified','ingested':timestamp.isoformat(),'dataset':'microsoft_dhcp.log','kind':'event','original':line,'outcome':outcome,'reason':reason,'timezone':'UTC','type':['connection'] if dns else ['allowed','connection']},'microsoft':{'dhcp':dhcp},'agent':{'ephemeral_id':'a1b2c3d4-1111-4444-8888-123456789abc','id':'a1b2c3d4-1111-4444-8888-123456789abc','name':params.server_name,'type':'filebeat','version':'8.17.0'},'elastic_agent':{'id':'a1b2c3d4-1111-4444-8888-123456789abc','snapshot':false,'version':'8.17.0'},'data_stream':{'dataset':'microsoft_dhcp.log','namespace':'default','type':'logs'},'host':{'name':params.server_name,'ip':[params.server_ip],'mac':['02-42-AC-11-00-10']},'input':{'type':'log'},'log':{'file':{'path':path},'offset':offset},'message':label,'observer':{'hostname':params.server_name,'ip':[params.server_ip],'mac':['02-42-AC-11-00-10']},'source':source,'related':{'ip':[ip],'hosts':[hostname]},'tags':['preserve_original_event','microsoft_dhcp']} -%}
+{{- out | tojson -}}
