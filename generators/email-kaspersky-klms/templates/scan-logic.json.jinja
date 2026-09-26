@@ -1,67 +1,158 @@
+{#- KLMS ScanLogic MA and AV exports. The input yields two timestamps per
+    second: the first render may export the MA record of the earliest due
+    message, the second exports the AV record of that same message. Every
+    other render is dropped. -#}
 {%- macro cef_extension(value) -%}
 {{- value | string | replace('\\', '\\\\') | replace('=', '\\=') | replace('\n', '\\n') | replace('\r', '\\r') -}}
 {%- endmacro -%}
 {%- macro cef_header(value) -%}
 {{- value | string | replace('\\', '\\\\') | replace('|', '\\|') -}}
 {%- endmacro -%}
-{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set now = utc.timestamp() -%}
-{%- set interval = ([1, params.anomaly_interval_hours | float] | max) * 3600 -%}
-{%- if shared.get('next_anomaly') is none -%}
-  {%- do shared.set('next_anomaly', now + interval) -%}
-  {%- do shared.set('next_special_failure', now + 1200) -%}
+{%- set tz = module.datetime.timezone.utc -%}
+{%- set now = timestamp.astimezone(tz).timestamp() | int -%}
+{%- set num = module.rand.number -%}
+{%- set rand = module.rand -%}
+{%- set ln = module.math.log -%}
+{%- set window = 180 -%}
+{%- set amplitude = 0.4 -%}
+{%- set interval = (([1, params.anomaly_interval_hours | float] | max) * 3600) | int -%}
+{%- set PPP = ['Pass', 'Pass', 'Pass'] -%}
+{%- set FFF = ['Fail', 'Fail', 'Fail'] -%}
+{%- set FPP = ['Fail', 'Pass', 'Pass'] -%}
+{%- set PFP = ['Pass', 'Fail', 'Pass'] -%}
+{#- Per sender kind: diurnal human-driven traffic, messages per session,
+    in-session gap log-normal (median s, sigma), share of sessions that
+    address one recipient, SPF/DKIM/DMARC tuples with weights, share of
+    messages keeping the session tuple, infection chance of the first and
+    of later messages, and size
+    log-normal. -#}
+{%- set kinds = {
+  'partner': {'diurnal': true, 'k': [[1, 2, 3, 4], [70, 20, 7, 3]], 'gap': [2.5, 0.8], 'single': 0.7,
+    'tuples': [[PPP, FPP, PFP, FFF], [93, 3, 3.5, 0.5]], 'stick': 0.97, 'infected': [0.002, 0.002], 'size': [10.3, 1.1]},
+  'bulk': {'diurnal': true, 'k': [[4, 5, 6, 7, 8, 9, 10], [10, 14, 17, 17, 16, 14, 12]], 'gap': [2.5, 0.8], 'single': 0.0,
+    'tuples': [[PPP, PFP, FPP], [90, 6, 4]], 'stick': 0.97, 'infected': [0.0, 0.0], 'size': [10.8, 0.5]},
+  'notify': {'diurnal': true, 'k': [[1, 2, 3], [75, 18, 7]], 'gap': [2.5, 0.8], 'single': 0.8,
+    'tuples': [[PPP, FPP], [90, 10]], 'stick': 0.97, 'infected': [0.0, 0.0], 'size': [9.0, 0.6]},
+  'forwarder': {'diurnal': true, 'k': [[1, 2, 3, 4], [60, 25, 10, 5]], 'gap': [3, 0.8], 'single': 0.5,
+    'tuples': [[FPP, FFF, PPP], [50, 35, 15]], 'stick': 0.97, 'infected': [0.004, 0.004], 'size': [9.8, 0.9]},
+  'spoof': {'diurnal': false, 'k': [[1, 2, 3, 4, 5, 6], [55, 25, 11, 5, 3, 1]], 'gap': [35, 1.0], 'single': 0.6,
+    'tuples': [[FFF, FPP, PFP], [85, 10, 5]], 'stick': 0.85, 'infected': [0.04, 0.22], 'size': [9.6, 0.8]}} -%}
+{%- if shared.get('actors') is none -%}
+  {%- set actors = [] -%}
+  {%- for row in samples.senders -%}
+    {%- set diurnal = kinds[row.kind].diurnal -%}
+    {%- set peak = row.sessions_per_day / 86400 * ((1 + amplitude) if diurnal else 1) -%}
+    {%- do actors.append({'relay': row.relay, 'sender': row.sender, 'kind': row.kind, 'peak': peak,
+      'next': now + 1 + (num.exponential(peak) | int)}) -%}
+  {%- endfor -%}
+  {%- set mailboxes = samples.recipients | map(attribute='mailbox') | list -%}
+  {%- do shared.update({'actors': actors, 'mailboxes': mailboxes,
+    'weights': samples.recipients | map(attribute='weight') | list,
+    'lure_weights': samples.recipients | map(attribute='lure_weight') | list,
+    'targets': samples.recipients | selectattr('episode') | map(attribute='mailbox') | list,
+    'queue': [], 'seq': 0, 'flows': {}, 'pending': none, 'phase': 0,
+    'next_episode': now + interval, 'last_episode': [none, none]}) -%}
 {%- endif -%}
-{%- set message = shared.get('pending_message') -%}
-{%- set av = message is not none -%}
-{%- if not av -%}
-  {%- if params.anomaly_mode and shared.get('chain_step') is none and now >= shared.get('next_anomaly') -%}
-    {%- do shared.set('chain_step', 0) -%}
-    {%- do shared.set('next_anomaly', now + interval) -%}
-    {%- do shared.set('next_special_failure', now + 1200) -%}
+{%- set phase = shared.get('phase') -%}
+{%- do shared.set('phase', 1 - phase) -%}
+{%- if phase == 1 -%}
+  {%- set message = shared.get('pending') -%}
+  {%- if message is none -%}
+    {%- do dispatch.drop() -%}
   {%- endif -%}
-  {%- set step = shared.get('chain_step') -%}
-  {%- set in_chain = step is not none -%}
-  {%- set failures = shared.get('actor_failures', {}) -%}
-  {%- set target_key = params.unusual_relay_ip ~ ':' ~ params.unusual_sender -%}
-  {%- set special = not in_chain and now >= shared.get('next_special_failure') and now - failures.get(target_key, -1200) >= 1200 -%}
-  {%- set actors = [
-    ['198.51.100.11', 'news@partner.example.test'],
-    ['198.51.100.12', 'alerts@vendor.example.test'],
-    ['198.51.100.13', 'orders@shop.example.test'],
-    [params.unusual_relay_ip, params.unusual_sender]] -%}
-  {%- set actor = actors[3] if in_chain or special else module.rand.weighted_choice(actors, [30, 30, 25, 15]) -%}
-  {%- set relay_ip = actor[0] -%}
-  {%- set sender = actor[1] -%}
-  {%- set recipient = params.target_recipient if in_chain or special else module.rand.choice(['ops@example.test', 'support@example.test', 'sales@example.test', params.target_recipient]) -%}
-  {%- set actor_key = relay_ip ~ ':' ~ sender -%}
-  {%- set failed = in_chain or special or (now - failures.get(actor_key, -1200) >= 1200 and module.rand.chance(0.07)) -%}
-  {%- set verdicts = ['Pass', 'Pass', 'Pass'] -%}
-  {%- if failed -%}
-    {%- set verdicts = ['Fail', 'Fail', 'Fail'] if in_chain or special else module.rand.weighted_choice([['Fail', 'Fail', 'Fail'], ['Fail', 'Pass', 'Pass'], ['Pass', 'Fail', 'Pass']], [35, 35, 30]) -%}
-    {%- do failures.update({actor_key: now}) -%}
-    {%- do shared.set('actor_failures', failures) -%}
-  {%- endif -%}
-  {%- set infected = in_chain and step == 2 -%}
-  {%- if special -%}
-    {%- set cursor = shared.get('special_cursor', 0) -%}
-    {%- set infected = cursor == 3 -%}
-    {%- do shared.set('special_cursor', (cursor + 1) % 4) -%}
-    {%- do shared.set('next_special_failure', now + 1200) -%}
-  {%- elif not in_chain -%}
-    {%- set infected = module.rand.chance(0.08) -%}
-  {%- endif -%}
-  {%- set message = {'id': module.rand.string.hex(16), 'relay': relay_ip, 'sender': sender, 'recipient': recipient,
-    'size': module.rand.number.clamp(module.rand.number.lognormal(10, 1.2) | int, 500, 30000000),
-    'time': utc, 'verdicts': verdicts, 'infected': infected, 'chain_step': step} -%}
-  {%- do shared.set('pending_message', message) -%}
+  {%- do shared.set('pending', none) -%}
+  {%- set av = true -%}
 {%- else -%}
-  {%- set utc = message.time -%}
-  {%- do shared.pop('pending_message') -%}
-  {%- if message.chain_step is not none -%}
-    {%- if message.chain_step == 2 -%}{%- do shared.pop('chain_step') -%}
-    {%- else -%}{%- do shared.set('chain_step', message.chain_step + 1) -%}{%- endif -%}
+  {%- set queue = shared.get('queue') -%}
+  {%- set counter = namespace(seq=shared.get('seq'), added=false) -%}
+  {#- Sender sessions: independent Poisson starts per sender, thinned by a
+      diurnal profile for human-driven kinds. -#}
+  {%- for actor in shared.get('actors') if actor.next <= now -%}
+    {%- set kind = kinds[actor.kind] -%}
+    {%- set hour = (now % 86400) / 3600 -%}
+    {%- set level = 1 + amplitude * module.math.cos(2 * module.math.pi * (hour - 13) / 24) -%}
+    {%- do actor.update({'next': now + 1 + (num.exponential(actor.peak) | int)}) -%}
+    {%- if not kind.diurnal or rand.chance(level / (1 + amplitude)) -%}
+      {%- set k = rand.weighted_choice(kind.k[0], kind.k[1]) -%}
+      {%- set weights = shared.get('lure_weights') if actor.kind == 'spoof' else shared.get('weights') -%}
+      {%- set single = rand.chance(kind.single) -%}
+      {%- set first = rand.weighted_choice(shared.get('mailboxes'), weights) -%}
+      {%- set spread = rand.shuffle(shared.get('mailboxes')) -%}
+      {%- set base = rand.weighted_choice(kind.tuples[0], kind.tuples[1]) -%}
+      {%- set clock = namespace(t=now) -%}
+      {%- for i in range(k) -%}
+        {%- if i > 0 -%}
+          {%- set clock.t = clock.t + ([1, num.lognormal(ln(kind.gap[0]), kind.gap[1]) | round | int] | max) -%}
+        {%- endif -%}
+        {%- if actor.kind == 'bulk' -%}
+          {%- set recipient = spread[i % (spread | length)] -%}
+        {%- elif single or i == 0 -%}
+          {%- set recipient = first -%}
+        {%- else -%}
+          {%- set recipient = rand.weighted_choice(shared.get('mailboxes'), weights) -%}
+        {%- endif -%}
+        {%- set verdicts = base if rand.chance(kind.stick) else rand.weighted_choice(kind.tuples[0], kind.tuples[1]) -%}
+        {%- set counter.seq = counter.seq + 1 -%}
+        {%- do queue.append({'t': clock.t, 'seq': counter.seq, 'relay': actor.relay, 'sender': actor.sender,
+          'recipient': recipient, 'kind': actor.kind, 'verdicts': verdicts, 'idx': i, 'episode': false}) -%}
+      {%- endfor -%}
+      {%- set counter.added = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- Episode: once due, it starts after a random 1-30 minute delay and
+      sends three all-fail messages from one spoofing sender to one
+      high-value mailbox within the window, the third infected. The next
+      episode is due one interval after this actual start. Background
+      schedules are not touched. -#}
+  {%- if params.anomaly_mode and now >= shared.get('next_episode') -%}
+    {%- set last = shared.get('last_episode') -%}
+    {%- set pool = shared.get('actors') | selectattr('kind', 'equalto', 'spoof') | rejectattr('sender', 'equalto', last[0]) | list -%}
+    {%- set actor = rand.choice(pool) -%}
+    {%- set recipient = rand.choice(shared.get('targets') | reject('equalto', last[1]) | list) -%}
+    {%- set begin = now + num.integer(60, 1800) -%}
+    {%- set gaps = namespace(a=0, b=0) -%}
+    {%- for _ in range(1000) -%}
+      {%- set gaps.a = [1, num.lognormal(ln(35), 1.0) | round | int] | max -%}
+      {%- set gaps.b = [1, num.lognormal(ln(35), 1.0) | round | int] | max -%}
+      {%- if gaps.a + gaps.b <= window - 10 -%}{%- break -%}{%- endif -%}
+    {%- endfor -%}
+    {%- for offset in [0, gaps.a, gaps.a + gaps.b] -%}
+      {%- set counter.seq = counter.seq + 1 -%}
+      {%- do queue.append({'t': begin + offset, 'seq': counter.seq, 'relay': actor.relay, 'sender': actor.sender,
+        'recipient': recipient, 'kind': 'spoof', 'verdicts': FFF, 'episode': true, 'infected': loop.last}) -%}
+    {%- endfor -%}
+    {%- set counter.added = true -%}
+    {%- do shared.update({'next_episode': begin + interval, 'last_episode': [actor.sender, recipient]}) -%}
   {%- endif -%}
+  {%- if counter.added -%}
+    {%- set queue = queue | sort(attribute='t,seq') -%}
+    {%- do shared.update({'queue': queue, 'seq': counter.seq}) -%}
+  {%- endif -%}
+  {%- if not queue or queue[0].t > now -%}
+    {%- do dispatch.drop() -%}
+  {%- endif -%}
+  {%- set message = queue.pop(0) -%}
+  {%- set kind = kinds[message.kind] -%}
+  {%- set allfail = message.verdicts == FFF -%}
+  {%- set key = message.relay ~ '|' ~ message.sender ~ '|' ~ message.recipient -%}
+  {%- set flows = shared.get('flows') -%}
+  {%- set recent = flows.get(key, []) | selectattr(0, 'ge', message.t - window) | list -%}
+  {%- if not message.episode -%}
+    {%- set infected = rand.chance(kind.infected[0 if message.idx == 0 else 1]) -%}
+    {#- Ordinary traffic never completes the exact episode shape. -#}
+    {%- if infected and allfail and recent | selectattr(1) | rejectattr(2) | list | length >= 2 -%}
+      {%- set infected = false -%}
+    {%- endif -%}
+    {%- do message.update({'infected': infected}) -%}
+  {%- endif -%}
+  {%- do recent.append([message.t, allfail, message.infected]) -%}
+  {%- do flows.update({key: recent}) -%}
+  {%- set size = num.lognormal(11.6, 0.7) if message.infected else num.lognormal(kind.size[0], kind.size[1]) -%}
+  {%- do message.update({'id': rand.string.hex(16), 'size': num.clamp(size | int, 500, 30000000)}) -%}
+  {%- do shared.set('pending', message) -%}
+  {%- set av = false -%}
 {%- endif -%}
+{%- set utc = module.datetime.datetime.fromtimestamp(message.t, tz) -%}
 {%- set failed = 'Fail' in message.verdicts -%}
 {%- set class_id = 'LMS_EV_SCAN_LOGIC_AV_STATUS' if av else 'LMS_EV_SCAN_LOGIC_MA_STATUS' -%}
 {%- set name = 'antivirus scan status' if av else 'mail authentication status' -%}
