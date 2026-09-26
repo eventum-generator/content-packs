@@ -1,0 +1,161 @@
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set step = vars.step -%}
+{%- set kind = step -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- do shared.pop('to_maintenance', none) -%}
+  {%- do shared.pop('to_restore', none) -%}
+  {%- set count = (shared.get('routine_count', 0) % 1000000) + 1 -%}
+  {%- do shared.set('routine_count', count) -%}
+  {%- set now = utc.timestamp() -%}
+  {%- if shared.get('restore_due') is not none and now >= shared.get('restore_due') -%}
+    {%- do shared.set('to_restore', true) -%}
+  {%- endif -%}
+  {%- if count >= params.maintenance_after_events and not shared.get('maintenance_done', false) and not shared.get('acl_open', false) and not shared.get('to_restore', false) -%}
+    {%- do shared.set('to_maintenance', true) -%}
+    {%- do shared.set('maintenance_done', true) -%}
+  {%- endif -%}
+  {%- if params.anomaly_mode -%}
+    {%- set interval = [params.anomaly_interval_hours | float, 0.5] | max * 3600 -%}
+    {%- set due = shared.get('next_attack_epoch', now + interval) -%}
+    {%- if now >= due and not shared.get('acl_open', false) and not shared.get('to_restore', false) and not shared.get('to_maintenance', false) -%}
+      {%- do shared.set('to_attack', true) -%}
+      {%- do shared.set('next_attack_epoch', now + interval) -%}
+    {%- else -%}
+      {%- do shared.set('next_attack_epoch', due) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set kind = module.rand.weighted_choice(['acl_traffic','login_normal','login_fail_normal','command_acl_normal','command_permit_normal','config_normal','line'],[968,10,8,4,4,5,1]) -%}
+{%- endif -%}
+{%- set seq = (shared.get('sequence', 100000) % 2147483647) + 1 -%}
+{%- do shared.set('sequence', seq) -%}
+{%- set facility = 'SEC' -%}
+{%- set severity = 6 -%}
+{%- set code = 'IPACCESSLOGP' -%}
+{%- set action = 'acl-deny' -%}
+{%- set outcome = none -%}
+{%- set category = ['network'] -%}
+{%- set event_type = ['connection','denied'] -%}
+{%- set extra = {} -%}
+{%- set msg = '' -%}
+{%- if kind in ['acl_traffic','blocked_flow','permitted_flow','maintenance_flow','maintenance_denied','restore_denied'] -%}
+  {%- set scenario_flow = kind != 'acl_traffic' -%}
+  {%- set flow = none if scenario_flow else samples.flows.pick() -%}
+  {%- set controlled_sample = not scenario_flow and flow.controlled -%}
+  {%- set src = params.anomaly_source_ip if scenario_flow or controlled_sample else flow.source_ip -%}
+  {%- set dst = params.anomaly_target_ip if scenario_flow or controlled_sample else flow.destination_ip -%}
+  {%- set dport = 443 if scenario_flow else flow.destination_port -%}
+  {%- if kind == 'blocked_flow' -%}
+    {%- set episode = (shared.get('episode', 0) % 10000) + 1 -%}
+    {%- do shared.set('episode', episode) -%}
+    {%- do shared.set('chain_port', 55222 + episode % 10000) -%}
+  {%- endif -%}
+  {%- set sport = (shared.get('chain_port', 55222) if kind in ['blocked_flow','permitted_flow','restore_denied'] else shared.get('maintenance_port', 55222)) if scenario_flow else module.rand.number.integer(flow.source_port, 65535) -%}
+  {%- set acl = params.acl_name if scenario_flow or controlled_sample else module.rand.weighted_choice(['EDGE_FILTER',params.acl_name],[7,3]) -%}
+  {%- set controlled_flow = src == params.anomaly_source_ip and dst == params.anomaly_target_ip and dport == 443 and acl == params.acl_name -%}
+  {%- set permitted = kind in ['permitted_flow','maintenance_flow'] or (kind == 'acl_traffic' and (shared.get('acl_open', false) if controlled_flow else dport == 443)) -%}
+  {%- set action = 'acl-permit' if permitted else 'acl-deny' -%}
+  {%- set outcome = 'success' if permitted else 'failure' -%}
+  {%- set event_type = ['connection','allowed'] if permitted else ['connection','denied'] -%}
+  {%- set recent = [] -%}
+  {%- set recent_keys = [] -%}
+  {%- set now = utc.timestamp() -%}
+  {%- for item in shared.get('acl_recent', [])[-128:] -%}
+    {%- if 0 <= now - item[1] < 300 -%}
+      {%- do recent.append(item) -%}
+      {%- do recent_keys.append(item[0]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set selection = namespace(port=sport) -%}
+  {%- for attempt in range(129) -%}
+    {%- set key = [acl, permitted, src, selection.port, dst, dport] -%}
+    {%- set inverse_key = [acl, not permitted, src, selection.port, dst, dport] -%}
+    {%- if key not in recent_keys and (kind not in ['blocked_flow','maintenance_flow'] or inverse_key not in recent_keys) -%}
+      {%- break -%}
+    {%- endif -%}
+    {%- set selection.port = 55222 + (selection.port - 55222 + 1) % 10314 -%}
+  {%- endfor -%}
+  {%- set sport = selection.port -%}
+  {%- do recent.append([[acl, permitted, src, sport, dst, dport], now]) -%}
+  {%- do shared.set('acl_recent', recent[-128:]) -%}
+  {%- if kind == 'blocked_flow' -%}
+    {%- do shared.set('chain_port', sport) -%}
+  {%- elif kind == 'maintenance_flow' -%}
+    {%- do shared.set('maintenance_port', sport) -%}
+  {%- elif kind == 'maintenance_denied' -%}
+    {%- do shared.pop('maintenance_port', none) -%}
+  {%- endif -%}
+  {%- set msg = 'list ' ~ acl ~ ' ' ~ ('permitted' if permitted else 'denied') ~ ' tcp ' ~ src ~ '(' ~ sport ~ ') -> ' ~ dst ~ '(' ~ dport ~ '), 1 packet' -%}
+  {%- if kind == 'permitted_flow' -%}
+    {%- do shared.set('restore_due', utc.timestamp() + 600) -%}
+  {%- elif kind == 'restore_denied' -%}
+    {%- do shared.pop('restore_due', none) -%}
+    {%- do shared.pop('chain_port', none) -%}
+  {%- endif -%}
+  {%- do extra.update({'source':{'address':src,'ip':src,'port':sport},'destination':{'address':dst,'ip':dst,'port':dport},'network':{'transport':'tcp'},'related':{'ip':[src,dst]},'cisco':{'ios':{'access_list':acl}}}) -%}
+{%- elif kind in ['login_fail_1','login_fail_2','login_fail_3','login_success','login_normal','login_fail_normal'] -%}
+  {%- set bad = kind.startswith('login_fail') -%}
+  {%- set routine = kind in ['login_normal','login_fail_normal'] -%}
+  {%- set actor = module.rand.weighted_choice([params.normal_user,params.anomaly_user],[8,2]) if routine else params.anomaly_user -%}
+  {%- set src = (params.normal_source_ip if actor == params.normal_user else params.anomaly_source_ip) if routine else params.anomaly_source_ip -%}
+  {%- set facility = 'SEC_LOGIN' -%}
+  {%- set severity = 4 if bad else 5 -%}
+  {%- set code = 'LOGIN_FAILED' if bad else 'LOGIN_SUCCESS' -%}
+  {%- set action = 'login-failed' if bad else 'login-success' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start','denied'] if bad else ['start','allowed'] -%}
+  {%- set outcome = 'failure' if bad else 'success' -%}
+  {%- set msg = ('Login failed' if bad else 'Login Success') ~ ' [user: ' ~ actor ~ '] [Source: ' ~ src ~ '] [localport: 22]' ~ (' [Reason: Login Authentication Failed]' if bad else '') ~ ' at ' ~ utc.strftime('%H:%M:%S UTC %a %b ') ~ utc.day ~ utc.strftime(' %Y') -%}
+  {%- do extra.update({'user':{'name':actor},'source':{'address':src,'ip':src,'user':{'name':actor}},'destination':{'ip':params.router_ip,'port':22},'related':{'ip':[src,params.router_ip],'user':[actor]},'cisco':{'ios':{'action':'Login'}}}) -%}
+{%- elif kind in ['command_acl','command_permit','command_acl_normal','command_permit_normal','maintenance_acl','maintenance_permit','maintenance_reenter_acl','maintenance_revoke','restore_acl','restore_revoke'] -%}
+  {%- set facility = 'PARSER' -%}
+  {%- set severity = 5 -%}
+  {%- set code = 'CFGLOG_LOGGEDCMD' -%}
+  {%- set action = 'configuration-command' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- set actor = params.normal_user if kind.startswith('restore_') or kind in ['maintenance_reenter_acl','maintenance_revoke'] else (module.rand.weighted_choice([params.normal_user,params.anomaly_user],[8,2]) if kind.endswith('_normal') else params.anomaly_user) -%}
+  {%- if kind in ['command_acl','command_acl_normal','maintenance_acl','maintenance_reenter_acl','restore_acl'] -%}
+    {%- set command = 'ip access-list extended ' ~ params.acl_name -%}
+  {%- elif kind == 'command_permit_normal' -%}
+    {%- set command = '30 permit tcp host ' ~ params.normal_source_ip ~ ' host 10.50.2.20 eq 443 log' -%}
+  {%- elif kind in ['maintenance_revoke','restore_revoke'] -%}
+    {%- set command = 'no permit tcp host ' ~ params.anomaly_source_ip ~ ' host ' ~ params.anomaly_target_ip ~ ' eq 443 log' -%}
+    {%- do shared.set('acl_open', false) -%}
+  {%- else -%}
+    {%- set command = '50 permit tcp host ' ~ params.anomaly_source_ip ~ ' host ' ~ params.anomaly_target_ip ~ ' eq 443 log' -%}
+    {%- do shared.set('acl_open', true) -%}
+  {%- endif -%}
+  {%- set msg = 'User:' ~ actor ~ '  logged command:' ~ command -%}
+  {%- do extra.update({'user':{'name':actor},'related':{'user':[actor]},'cisco':{'ios':{'command':command,'access_list':params.acl_name}}}) -%}
+{%- elif kind in ['config_normal','config_saved','maintenance_change','maintenance_closed','restore_change'] -%}
+  {%- set actor = params.normal_user if kind in ['restore_change','maintenance_closed'] else (module.rand.weighted_choice([params.normal_user,params.anomaly_user],[8,2]) if kind == 'config_normal' else params.anomaly_user) -%}
+  {%- set src = params.normal_source_ip if actor == params.normal_user else params.anomaly_source_ip -%}
+  {%- set facility = 'SYS' -%}
+  {%- set severity = 5 -%}
+  {%- set code = 'CONFIG_I' -%}
+  {%- set action = 'configuration-changed' -%}
+  {%- set category = ['configuration'] -%}
+  {%- set event_type = ['change'] -%}
+  {%- set msg = 'Configured from console by ' ~ actor ~ ' on vty0 (' ~ src ~ ')' -%}
+  {%- do extra.update({'user':{'name':actor},'source':{'address':src,'ip':src},'related':{'ip':[src],'user':[actor]}}) -%}
+{%- else -%}
+  {%- set facility = 'LINEPROTO' -%}
+  {%- set severity = 5 -%}
+  {%- set code = 'UPDOWN' -%}
+  {%- set line_up = not shared.get('line_up', true) -%}
+  {%- do shared.set('line_up', line_up) -%}
+  {%- set action = 'line-protocol-up' if line_up else 'line-protocol-down' -%}
+  {%- set event_type = ['info'] -%}
+  {%- set msg = 'Line protocol on Interface GigabitEthernet0/1, changed state to ' ~ ('up' if line_up else 'down') -%}
+{%- endif -%}
+{%- set body = '%' ~ facility ~ '-' ~ severity ~ '-' ~ code ~ ': ' ~ msg -%}
+{%- set device_date = utc.strftime('%b') ~ ' ' ~ (' ' if utc.day < 10 else '') ~ utc.day ~ utc.strftime(' %Y %H:%M:%S.%f')[:-3] ~ ' UTC' -%}
+{%- set priority = 184 + severity -%}
+{%- set original = '<' ~ priority ~ '>' ~ seq ~ ': ' ~ device_date ~ ': ' ~ body -%}
+{%- set event = {'action':action,'category':category,'code':code,'agent_id_status':'verified','ingested':utc.isoformat(),'timezone':'+00:00','dataset':'cisco_ios.log','kind':'event','original':original,'provider':'firewall','sequence':seq,'severity':severity,'type':event_type} -%}
+{%- if outcome is not none -%}{%- do event.update({'outcome':outcome}) -%}{%- endif -%}
+{%- set out = {'@timestamp':utc.isoformat(),'ecs':{'version':'8.17.0'},'event':event,'agent':{'ephemeral_id':'c0ffee00-1111-4444-8888-123456789abc','id':'c0ffee00-1111-4444-8888-123456789abc','name':'syslog-collector','type':'filebeat','version':'8.17.0'},'elastic_agent':{'id':'c0ffee00-1111-4444-8888-123456789abc','snapshot':false,'version':'8.17.0'},'cisco':{'ios':{'facility':facility,'message_count':seq}},'data_stream':{'dataset':'cisco_ios.log','namespace':'default','type':'logs'},'input':{'type':'tcp'},'log':{'level':'warning' if severity == 4 else ('notification' if severity == 5 else 'informational'),'source':{'address':params.router_ip ~ ':49152'},'syslog':{'priority':priority}},'message':msg,'observer':{'hostname':params.router_name,'ip':params.router_ip,'product':'IOS','type':'router','vendor':'Cisco'},'tags':['preserve_original_event','cisco-ios','forwarded']} -%}
+{%- if extra.cisco is defined -%}{%- do out.cisco.ios.update(extra.pop('cisco').ios) -%}{%- endif -%}
+{%- do out.update(extra) -%}
+{{- out | tojson -}}
