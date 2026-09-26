@@ -1,0 +1,103 @@
+{# One source, one current workflow, fixed inventory, no event history. #}
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = utc.timestamp() | int -%}
+{%- set interval = ((params.anomaly_interval_hours | float, 1) | max, 8760) | min -%}
+{%- if shared.get('users') is none -%}
+  {%- set users = [] -%}
+  {%- for i in range(samples.users | length) -%}
+    {%- set row = samples.users[i] -%}
+    {%- set name = params.attack_user if i == 8 else (params.granted_principal.split('\\')[-1] if i == 1 else row.name) -%}
+    {%- do users.append({'name': params.granted_principal if i == 1 else params.domain ~ '\\' ~ name, 'ip': params.attack_ip if i == 8 else row.ip, 'administrator': row.administrator, 'user_agent': row.user_agent}) -%}
+  {%- endfor -%}
+  {%- set vms = [] -%}
+  {%- for i in range(samples.vms | length) -%}
+    {%- set row = samples.vms[i] -%}
+    {%- do vms.append({'name': params.critical_vm if i == 0 else row.name, 'host': row.host, 'powered_on': true, 'cbt_enabled': true}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'users': users, 'vms': vms, 'sessions': {}, 'grant': false, 'workflow': [], 'next_episode': now + (interval * 3600) | int, 'episodes': 0, 'ordinary_cursor': 0, 'last_failure': now - 900, 'event_key': 575791}) -%}
+{%- endif -%}
+{%- set users = shared.get('users') -%}
+{%- set vms = shared.get('vms') -%}
+{%- set sessions = shared.get('sessions') -%}
+{%- set queue = shared.get('workflow') -%}
+{%- set admins = [2, 3, 6, 7, 8] -%}
+{%- if not queue -%}
+  {%- if params.anomaly_mode and now >= shared.get('next_episode') and now - shared.get('last_failure') >= 900 -%}
+    {%- set episode = shared.get('episodes') -%}
+    {%- set admin = [8, 2, 3][episode % 3] -%}
+    {%- set responder = admins[(admins.index(admin) + 1) % 5] -%}
+    {%- set target = episode % (vms | length) -%}
+    {%- set peer = users[admin].ip -%}
+    {%- set failures = [2, 3, 4, admin] if admin == 8 else ([8, 3, 4, admin] if admin == 2 else [8, 2, 4, admin]) -%}
+    {%- for i in range(4) -%}
+      {%- do queue.append({'at': now + i * 60, 'kind': 'EventEx', 'actor': failures[i], 'peer': peer}) -%}
+    {%- endfor -%}
+    {%- for step in [
+      [4, 'UserLoginSessionEvent', admin], [5, 'PermissionAddedEvent', admin],
+      [6, 'UserLogoutSessionEvent', admin], [7, 'UserLoginSessionEvent', 1],
+      [8, 'VmReconfiguredEvent', 1], [9, 'VmPoweredOffEvent', 1],
+      [10, 'UserLogoutSessionEvent', 1], [15, 'UserLoginSessionEvent', responder],
+      [16, 'VmReconfiguredEvent', responder], [17, 'VmPoweredOnEvent', responder],
+      [18, 'PermissionRemovedEvent', responder], [19, 'UserLogoutSessionEvent', responder]
+    ] -%}
+      {%- do queue.append({'at': now + step[0] * 60, 'kind': step[1], 'actor': step[2], 'vm': target}) -%}
+    {%- endfor -%}
+    {%- do shared.update({'episodes': episode + 1, 'next_episode': now + (interval * 3600) | int, 'last_failure': now + 180}) -%}
+  {%- else -%}
+    {%- set cursor = shared.get('ordinary_cursor') -%}
+    {%- set actor = cursor % (users | length) -%}
+    {%- set target = (cursor // (users | length)) % (vms | length) -%}
+    {%- set kind = module.rand.weighted_choice(['query', 'reconfigure', 'power', 'permission', 'retry'], [55, 15, 15, 10, 5]) -%}
+    {%- if kind == 'retry' and now - shared.get('last_failure') < 900 -%}{%- set kind = 'query' -%}{%- endif -%}
+    {%- if kind in ['reconfigure', 'power', 'permission'] and not users[actor].administrator -%}
+      {%- set actor = admins[(cursor // (users | length)) % 5] -%}
+    {%- endif -%}
+    {%- set kinds = ['UserLoginSessionEvent', 'UserLogoutSessionEvent'] -%}
+    {%- if kind == 'reconfigure' -%}
+      {%- set kinds = ['UserLoginSessionEvent', 'VmReconfiguredEvent', 'VmReconfiguredEvent', 'UserLogoutSessionEvent'] -%}
+    {%- elif kind == 'power' -%}
+      {%- set kinds = ['UserLoginSessionEvent', 'VmPoweredOffEvent', 'VmPoweredOnEvent', 'UserLogoutSessionEvent'] -%}
+    {%- elif kind == 'permission' -%}
+      {%- set responder = admins[(admins.index(actor) + 1) % 5] -%}
+      {%- set kinds = ['UserLoginSessionEvent', 'PermissionAddedEvent', 'UserLogoutSessionEvent', 'UserLoginSessionEvent', 'VmReconfiguredEvent', 'VmPoweredOffEvent', 'VmReconfiguredEvent', 'VmPoweredOnEvent', 'UserLogoutSessionEvent', 'UserLoginSessionEvent', 'PermissionRemovedEvent', 'UserLogoutSessionEvent'] -%}
+    {%- elif kind == 'retry' -%}
+      {%- set kinds = ['EventEx', 'UserLoginSessionEvent', 'UserLogoutSessionEvent'] -%}
+      {%- do shared.set('last_failure', now) -%}
+    {%- endif -%}
+    {%- for i in range(kinds | length) -%}
+      {%- set step_actor = (1 if 3 <= i <= 8 else (responder if i >= 9 else actor)) if kind == 'permission' else actor -%}
+      {%- do queue.append({'at': now + i * 60, 'kind': kinds[i], 'actor': step_actor, 'peer': users[step_actor].ip, 'vm': target}) -%}
+    {%- endfor -%}
+    {%- do shared.set('ordinary_cursor', cursor + 1) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if queue[0].at <= now -%}
+  {%- set current = queue.pop(0) -%}
+{%- else -%}
+  {# Four ordinary read-only login/logout records during recovery wait. #}
+  {%- set monitor = 0 if shared.get('gap_actor') is none else shared.get('gap_actor') -%}
+  {%- if monitor not in sessions -%}
+    {%- set current = {'kind': 'UserLoginSessionEvent', 'actor': monitor, 'peer': users[monitor].ip} -%}
+    {%- do shared.set('gap_actor', monitor) -%}
+  {%- else -%}
+    {%- set current = {'kind': 'UserLogoutSessionEvent', 'actor': monitor} -%}
+    {%- do shared.pop('gap_actor') -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set actor_index = current.actor -%}
+{%- set actor = users[actor_index] -%}
+{%- set kind = current.kind -%}
+{%- set key = shared.get('event_key') + 1 -%}
+{%- do shared.set('event_key', key) -%}
+{%- set header_time = utc + module.datetime.timedelta(microseconds=300) -%}
+{%- set native_time = utc.strftime('%Y-%m-%dT%H:%M:%S.%fZ') -%}
+{%- set normalized_time = header_time.isoformat(timespec='milliseconds').replace('+00:00', 'Z') -%}
+{%- set details = {'class': 'vim.event.' ~ kind, 'key': key, 'chain_id': key, 'created_time': native_time, 'user_name': actor.name} -%}
+{%- set result = {'at': normalized_time, 'native_time': native_time, 'header': header_time.isoformat(), 'details': details, 'actor': actor, 'kind': kind, 'key': key} -%}
+{%- if kind in ['EventEx', 'UserLoginSessionEvent', 'UserLogoutSessionEvent'] -%}
+  {%- include 'templates/session.json.jinja' -%}
+{%- elif kind in ['PermissionAddedEvent', 'PermissionRemovedEvent'] -%}
+  {%- include 'templates/permission.json.jinja' -%}
+{%- else -%}
+  {%- include 'templates/virtual-machine.json.jinja' -%}
+{%- endif -%}
