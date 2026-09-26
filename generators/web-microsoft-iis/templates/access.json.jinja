@@ -1,103 +1,351 @@
-{%- set step = vars.step -%}
-{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set source_ip = module.rand.choice(['10.20.1.23', '10.20.1.45', '10.20.2.18', '10.20.2.44', '192.0.2.36', params.anomaly_source_ip]) -%}
-{%- set user_name = '-' -%}
-{%- set method = 'GET' -%}
-{%- set path = '/Default.htm' -%}
-{%- set query = '-' -%}
-{%- set status = 200 -%}
-{%- set sub_status = 0 -%}
-{%- set win32_status = 0 -%}
-{%- set time_taken = module.rand.number.integer(3, 160) -%}
-{%- set user_agent_log = module.rand.choice([
-    'Mozilla/5.0+(Windows+NT+10.0;+WOW64;+Trident/7.0;+Touch;+rv:11.0)+like+Gecko',
-    'Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64)+AppleWebKit/537.36+(KHTML,+like+Gecko)+Chrome/91.0.4472.124+Safari/537.36'
-  ]) -%}
-{%- set referer = '-' -%}
-{%- set kind = step -%}
-{%- if step == 'routine' -%}
-  {%- do shared.pop('to_anomaly', none) -%}
-  {%- set phase = shared.get('routine_count', 0) + 1 -%}
-  {%- do shared.set('routine_count', 0 if phase >= 2880 else phase) -%}
-  {%- if params.anomaly_mode -%}
-    {%- set interval = [params.anomaly_interval_hours | float, 0.5] | max * 3600 -%}
-    {%- set now = utc.timestamp() -%}
-    {%- set due = shared.get('next_anomaly_epoch', now + interval) -%}
-    {%- if now >= due -%}
-      {%- do shared.set('to_anomaly', true) -%}
-      {%- do shared.set('next_anomaly_epoch', now + interval) -%}
+{#- IIS 10.0 W3C access rows, 15-field profile. The input fires five
+    renders every 5 s; each render writes the earliest request due
+    before the end of that window, or is dropped when none is due.
+    Clients run independent random processes; an anomaly episode is one
+    more request plan in the same queue and changes no client state. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{%- macro push(out, t, ci, k, p, s, ss=0, w=0, r='-', u='-', q='-', ep=false, n=0) -%}
+  {%- do out.append({'t': t, 'c': ci, 'k': k, 'p': p, 's': s, 'ss': ss, 'w': w, 'r': r, 'u': u, 'q': q, 'ep': ep, 'n': n}) -%}
+{%- endmacro -%}
+{%- set rand = module.rand -%}
+{%- set num = module.rand.number -%}
+{%- set math = module.math -%}
+{%- set tz = module.datetime.timezone.utc -%}
+{%- set utc = timestamp.astimezone(tz) -%}
+{%- set T = utc.timestamp() -%}
+{%- set W = T + 5 -%}
+{%- set site = 'https://intranet.contoso.example' -%}
+{%- set browsers = ['records', 'it', 'staff', 'mobile'] -%}
+{%- set page_paths = ['/Default.htm', '/news.htm', '/policies/handbook.htm', '/reports.htm', '/apps/directory.htm', '/it/servicedesk.htm'] -%}
+{%- set page_weights = [32, 22, 14, 14, 10, 8] -%}
+{%- set legacy_pages = ['/news.htm', '/policies/handbook.htm'] -%}
+{%- set assets = ['/DeptLogo.gif', '/styles/site.css', '/scripts/site.js'] -%}
+{%- set broken_links = ['/news/2019/holiday-schedule.htm', '/policies/travel-2018.htm'] -%}
+{%- set probes = [
+  ['/backup/', 404, 0, 2], ['/admin/', 403, 14, 0], ['/exports/', 403, 14, 0],
+  ['/old/', 404, 0, 2], ['/test/', 404, 0, 2], ['/web.config.bak', 404, 0, 2],
+  ['/wp-login.php', 404, 0, 2], ['/phpinfo.php', 404, 0, 2],
+  ['/server-status', 404, 0, 2], ['/login.aspx', 404, 0, 2],
+  ['/backup.zip', 404, 0, 2], ['/robots.txt', 404, 0, 2],
+  ['/iisstart.htm', 404, 0, 2], ['/.env', 404, 0, 2], ['/Default.htm', 200, 0, 0]
+] -%}
+{#- Sensitive-area plans: B /backup/ 404, A /admin/ 403.14, E /exports/
+    403.14, D authenticated export download, X mistyped export 404,
+    R retried export that is not generated yet. -#}
+{%- set plans = {
+  'records': [['D', 'DD', 'ED', 'EDD', 'AED', 'AD', 'BD', 'BED', 'AE', 'BA', 'BAE', 'B', 'A', 'EA', 'AB', 'XD'], [30, 12, 18, 6, 24, 6, 4, 3, 5, 5, 22, 4, 4, 3, 3, 6]],
+  'script': [['D', 'DD', 'DDD', 'ED', 'EDD', 'R', 'B', 'A', 'BA', 'AE', 'AED', 'AD', 'BD', 'BAE'], [32, 22, 8, 14, 6, 20, 4, 3, 2, 2, 10, 3, 3, 8]],
+  'it': [['A', 'AA', 'BA', 'B', 'AE', 'BAE', 'E', 'EA'], [30, 15, 15, 10, 12, 26, 5, 5]],
+  'staff': [['B', 'A', 'E', 'BA'], [40, 30, 30, 10]],
+  'mobile': [['B', 'A', 'E', 'BA'], [40, 30, 30, 10]]
+} -%}
+{%- set ipv4 = '((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' -%}
+{%- macro gap(rate, t, diurnal) -%}
+  {#- Exponential gap for `rate` events per day, thinned by office hours
+      (bell around 11:30 UTC) for interactive clients. -#}
+  {%- set mean = 86400 / rate -%}
+  {%- if diurnal -%}
+    {%- set h = (t % 86400) / 3600 -%}
+    {%- set f = 0.15 + 0.85 * math.exp(-(((h - 11.5) / 3.2) ** 2)) -%}
+    {%- set mean = mean * 0.351 / f -%}
+  {%- endif -%}
+  {{- num.exponential(1 / mean) -}}
+{%- endmacro -%}
+{%- macro step_gap() -%}
+  {{- 2 + num.lognormal(math.log(18), 0.8) -}}
+{%- endmacro -%}
+{%- macro sens(out, t, ci, c, ch, f, ep=false, n=0) -%}
+  {%- if ch == 'B' -%}
+    {{- push(out, t, ci, 'B', '/backup/', 404, 0, 2, ep=ep, n=n) -}}
+  {%- elif ch == 'A' -%}
+    {{- push(out, t, ci, 'A', '/admin/', 403, 14, 0, ep=ep, n=n) -}}
+  {%- elif ch == 'E' -%}
+    {{- push(out, t, ci, 'E', '/exports/', 403, 14, 0, ep=ep, n=n) -}}
+  {%- elif ch == 'D' -%}
+    {%- if c.role in browsers and rand.chance(0.6) -%}
+      {#- A browser download follows the link on /reports.htm: the page
+          view (and its revalidated assets) comes first, a few seconds
+          before the download that names it as referer. -#}
+      {{- push(out, t, ci, 'P', '/reports.htm', 304 if rand.chance(0.3) else 200) -}}
+      {%- for asset in assets -%}
+        {%- if rand.chance(0.35) -%}
+          {{- push(out, t + num.floating(0.05, 1.8), ci, 'S', asset, 304 if rand.chance(0.8) else 200, r=site ~ '/reports.htm') -}}
+        {%- endif -%}
+      {%- endfor -%}
+      {{- push(out, t + num.floating(3, 20), ci, 'D', '/exports/' ~ f, 200, 0, 0, site ~ '/reports.htm', c.user, ep=ep, n=n) -}}
     {%- else -%}
-      {%- do shared.set('next_anomaly_epoch', due) -%}
+      {{- push(out, t, ci, 'D', '/exports/' ~ f, 200, 0, 0, '-', c.user, ep=ep, n=n) -}}
+    {%- endif -%}
+  {%- elif ch == 'X' -%}
+    {%- set stem = f.rsplit('.', 1)[0] -%}
+    {{- push(out, t, ci, 'X', '/exports/' ~ rand.choice([stem, stem ~ '.txt', stem ~ '-old.' ~ f.rsplit('.', 1)[1]]), 404, 0, 2) -}}
+  {%- elif ch == 'M' -%}
+    {{- push(out, t, ci, 'M', '/exports/' ~ f, 404, 0, 2) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- if shared.get('clients') is none -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean or not module.math.isfinite(params.anomaly_interval_hours) or params.anomaly_interval_hours <= 0 -%}
+    {{- invalid('anomaly_interval_hours must be a positive number') -}}
+  {%- endif -%}
+  {%- if params.server_name is not string or not module.re.fullmatch('[A-Za-z0-9][A-Za-z0-9.-]{0,62}', params.server_name) -%}
+    {{- invalid('server_name must be a host name') -}}
+  {%- endif -%}
+  {%- if params.server_ip is not string or not module.re.fullmatch(ipv4, params.server_ip) -%}
+    {{- invalid('server_ip must be a dotted-quad IPv4 address') -}}
+  {%- endif -%}
+  {%- if params.server_port is not integer or params.server_port is boolean or not 1 <= params.server_port <= 65535 -%}
+    {{- invalid('server_port must be an integer in 1..65535') -}}
+  {%- endif -%}
+  {%- set clients = [] -%}
+  {%- set eligible = [] -%}
+  {%- for row in samples.clients -%}
+    {%- if row.role not in ['monitor', 'scanner', 'script', 'records', 'it', 'staff', 'mobile'] -%}
+      {{- invalid('client role is not supported') -}}
+    {%- endif -%}
+    {%- if row.ip is not string or not module.re.fullmatch(ipv4, row.ip) -%}
+      {{- invalid('client ip must be a dotted-quad IPv4 address') -}}
+    {%- endif -%}
+    {%- for rate in [row.sessions_per_day, row.sensitive_per_day] -%}
+      {%- if rate is not number or rate is boolean or not 0 <= rate <= 86400 -%}
+        {{- invalid('client rates must be numbers in 0..86400 per day') -}}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if row.user_agent is not string or ' ' in row.user_agent or not row.user_agent -%}
+      {{- invalid('client user_agent must be W3C-encoded without spaces') -}}
+    {%- endif -%}
+    {%- set files = row.files.split() -%}
+    {%- if (row.role in ['script', 'records']) != (files | length > 0) or (files and not module.re.fullmatch('[A-Z0-9]+\\\\[A-Za-z0-9._-]+', row.account)) -%}
+      {{- invalid('script and records clients need export files and a DOMAIN\\user account') -}}
+    {%- endif -%}
+    {%- set browse = row.sessions_per_day -%}
+    {%- set sensitive = row.sensitive_per_day -%}
+    {%- if files -%}
+      {%- do eligible.append(clients | length) -%}
+    {%- endif -%}
+    {%- do clients.append({
+      'ip': row.ip, 'ua': row.user_agent, 'user': row.account, 'role': row.role,
+      'files': files, 'browse': browse, 'sensitive': sensitive,
+      'nb': T + (gap(browse, T, row.role in browsers) | float if browse > 0 else 0),
+      'ns': T + (gap(sensitive, T, row.role in browsers) | float if sensitive > 0 else 0),
+      'g1': -1.0e18, 'g2': -1.0e18, 'g3': -1.0e18
+    }) -%}
+  {%- endfor -%}
+  {%- if params.anomaly_mode and eligible | length < 2 -%}
+    {{- invalid('anomaly_mode needs at least two clients with export files') -}}
+  {%- endif -%}
+  {%- do shared.update({
+    'clients': clients, 'eligible': eligible, 'queue': [], 'last_window': none,
+    'interval_s': ([params.anomaly_interval_hours, 3] | max) * 3600,
+    'ep_next': T + ([params.anomaly_interval_hours, 3] | max) * 3600,
+    'ep': none, 'ep_client': none, 'ep_file': none
+  }) -%}
+{%- endif -%}
+{%- set clients = shared.get('clients') -%}
+{#- Planning happens once per window, before any row of it is written,
+    so rows stay in timestamp order. -#}
+{%- if shared.get('last_window') != T -%}
+  {%- do shared.set('last_window', T) -%}
+  {%- set new = [] -%}
+  {%- for c in clients -%}
+    {%- set ci = loop.index0 -%}
+    {%- set diurnal = c.role in browsers -%}
+    {%- if c.browse > 0 and c.nb < W -%}
+      {%- set start = [c.nb, T - 5] | max -%}
+      {%- if c.role == 'monitor' -%}
+        {{- push(new, start, ci, 'API', '/api/status', 200, q='site=main') -}}
+        {%- do c.update({'nb': start + num.lognormal(math.log(86400 / c.browse), 0.3)}) -%}
+      {%- elif c.role == 'scanner' -%}
+        {%- set st = namespace(t=start) -%}
+        {%- for probe in rand.shuffle(probes)[:num.integer(8, 15)] -%}
+          {{- push(new, st.t, ci, 'Q', probe[0], probe[1], probe[2], probe[3]) -}}
+          {%- set st.t = st.t + 0.3 + num.lognormal(math.log(2.5), 0.8) -%}
+        {%- endfor -%}
+        {%- do c.update({'nb': st.t + gap(c.browse, st.t, false) | float}) -%}
+      {%- else -%}
+        {%- set st = namespace(t=start, go=true, first=true, prev=none) -%}
+        {%- for _ in range(12) -%}
+          {%- if st.go -%}
+            {%- set ref = site ~ st.prev if st.prev else '-' -%}
+            {%- if st.prev in legacy_pages and rand.chance(0.25) -%}
+              {#- A stale link on a legacy page: IIS answers with its
+                  static error page, which references no assets. -#}
+              {{- push(new, st.t, ci, 'L', rand.choice(broken_links), 404, 0, 2, ref) -}}
+            {%- else -%}
+              {%- set page = rand.weighted_choice(page_paths, page_weights) -%}
+              {{- push(new, st.t, ci, 'P', page, 304 if not st.first and rand.chance(0.2) else 200, r=ref) -}}
+              {%- for asset in assets -%}
+                {%- if rand.chance(0.9 if st.first else 0.2) -%}
+                  {{- push(new, st.t + num.floating(0.05, 1.8), ci, 'S', asset, 304 if rand.chance(0.35 if st.first else 0.8) else 200, r=site ~ page) -}}
+                {%- endif -%}
+              {%- endfor -%}
+              {%- if page in legacy_pages and rand.chance(0.8) -%}
+                {{- push(new, st.t + num.floating(0.3, 2.5), ci, 'F', '/favicon-old.ico', 404, 0, 2) -}}
+              {%- endif -%}
+              {%- if c.role == 'mobile' and rand.chance(0.6) -%}
+                {%- set icon_t = st.t + num.floating(0.5, 3.0) -%}
+                {{- push(new, icon_t, ci, 'I', '/apple-touch-icon-precomposed.png', 404, 0, 2) -}}
+                {{- push(new, icon_t + num.floating(0.1, 0.6), ci, 'I', '/apple-touch-icon.png', 404, 0, 2) -}}
+              {%- endif -%}
+              {%- set st.prev = page -%}
+            {%- endif -%}
+            {%- set st.first = false -%}
+            {%- set st.go = rand.chance(0.55) -%}
+            {%- if st.go -%}
+              {%- set st.t = st.t + 3 + num.lognormal(math.log(30), 1.0) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- do c.update({'nb': st.t + 3 + gap(c.browse, st.t, diurnal) | float}) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if c.sensitive > 0 and c.ns < W -%}
+      {%- set start = [c.ns, T - 5] | max -%}
+      {%- set pool = plans[c.role] -%}
+      {%- set plan = rand.weighted_choice(pool[0], pool[1]) -%}
+      {%- set st = namespace(t=start, i=0) -%}
+      {%- set order = rand.shuffle(c.files) if c.files else [] -%}
+      {%- if plan == 'R' -%}
+        {%- set f = rand.choice(c.files) -%}
+        {%- set rt = namespace(go=true) -%}
+        {%- for _ in range(5) -%}
+          {%- if rt.go -%}
+            {{- sens(new, st.t, ci, c, 'M', f) -}}
+            {%- set st.t = st.t + 20 + num.lognormal(math.log(60), 0.5) -%}
+            {%- set rt.go = rand.chance(0.5) -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if rand.chance(0.75) -%}
+          {{- sens(new, st.t, ci, c, 'D', f) -}}
+        {%- endif -%}
+      {%- else -%}
+        {%- for ch in plan -%}
+          {%- if not loop.first -%}
+            {%- set st.t = st.t + step_gap() | float -%}
+          {%- endif -%}
+          {%- if ch in 'DX' -%}
+            {{- sens(new, st.t, ci, c, ch, order[st.i % (order | length)]) -}}
+            {%- if ch == 'D' -%}
+              {%- set st.i = st.i + 1 -%}
+            {%- endif -%}
+          {%- else -%}
+            {{- sens(new, st.t, ci, c, ch, none) -}}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- do c.update({'ns': st.t + gap(c.sensitive, st.t, diurnal) | float}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- Episode: due one interval after the previous actual start (the
+      first one interval after the first render), begins 0-10 min after
+      it is due, rotates client and export file. -#}
+  {%- if params.anomaly_mode and shared.get('ep') is none and shared.get('ep_next') < W -%}
+    {%- set last = shared.get('ep_client') -%}
+    {%- set candidates = shared.get('eligible') | reject('equalto', last) | list -%}
+    {#- Actors are weighted by their current activity, so office-hours
+        clients rarely act at night and script hosts carry those
+        episodes, as in their ordinary traffic. -#}
+    {%- set h = (T % 86400) / 3600 -%}
+    {%- set f_now = 0.15 + 0.85 * math.exp(-(((h - 11.5) / 3.2) ** 2)) -%}
+    {%- set weights = [] -%}
+    {%- for i in candidates -%}
+      {%- do weights.append(clients[i].sensitive * (f_now / 0.351 if clients[i].role in browsers else 1)) -%}
+    {%- endfor -%}
+    {%- set ci = rand.weighted_choice(candidates, weights) -%}
+    {%- set c = clients[ci] -%}
+    {%- set files = c.files | reject('equalto', shared.get('ep_file')) | list or c.files -%}
+    {%- set f = rand.choice(files) -%}
+    {%- set st = namespace(t=[shared.get('ep_next'), T] | max + num.floating(0, 600)) -%}
+    {%- for ch in 'BAED' -%}
+      {%- if not loop.first -%}
+        {%- set st.t = st.t + step_gap() | float -%}
+      {%- endif -%}
+      {{- sens(new, st.t, ci, c, ch, f, true, loop.index) -}}
+    {%- endfor -%}
+    {%- do shared.update({'ep': ci, 'ep_client': ci, 'ep_file': f}) -%}
+  {%- endif -%}
+  {%- if new -%}
+    {%- do shared.set('queue', (shared.get('queue') + new) | sort(attribute='t')) -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Write the earliest due request. Ordinary downloads that would
+    complete /backup/ -> /admin/ -> /exports/ -> download from one client
+    within a window drawn per decision from 30-60 minutes are skipped, so
+    the complete chain stays specific to episodes without a cliff at one
+    window length. The check uses ordinary rows only, identical in both
+    modes. -#}
+{%- set queue = shared.get('queue') -%}
+{%- set out = namespace(item=none, sec=0) -%}
+{%- for _ in range(8) -%}
+  {%- if out.item is none and queue and queue[0].t < W -%}
+    {%- set it = queue.pop(0) -%}
+    {%- set sec = ([it.t, T] | max) | int -%}
+    {%- set c = clients[it.c] -%}
+    {%- if it.ep -%}
+      {%- set out.item = it -%}
+      {%- set out.sec = sec -%}
+    {%- elif not (it.k == 'D' and sec - c.g3 <= num.floating(1800, 3600)) -%}
+      {%- if it.k == 'B' or (it.k == 'Q' and it.p == '/backup/') -%}
+        {%- do c.update({'g1': sec}) -%}
+      {%- elif it.k == 'A' or (it.k == 'Q' and it.p == '/admin/') -%}
+        {%- do c.update({'g2': [c.g2, c.g1] | max}) -%}
+      {%- elif it.k == 'E' or (it.k == 'Q' and it.p == '/exports/') -%}
+        {%- do c.update({'g3': [c.g3, c.g2] | max}) -%}
+      {%- endif -%}
+      {%- set out.item = it -%}
+      {%- set out.sec = sec -%}
     {%- endif -%}
   {%- endif -%}
-  {%- if phase == 600 -%}
-    {%- set kind = 'probe_one' -%}
-  {%- elif phase == 1200 -%}
-    {%- set kind = 'probe_two' -%}
-  {%- elif phase == 1800 -%}
-    {%- set kind = 'denied' -%}
-  {%- elif phase == 2400 -%}
-    {%- set kind = 'download' -%}
-  {%- else -%}
-    {%- set kind = module.rand.weighted_choice(
-      ['page', 'asset', 'api', 'missing', 'admin_directory'],
-      [50, 32, 12, 5, 1]
-    ) -%}
+{%- endfor -%}
+{%- if out.item is none -%}
+  {%- do dispatch.drop() -%}
+{%- endif -%}
+{%- set it = out.item -%}
+{%- set c = clients[it.c] -%}
+{%- if it.ep -%}
+  {%- if it.n == 1 -%}
+    {%- do shared.set('ep_next', out.sec + shared.get('interval_s')) -%}
+  {%- elif it.n == 4 -%}
+    {%- do shared.set('ep', none) -%}
   {%- endif -%}
 {%- endif -%}
-{%- if kind == 'asset' -%}
-  {%- set path = module.rand.choice(['/DeptLogo.gif', '/styles/site.css', '/scripts/site.js']) -%}
-  {%- set referer = 'https://intranet.contoso.example/Default.htm' -%}
-{%- elif kind == 'api' -%}
-  {%- set path = '/api/status' -%}
-  {%- set query = 'site=main' -%}
-  {%- set user_agent_log = 'curl/8.5.0' -%}
-{%- elif kind == 'missing' -%}
-  {%- set path = '/favicon-old.ico' -%}
-  {%- set status = 404 -%}
-  {%- set win32_status = 2 -%}
-{%- elif kind == 'admin_directory' -%}
-  {%- set path = '/admin/' -%}
-  {%- set status = 403 -%}
-  {%- set sub_status = 14 -%}
-{%- elif kind in ['probe_one', 'probe_two', 'denied', 'download'] -%}
-  {%- set source_ip = params.anomaly_source_ip -%}
-  {%- set user_agent_log = 'curl/8.5.0' -%}
-  {%- if kind == 'probe_one' -%}
-    {%- set path = '/backup/' -%}
-    {%- set status = 404 -%}
-    {%- set win32_status = 2 -%}
-  {%- elif kind == 'probe_two' -%}
-    {%- set path = '/admin/' -%}
-    {%- set status = 403 -%}
-    {%- set sub_status = 14 -%}
-  {%- elif kind == 'denied' -%}
-    {%- set path = '/exports/' -%}
-    {%- set status = 403 -%}
-    {%- set sub_status = 14 -%}
-  {%- else -%}
-    {%- set path = '/exports/payroll.csv' -%}
-    {%- set user_name = params.anomaly_user -%}
-    {%- set time_taken = module.rand.number.integer(30, 500) -%}
-  {%- endif -%}
+{%- set k = it.k -%}
+{%- if k == 'D' -%}
+  {%- set tt_mu, tt_sigma = 160, 0.9 -%}
+{%- elif k == 'API' -%}
+  {%- set tt_mu, tt_sigma = 11, 0.5 -%}
+{%- elif it.s == 304 -%}
+  {%- set tt_mu, tt_sigma = 1.3, 0.6 -%}
+{%- elif k == 'P' or (k == 'Q' and it.s == 200) -%}
+  {%- set tt_mu, tt_sigma = 18, 0.7 -%}
+{%- elif k == 'S' -%}
+  {%- set tt_mu, tt_sigma = 5, 0.8 -%}
+{%- elif it.s == 403 -%}
+  {%- set tt_mu, tt_sigma = 2.2, 0.6 -%}
+{%- else -%}
+  {%- set tt_mu, tt_sigma = 1.8, 0.6 -%}
 {%- endif -%}
+{%- set time_taken = num.lognormal(math.log(tt_mu), tt_sigma) | round | int -%}
+{%- set when = module.datetime.datetime.fromtimestamp(out.sec, tz) -%}
 {%- set fields = [
-  utc.strftime('%Y-%m-%d'), utc.strftime('%H:%M:%S'),
-  params.server_ip, method, path, query, params.server_port,
-  user_name, source_ip, user_agent_log, referer, status,
-  sub_status, win32_status, time_taken
+  when.strftime('%Y-%m-%d'), when.strftime('%H:%M:%S'),
+  params.server_ip, 'GET', it.p, it.q, params.server_port,
+  it.u, c.ip, c.ua, it.r, it.s, it.ss, it.w, time_taken
 ] -%}
-{%- set original = fields | join(' ') -%}
 {
-  "@timestamp": {{ utc.isoformat() | tojson }},
+  "@timestamp": {{ when.isoformat() | tojson }},
   "ecs": {"version": "8.17.0"},
-  "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": {{ ('success' if status < 400 else 'failure') | tojson }}, "duration": {{ time_taken * 1000000 }}, "original": {{ original | tojson }}},
+  "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": {{ ('success' if it.s < 400 else 'failure') | tojson }}, "duration": {{ time_taken * 1000000 }}, "original": {{ fields | join(' ') | tojson }}},
   "host": {"name": {{ params.server_name | tojson }}, "ip": {{ params.server_ip | tojson }}},
-  "source": {"ip": {{ source_ip | tojson }}},
+  "source": {"ip": {{ c.ip | tojson }}},
   "destination": {"ip": {{ params.server_ip | tojson }}, "port": {{ params.server_port }}},
-  "http": {"request": {"method": {{ method | tojson }}}, "response": {"status_code": {{ status }}}},
-  "url": {"path": {{ path | tojson }}{% if query != '-' %}, "query": {{ query | tojson }}{% endif %}},
-  "user_agent": {"original": {{ user_agent_log.replace('+', ' ') | tojson }}},
-  "iis": {"access": {"sub_status": {{ sub_status }}, "win32_status": {{ win32_status }}}}
-  {%- if user_name != '-' %}, "user": {"name": {{ user_name | tojson }}}{% endif %}
+  "http": {"request": {"method": "GET"}, "response": {"status_code": {{ it.s }}}},
+  "url": {"path": {{ it.p | tojson }}{% if it.q != '-' %}, "query": {{ it.q | tojson }}{% endif %}},
+  "user_agent": {"original": {{ c.ua.replace('+', ' ') | tojson }}},
+  "iis": {"access": {"sub_status": {{ it.ss }}, "win32_status": {{ it.w }}}}
+  {%- if it.u != '-' %}, "user": {"name": {{ it.u | tojson }}}{% endif %}
 }
