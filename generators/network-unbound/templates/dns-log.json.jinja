@@ -1,0 +1,125 @@
+{%- set pending = shared.pop('pending', none) -%}
+{%- set is_reply = pending is not none -%}
+{%- if is_reply -%}
+  {%- set client = pending.client -%}
+  {%- set qname = pending.qname -%}
+  {%- set qtype = pending.qtype -%}
+  {%- set response_code = pending.rcode -%}
+  {%- set response_size = pending.size -%}
+  {%- set from_cache = pending.from_cache -%}
+  {%- set latency_us = pending.latency_us -%}
+  {%- set worker = pending.worker -%}
+  {%- set offset_us = latency_us + module.rand.number.integer(200, 800) -%}
+  {%- set event_time = pending.query_time + module.datetime.timedelta(microseconds=offset_us) -%}
+  {%- if not pending.unique_episode_name and from_cache == 0 -%}
+    {%- set cache = shared.get('cache', {}) -%}
+    {%- set cache_key = qname ~ '|' ~ qtype -%}
+    {%- if cache_key not in cache and cache|length >= 128 -%}{%- do cache.pop(cache|first) -%}{%- endif -%}
+    {%- set ttl = 45 if response_code == 'NXDOMAIN' else 180 if qtype in ['TXT', 'MX'] else 60 -%}
+    {%- do cache.update({cache_key: pending.query_time + module.datetime.timedelta(seconds=ttl)}) -%}
+    {%- do shared.set('cache', cache) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set event_time = timestamp -%}
+  {%- set pair_no = shared.get('pair_no', 0) + 1 -%}
+  {%- do shared.set('pair_no', pair_no) -%}
+  {%- if shared.get('next_episode_at') is none -%}
+    {%- do shared.set('next_episode_at', timestamp + module.datetime.timedelta(seconds=params.anomaly_interval_seconds)) -%}
+  {%- endif -%}
+  {%- set episode_step = shared.get('episode_step', 0) -%}
+  {%- if params.anomaly_mode and episode_step == 0 and timestamp >= shared.get('next_episode_at') -%}
+    {%- set episode_step = 1 -%}
+    {%- do shared.set('episode_nonce', module.rand.string.hex(16)) -%}
+    {%- do shared.set('episode_count', shared.get('episode_count', 0) + 1) -%}
+    {%- do shared.set('next_episode_at', timestamp + module.datetime.timedelta(seconds=params.anomaly_interval_seconds)) -%}
+  {%- endif -%}
+  {%- set unique_episode_name = false -%}
+  {%- if episode_step > 0 -%}
+    {%- set client = params.suspicious_client_ip -%}
+    {%- if episode_step == 1 -%}
+      {%- set qname = params.tunnel_domain ~ '.' -%}
+      {%- set qtype = 'A' -%}
+      {%- set response_code = 'NOERROR' -%}
+      {%- set response_size = 76 + qname|length -%}
+    {%- else -%}
+      {%- set qname = shared.get('episode_nonce') ~ module.rand.string.hex(16) ~ '.' ~ params.tunnel_domain ~ '.' -%}
+      {%- set qtype = 'TXT' -%}
+      {%- set response_code = 'NXDOMAIN' -%}
+      {%- set response_size = 118 + qname|length -%}
+      {%- set unique_episode_name = true -%}
+    {%- endif -%}
+    {%- do shared.set('episode_step', 0 if episode_step == 9 else episode_step + 1) -%}
+  {%- elif pair_no % 300 == 10 -%}
+    {%- set client = params.suspicious_client_ip -%}
+    {%- set qname = params.tunnel_domain ~ '.' -%}
+    {%- set qtype = 'A' -%}
+    {%- set response_code = 'NOERROR' -%}
+    {%- set response_size = 76 + qname|length -%}
+  {%- elif pair_no % 300 == 20 -%}
+    {%- set client = params.suspicious_client_ip -%}
+    {%- set qname = 'a1b2c3d4e5f60718293a4b5c6d7e8f90.' ~ params.tunnel_domain ~ '.' -%}
+    {%- set qtype = 'TXT' -%}
+    {%- set response_code = 'NOERROR' -%}
+    {%- set response_size = 130 + qname|length -%}
+  {%- elif pair_no % 300 == 30 -%}
+    {%- set client = params.suspicious_client_ip -%}
+    {%- set qname = 'f0e1d2c3b4a5968778695a4b3c2d1e0f.' ~ params.tunnel_domain ~ '.' -%}
+    {%- set qtype = 'TXT' -%}
+    {%- set response_code = 'NXDOMAIN' -%}
+    {%- set response_size = 118 + qname|length -%}
+  {%- else -%}
+    {%- set client = params.suspicious_client_ip if module.rand.number.integer(1, 100) <= 4 else '10.20.30.' ~ module.rand.number.integer(11, 80) -%}
+    {%- set choice_roll = module.rand.number.integer(1, 100) -%}
+    {%- if choice_roll <= 2 -%}
+      {%- set qname = 'status.' ~ params.tunnel_domain ~ '.' -%}
+      {%- set qtype = 'TXT' -%}
+      {%- set response_code = 'NOERROR' -%}
+      {%- set response_size = 119 + qname|length -%}
+    {%- elif choice_roll <= 22 -%}
+      {%- set qname = 'host-%03d.corp.example.'|format(module.rand.number.integer(1, 100)) -%}
+      {%- set qtype = 'A' -%}
+      {%- set response_code = 'NOERROR' -%}
+      {%- set response_size = 66 + qname|length -%}
+    {%- else -%}
+      {%- set question = samples.questions.weighted_pick('weight') -%}
+      {%- set qname = question.name -%}
+      {%- set qtype = question.type -%}
+      {%- set response_code = question.rcode -%}
+      {%- set response_size = question.size -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set cache_key = qname ~ '|' ~ qtype -%}
+  {%- set cache = shared.get('cache', {}) -%}
+  {%- set from_cache = 1 if cache_key in cache and timestamp < cache[cache_key] else 0 -%}
+  {%- set latency_us = 0 if from_cache else module.rand.number.integer(18000, 92000) -%}
+  {%- set worker = module.rand.number.integer(0, params.worker_count - 1) -%}
+  {%- do shared.set('pending', {
+      'client': client,
+      'qname': qname,
+      'qtype': qtype,
+      'rcode': response_code,
+      'size': response_size,
+      'from_cache': from_cache,
+      'latency_us': latency_us,
+      'worker': worker,
+      'query_time': timestamp,
+      'unique_episode_name': unique_episode_name
+  }) -%}
+{%- endif -%}
+{%- set log_clock = event_time.strftime('%Y-%m-%dT%H:%M:%S.') ~ ('%03d'|format(event_time.microsecond // 1000)) ~ event_time.strftime('%z') -%}
+{%- set log_clock = log_clock[:-2] ~ ':' ~ log_clock[-2:] -%}
+{%- set latency_text = '0.%06d'|format(latency_us) -%}
+{%- set message = ('reply: ' if is_reply else 'query: ') ~ client ~ ' ' ~ qname ~ ' ' ~ qtype ~ ' IN' ~ (' ' ~ response_code ~ ' ' ~ latency_text ~ ' ' ~ from_cache ~ ' ' ~ response_size if is_reply else '') -%}
+{%- set original = log_clock ~ ' unbound[' ~ params.process_id ~ ':' ~ worker ~ '] ' ~ message -%}
+{%- set event = {
+  '@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['network'], 'type': ['end'] if is_reply else ['start'], 'action': 'dns-reply' if is_reply else 'dns-query', 'original': original},
+  'host': {'name': params.host_name},
+  'process': {'name': 'unbound', 'pid': params.process_id},
+  'source': {'ip': client},
+  'related': {'ip': [client]},
+  'dns': {'type': 'answer' if is_reply else 'query', 'question': {'name': qname, 'type': qtype, 'class': 'IN'}, 'response_code': response_code if is_reply else none},
+  'unbound': {'worker_id': worker, 'reply': {'time_to_resolve': latency_us / 1000000, 'from_cache': from_cache, 'response_size': response_size} if is_reply else none}
+} -%}
+{{- event | tojson -}}
