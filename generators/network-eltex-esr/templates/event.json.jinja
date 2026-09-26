@@ -1,0 +1,323 @@
+{# One source, bounded maintenance queue and one temporary local account.
+   SSH CLI commit/confirm messages are outside this documented subset.
+   Deployment assumption: every commit is confirmed within 600 seconds. #}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- if not (6 <= interval <= 8760) -%}
+  {{ module.math.sqrt(-1) }}
+{%- endif -%}
+{%- if not shared.get('initialized', false) -%}
+  {%- for name in [params.normal_user, params.unusual_user,
+      params.service_user_prefix ~ '001', params.service_user_prefix ~ '002',
+      params.service_user_prefix ~ '003'] -%}
+    {%- if not module.re.fullmatch('[A-Za-z][A-Za-z0-9_-]{0,30}', name) -%}
+      {{ module.math.sqrt(-1) }}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if params.normal_user == params.unusual_user or
+      params.normal_user in [params.service_user_prefix ~ '001',
+      params.service_user_prefix ~ '002', params.service_user_prefix ~ '003'] or
+      params.unusual_user in [params.service_user_prefix ~ '001',
+      params.service_user_prefix ~ '002', params.service_user_prefix ~ '003'] -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- for ip in [params.router_ip, params.normal_source_ip,
+      params.unusual_source_ip] -%}
+    {%- set checked_ip = module.ipaddress.IPv4Address(ip) -%}
+  {%- endfor -%}
+  {%- if not module.re.fullmatch('[A-Za-z0-9][A-Za-z0-9.-]{0,63}',
+      params.router_name) -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- do shared.update({'initialized': true, 'next_episode': now +
+      (interval * 3600) | int, 'next_maintenance': now + 3600,
+      'maintenance_phase': 0, 'maintenance_cursor': 0,
+      'episode_cursor': 0, 'queue': [],
+      'queue_index': 0, 'temporary': none, 'context': {}}) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- if not queue -%}
+  {%- set temporary = shared.get('temporary') -%}
+  {%- set due = params.anomaly_mode and now >= shared.get('next_episode') -%}
+  {%- set cleanup = temporary and (due or now >= temporary.cleanup_at) -%}
+  {%- set phase = shared.get('maintenance_phase') -%}
+  {%- set actor = params.unusual_user if (due or phase % 2)
+      else params.normal_user -%}
+  {%- set src = params.unusual_source_ip if actor == params.unusual_user
+      else params.normal_source_ip -%}
+  {%- set session = {'actor': actor, 'ip': src,
+      'port': module.rand.number.integer(32768, 60999),
+      'target': temporary.name if temporary else ''} -%}
+  {%- do session.update({'service_port': 32768 +
+      ((session.port - 32768 + module.rand.number.integer(1, 28231)) % 28232)}) -%}
+  {%- if cleanup -%}
+    {%- set queue = ['accepted', 'opened', 'remove', 'apply', 'closed'] -%}
+  {%- elif due -%}
+    {%- set cursor = shared.get('episode_cursor') -%}
+    {%- do shared.set('episode_cursor', (cursor + 1) % 3) -%}
+    {%- do session.update({'target': params.service_user_prefix ~
+        ('%03d' % (cursor + 1))}) -%}
+    {%- set queue = ['failed', 'failed', 'failed', 'accepted', 'opened',
+        'enable', 'create', 'privilege', 'apply', 'time',
+        'service_accepted', 'service_opened', 'service_closed', 'closed'] -%}
+    {%- do shared.set('next_episode', now + (interval * 3600) | int) -%}
+  {%- elif now >= shared.get('next_maintenance') -%}
+    {%- do shared.set('next_maintenance', now + 3600) -%}
+    {%- do shared.set('maintenance_phase', phase if phase == 0 and temporary else (phase + 1) % 6) -%}
+    {%- if phase == 0 and not temporary -%}
+      {%- set cursor = shared.get('maintenance_cursor') -%}
+      {%- do shared.set('maintenance_cursor', (cursor + 1) % 3) -%}
+      {%- do session.update({'target': params.service_user_prefix ~
+          ('%03d' % (cursor + 1))}) -%}
+      {%- set queue = ['failed', 'accepted', 'opened', 'create', 'apply',
+          'service_accepted', 'service_opened', 'service_closed', 'closed'] -%}
+    {%- elif phase == 1 and temporary and temporary.privilege == 1 -%}
+      {%- set queue = ['accepted', 'opened', 'privilege', 'apply', 'closed'] -%}
+    {%- elif phase == 2 and temporary and temporary.applied -%}
+      {%- set queue = ['service_accepted', 'service_opened', 'service_closed'] -%}
+    {%- elif phase == 3 -%}
+      {%- set queue = ['accepted', 'opened', 'enable', 'apply', 'time', 'closed'] -%}
+    {%- elif phase == 4 and temporary -%}
+      {%- set queue = ['accepted', 'opened', 'remove', 'apply', 'closed'] -%}
+    {%- else -%}
+      {%- set queue = ['failed', 'accepted', 'opened', 'closed'] -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if queue -%}
+    {%- do shared.update({'queue': queue, 'queue_index': 0,
+        'context': session}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set extra = {} -%}
+{%- set category = ['network'] -%}
+{%- set event_type = ['info'] -%}
+{%- set outcome = 'success' -%}
+{%- set group = 'FIREWALL' -%}
+{%- set severity_code = 'I' -%}
+{%- set mnemonic = 'LOG' -%}
+{%- set action = 'firewall_permitted' -%}
+{%- if queue -%}
+  {%- set index = shared.get('queue_index') -%}
+  {%- set step = queue[index] -%}
+  {%- set context = shared.get('context') -%}
+  {%- set actor = context.target if step.startswith('service_')
+      else context.actor -%}
+  {%- set src = context.ip -%}
+  {%- set port = context.service_port if step.startswith('service_')
+      else context.port -%}
+  {%- if step in ['failed', 'accepted', 'service_accepted'] -%}
+    {%- set group = 'AAA' -%}
+    {%- set mnemonic = 'SSH' -%}
+    {%- set accepted = step != 'failed' -%}
+    {%- set body = ('Accepted' if accepted else 'Failed') ~
+        ' password for ' ~ actor ~ ' from ' ~ src ~ ' port ' ~ port ~ ' ssh2' -%}
+    {%- set action = 'ssh_password_accepted' if accepted else 'ssh_password_failed' -%}
+    {%- set category = ['authentication'] -%}
+    {%- set event_type = ['start', 'allowed' if accepted else 'denied'] -%}
+    {%- set outcome = 'success' if accepted else 'failure' -%}
+    {%- do extra.update({'user': {'name': actor}, 'source': {'ip': src, 'port': port},
+        'destination': {'ip': params.router_ip, 'port': 22},
+        'network': {'transport': 'tcp'},
+        'eltex': {'esr': {'ssh': {'protocol': 'ssh2'}}}}) -%}
+  {%- elif step in ['opened', 'closed', 'service_opened', 'service_closed'] -%}
+    {%- set group = 'AAA-LOCAL' -%}
+    {%- set mnemonic = 'SESSION' -%}
+    {%- set opened = step.endswith('opened') -%}
+    {%- set body = 'ssh: session ' ~ ('opened' if opened else 'closed') ~ ' for user ' ~ actor -%}
+    {%- set action = 'session_opened' if opened else 'session_closed' -%}
+    {%- set category = ['authentication'] -%}
+    {%- set event_type = ['start'] if opened else ['end'] -%}
+    {%- do extra.update({'user': {'name': actor},
+        'eltex': {'esr': {'session': {'access': 'ssh'}}}}) -%}
+  {%- elif step == 'enable' -%}
+    {%- do shared.set('pending_change', 'enable') -%}
+    {%- set group = 'USER' -%}
+    {%- set mnemonic = 'INFO' -%}
+    {%- set body = "password for '$enab15$' changed by '" ~ actor ~ "'" -%}
+    {%- set action = 'enable_password_changed' -%}
+    {%- set category = ['iam', 'configuration'] -%}
+    {%- set event_type = ['change'] -%}
+    {%- do extra.update({'user': {'name': actor},
+        'eltex': {'esr': {'privilege_level': 15}}}) -%}
+  {%- elif step == 'create' -%}
+    {%- do shared.set('pending_change', 'create') -%}
+    {%- set group = 'USER' -%}
+    {%- set mnemonic = 'ADD' -%}
+    {%- set body = 'User ' ~ context.target ~ ' was created' -%}
+    {%- set action = 'user_created' -%}
+    {%- set category = ['iam'] -%}
+    {%- set event_type = ['creation'] -%}
+    {%- do extra.update({'user': {'target': {'name': context.target}}}) -%}
+    {%- do shared.set('temporary', {'name': context.target, 'privilege': 1,
+        'applied': false, 'removed': false,
+        'cleanup_at': now + (3600 if 'enable' in queue else 18000)}) -%}
+  {%- elif step == 'privilege' -%}
+    {%- do shared.set('pending_change', 'privilege') -%}
+    {%- set group = 'USER' -%}
+    {%- set mnemonic = 'INFO' -%}
+    {%- set body = 'Privilege level of user ' ~ context.target ~ ' was changed from 1 to 14' -%}
+    {%- set action = 'user_privilege_changed' -%}
+    {%- set category = ['iam'] -%}
+    {%- set event_type = ['change'] -%}
+    {%- do extra.update({'user': {'target': {'name': context.target}},
+        'eltex': {'esr': {'privilege': {'old': 1, 'new': 14}}}}) -%}
+    {%- do shared.get('temporary').update({'privilege': 14, 'applied': false}) -%}
+  {%- elif step == 'remove' -%}
+    {%- do shared.set('pending_change', 'remove') -%}
+    {%- set group = 'USER' -%}
+    {%- set mnemonic = 'ADD' -%}
+    {%- set body = 'User ' ~ context.target ~ ' was removed' -%}
+    {%- set action = 'user_removed' -%}
+    {%- set category = ['iam'] -%}
+    {%- set event_type = ['deletion'] -%}
+    {%- do extra.update({'user': {'target': {'name': context.target}}}) -%}
+    {%- do shared.get('temporary').update({'removed': true}) -%}
+  {%- elif step == 'apply' -%}
+    {%- set group = 'SYS' -%}
+    {%- set mnemonic = 'EVENT' -%}
+    {%- set severity_code = 'W' -%}
+    {%- set body = 'Configuration is applied' -%}
+    {%- set action = 'configuration_applied' -%}
+    {%- set category = ['configuration'] -%}
+    {%- set event_type = ['change'] -%}
+    {%- if shared.get('pending_change') != 'enable' -%}
+    {%- if shared.get('temporary').removed -%}
+      {%- do shared.set('temporary', none) -%}
+    {%- else -%}
+      {%- do shared.get('temporary').update({'applied': true}) -%}
+    {%- endif -%}
+    {%- endif -%}
+    {%- do shared.pop('pending_change', none) -%}
+  {%- elif step == 'time' -%}
+    {%- set group = 'TIME' -%}
+    {%- set mnemonic = 'INFO' -%}
+    {%- set body = 'System time was changed by user ' ~ actor -%}
+    {%- set action = 'system_time_changed' -%}
+    {%- set category = ['configuration'] -%}
+    {%- set event_type = ['change'] -%}
+    {%- do extra.update({'user': {'name': actor}}) -%}
+  {%- endif -%}
+  {%- if index + 1 == queue | length -%}
+    {%- do shared.update({'queue': [], 'queue_index': 0, 'context': {}}) -%}
+  {%- else -%}
+    {%- do shared.set('queue_index', index + 1) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set kind = module.rand.weighted_choice(['permit', 'deny', 'nat', 'ips'], [620, 200, 150, 15]) -%}
+  {%- set flow = samples.flows.where(decision='denied' if kind == 'deny' else 'permitted').pick() -%}
+  {%- if kind == 'permit' or kind == 'deny' -%}
+    {%- set decision = 'permitted' if kind == 'permit' else 'denied' -%}
+    {%- set action = 'firewall_' ~ decision -%}
+    {%- set event_type = ['connection',
+        'allowed' if kind == 'permit' else 'denied'] -%}
+    {%- set outcome = 'success' if kind == 'permit' else 'failure' -%}
+    {%- set body = "zone-pair 'trust untrust' rule " ~ flow.rule
+        ~ ' (VRF_prod) ' ~ decision ~ ' tcp '
+        ~ flow.source_ip ~ ':' ~ flow.source_port ~ ' ('
+        ~ flow.interface ~ ' ' ~ flow.interface_mac ~ ') -> '
+        ~ flow.destination_ip ~ ':' ~ flow.destination_port
+        ~ ', dscp 0' -%}
+    {%- do extra.update({'source': {'ip': flow.source_ip,
+        'port': flow.source_port, 'zone': 'trust'},
+        'destination': {'ip': flow.destination_ip,
+            'port': flow.destination_port, 'zone': 'untrust'},
+        'network': {'transport': 'tcp'},
+        'eltex': {'esr': {'zone_pair': 'trust untrust',
+            'rule': flow.rule, 'vrf': 'VRF_prod', 'decision': decision,
+            'interface': {'name': flow.interface,
+                'mac': flow.interface_mac}, 'dscp': 0}}}) -%}
+  {%- elif kind == 'nat' -%}
+    {%- set group = 'NAT' -%}
+    {%- set action = 'snat_translation' -%}
+    {%- set event_type = ['connection', 'allowed'] -%}
+    {%- set body = "SNAT ruleset 'office-egress' rule 1 (VRF_prod) "
+        ~ 'permitted translation for tcp ' ~ flow.source_ip ~ ':'
+        ~ flow.source_port ~ ' to ' ~ flow.nat_ip ~ ':'
+        ~ flow.nat_port -%}
+    {%- do extra.update({'source': {'ip': flow.source_ip,
+        'port': flow.source_port,
+        'nat': {'ip': flow.nat_ip, 'port': flow.nat_port}},
+        'network': {'transport': 'tcp'},
+        'eltex': {'esr': {'nat': {'type': 'SNAT',
+            'ruleset': 'office-egress', 'rule': 1,
+            'vrf': 'VRF_prod', 'decision': 'permitted'}}}}) -%}
+  {%- elif kind == 'ips' -%}
+    {%- set group = 'IPS' -%}
+    {%- set mnemonic = 'INFO' -%}
+    {%- set action = 'ips_drop' -%}
+    {%- set category = ['network', 'intrusion_detection'] -%}
+    {%- set event_type = ['denied'] -%}
+    {%- set outcome = 'failure' -%}
+    {%- set body = '[Drop] [1:30010:0] Rule 10 Drop '
+        ~ '[Classification: Generic ICMP event] [Priority: 3] '
+        ~ '{ICMP} ' ~ flow.source_ip ~ ':2048 -> '
+        ~ flow.destination_ip ~ ':0' -%}
+    {%- do extra.update({'source': {'ip': flow.source_ip,
+        }, 'destination': {'ip': flow.destination_ip}, 'network': {'transport': 'icmp'},
+        'eltex': {'esr': {'ips': {'action': 'Drop',
+            'signature_id': '1:30010:0',
+            'group_id': 1, 'rule_id': 30010, 'revision': 0,
+            'description': 'Rule 10 Drop',
+            'classification': 'Generic ICMP event',
+            'priority': 3, 'native_source_suffix': 2048,
+            'native_destination_suffix': 0}}}}) -%}
+
+  {%- endif -%}
+{%- endif -%}
+{%- set raw = '%' ~ group ~ '-' ~ severity_code
+    ~ '-' ~ mnemonic ~ ': ' ~ body -%}
+{%- set sequence = shared.get('sequence', 0) + 1 -%}
+{%- do shared.set('sequence', sequence % 2147483647) -%}
+{%- set app_name = 'login' if group in ['AAA', 'AAA-LOCAL']
+    else group.lower() -%}
+{%- set facility = 10 if group in ['AAA', 'AAA-LOCAL'] else 16 -%}
+{%- set severity = {'I': 6, 'W': 4, 'F': 2}[severity_code] -%}
+{%- set priority = facility * 8 + severity -%}
+{%- set frame = '<' ~ priority ~ '>1 ' ~ timestamp.astimezone(module.datetime.timezone.utc).isoformat(timespec='seconds')
+    ~ ' ' ~ params.router_name ~ ' ' ~ app_name ~ ' - - - '
+    ~ sequence ~ ': ' ~ raw -%}
+{
+  "@timestamp": {{ timestamp.astimezone(module.datetime.timezone.utc).isoformat(timespec='seconds') | tojson }},
+  "ecs": {"version": "8.17.0"},
+  "event": {
+    "action": {{ action | tojson }},
+    "category": {{ category | tojson }},
+    "dataset": "eltex.esr.syslog",
+    "kind": "event",
+    "module": "eltex",
+    "original": {{ frame | tojson }},
+    "outcome": {{ outcome | tojson }},
+    "type": {{ event_type | tojson }}
+  },
+  "message": {{ raw | tojson }},
+  "log": {
+    "level": {{ {'I': 'info', 'W': 'warning',
+      'F': 'critical'}[severity_code] | tojson }},
+    "syslog": {"priority": {{ priority }},
+      "facility": {"code": {{ facility }}},
+      "severity": {"code": {{ severity }}},
+      "appname": {{ app_name | tojson }},
+      "version": "1"}
+  },
+  "observer": {
+    "hostname": {{ params.router_name | tojson }},
+    "ip": {{ [params.router_ip] | tojson }},
+    "name": {{ params.router_name | tojson }},
+    "product": "ESR",
+    "type": "router",
+    "vendor": "Eltex"
+  },
+  "eltex": {"esr": {
+    "group": {{ group | tojson }},
+    "mnemonic": {{ mnemonic | tojson }},
+    "severity_code": {{ severity_code | tojson }},
+    "sequence_number": {{ sequence }},
+    "details": {{ extra.get('eltex', {}).get('esr', {}) | tojson }}
+  }}{% if extra.get('source') %},
+  "source": {{ extra.source | tojson }}{% endif %}{% if extra.get('destination') %},
+  "destination": {{ extra.destination | tojson }}{% endif %}{% if extra.get('network') %},
+  "network": {{ extra.network | tojson }}{% endif %}{% if extra.get('user') %},
+  "user": {{ extra.user | tojson }}{% endif %}{% if extra.get('user') %},
+  "related": {"user": {{ [extra.user.get('name', extra.user.get('target', {}).get('name'))] | tojson }}}{% elif extra.get('source') %},
+  "related": {"ip": {{ [extra.source.ip] | tojson }}}{% endif %}
+}
