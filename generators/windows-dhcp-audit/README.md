@@ -1,34 +1,36 @@
 # Microsoft DHCP Server CSV Audit Log
 
-Generates Windows DHCP Server audit rows in `event.original` with ECS fields shaped like the Elastic Microsoft DHCP integration. The modeled server has 97 Windows clients across two private subnets, each with a configured eight-hour lease duration. Its one-minute input ticks skip idle periods. All clients start with pre-existing valid leases; subsequent renewals, releases, and reassignments obey per-client state. Renewals occur no sooner than four hours after the preceding lease event, while releases have a separate timer. Each DNS result follows a request for the same host and IP.
+Generates the 19-column IPv4 DHCP audit CSV variant, with parsed ECS JSON in the output file and the native row in `event.original`. This is the Windows DHCP audit file stream, not Windows Event Log or IPv6. The selected format follows complete Microsoft, Elastic and Graylog integration examples. Those examples do not identify an exact Windows Server build. The modeled server runs in UTC, so both the timezone-free CSV date/time and `event.timezone: UTC` agree even when the input CLI uses another timezone. Weekday file names follow the server's UTC day.
 
-The emitted records use the 19-column CSV variant shown in Elastic's raw fixture and Microsoft's full ID 11 example. Dates are modeled in UTC, which is also the explicit `event.timezone` used to interpret the timezone-free CSV line. File names follow the source's weekday rotation.
+The server has 97 Windows clients across two private subnets. All start with pre-existing valid leases and staggered first renewal times. The default synthetic lease duration is eight hours, with T1 renewal scheduled after four hours. Each successful assignment/renewal refreshes the full lease lifetime. Releases only apply to an active matching client/IP. The state model retires an expired lease before issuing a new assignment; lease-expiry audit IDs 17/18 are outside this selected emitted subset. The default one-minute cadence keeps observed renewals before expiration. Lease lifetime is internal simulation state, not an invented CSV column.
 
 ## Event Types
 
 | CSV ID | Native description | Background behavior |
 | --- | --- | --- |
-| 10 | Assign | Reassignment after release |
-| 11 | Renew | Active lease reaches its four-hour renewal time |
-| 12 | Release | Active client lease released |
-| 30 | DNS Update Request | May follow an assignment or renewal |
-| 32 | DNS Update Successful | Follows ID 30 for the same host and IP |
-| 31 | DNS Update Failed | Follows ID 30 for the same host and IP; uses the observed `10054` error code |
+| 10 | Assign | New assignment after release or expired state |
+| 11 | Renew | Existing active lease reaches T1 |
+| 12 | Release | Client releases its active matching lease; vendor-class fields are empty |
+| 30 | DNS Update Request | May follow assignment or renewal |
+| 32 | DNS Update Successful | Result for the same host and IP as ID 30 |
+| 31 | DNS Update Failed | Result for the same host and IP; observed error `10054` |
 
-Each active client has an independent release timer: 2–24 hours for the 13 mobile clients and 1–7 days for stationary clients. After a background release, a client reconnects in 30–180 minutes; a renewal is scheduled four hours after an assignment or previous renewal. A DNS request follows 30% of assignments or 5% of renewals, and 5% of requests fail. Request and result events are separated by 1–8 seconds. These are synthetic selection settings, not measured Microsoft frequencies. The background includes ID 31, the target client, and all four target addresses. The target has one row in the 97-client sample, so it is not overrepresented in the client pool.
+The 13 mobile clients release after 2–24 hours, stationary clients after 1–7 days. Background reconnect is scheduled 30–180 minutes after release. Due operations compete for one input tick and can wait longer than the timer. DNS requests follow 30% of assignments or 5% of renewals, and 5% of results fail. The request follows its lease event by 1–8 seconds, and its result follows by another 1–8 seconds. These rates and fleet timers are synthetic choices, not measured Microsoft frequencies. Pending DNS events finish before another lease operation or episode begins.
+
+Both modes include the target client, all four target addresses, releases, assignments, renewals and ordinary DNS failures. Assign/Renew carry the observed `MSFT 5.0` vendor class; Release and DNS rows leave it empty. DNS rows also leave native MAC empty and use transaction ID 0 / QResult 6. Lease rows use a nonzero synthetic 32-bit transaction ID and QResult 0. No transaction ID is claimed to identify a client session.
 
 ## Anomaly Chain
 
-After at least 250 background rows, `anomaly_mode: true` emits one eight-row sequence for `ws-finance-01.corp.example` / client ID `0023DF0000A1`:
+`anomaly_mode: true` repeats an eight-row address-churn episode every 24 hours of generated source time by default. When due, it waits for pending DNS to finish and for the target to have a valid lease, then starts on the next input tick. A target awaiting ordinary reconnect can defer an episode. The next interval is measured from the actual initial release, so episodes do not overlap or catch up in a burst.
 
-1. ID 12 releases its current lease.
-2. IDs 10 and 12 assign then release `10.20.7.41`.
-3. IDs 10 and 12 assign then release `10.20.7.42`.
-4. ID 10 assigns `10.20.7.43`, followed by ID 30 DNS Update Request and ID 31 DNS Update Failed for that address.
+1. ID 12 releases the target's current active address.
+2. ID 10 assigns another address, followed by ID 12 for that same address.
+3. ID 10 assigns a second address, followed by ID 12 for that address.
+4. ID 10 assigns a third distinct address, then ID 30 and ID 31 for the final hostname/IP.
 
-The sequence takes less than seven minutes, with one-minute ticks for lease events and 1–8 seconds between the final assignment, DNS request, and DNS result. Join lease rows by MAC/client ID, hostname, and server. Native DNS rows leave the MAC column empty, as in Elastic's raw examples, so join IDs 30/31 to the final lease by hostname, IP, server, and time. A rule can detect three distinct assignments with two intervening releases for one client within six minutes, then a DNS failure for the final address within 20 seconds of its assignment. The DNS failure coincides with rapid address churn; the log does not prove that the churn caused the failure or that a malicious actor is involved.
+The three assigned addresses come from the same four-address pool used by ordinary reconnects. Their order varies between adjacent episodes using a bounded rotation; addresses can be reused in later episodes. Lease transaction IDs vary per operation. The eight records take less than seven minutes: one-minute ticks plus 0–59 second jitter for lease events, and the two short DNS gaps. Join lease rows by MAC/client ID, hostname and server. Native DNS rows have no MAC, so join to the final assignment by hostname, IP, server and time. A rule can detect three distinct assignments with two intervening releases within six minutes, followed by DNS failure within 20 seconds of the final assignment. The failure coincides with churn; these logs do not establish causation or a malicious actor.
 
-`anomaly_mode` defaults to `true`. Set it to `false` for ordinary background only. Both modes use the same target identity, addresses, event IDs, and error code. The timed sequence is the anomaly, not any single row.
+`anomaly_mode` defaults to `true`. Set it to `false` for ordinary background without the complete fast sequence. No extra native marker or synthetic event sequence identifies an episode.
 
 ## Parameters
 
@@ -39,18 +41,18 @@ Edit `event.template.params` in `generator.yml`:
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `server_name`, `server_ip` | `dhcp-01.corp.example`, `10.20.0.10` | DHCP server identity |
-| `anomaly_hostname`, `anomaly_client_id` | `ws-finance-01.corp.example`, `0023DF0000A1` | Client used in the correlated sequence and normal traffic |
-| `anomaly_base_ip` | `10.20.7.40` | Target client's ordinary starting address |
-| `anomaly_ips` | `10.20.7.41`, `.42`, `.43` | Successive anomaly addresses; also rotate in normal traffic after releases |
-| `anomaly_after_events` | `250` | Minimum number of background rows before the one-time sequence |
-| `lease_renew_minutes` | `240` | Four-hour renewal time for the modeled eight-hour lease |
-| `anomaly_mode` | `true` | Include one sequence; `false` produces background only |
+| `anomaly_hostname`, `anomaly_client_id` | `ws-finance-01.corp.example`, `0023DF0000A1` | Client used in episodes and ordinary traffic |
+| `anomaly_base_ip` | `10.20.7.40` | Target's initial address, also in the rotating pool |
+| `anomaly_ips` | `10.20.7.41`, `.42`, `.43` | Three more pool addresses; their episode order varies |
+| `anomaly_interval_hours` | `24` | Positive recurrence interval, clamped to at least one hour |
+| `lease_renew_minutes` | `240` | T1, clamped to at least 240 minutes; full modeled lease is twice T1 |
+| `anomaly_mode` | `true` | Periodic episodes mixed with background; `false` for background only |
 
-The 97-client pool is in `samples/clients.json`; `mobile` selects the shorter ordinary release interval. Change that file to model another client population. Keep the four target addresses distinct and outside the other clients' addresses.
+Use lower-case ASCII hostnames and uppercase 12-hex Ethernet client IDs. Keep the four target IPv4 addresses distinct, in one client subnet, and outside other clients' addresses. Keep the target hostname/client ID distinct from the other 96 clients. The pool is in `samples/clients.json`; `mobile` selects the shorter release timer. The shipped source cadence is one tick per minute with count 1. Adjust fleet and timers together when changing cadence or population. State is bounded by 97 leases, one pending DNS pair, three episode addresses and scalar scheduler/cursor/file counters.
 
 ### Output Parameters
 
-The shipped configuration writes `output/events.json` locally. It has no required top-level `${params.*}` or `${secrets.*}` overrides. Change `output.file.path` or replace the output plugin when connecting to a SIEM.
+The shipped config writes `output/events.json` locally. It has no required top-level `${params.*}` or `${secrets.*}` substitutions. Change the file path or output plugin for SIEM delivery.
 
 ## Usage
 
@@ -60,15 +62,33 @@ From the content-packs repository root:
 uv run --project ../eventum eventum generate --path generators/windows-dhcp-audit/generator.yml --id windows-dhcp-audit --live-mode true
 ```
 
-For an existing Eventum installation, run `eventum generate` with the same arguments. The five-field cron expression offers one timestamp per minute. The state model drops idle ticks, so output volume follows the 97-client lease and release schedules. Adjust the cron interval, client sample, and timers together for another fleet.
+For a finite eight-day-and-six-hour sample covering multiple default episodes, create a config beside the original so relative sample/template paths stay valid:
+
+```bash
+uv run --project ../eventum python - <<'PYCONFIG'
+from pathlib import Path
+import yaml
+root = Path('generators/windows-dhcp-audit')
+config = yaml.safe_load((root / 'generator.yml').read_text())
+config['input'][0]['cron'].update(
+    start='2026-09-25T00:00:00+00:00',
+    end='2026-10-03T06:00:00+00:00',
+)
+(root / '.finite.yml').write_text(yaml.safe_dump(config, sort_keys=False))
+PYCONFIG
+flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/windows-dhcp-audit/.finite.yml --id windows-dhcp-sample --live-mode false --keep-order true
+rm generators/windows-dhcp-audit/.finite.yml
+```
+
+Idle input ticks are dropped, so row count depends on generated lease/release/DNS schedules. Set `anomaly_mode: false` in the temporary config for the same background window. A finite run may end with a pending DNS result; the generator does not fabricate a completion.
 
 ## Sample Output
 
-The following event was copied from the enabled-mode seven-day validation run:
+This synthetic Release event was copied from a verified enabled-mode run. Its optional vendor-class columns are empty, matching the observed ID 12 variant. The same shape occurs in background; this is not a vendor capture.
 
 ```json
 {
-  "@timestamp": "2026-09-25T08:57:13+00:00",
+  "@timestamp": "2026-09-26T00:02:08+00:00",
   "agent": {
     "ephemeral_id": "a1b2c3d4-1111-4444-8888-123456789abc",
     "id": "a1b2c3d4-1111-4444-8888-123456789abc",
@@ -90,20 +110,21 @@ The following event was copied from the enabled-mode seven-day validation run:
     "version": "8.17.0"
   },
   "event": {
-    "action": "dhcp-dns-update",
+    "action": "dhcp-release",
     "agent_id_status": "verified",
     "category": [
       "network"
     ],
-    "code": "31",
+    "code": "12",
     "dataset": "microsoft_dhcp.log",
-    "ingested": "2026-09-25T08:57:13+00:00",
+    "ingested": "2026-09-26T00:02:08+00:00",
     "kind": "event",
-    "original": "31,09/25/26,08:57:13,DNS Update Failed,10.20.7.43,ws-finance-01.corp.example,,,0,6,,,,,,,,,10054",
-    "outcome": "failure",
-    "reason": "DNS update failed.",
+    "original": "12,09/26/26,00:02:08,Release,10.20.7.42,ws-finance-01.corp.example,0023DF0000A1,,3812757102,0,,,,,,,,,0",
+    "outcome": "success",
+    "reason": "A lease was released by a client.",
     "timezone": "UTC",
     "type": [
+      "allowed",
       "connection"
     ]
   },
@@ -121,17 +142,17 @@ The following event was copied from the enabled-mode seven-day validation run:
   },
   "log": {
     "file": {
-      "path": "C:\\Windows\\System32\\Dhcp\\DhcpSrvLog-Fri.log"
+      "path": "C:\\Windows\\System32\\Dhcp\\DhcpSrvLog-Sat.log"
     },
-    "offset": 31774
+    "offset": 0
   },
-  "message": "DNS Update Failed",
+  "message": "Release",
   "microsoft": {
     "dhcp": {
-      "dns_error_code": "10054",
-      "result": "6",
-      "result_description": "No Quarantine Information",
-      "transaction_id": "0"
+      "dns_error_code": "0",
+      "result": "0",
+      "result_description": "NoQuarantine",
+      "transaction_id": "3812757102"
     }
   },
   "observer": {
@@ -148,13 +169,14 @@ The following event was copied from the enabled-mode seven-day validation run:
       "ws-finance-01.corp.example"
     ],
     "ip": [
-      "10.20.7.43"
+      "10.20.7.42"
     ]
   },
   "source": {
     "address": "ws-finance-01.corp.example",
     "domain": "ws-finance-01.corp.example",
-    "ip": "10.20.7.43"
+    "ip": "10.20.7.42",
+    "mac": "00-23-DF-00-00-A1"
   },
   "tags": [
     "preserve_original_event",
@@ -163,12 +185,14 @@ The following event was copied from the enabled-mode seven-day validation run:
 }
 ```
 
-## Evidence and Limits
+## References and Limits
 
-- [Microsoft DHCP Server audit-log format and ID catalog](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-r2-and-2008/dd183591(v=ws.10)) establishes IDs 10/11/12 and 30/31/32, but documents the older seven-column baseline rather than the newer 19-column suffix.
-- [Microsoft's full ID 11 row](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/event-4199-windows-client-cannot-get-ip-address-dhcp-server) shows a nonzero transaction ID, result 0, and `MSFT 5.0` vendor class.
-- [Elastic's first-party raw fixture](https://github.com/elastic/integrations/blob/main/packages/microsoft_dhcp/data_stream/log/_dev/test/pipeline/test-log.log) provides full ID 10, 30, and 31 rows. Its [ingest pipeline](https://github.com/elastic/integrations/blob/main/packages/microsoft_dhcp/data_stream/log/elasticsearch/ingest_pipeline/dhcp.yml) maps the extended columns and ECS fields. The [Elastic sample event](https://github.com/elastic/integrations/blob/main/packages/microsoft_dhcp/data_stream/log/sample_event.json) has 40 leaf fields; all 40 paths occur in generated output. That sample is ID 35, which this generator does not emit, so field coverage is not ID 35 behavior validation.
-- [Microsoft's DHCP troubleshooting guide](https://learn.microsoft.com/en-us/windows-server/troubleshoot/troubleshoot-dhcp-issue) documents renewal at half the lease duration; [Add-DhcpServerv4Scope](https://learn.microsoft.com/en-us/powershell/module/dhcpserver/add-dhcpserverv4scope?view=windowsserver2025-ps) shows the configurable scope duration and its eight-day default. This pack intentionally models a shorter eight-hour lease duration across its client subnets.
-- [Microsoft's dynamic DNS documentation](https://learn.microsoft.com/en-us/windows-server/networking/dns/dynamic-update) supports DHCP updates on client behalf. [Microsoft's weekday log-name specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-ipamm/39bcd84c-4d67-4711-85cc-6a03eaf1bb3d) supports the `DhcpSrvLog-<weekday>.log` path. [Windows QuarantineStatus](https://learn.microsoft.com/en-us/windows/win32/api/dhcpsapi/ne-dhcpsapi-quarantinestatus) defines result values 0 and 6.
+- [Microsoft audit-log catalog](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-server-2008-r2-and-2008/dd183591(v=ws.10)) defines IDs 10/11/12 and 30/31/32. Its older seven-column example does not establish the modern optional suffix.
+- [Microsoft full Renew example](https://learn.microsoft.com/en-us/troubleshoot/windows-server/networking/event-4199-windows-client-cannot-get-ip-address-dhcp-server) shows the extended ID 11 row. [Graylog Illuminate 7.1 DHCP integration](https://go2docs.graylog.org/illuminate-current/content_packs/microsoft_dhcp_content_pack.htm) gives complete Assign/Renew/Release examples, including empty Release vendor columns. Its supported server range is 2016/2019/2022/2025, but the example has no exact build identifier.
+- [Elastic raw DHCP fixtures](https://github.com/elastic/integrations/blob/158ba7a3e2c86176f28292a317828261ec3782c1/packages/microsoft_dhcp/data_stream/log/_dev/test/pipeline/test-log.log) contain complete ID 10/30/31/32 rows. [Elastic pipeline](https://github.com/elastic/integrations/blob/main/packages/microsoft_dhcp/data_stream/log/elasticsearch/ingest_pipeline/dhcp.yml) supplies the manual ECS field/action/QResult mapping. Its [sample event](https://github.com/elastic/integrations/blob/main/packages/microsoft_dhcp/data_stream/log/sample_event.json) is ID 35, which is not generated here; matching field paths does not validate ID semantics.
+- [NXLog IPv4 audit header](https://docs.nxlog.co/integrations/dhcp/windows-dhcp-server.html) confirms 19 column names/order. [Microsoft weekday audit files](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-ipamm/39bcd84c-4d67-4711-85cc-6a03eaf1bb3d) defines day-of-week naming.
+- [Microsoft DHCP lifecycle](https://learn.microsoft.com/en-us/windows-server/troubleshoot/troubleshoot-dhcp-issue) describes T1 at 50% of lease time. [Scope configuration](https://learn.microsoft.com/en-us/powershell/module/dhcpserver/add-dhcpserverv4scope?view=windowsserver2025-ps) documents configurable duration and an eight-day default; this generator intentionally uses eight hours. [Dynamic DNS](https://learn.microsoft.com/en-us/windows-server/networking/dns/dynamic-update) describes server updates on clients' behalf.
 
-**Raw-evidence limit:** no complete current Microsoft ID 12 CSV row was found. Its event meaning is documented, but the extended optional columns for release rows are inferred from the ID 10/11 lease layout. Collector fields such as Filebeat IDs, `event.ingested`, and `log.offset` are synthetic. This pack remains a draft until the ID 12 suffix is checked against a native capture.
+**BLOCKED_RAW_EVIDENCE:** individual selected native row variants are now supported by complete examples, including Release. A complete correlated episode and an exact Windows Server build capture remain unavailable after a bounded search. This is a selected synthetic scenario, not full native trace parity. Empty relay-agent/DHCID/user-class/user-name fields model the observed direct-client variant. Scope configuration, lease timers and expiry cleanup are internal assumptions; expiry IDs 17/18, file headers, service lifecycle, failover and IPv6 are omitted. `log.offset` counts only emitted ASCII body rows with CRLF and resets per UTC date; it is not a real file offset including headers. Filebeat identity, host/observer MACs and immediate ingestion timestamps are synthetic collector metadata.
+
+Existing `linux-syslog` DHCP rows are an ISC daemon host stream, and Suricata/NetFlow DHCP traffic is network telemetry. They do not duplicate this Windows server IPv4 CSV audit stream.
