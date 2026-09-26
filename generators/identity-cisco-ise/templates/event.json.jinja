@@ -1,0 +1,155 @@
+{%- set step = vars.step -%}
+{%- set kind = step -%}
+{%- set event_time = timestamp.astimezone(module.datetime.timezone.utc) + module.datetime.timedelta(milliseconds=module.rand.number.integer(0, 9999)) -%}
+{%- set interval = [params.anomaly_interval_hours|float, 2] | max * 3600 -%}
+{%- set due = shared.get('anomaly_next_at', event_time + module.datetime.timedelta(seconds=interval)) -%}
+{%- do shared.set('anomaly_next_at', due) -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- if shared.get('session_active', false) -%}
+    {%- set actor = shared.get('session_actor') -%}
+    {%- set src = shared.get('session_ip') -%}
+    {%- set kind = 'normal_logout' if shared.get('session_edits', 0) >= 2 else module.rand.weighted_choice(['normal_logout', 'normal_config', 'normal_target'], [90, 4, 6]) -%}
+  {%- elif shared.get('pending_login_actor') -%}
+    {%- set actor = shared.pop('pending_login_actor') -%}
+    {%- set src = shared.pop('pending_login_ip') -%}
+    {%- set kind = 'normal_login' -%}
+  {%- elif (not shared.get('remote_enabled', true) or not shared.get('auth_logging_enabled', true)) and ((shared.get('recovery_due') and event_time >= shared.get('recovery_due')) or (params.anomaly_mode and event_time >= due)) -%}
+    {%- set actor = params.normal_admin -%}
+    {%- set src = params.normal_admin_ip -%}
+    {%- set kind = 'normal_login' -%}
+    {%- if not shared.get('auth_logging_enabled', true) -%}{%- do shared.set('to_recovery_auth', true) -%}{%- endif -%}
+    {%- if not shared.get('remote_enabled', true) -%}{%- do shared.set('to_recovery_target', true) -%}{%- endif -%}
+  {%- else -%}
+    {%- set actor = module.rand.weighted_choice([params.normal_admin, params.anomaly_admin], [80, 20]) -%}
+    {%- set src = params.anomaly_admin_ip if actor == params.anomaly_admin else params.normal_admin_ip -%}
+    {%- set kind = module.rand.weighted_choice(['normal_login', 'normal_fail'], [95, 5]) -%}
+  {%- endif -%}
+{%- elif step.startswith('recovery_') -%}
+  {%- set actor = params.normal_admin -%}
+  {%- set src = params.normal_admin_ip -%}
+{%- else -%}
+  {%- set actor = params.anomaly_admin -%}
+  {%- set src = params.anomaly_admin_ip -%}
+{%- endif -%}
+{%- if kind == 'normal_fail' -%}
+  {%- do shared.set('pending_login_actor', actor) -%}
+  {%- do shared.set('pending_login_ip', src) -%}
+{%- elif kind in ['normal_login', 'login_success'] -%}
+  {%- do shared.update({'session_active': true, 'session_actor': actor, 'session_ip': src, 'session_edits': 0}) -%}
+{%- elif kind in ['normal_logout', 'attack_logout', 'recovery_logout'] -%}
+  {%- do shared.pop('session_active', none) -%}
+  {%- do shared.pop('session_actor', none) -%}
+  {%- do shared.pop('session_ip', none) -%}
+  {%- do shared.pop('session_edits', none) -%}
+  {%- if params.anomaly_mode and event_time >= due and shared.get('remote_enabled', true) and shared.get('auth_logging_enabled', true) -%}
+    {%- do shared.set('to_attack', true) -%}
+  {%- endif -%}
+{%- elif kind in ['normal_config', 'normal_target'] -%}
+  {%- do shared.set('session_edits', shared.get('session_edits', 0) + 1) -%}
+{%- elif kind == 'login_fail_1' -%}
+  {%- do shared.pop('to_attack', none) -%}
+  {%- do shared.set('anomaly_next_at', event_time + module.datetime.timedelta(seconds=interval)) -%}
+{%- endif -%}
+{%- set msg_number = shared.get('message_number', 27384) + 1 -%}
+{%- set seq = shared.get('sequence', 188270) + 1 -%}
+{%- do shared.set('message_number', msg_number) -%}
+{%- do shared.set('sequence', seq) -%}
+{%- set mid = '%010d' % msg_number -%}
+{%- set seq_text = '%010d' % seq -%}
+{%- set version = shared.get('config_version', 2732) -%}
+{%- set code = '51001' -%}
+{%- set desc = 'Administrator-Login: Administrator authentication succeeded' -%}
+{%- set action = 'administrator-login' -%}
+{%- set operation = 'Administrator authentication successful' -%}
+{%- set category = ['iam', 'authentication'] -%}
+{%- set event_type = ['admin', 'info'] -%}
+{%- set outcome = 'success' -%}
+{%- set detail = {} -%}
+{%- set config_fields = '' -%}
+{%- if kind in ['normal_fail', 'login_fail_1', 'login_fail_2', 'login_fail_3'] -%}
+  {%- set code = '51000' -%}
+  {%- set desc = 'Administrator-Login: Administrator authentication failed' -%}
+  {%- set operation = 'Authentication failed due to invalid user or password\\, or account is disabled/locked' -%}
+  {%- set category = none -%}
+  {%- set event_type = none -%}
+  {%- set outcome = 'failure' -%}
+{%- elif kind in ['normal_logout', 'attack_logout', 'recovery_logout'] -%}
+  {%- set code = '51002' -%}
+  {%- set desc = 'Administrator-Login: Administrator logged off' -%}
+  {%- set operation = 'User logged out' -%}
+{%- elif kind in ['normal_config', 'disable_auth_logging', 'recovery_auth'] -%}
+  {%- set code = '52001' -%}
+  {%- set desc = 'Configuration-Changes: Changed configuration' -%}
+  {%- set action = 'configuration-changes' -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_type = ['change', 'info'] -%}
+  {%- set outcome = none -%}
+  {%- set name = 'Passed Authentications' if kind in ['disable_auth_logging', 'recovery_auth'] or module.rand.number.integer(1, 10) <= 3 else 'System Statistics' -%}
+  {%- if kind == 'recovery_auth' -%}
+    {%- do shared.pop('to_recovery_auth', none) -%}
+    {%- set local = 'enable' -%}
+  {%- elif kind == 'disable_auth_logging' -%}
+    {%- set local = 'disable' -%}
+  {%- elif name == 'Passed Authentications' -%}
+    {%- set local = 'disable' if shared.get('auth_logging_enabled', true) else 'enable' -%}
+  {%- else -%}
+    {%- set local = 'disable' if shared.get('stats_logging', true) else 'enable' -%}
+  {%- endif -%}
+  {%- do shared.set('auth_logging_enabled' if name == 'Passed Authentications' else 'stats_logging', local == 'enable') -%}
+  {%- set targets = [] if local == 'disable' else ['LogCollector'] -%}
+  {%- set target_text = '{}' if not targets else '{LogCollector}' -%}
+  {%- set change = 'Object modified:\\, Log Severity Level = INFO\\,Local Logging = ' ~ local ~ '\\,Assigned Targets = ' ~ target_text -%}
+  {%- set operation = 'LoggingCategories "' ~ name ~ '" has been edited successfully.' -%}
+  {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSCategory, ObjectName=' ~ name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSCategory', 'name': name}, 'local_logging': local, 'assigned_targets': targets, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
+  {%- set version = version + 1 -%}
+  {%- do shared.set('config_version', version) -%}
+{%- elif kind in ['normal_target', 'disable_collector', 'recovery_target'] -%}
+  {%- set code = '52001' -%}
+  {%- set desc = 'Configuration-Changes: Changed configuration' -%}
+  {%- set action = 'configuration-changes' -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_type = ['change', 'info'] -%}
+  {%- set outcome = none -%}
+  {%- set name = 'RemoteCollector' if kind in ['disable_collector', 'recovery_target'] or module.rand.number.integer(1, 10) <= 3 else 'BackupCollector' -%}
+  {%- if kind == 'recovery_target' -%}{%- do shared.pop('to_recovery_target', none) -%}{%- endif -%}
+  {%- set old_status = 'ENABLED' if shared.get('remote_enabled' if name == 'RemoteCollector' else 'backup_enabled', true) else 'DISABLED' -%}
+  {%- set new_status = 'DISABLED' if old_status == 'ENABLED' else 'ENABLED' -%}
+  {%- do shared.set('remote_enabled' if name == 'RemoteCollector' else 'backup_enabled', new_status == 'ENABLED') -%}
+  {%- set target_ip = params.remote_collector_ip if name == 'RemoteCollector' else params.backup_collector_ip -%}
+  {%- set target_description = 'Remote UDP Collector' if name == 'RemoteCollector' else 'Backup UDP Collector' -%}
+  {%- set change = 'Object modified:\\,Port = 514\\,IP Address = ' ~ target_ip ~ '\\,Facility Code = LOCAL6\\,Length = 1024\\,Description = ' ~ target_description ~ '\\,Include Alarms = FALSE\\,Old status = ' ~ old_status ~ ' New status = ' ~ new_status ~ '\\,' -%}
+  {%- set operation = 'LoggingTargets "' ~ name ~ '" has been edited successfully.' -%}
+  {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSLogTarget, ObjectName=' ~ name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSLogTarget', 'name': name}, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
+  {%- set version = version + 1 -%}
+  {%- do shared.set('config_version', version) -%}
+{%- endif -%}
+{%- if not shared.get('remote_enabled', true) or not shared.get('auth_logging_enabled', true) -%}
+  {%- if not shared.get('recovery_due') -%}{%- do shared.set('recovery_due', event_time + module.datetime.timedelta(hours=1)) -%}{%- endif -%}
+{%- else -%}
+  {%- do shared.pop('recovery_due', none) -%}
+{%- endif -%}
+{%- set inner_time = event_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] -%}
+{%- set payload = inner_time ~ ' +00:00 ' ~ seq_text ~ ' ' ~ code ~ ' NOTICE ' ~ desc ~ ', ConfigVersionId=' ~ version ~ ', ' ~ config_fields ~ 'AdminInterface=GUI, AdminIPAddress=' ~ src ~ ', ' -%}
+{%- if code in ['51001', '51002'] -%}{%- set payload = payload ~ 'AdminSession=AdminGUI_Session, ' -%}{%- endif -%}
+{%- set payload = payload ~ 'AdminName=' ~ actor ~ ', ' -%}
+{%- if code in ['51000', '51001', '51002'] -%}
+  {%- set payload = payload ~ 'OperationMessageText=' ~ operation ~ ',' -%}
+{%- else -%}
+  {%- set payload = payload ~ config_tail -%}
+{%- endif -%}
+{%- set original = '<181>' ~ event_time.strftime('%b %e %H:%M:%S') ~ ' ' ~ params.ise_name ~ ' CISE_Administrative_and_Operational_Audit ' ~ mid ~ ' 1 0 ' ~ payload -%}
+{%- set cise = {'admin': {'interface': 'GUI'}, 'category': {'name': 'CISE_Administrative_and_Operational_Audit'}, 'config_version': {'id': version}, 'message': {'code': code, 'description': desc, 'id': mid}, 'segment': {'number': 0, 'total': 1}} -%}
+{%- if code in ['51001', '51002'] -%}{%- do cise.admin.update({'session': 'AdminGUI_Session'}) -%}{%- endif -%}
+{%- if code in ['51000', '51001', '51002'] -%}{%- do cise.update({'operation_message': {'text': operation}}) -%}{%- endif -%}
+{%- do cise.update(detail) -%}
+{%- set event = {'action': action, 'code': code, 'dataset': 'cisco_ise.log', 'kind': 'event', 'original': original, 'sequence': seq, 'timezone': '+00:00'} -%}
+{%- if category is not none -%}{%- do event.update({'category': category}) -%}{%- endif -%}
+{%- if event_type is not none -%}{%- do event.update({'type': event_type}) -%}{%- endif -%}
+{%- if outcome is not none -%}{%- do event.update({'outcome': outcome}) -%}{%- endif -%}
+{%- set out = {'@timestamp': event_time.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': event, 'cisco_ise': {'log': cise}, 'client': {'ip': src, 'user': {'name': actor}}, 'host': {'hostname': params.ise_name}, 'observer': {'name': params.ise_name, 'product': 'Identity Services Engine', 'vendor': 'Cisco', 'version': '3.4'}, 'log': {'level': 'notice', 'syslog': {'priority': 181, 'severity': {'name': 'notice'}}}, 'message': payload, 'related': {'hosts': [params.ise_name], 'ip': [src], 'user': [actor]}, 'user': {'name': actor}} -%}
+{{- out | tojson -}}
