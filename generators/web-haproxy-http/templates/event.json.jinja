@@ -1,19 +1,28 @@
 {%- set step = vars.step -%}
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set interval = module.datetime.timedelta(hours=[params.anomaly_interval_hours|float, 0.5]|max) -%}
+{%- set export_path = module.urllib.parse.quote(params.anomaly_path, safe='/-._~') -%}
 {%- if step == 'routine' -%}
   {%- do shared.pop('to_attack', none) -%}
-  {%- if params.anomaly_mode and not shared.get('anomaly_fired', false) -%}
-    {%- set count = shared.get('routine_count', 0) + 1 -%}
-    {%- do shared.set('routine_count', count) -%}
-    {%- if count >= params.anomaly_after_events -%}
+  {%- if params.anomaly_mode -%}
+    {%- set due = shared.get('next_episode_at', none) -%}
+    {%- if due is none -%}
+      {%- do shared.set('next_episode_at', utc + interval) -%}
+    {%- elif utc >= due -%}
       {%- do shared.set('to_attack', true) -%}
+      {%- do shared.set('next_episode_at', utc + interval) -%}
+      {%- set ports = module.random.sample(range(40000, 62001), 6) -%}
+      {%- if ports[0] == shared.get('last_first_port', none) -%}
+        {%- do ports.reverse() -%}
+      {%- endif -%}
+      {%- do shared.set('last_first_port', ports[0]) -%}
+      {%- do shared.set('episode_ports', ports) -%}
     {%- endif -%}
   {%- endif -%}
-{%- elif step == 'admin_export' -%}
-  {%- do shared.set('anomaly_fired', true) -%}
 {%- endif -%}
 {%- set req = samples.requests.pick() -%}
 {%- set method = req.method -%}
-{%- set path = params.anomaly_path if req.path == '/admin/export' else req.path -%}
+{%- set path = export_path if req.path == '/admin/export' else req.path -%}
 {%- set status = req.status -%}
 {%- set bytes = req.bytes -%}
 {%- set server = req.backend -%}
@@ -34,13 +43,20 @@
   {%- set src = params.anomaly_ip -%}
 {%- elif step == 'admin_export' -%}
   {%- set method = 'GET' -%}
-  {%- set path = params.anomaly_path -%}
+  {%- set path = export_path -%}
   {%- set status = 200 -%}
   {%- set bytes = 843220 -%}
   {%- set server = 'app1' -%}
   {%- set src = params.anomaly_ip -%}
 {%- endif -%}
 {%- set src_port = module.rand.number.integer(40000, 62000) -%}
+{%- if step != 'routine' -%}
+  {%- set port_index = {'fail_1':0, 'fail_2':1, 'fail_3':2, 'fail_4':3, 'login_success':4, 'admin_export':5}[step] -%}
+  {%- set src_port = shared.get('episode_ports')[port_index] -%}
+  {%- if step == 'admin_export' -%}
+    {%- do shared.pop('episode_ports', none) -%}
+  {%- endif -%}
+{%- endif -%}
 {%- set no_server = server == '<NOSRV>' -%}
 {%- if no_server -%}
   {%- set tr_request = 0 -%}
@@ -57,9 +73,9 @@
   {%- set tr_request = module.rand.number.integer(0, 2) -%}
   {%- set tw_queue = 0 -%}
   {%- set tc_connect = module.rand.number.integer(0, 4) -%}
-  {%- if path == params.anomaly_path -%}
+  {%- if path == export_path -%}
     {%- set tr_response = module.rand.number.integer(80, 240) -%}
-    {%- set transfer = module.rand.number.integer(300, 1500) -%}
+    {%- set transfer = module.rand.number.integer(300, 700) -%}
   {%- elif status == 401 -%}
     {%- set tr_response = module.rand.number.integer(8, 35) -%}
     {%- set transfer = module.rand.number.integer(0, 10) -%}
@@ -83,21 +99,22 @@
 {%- set timers = tr_request ~ '/' ~ tw_queue ~ '/' ~ tc_connect ~ '/' ~ tr_response ~ '/' ~ ta_active -%}
 {%- set connections = actconn ~ '/' ~ feconn ~ '/' ~ beconn ~ '/' ~ srvconn ~ '/0' -%}
 {%- set reqline = method ~ ' ' ~ path ~ ' HTTP/1.1' -%}
-{%- set accept = timestamp.strftime('%d/%b/%Y:%H:%M:%S.%f')[:-3] -%}
+{%- set request_time = utc - module.datetime.timedelta(milliseconds=ta_active) -%}
+{%- set accept = request_time.strftime('%d/%b/%Y:%H:%M:%S.%f')[:-3] -%}
 {%- set body = src ~ ':' ~ src_port ~ ' [' ~ accept ~ '] ' ~ params.frontend_name ~ ' ' ~ params.backend_name ~ '/' ~ server ~ ' ' ~ timers ~ ' ' ~ status ~ ' ' ~ bytes ~ ' - - ' ~ termination ~ ' ' ~ connections ~ ' 0/0 "' ~ reqline ~ '"' -%}
-{%- set syslog_time = timestamp.strftime('%b ') ~ ('%2d' % timestamp.day) ~ timestamp.strftime(' %H:%M:%S') -%}
+{%- set syslog_time = utc.strftime('%b ') ~ ('%2d' % utc.day) ~ utc.strftime(' %H:%M:%S') -%}
 {%- set original = syslog_time ~ ' ' ~ params.proxy_name ~ ' haproxy[2431]: ' ~ body -%}
 {%- set offset = shared.get('offset', 0) -%}
-{%- do shared.set('offset', offset + original|length + 1) -%}
+{%- do shared.set('offset', offset + original.encode('utf-8')|length + 1) -%}
 {%- set url = {'original':path,'path':path} -%}
 {%- if path.endswith('.js') -%}{%- do url.update({'extension':'js'}) -%}{%- endif -%}
 {%- set out = {
-  '@timestamp': timestamp.isoformat(),
+  '@timestamp': request_time.isoformat(),
   'ecs': {'version':'8.17.0'},
   'agent': {'ephemeral_id':'bb220000-2222-4444-8888-123456789abc','id':'aa110000-1111-4444-8888-123456789abc','name':params.proxy_name,'type':'filebeat','version':'8.17.0'},
   'elastic_agent': {'id':'aa110000-1111-4444-8888-123456789abc','snapshot':false,'version':'8.17.0'},
   'data_stream': {'dataset':'haproxy.log','namespace':'default','type':'logs'},
-  'event': {'agent_id_status':'verified','category':['web'],'dataset':'haproxy.log','duration':ta_active * 1000000,'ingested':timestamp.isoformat(),'kind':'event','original':original,'outcome':'failure' if status >= 400 else 'success','timezone':'+00:00'},
+  'event': {'agent_id_status':'verified','category':['web'],'dataset':'haproxy.log','duration':ta_active * 1000000,'ingested':utc.isoformat(),'kind':'event','original':original,'outcome':'failure' if status >= 400 else 'success','timezone':'+00:00'},
   'haproxy': {
     'backend_name':params.backend_name,'backend_queue':0,'bytes_read':bytes,'connection_wait_time_ms':tc_connect,
     'connections':{'active':actconn,'backend':beconn,'frontend':feconn,'retries':0,'server':srvconn},
