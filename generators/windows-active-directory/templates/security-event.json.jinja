@@ -124,6 +124,19 @@
   {%- endif -%}
 {%- endif -%}
 {%- set user_sid = params.domain_sid ~ '-' ~ user_row.rid -%}
+{# One current TGT per modeled account/client. Missing entries predate the window. #}
+{%- if code in ['4768', '4769'] -%}
+  {%- set tgt_cache = shared.get('tgt_cache', {}) -%}
+  {%- set tgt_key = user_sid ~ '|' ~ source_ip -%}
+  {%- set tgt = tgt_cache.get(tgt_key) -%}
+  {%- if code == '4768' or tgt is none -%}
+    {%- set tgt = {
+      'hash': module.base64.b64encode(module.os.urandom(32)).decode('ascii'),
+      'logon_guid': '{' ~ module.rand.crypto.uuid4() ~ '}'} -%}
+    {%- do tgt_cache.update({tgt_key: tgt}) -%}
+    {%- do shared.set('tgt_cache', tgt_cache) -%}
+  {%- endif -%}
+{%- endif -%}
 {%- set seq = shared.get('record_id', 900000) + 1 -%}
 {%- do shared.set('record_id', seq) -%}
 {%- set event_data = {} -%}
@@ -151,7 +164,7 @@
     'TicketOptionsDescription': ['Forwardable', 'Renewable-ok',
       'Name-canonicalize', 'Renewable']}) -%}
   {%- do event_data.update({
-    'ResponseTicket': module.base64.b64encode(module.os.urandom(32)).decode('ascii'),
+    'ResponseTicket': tgt.hash,
     'AccountSupportedEncryptionTypes': '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)',
     'AccountAvailableKeys': 'AES-SHA1, RC4',
     'ServiceSupportedEncryptionTypes': '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)',
@@ -171,7 +184,7 @@
   {%- set enc_name = {'0x12': 'AES256-CTS-HMAC-SHA1-96',
     '0x17': 'RC4-HMAC'}[enc] -%}
   {%- do event_data.update({
-    'LogonGuid': '{' ~ module.rand.crypto.uuid4() ~ '}',
+    'LogonGuid': tgt.logon_guid,
     'ServiceName': service_name,
     'ServiceSid': params.domain_sid ~ '-' ~ service_row.rid,
     'Status': '0x0', 'StatusDescription': 'KDC_ERR_NONE',
@@ -184,7 +197,7 @@
       'Renewable']}) -%}
   {%- do event_data.update({
     'TransmittedServices': '-',
-    'RequestTicketHash': module.base64.b64encode(module.os.urandom(32)).decode('ascii'),
+    'RequestTicketHash': tgt.hash,
     'ResponseTicketHash': module.base64.b64encode(module.os.urandom(32)).decode('ascii'),
     'AccountSupportedEncryptionTypes': 'N/A',
     'AccountAvailableKeys': 'N/A',
@@ -194,7 +207,7 @@
     'DCAvailableKeys': 'AES-SHA1, RC4',
     'ClientAdvertizedEncryptionTypes': 'RC4-HMAC-NT' if enc == '0x17'
       else 'AES256-CTS-HMAC-SHA1-96 AES128-CTS-HMAC-SHA1-96 RC4-HMAC-NT',
-    'SessionKeyEncryptionType': '0x12'}) -%}
+    'SessionKeyEncryptionType': '0x17' if enc == '0x17' else '0x12'}) -%}
 {%- elif code == '4771' -%}
   {%- set action = 'kerberos-preauth-failed' -%}
   {%- set task = 'Kerberos Authentication Service' -%}

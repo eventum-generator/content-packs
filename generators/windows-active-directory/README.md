@@ -21,13 +21,15 @@ The default is a small synthetic controller emitting one event per second. The a
 
 After the episode, another 3,600 ordinary events precede the next one. At one event per second, episode starts are about 1 hour and 2 minutes apart. Each cycle uses another pre-existing service account, with a new name and RID; its object GUID stays fixed within the cycle. Episode logon IDs and change-correlation GUIDs are new. The first two targets are `svc_sync_001` and `svc_sync_003`; approved group additions use `svc_sync_002` and `svc_sync_004`. No membership is added twice. The model assumes these accounts already exist and do not belong to Domain Admins before their addition.
 
-Ordinary delegation maintenance touches the same object later used by the episode. It first replaces `cifs/backup01.contoso.local` with `cifs/filesrv01.contoso.local`, establishing the value subsequently removed by the correlated change. The same actor, source IP, service-account family, event types and RC4 tickets also appear in the background. A target name or event ID alone does not label the incident.
+Ordinary delegation maintenance touches the same object later used by the episode. It first replaces `cifs/backup01.contoso.local` with `cifs/filesrv01.contoso.local`, establishing the value subsequently removed by the correlated change. The same actor, source IP, service-account family, event types and RC4 tickets also appear in the background. A target name or event ID alone does not label the incident. The sensitive `ldap/<controller>` delegation value is specific to the episode and can itself be a useful detection condition; background maintenance changes CIFS values.
 
-Correlate distinct 4771 users by IP, then join the 4768 success and 4769 sweep by IP, account and time. Join 4728 and 5136 by `SubjectUserSid` and `SubjectLogonId`, and the 5136 pair by `OpCorrelationID` and object GUID. Event 4768 does not contain a logon ID, so its connection to administrative activity is temporal and account-based. Changing `msDS-AllowedToDelegateTo` alone is not asserted to enable delegation.
+Correlate distinct 4771 users by IP, then join the 4768 `ResponseTicket` to each 4769 `RequestTicketHash`, checking account, IP and time. The three sweep requests reuse that issued TGT and one client `LogonGuid`; each response has its own service-ticket hash. Join 4728 and 5136 by `SubjectUserSid` and `SubjectLogonId`, and the 5136 pair by `OpCorrelationID` and object GUID. Event 4768 does not contain a logon ID, so its connection to administrative activity is temporal and account-based. Changing `msDS-AllowedToDelegateTo` alone is not asserted to enable delegation.
 
 `anomaly_mode: false` emits ordinary traffic and recurring approved maintenance, without the correlated spray/TGT/RC4 sweep/group/delegation episode. Four finite 2.5-hour default/custom runs produced 9,001 records each: two complete episodes in each anomaly run and zero in each background run.
 
 Validation covers 258 of 263 field paths in six Elastic System Security expected-event fixtures (98.1%). The five omitted paths are `log.file.path`, which points to Elastic's local XML fixture files rather than a live Windows Event Log source. Microsoft Security event XML is the source for the native `winlog.event_data` values; this generator emits normalized ECS JSON, not raw XML.
+
+The selected client model keeps one current TGT per user SID and client IP, replacing it after each successful 4768. Background requests reuse credentials by the same rule. Requests before the first observed 4768 use a pre-existing TGT; ticket lifetimes, renewals and simultaneous credentials for one client are outside this model. State has at most one entry per user sample plus the shared bastion client. RC4-only requests negotiate an RC4 session key, while AES-capable requests use AES256. Ticket encryption and session-key encryption are separate fields and need not always match in real deployments.
 
 The 4768/4769 version-2 fields model Windows Server 2016, 2019, or 2022 with the January 14, 2025 or later security update. Successful Kerberos ticket events require the relevant Kerberos audit subcategories; 4728 requires Security Group Management auditing. The 5136 pair requires Directory Service Changes auditing and a matching SACL on the modified object. RC4 tickets in this scenario require service accounts and policy that still permit RC4; this is not a recommended security setting.
 
@@ -180,7 +182,7 @@ This complete synthetic ECS 4728 event was copied from the first validated perio
       "MemberName": "CN=svc_sync_001,CN=Users,DC=contoso,DC=local",
       "MemberSid": "S-1-5-21-3457937927-2839227994-823803824-2108",
       "SubjectDomainName": "CONTOSO",
-      "SubjectLogonId": "0x2d0be9",
+      "SubjectLogonId": "0x338f51",
       "SubjectUserName": "helpdesk.admin",
       "SubjectUserSid": "S-1-5-21-3457937927-2839227994-823803824-1114",
       "TargetDomainName": "CONTOSO",
@@ -193,14 +195,14 @@ This complete synthetic ECS 4728 event was copied from the first validated perio
     ],
     "level": "information",
     "logon": {
-      "id": "0x2d0be9"
+      "id": "0x338f51"
     },
     "opcode": "Info",
     "outcome": "success",
     "process": {
       "pid": 516,
       "thread": {
-        "id": 5529
+        "id": 4703
       }
     },
     "provider_guid": "{54849625-5478-4994-a5ba-3e3b0328c30d}",
@@ -214,6 +216,8 @@ This complete synthetic ECS 4728 event was copied from the first validated perio
 ```
 
 ## References
+
+- [IETF RFC 4120: Kerberos TGS and session-key negotiation](https://www.rfc-editor.org/rfc/rfc4120.html#section-3.3)
 
 - [Microsoft: Advanced Audit Policy Configuration](https://learn.microsoft.com/en-us/windows-server/identity/ad-ds/plan/security-best-practices/advanced-audit-policy-configuration)
 - [Microsoft: 4768 Kerberos TGT](https://learn.microsoft.com/en-us/previous-versions/windows/it-pro/windows-10/security/threat-protection/auditing/event-4768)
