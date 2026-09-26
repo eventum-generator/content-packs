@@ -1,0 +1,156 @@
+{%- set step = vars.step -%}
+{%- set target = {'user': params.unusual_user,
+    'station': params.unusual_station,
+    'nas_port': params.unusual_nas_port,
+    'framed_ip': params.unusual_framed_ip} -%}
+{%- if step == 'routine' -%}
+  {%- do shared.pop('start_anomaly', none) -%}
+  {%- do shared.pop('start_normal', none) -%}
+  {%- set active = shared.get('active', {}) -%}
+  {%- set due = [] -%}
+  {%- for session in active.values() -%}
+    {%- if timestamp >= session.stop_at -%}
+      {%- do due.append(session) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if due -%}
+    {%- set session = due[0] -%}
+    {%- set client = session.client -%}
+    {%- set action = 'disconnect' -%}
+    {%- set elapsed = ((timestamp - session.started_at).total_seconds()) | int -%}
+    {%- do active.pop(client.station) -%}
+    {%- do shared.set('active', active) -%}
+  {%- else -%}
+    {%- set ordinary = {'user': params.ordinary_user,
+        'station': params.ordinary_station,
+        'nas_port': params.ordinary_nas_port,
+        'framed_ip': params.ordinary_framed_ip} -%}
+    {%- set available = [] -%}
+    {%- for candidate in [ordinary, target] -%}
+      {%- if candidate.station not in active -%}
+        {%- do available.append(candidate) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- for index in range(samples.clients | length) -%}
+      {%- set row = samples.clients[index] -%}
+      {%- if row.station not in active -%}
+        {%- do available.append({'user': row.user,
+            'station': row.station, 'nas_port': row.nas_port,
+            'framed_ip': row.framed_ip}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if not available -%}{%- do dispatch.drop() -%}{%- endif -%}
+    {%- set client = module.rand.choice(available) -%}
+    {%- set action = module.rand.weighted_choice(['accept', 'reject'], [70, 30]) -%}
+    {%- set last_target_reject = shared.get('last_target_reject') -%}
+    {%- if client.station == target.station and action == 'reject' -%}
+      {%- if last_target_reject is not none and
+          (timestamp - last_target_reject).total_seconds() < 600 -%}
+        {%- set action = 'accept' -%}
+      {%- else -%}
+        {%- do shared.set('last_target_reject', timestamp) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if action == 'accept' -%}
+      {%- do shared.set('pending', client) -%}
+      {%- do shared.set('start_normal', true) -%}
+    {%- endif -%}
+    {%- set attempts = [shared.get('attempts', 0) + 1, params.anomaly_after_attempts] | min -%}
+    {%- do shared.set('attempts', attempts) -%}
+    {%- if params.anomaly_mode and attempts >= params.anomaly_after_attempts
+        and (shared.get('next_anomaly_at') is none or
+            timestamp >= shared.get('next_anomaly_at'))
+        and action == 'reject' and client.station != target.station
+        and target.station not in active
+        and (last_target_reject is none or
+            (timestamp - last_target_reject).total_seconds() >= 600) -%}
+      {%- do shared.set('next_anomaly_at', timestamp +
+          module.datetime.timedelta(seconds=params.anomaly_interval_seconds)) -%}
+      {%- do shared.set('start_anomaly', true) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- elif step == 'normal_connect' -%}
+  {%- set client = shared.pop('pending') -%}
+  {%- set action = 'connect' -%}
+  {%- set active = shared.get('active', {}) -%}
+  {%- set duration = module.rand.choice([600, 900, 1200, 1800]) -%}
+  {%- do active.update({client.station: {'client': client,
+      'started_at': timestamp,
+      'stop_at': timestamp + module.datetime.timedelta(seconds=duration)}}) -%}
+  {%- do shared.set('active', active) -%}
+{%- else -%}
+  {%- set client = target -%}
+  {%- if step.startswith('attack_reject_') -%}
+    {%- set action = 'reject' -%}
+  {%- elif step == 'attack_accept' -%}
+    {%- set action = 'accept' -%}
+  {%- else -%}
+    {%- set action = 'connect' -%}
+    {%- set active = shared.get('active', {}) -%}
+    {%- do active.update({client.station: {'client': client,
+        'started_at': timestamp,
+        'stop_at': timestamp + module.datetime.timedelta(seconds=900)}}) -%}
+    {%- do shared.set('active', active) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set principal = '[' ~ client.user ~ ']' -%}
+{%- if action == 'reject' -%}
+  {%- set message = 'Rejected user: ' ~ principal ~ ' (cli '
+      ~ client.station ~ ' port ' ~ client.nas_port ~ ')' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start'] -%}
+  {%- set outcome = 'failure' -%}
+{%- elif action == 'accept' -%}
+  {%- set message = 'Accepted user: ' ~ principal ~ ' (cli '
+      ~ client.station ~ ' port ' ~ client.nas_port ~ ')' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set event_type = ['start'] -%}
+  {%- set outcome = 'success' -%}
+{%- elif action == 'connect' -%}
+  {%- set message = 'Connect: ' ~ principal ~ ' (did '
+      ~ params.called_station ~ ' cli ' ~ client.station ~ ' port '
+      ~ client.nas_port ~ ' ip ' ~ client.framed_ip ~ ')' -%}
+  {%- set category = ['session'] -%}
+  {%- set event_type = ['start'] -%}
+  {%- set outcome = 'success' -%}
+{%- else -%}
+  {%- set message = 'Disconnect: ' ~ principal ~ ' (did '
+      ~ params.called_station ~ ' cli ' ~ client.station ~ ' port '
+      ~ client.nas_port ~ ' ip ' ~ client.framed_ip ~ ') '
+      ~ elapsed ~ ' seconds' -%}
+  {%- set category = ['session'] -%}
+  {%- set event_type = ['end'] -%}
+  {%- set outcome = 'success' -%}
+{%- endif -%}
+{%- set radius = {'client_shortname': params.nas_client,
+    'nas_port': client.nas_port,
+    'calling_station_id': client.station} -%}
+{%- if action in ['connect', 'disconnect'] -%}
+  {%- do radius.update({'called_station_id': params.called_station,
+      'framed_ip_address': client.framed_ip,
+      'acct_status_type': 'Start' if action == 'connect' else 'Stop'}) -%}
+{%- endif -%}
+{%- if action == 'disconnect' -%}
+  {%- do radius.update({'acct_session_time': elapsed}) -%}
+{%- endif -%}
+{%- set event = {'dataset': 'freeradius.linelog',
+    'module': 'freeradius', 'kind': 'event', 'category': category,
+    'type': event_type, 'action': action, 'outcome': outcome,
+    'original': message} -%}
+{%- if action == 'disconnect' -%}
+  {%- do event.update({'duration': elapsed * 1000000000}) -%}
+{%- endif -%}
+{%- set source = {'mac': client.station} -%}
+{%- if action in ['connect', 'disconnect'] -%}
+  {%- do source.update({'ip': client.framed_ip}) -%}
+{%- endif -%}
+{{ {'@timestamp': timestamp.isoformat(),
+    'ecs': {'version': '8.17.0'},
+    'event': event,
+    'message': message,
+    'host': {'name': params.radius_host},
+    'service': {'name': 'radiusd'},
+    'user': {'name': client.user},
+    'source': source,
+    'radius': radius
+} | tojson }}
