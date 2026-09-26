@@ -1,19 +1,27 @@
 {%- set step = vars.step -%}
 {%- if step == 'routine' -%}
-  {%- set cap = ([params.anomaly_after_events, 200] | max) + 200 -%}
-  {%- set n = (shared.get('routine_count', 0) % cap) + 1 -%}
+  {%- set n = (shared.get('routine_count', 0) % 1000000) + 1 -%}
   {%- do shared.set('routine_count', n) -%}
   {%- set batch = n % 200 >= 100 and n % 200 < 198 -%}
   {%- if batch -%}
     {%- do shared.set('seen_contending_user', true) -%}
     {%- do shared.set('last_contending_event', timestamp.timestamp()) -%}
   {%- endif -%}
-  {%- if params.anomaly_mode and not shared.get('anomaly_done', false)
-      and n >= params.anomaly_after_events
+  {%- set next_due = shared.get('next_anomaly_epoch', none) -%}
+  {%- if params.anomaly_mode and next_due is none -%}
+    {%- do shared.set('next_anomaly_epoch', timestamp.timestamp()
+        + params.anomaly_interval_hours * 3600) -%}
+  {%- endif -%}
+  {%- if params.anomaly_mode and next_due is not none
+      and timestamp.timestamp() >= next_due
       and shared.get('seen_contending_user', false)
       and not batch
       and timestamp.timestamp() - shared.get('last_contending_event', 0) >= 6 -%}
-    {%- do shared.set('anomaly_done', true) -%}
+    {%- do shared.set('next_anomaly_epoch', timestamp.timestamp()
+        + params.anomaly_interval_hours * 3600) -%}
+    {%- set episode = (shared.get('episode', 0) % 1000000) + 1 -%}
+    {%- do shared.set('episode', episode) -%}
+    {%- do shared.set('chain_document', ['DOC-0042', 'DOC-0043', 'DOC-0044'][(episode - 1) % 3]) -%}
     {%- do shared.set('start_anomaly', true) -%}
   {%- endif -%}
   {%- set slot = n % 100 -%}
@@ -36,6 +44,7 @@
   {%- set duration = {'lock_wait': 2000000,
       'exception': 0, 'call_result': 5500000}[step] -%}
 {%- endif -%}
+{%- set document = module.rand.choice(['DOC-0042', 'DOC-0043', 'DOC-0044']) if step == 'routine' else shared.get('chain_document') -%}
 {%- set user = params.contending_user if batch else params.routine_user -%}
 {%- set client_id = params.contending_client_id if batch else params.routine_client_id -%}
 {%- set thread = '15968' if batch else '15432' -%}
@@ -80,7 +89,7 @@
   {%- endif -%}
 {%- elif name == 'TLOCK' -%}
   {%- do raw.update({'Regions': 'InfoRg42.DIMS',
-      'Locks': 'InfoRg42.DIMS Exclusive Fld43="DOC-0042"',
+      'Locks': 'InfoRg42.DIMS Exclusive Fld43="' ~ document ~ '"',
       'WaitConnections': blocker,
       'Context': 'ОбщийМодуль.ЗаписьДокументов.Модуль : 81 : НаборЗаписей.Записать();'}) -%}
 {%- else -%}
@@ -88,6 +97,7 @@
       'Превышено максимальное время ожидания предоставления блокировки',
       'Context': 'ОбщийМодуль.ЗаписьДокументов.Модуль : 81 : НаборЗаписей.Записать();'}) -%}
 {%- endif -%}
+{%- if step == 'call_result' -%}{%- do shared.pop('chain_document', none) -%}{%- endif -%}
 {{ {'@timestamp': event_time.isoformat(),
     'ecs': {'version': '8.17.0'},
     'event': {'dataset': '1c.techjournal', 'kind': 'event',
