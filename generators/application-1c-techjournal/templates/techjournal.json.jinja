@@ -1,103 +1,412 @@
-{%- set step = vars.step -%}
-{%- if step == 'routine' -%}
-  {%- set n = (shared.get('routine_count', 0) % 1000000) + 1 -%}
-  {%- do shared.set('routine_count', n) -%}
-  {%- set batch = n % 200 >= 100 and n % 200 < 198 -%}
-  {%- if batch -%}
-    {%- do shared.set('seen_contending_user', true) -%}
-    {%- do shared.set('last_contending_event', timestamp.timestamp()) -%}
-  {%- endif -%}
-  {%- set next_due = shared.get('next_anomaly_epoch', none) -%}
-  {%- if params.anomaly_mode and next_due is none -%}
-    {%- do shared.set('next_anomaly_epoch', timestamp.timestamp()
-        + params.anomaly_interval_hours * 3600) -%}
-  {%- endif -%}
-  {%- if params.anomaly_mode and next_due is not none
-      and timestamp.timestamp() >= next_due
-      and shared.get('seen_contending_user', false)
-      and not batch
-      and timestamp.timestamp() - shared.get('last_contending_event', 0) >= 6 -%}
-    {%- do shared.set('next_anomaly_epoch', timestamp.timestamp()
-        + params.anomaly_interval_hours * 3600) -%}
-    {%- set episode = (shared.get('episode', 0) % 1000000) + 1 -%}
-    {%- do shared.set('episode', episode) -%}
-    {%- do shared.set('chain_document', ['DOC-0042', 'DOC-0043', 'DOC-0044'][(episode - 1) % 3]) -%}
-    {%- do shared.set('start_anomaly', true) -%}
-  {%- endif -%}
-  {%- set slot = n % 100 -%}
-  {%- if slot in [10, 55, 90] -%}
-    {%- set name = 'TLOCK' -%}
-  {%- elif slot == 72 -%}
-    {%- set name = 'EXCP' -%}
-  {%- elif slot % 5 == 0 -%}
-    {%- set name = 'CALL' -%}
+{#- 1C:Enterprise 8.3.27 technological log, JSON format, rphost records
+    of one infobase. Every input tick offers many slots; each slot emits
+    at most one record of the session whose next record is due earliest
+    within that second, otherwise it is dropped. Lock requests are
+    decided when they are made: granted if compatible with every holder,
+    otherwise queued behind the holder and granted when it releases, or
+    timed out after 20 s. Locks are held until the call ends or an
+    exception rolls the transaction back. All clocks are integer
+    microseconds since the epoch. -#}
+{#- Jinja has no raise statement: a missing-key lookup through the
+    standard library aborts the render with the message as the key. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{#- Holders of `doc` other than session `me` that conflict with `mode`. -#}
+{%- macro conflicts(st, doc, mode, me, out) -%}
+  {%- for h in st.holds.get(doc, []) -%}
+    {%- if h.i != me and (mode == 'Exclusive' or h.mode == 'Exclusive') -%}
+      {%- do out.append(h.i) -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{#- Session `i` releases every lock at time `t`; queued requests on the
+    freed keys are then granted in arrival order when compatible with
+    the remaining holders, or wait on a remaining conflicting holder. -#}
+{%- macro release(st, i, t) -%}
+  {%- set N = module.rand.number -%}
+  {%- set ln = module.math.log -%}
+  {%- set freed = [] -%}
+  {%- for doc, hs in st.holds.items() -%}
+    {%- set keep = hs | rejectattr('i', 'eq', i) | list -%}
+    {%- if keep | length != hs | length -%}{%- do freed.append(doc) -%}{%- endif -%}
+    {%- do hs.clear() -%}
+    {%- do hs.extend(keep) -%}
+  {%- endfor -%}
+  {%- for doc in freed -%}
+    {%- set queue = st.queue.get(doc, []) -%}
+    {%- for wi in queue | list -%}
+      {%- set w = st.sessions[wi] -%}
+      {%- set ws = w.call.next if w.call is not none else none -%}
+      {%- if ws is none or ws.k != 'TLOCK' or ws.w != 'wait' or ws.granted or w.due <= t -%}
+        {%- continue -%}
+      {%- endif -%}
+      {%- set held = [] -%}
+      {%- do conflicts(st, doc, ws.mode, wi, held) -%}
+      {%- if held -%}
+        {%- do ws.update({'blocker': held[0]}) -%}
+      {%- else -%}
+        {%- set grant = t + (N.lognormal(ln(300), 1.0) | int) + 1 -%}
+        {%- do ws.update({'granted': true}) -%}
+        {%- do st.holds.setdefault(doc, []).append({'i': wi, 'mode': ws.mode}) -%}
+        {%- do queue.remove(wi) -%}
+        {%- do w.update({'due': grant}) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{#- Draw the next record of session `i`; `prev` is the end of the
+    previous record or the call start. A lock request is only marked
+    here and decided when it is made. -#}
+{%- macro schedule(st, i, prev) -%}
+  {%- set N = module.rand.number -%}
+  {%- set ln = module.math.log -%}
+  {%- set s = st.sessions[i] -%}
+  {%- set call = s.call -%}
+  {%- set step = call.plan.pop(0) if call.plan else {'k': 'CALL'} -%}
+  {%- set gap = (N.lognormal(ln(1500), 1.2) if step.k == 'CALL' else N.lognormal(ln(250), 1.2)) | int -%}
+  {%- set at = prev + gap + step.get('pre', 0) -%}
+  {%- do step.update({'start': at}) -%}
+  {%- if step.k == 'SCALL' -%}
+    {%- do s.update({'due': at + (N.lognormal(ln(450), 1.0) | int) + 1}) -%}
+  {%- elif step.k == 'TLOCK' -%}
+    {%- do step.update({'w': 'request', 'granted': false}) -%}
+    {%- do s.update({'due': at}) -%}
   {%- else -%}
-    {%- set name = 'SCALL' -%}
+    {%- do s.update({'due': at}) -%}
   {%- endif -%}
-  {%- set duration = module.rand.number.clamp(
-      module.rand.number.lognormal(8.5, 1.0), 300, 90000) | int -%}
-{%- else -%}
-  {%- do shared.pop('start_anomaly', none) -%}
-  {%- set batch = true -%}
-  {%- set name = {'lock_wait': 'TLOCK', 'exception': 'EXCP',
-      'call_result': 'CALL'}[step] -%}
-  {%- set duration = {'lock_wait': 2000000,
-      'exception': 0, 'call_result': 5500000}[step] -%}
+  {%- do call.update({'next': step}) -%}
+{%- endmacro -%}
+{%- set R = module.rand -%}
+{%- set N = module.rand.number -%}
+{%- set ln = module.math.log -%}
+{%- set SEC = 1000000 -%}
+{%- set T = (timestamp.timestamp() | int) * SEC -%}
+{%- set write_ops = [
+    'ОбщийМодуль.ЗаписьДокументов.Модуль : 81 : НаборЗаписей.Записать();',
+    'Документ.РеализацияТоваровУслуг.МодульОбъекта : 214 : БлокировкаДанных.Заблокировать();',
+    'Документ.ПоступлениеТоваровУслуг.МодульОбъекта : 188 : БлокировкаДанных.Заблокировать();'] -%}
+{%- set read_ops = [
+    'ОбщийМодуль.ОбщегоНазначения.Модуль : 1532 : Запрос.Выполнить();',
+    'Справочник.Номенклатура.Форма.ФормаСписка.Форма : 77 : ОбновитьСписок();',
+    'Отчет.ОборотноСальдоваяВедомость.МодульОбъекта : 305 : Запрос.Выполнить();'] -%}
+{%- set st = shared.get('st') -%}
+{%- if st is none -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean
+      or not 0.5 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- invalid('anomaly_interval_hours must be a number in 0.5..8760') -}}
+  {%- endif -%}
+  {%- if not 8 <= samples.sessions | length <= 64 -%}
+    {{- invalid('sessions sample must hold 8..64 sessions') -}}
+  {%- endif -%}
+  {%- set sessions = [] -%}
+  {%- for row in samples.sessions -%}
+    {%- if row.pace is not number or row.pace is boolean or not 0.1 <= row.pace <= 10 -%}
+      {{- invalid('session pace must be a number in 0.1..10') -}}
+    {%- endif -%}
+    {%- do sessions.append({'user': row.user,
+        'computer': row.computer or params.host_name,
+        'client_id': row.client_id, 'connect_id': row.connect_id,
+        'session_id': row.session_id, 'scall_client_id': row.scall_client_id,
+        'app': row.app, 'pace': row.pace,
+        'due': T + N.integer(0, 90 * SEC), 'call': none,
+        'retry_doc': none}) -%}
+  {%- endfor -%}
+  {%- set threads = [] -%}
+  {%- for _ in range(200) -%}
+    {%- if threads | length >= 24 -%}{%- break -%}{%- endif -%}
+    {%- set candidate = N.integer(1200, 29999) | string -%}
+    {%- if candidate not in threads -%}{%- do threads.append(candidate) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set docs = [] -%}
+  {%- set doc_weights = [] -%}
+  {%- for i in range(30) -%}
+    {%- do docs.append('DOC-%04d' | format(31 + i)) -%}
+    {%- do doc_weights.append(1.0 / (1 + i) ** 0.9) -%}
+  {%- endfor -%}
+  {%- set st = {'sessions': sessions, 'threads': threads,
+      'busy_threads': [], 'docs': R.shuffle(docs), 'doc_weights': doc_weights,
+      'holds': {}, 'queue': {}, 'last': T - 1, 'min_due': T,
+      'call_id': N.integer(20000, 40000), 'busy': false,
+      'regime_until': T + (N.exponential(1.0 / 3000) * SEC) | int,
+      'next_ep': (T + params.anomaly_interval_hours * 3600 * SEC) | int
+          if params.anomaly_mode else none,
+      'pending': none, 'ep': none, 'last_blocker': none} -%}
+  {%- do shared.set('st', st) -%}
 {%- endif -%}
-{%- set document = module.rand.choice(['DOC-0042', 'DOC-0043', 'DOC-0044']) if step == 'routine' else shared.get('chain_document') -%}
-{%- set user = params.contending_user if batch else params.routine_user -%}
-{%- set client_id = params.contending_client_id if batch else params.routine_client_id -%}
-{%- set thread = '15968' if batch else '15432' -%}
-{%- set session = '421' if batch else '103' -%}
-{%- set connection = '16' if batch else '17' -%}
-{%- set blocker = '17' if batch else '16' -%}
-{%- set event_time = timestamp.replace(
-    microsecond=module.rand.number.integer(1, 999999)) -%}
+{#- Contention regime: calm (mean 50 min) and busy (mean 10 min)
+    periods alternate independently of anything else. -#}
+{%- if T >= st.regime_until -%}
+  {%- set mean_s = 3000 if st.busy else 600 -%}
+  {%- do st.update({'busy': not st.busy,
+      'regime_until': T + (N.exponential(1.0 / mean_s) * SEC) | int}) -%}
+{%- endif -%}
+{#- Episode due: the idle session whose next call comes first (never
+    the previous one) becomes the blocker. Its lock mode is drawn as
+    for any write; an exclusive hold takes one of the two hottest keys,
+    a shared one (which only exclusive requests conflict with) the
+    hottest, so that enough ordinary requests arrive during the hold.
+    The key must be free. -#}
+{%- if st.next_ep is not none and st.pending is none and T >= st.next_ep -%}
+  {%- set pick = namespace(i=-1, due=0) -%}
+  {%- for s in st.sessions -%}
+    {%- if s.call is none and loop.index0 != st.last_blocker and s.retry_doc is none
+        and (pick.i < 0 or s.due < pick.due) -%}
+      {%- set pick.i = loop.index0 -%}
+      {%- set pick.due = s.due -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set emode = 'Exclusive' if R.chance(0.6) else 'Shared' -%}
+  {%- set hot = [] -%}
+  {%- for d in st.docs[:(2 if emode == 'Exclusive' else 1)] -%}
+    {%- if not st.holds.get(d) and not st.queue.get(d) -%}
+      {%- do hot.append(d) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if pick.i >= 0 and hot -%}
+    {%- set hw = [] -%}
+    {%- for d in hot -%}{%- do hw.append(st.doc_weights[st.docs.index(d)]) -%}{%- endfor -%}
+    {%- do st.update({'pending': {'b': pick.i, 'doc': R.weighted_choice(hot, hw), 'mode': emode}, 'min_due': T}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if st.min_due >= T + SEC -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{#- Pick the record for this slot. -#}
+{%- set out = namespace(i=-1, t=0) -%}
+{%- for _ in range(96) -%}
+  {%- set pick = namespace(i=-1, due=0) -%}
+  {%- for s in st.sessions -%}
+    {%- if pick.i < 0 or s.due < pick.due -%}
+      {%- set pick.i = loop.index0 -%}
+      {%- set pick.due = s.due -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do st.update({'min_due': pick.due}) -%}
+  {%- if pick.due >= T + SEC -%}{%- break -%}{%- endif -%}
+  {%- set i = pick.i -%}
+  {%- set s = st.sessions[i] -%}
+  {%- if s.call is none -%}
+    {#- Start a call at the session's due time, never before the last
+        emitted record, so a released worker thread is free again. -#}
+    {%- do s.update({'due': [s.due, st.last + 1] | max}) -%}
+    {%- set free = st.threads | reject('in', st.busy_threads) | list -%}
+    {%- set thread = R.choice(free) -%}
+    {%- do st.busy_threads.append(thread) -%}
+    {%- set episode = st.pending is not none and st.pending.b == i -%}
+    {%- set user_retry = s.retry_doc is not none -%}
+    {%- set write = episode or user_retry or R.chance(0.32) -%}
+    {%- set plan = [] -%}
+    {%- for _ in range(40) -%}
+      {%- if not R.chance(0.7) -%}{%- break -%}{%- endif -%}
+      {%- do plan.append({'k': 'SCALL'}) -%}
+    {%- endfor -%}
+    {%- if write -%}
+      {%- set groups = 1 + (1 if R.chance(0.35) else 0) + (1 if R.chance(0.1) else 0) -%}
+      {%- for g in range(groups) -%}
+        {%- if g > 0 -%}
+          {%- for _ in range(40) -%}
+            {%- if not R.chance(0.5) -%}{%- break -%}{%- endif -%}
+            {%- do plan.append({'k': 'SCALL'}) -%}
+          {%- endfor -%}
+        {%- endif -%}
+        {%- set mode = 'Exclusive' if R.chance(0.6) else 'Shared' -%}
+        {%- if g == 0 and episode -%}
+          {%- set doc = st.pending.doc -%}
+          {%- set mode = st.pending.mode -%}
+        {%- elif g == 0 and user_retry -%}
+          {%- set doc = s.retry_doc -%}
+        {%- else -%}
+          {%- set doc = R.weighted_choice(st.docs, st.doc_weights) -%}
+        {%- endif -%}
+        {%- do plan.append({'k': 'TLOCK', 'doc': doc, 'mode': mode}) -%}
+      {%- endfor -%}
+      {#- A long transaction pauses after its first lock. The episode's
+          pause lasts until enough sessions have timed out on it (at most
+          30 min); ordinary ones last 20 s plus a lognormal 22 s. -#}
+      {%- set pre_at = namespace(k=-1) -%}
+      {%- for step in plan -%}
+        {%- if step.k == 'TLOCK' and pre_at.k < 0 -%}{%- set pre_at.k = loop.index0 + 1 -%}{%- endif -%}
+      {%- endfor -%}
+      {%- if pre_at.k == plan | length -%}{%- do plan.append({'k': 'SCALL'}) -%}{%- endif -%}
+      {%- if episode -%}
+        {%- do plan[pre_at.k].update({'pre': 1800 * SEC, 'hold': true}) -%}
+        {%- do st.update({'ep': {'b': i, 'doc': st.pending.doc, 'need': 6,
+            'victims': []},
+            'next_ep': (s.due + params.anomaly_interval_hours * 3600 * SEC) | int,
+            'last_blocker': i, 'pending': none}) -%}
+      {%- elif R.chance(0.35 if st.busy else 0.12) -%}
+        {%- do plan[pre_at.k].update({'pre': 20 * SEC + (N.lognormal(ln(22 * SEC), 0.35) | int)}) -%}
+      {%- endif -%}
+    {%- elif R.chance(0.012) -%}
+      {#- A long report: minutes of database work, no locks. -#}
+      {%- do plan.append({'k': 'SCALL', 'pre': N.lognormal(ln(200 * SEC), 0.8) | int}) -%}
+    {%- endif -%}
+    {%- for _ in range(40) -%}
+      {%- if not R.chance(0.45) -%}{%- break -%}{%- endif -%}
+      {%- do plan.append({'k': 'SCALL'}) -%}
+    {%- endfor -%}
+    {%- do s.update({'call': {'start': s.due, 'thread': thread, 'plan': plan,
+        'op': R.choice(write_ops if write else read_ops),
+        'retried': false, 'fail_doc': none,
+        'dst': R.weighted_choice(['122', '124', '131'], [6, 3, 1]),
+        'next': none}, 'retry_doc': none}) -%}
+    {%- do schedule(st, i, s.due + (N.lognormal(ln(800), 1.0) | int)) -%}
+  {%- elif s.call.next.k == 'TLOCK' and s.call.next.w == 'request' -%}
+    {#- The lock request is made now. -#}
+    {%- set step = s.call.next -%}
+    {%- set at = [s.due, st.last + 1] | max -%}
+    {%- set held = [] -%}
+    {%- do conflicts(st, step.doc, step.mode, i, held) -%}
+    {%- do step.update({'start': at}) -%}
+    {%- if held -%}
+      {%- do step.update({'w': 'wait', 'blocker': held[0]}) -%}
+      {%- do st.queue.setdefault(step.doc, []).append(i) -%}
+      {%- do s.update({'due': at + 20000000 + (N.lognormal(ln(1500), 1.0) | int)}) -%}
+    {%- else -%}
+      {%- do step.update({'w': 'none', 'granted': true}) -%}
+      {%- do st.holds.setdefault(step.doc, []).append({'i': i, 'mode': step.mode}) -%}
+      {%- do s.update({'due': at + (N.lognormal(ln(20), 0.9) | int) + 1}) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set t = [s.due, st.last + 1] | max -%}
+    {%- if t >= T + SEC -%}{%- break -%}{%- endif -%}
+    {%- set out.i = i -%}
+    {%- set out.t = t -%}
+    {%- break -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.i < 0 -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set i = out.i -%}
+{%- set s = st.sessions[i] -%}
+{%- set t = out.t -%}
+{%- set call = s.call -%}
+{%- set step = call.next -%}
+{%- set name = step.k -%}
+{%- do st.update({'last': t}) -%}
+{%- set blocker = '' -%}
+{%- if name == 'CALL' -%}
+  {%- set duration = t - call.start -%}
+{%- elif name == 'EXCP' -%}
+  {%- set duration = 0 -%}
+{%- else -%}
+  {%- set duration = t - step.start -%}
+  {%- if name == 'TLOCK' and step.w == 'wait' -%}
+    {%- set blocker = st.sessions[step.blocker].connect_id -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set event_time = timestamp + module.datetime.timedelta(microseconds=t - T) -%}
 {%- set raw = {
     'ts': event_time.strftime('%Y-%m-%dT%H:%M:%S.%f'),
     'duration': duration | string,
     'name': name,
-    'depth': {'CALL': '1', 'SCALL': '2', 'TLOCK': '5',
-        'EXCP': '6'}[name],
+    'depth': {'CALL': '1', 'SCALL': '2', 'TLOCK': '5', 'EXCP': '6'}[name],
     'level': 'ERROR' if name == 'EXCP' else 'INFO',
     'process': params.process_name,
     'p:processName': params.infobase,
-    'OSThread': thread,
-    't:clientID': client_id,
-    't:applicationName': '1CV8C',
-    't:computerName': 'client-01' if batch else 'client-02',
-    't:connectID': connection,
-    'SessionID': session,
-    'Usr': user,
-    'AppID': '1CV8C'
+    'OSThread': call.thread,
+    't:clientID': s.client_id,
+    't:applicationName': s.app,
+    't:computerName': s.computer,
+    't:connectID': s.connect_id,
+    'SessionID': s.session_id,
+    'Usr': s.user,
+    'AppID': s.app
 } -%}
 {%- if name in ['SCALL', 'CALL'] -%}
-  {%- set call_id = (shared.get('call_id', 28283) % 999999999) + 1 -%}
-  {%- do shared.set('call_id', call_id) -%}
+  {%- set call_id = (st.call_id % 999999999) + 1 -%}
+  {%- do st.update({'call_id': call_id}) -%}
   {%- if name == 'SCALL' -%}
-    {%- do raw.update({'ClientID': '92' if batch else '8',
+    {%- do raw.update({'ClientID': s.scall_client_id,
         'Interface': 'bc15bd01-10bf-413c-a856-ddc907fcd123',
         'IName': 'IVResourceRemoteConnection', 'Method': '0',
         'CallID': call_id | string, 'MName': 'send',
-        'DstClientID': '122'}) -%}
+        'DstClientID': call.dst}) -%}
   {%- else -%}
-    {%- do raw.update({'Interface':
-        'bc15bd01-10bf-413c-a856-ddc907fcd123',
+    {%- do raw.update({'Interface': 'bc15bd01-10bf-413c-a856-ddc907fcd123',
         'Method': '0', 'CallID': call_id | string,
-        'InBytes': '2048', 'OutBytes': '512',
-        'Context': 'ОбщийМодуль.ЗаписьДокументов.Модуль : 81 : НаборЗаписей.Записать();'}) -%}
+        'InBytes': ((N.lognormal(ln(1500), 1.0) | int) + 60) | string,
+        'OutBytes': ((N.lognormal(ln(3000), 1.3) | int) + 60) | string,
+        'Context': call.op}) -%}
   {%- endif -%}
 {%- elif name == 'TLOCK' -%}
   {%- do raw.update({'Regions': 'InfoRg42.DIMS',
-      'Locks': 'InfoRg42.DIMS Exclusive Fld43="' ~ document ~ '"',
+      'Locks': 'InfoRg42.DIMS ' ~ step.mode ~ ' Fld43="' ~ step.doc ~ '"',
       'WaitConnections': blocker,
-      'Context': 'ОбщийМодуль.ЗаписьДокументов.Модуль : 81 : НаборЗаписей.Записать();'}) -%}
+      'Context': call.op}) -%}
 {%- else -%}
   {%- do raw.update({'Descr':
       'Превышено максимальное время ожидания предоставления блокировки',
-      'Context': 'ОбщийМодуль.ЗаписьДокументов.Модуль : 81 : НаборЗаписей.Записать();'}) -%}
+      'Context': call.op}) -%}
 {%- endif -%}
-{%- if step == 'call_result' -%}{%- do shared.pop('chain_document', none) -%}{%- endif -%}
+{#- Advance the session. -#}
+{%- if name == 'CALL' -%}
+  {%- do st.busy_threads.remove(call.thread) -%}
+  {%- do release(st, i, t) -%}
+  {%- if st.ep is not none and st.ep.b == i -%}
+    {%- do st.update({'ep': none}) -%}
+  {%- endif -%}
+  {%- if call.fail_doc is not none and R.chance(0.35) -%}
+    {%- do s.update({'retry_doc': call.fail_doc}) -%}
+  {%- endif -%}
+  {%- set think = N.lognormal(ln(6), 1.0)
+      if s.retry_doc is not none or R.chance(0.82) else N.lognormal(ln(240), 0.9) -%}
+  {%- do s.update({'call': none, 'due': t + (think * s.pace * SEC) | int}) -%}
+{%- elif name == 'EXCP' -%}
+  {#- The exception rolls the transaction back: its locks go. -#}
+  {%- do release(st, i, t) -%}
+  {%- do schedule(st, i, t) -%}
+{%- elif name == 'TLOCK' and step.w == 'wait' and not step.granted -%}
+  {#- Timeout: the platform raises the exception right away; whether
+      the code handles it is decided only afterwards. -#}
+  {%- set q = st.queue.get(step.doc, []) -%}
+  {%- if i in q -%}{%- do q.remove(i) -%}{%- endif -%}
+  {%- set ep = st.ep -%}
+  {%- if ep is not none and step.blocker == ep.b and step.doc == ep.doc and i not in ep.victims -%}
+    {%- do ep.victims.append(i) -%}
+    {%- if ep.victims | length >= ep.need -%}
+      {#- Enough sessions have timed out: the blocker finishes soon. -#}
+      {%- set b = st.sessions[ep.b] -%}
+      {%- set bs = b.call.next if b.call is not none else none -%}
+      {%- if bs is not none and bs.get('hold') -%}
+        {%- set end = t + (N.lognormal(ln(15 * SEC), 0.6) | int) -%}
+        {%- if end < b.due -%}
+          {%- do bs.update({'start': end - (N.lognormal(ln(450), 1.0) | int) - 1}) -%}
+          {%- do b.update({'due': end}) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set rest = call.plan -%}
+  {%- if R.chance(0.6) -%}
+    {#- Handled by the code: after the rollback the operation is often
+        retried as a new transaction; otherwise no further locks. -#}
+    {%- set kept = rest | selectattr('k', 'eq', 'SCALL') | list -%}
+    {%- if not call.retried and R.chance(0.4) -%}
+      {%- set kept = [{'k': 'TLOCK', 'doc': step.doc, 'mode': step.mode}] + rest -%}
+      {%- do call.update({'retried': true}) -%}
+    {%- endif -%}
+    {%- do rest.clear() -%}
+    {%- do rest.append({'k': 'EXCP'}) -%}
+    {%- do rest.extend(kept) -%}
+  {%- else -%}
+    {#- Unhandled: the call ends, after zero to two rollback calls. -#}
+    {%- do rest.clear() -%}
+    {%- do rest.append({'k': 'EXCP'}) -%}
+    {%- for _ in range(N.integer(0, 2)) -%}
+      {%- do rest.append({'k': 'SCALL'}) -%}
+    {%- endfor -%}
+    {%- do call.update({'fail_doc': step.doc}) -%}
+  {%- endif -%}
+  {%- do schedule(st, i, t) -%}
+{%- else -%}
+  {%- do schedule(st, i, t) -%}
+{%- endif -%}
 {{ {'@timestamp': event_time.isoformat(),
     'ecs': {'version': '8.17.0'},
     'event': {'dataset': '1c.techjournal', 'kind': 'event',
@@ -107,6 +416,6 @@
             separators=(',', ':'))},
     'host': {'name': params.host_name},
     'process': {'name': params.process_name},
-    'user': {'name': user},
+    'user': {'name': s.user},
     'one_c': {'techjournal': raw}
 } | tojson }}
