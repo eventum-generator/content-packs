@@ -1,6 +1,6 @@
 # Microsoft Network Policy Server Audit Generator
 
-Produces ECS JSON for Network Policy Server (NPS) RADIUS decisions from the Windows Security channel. `event.original` preserves a complete Security Event XML record and `winlog.event_data` exposes the corresponding named fields.
+Produces ECS JSON for Network Policy Server (NPS) RADIUS decisions from the Windows Security channel. `event.original` preserves a complete Security Event XML record and `winlog.event_data` exposes the corresponding named fields. The ECS timestamp and Windows `TimeCreated` are normalized to UTC.
 
 ## Event Types
 
@@ -14,7 +14,7 @@ Weights and the one-event-per-30-seconds cadence are illustrative defaults, not 
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), the generator emits one incident after 100 routine requests: four 6273 credential denials followed by one 6272 grant for `finance.admin` from station `DA-7A-11-B2-6F-48`. Each decision is 30 seconds apart, so the five-event sequence spans two minutes. Correlate on `winlog.event_data.SubjectUserName`, `CallingStationID`, `ClientName`, and `ProxyPolicyName` within a five-minute window. The same account and station also produce ordinary grants and occasional denials in both modes; one account, station, event ID, reason code, or policy alone is not an anomaly marker.
+With `anomaly_mode: true` (the default), the first episode begins after six hours, then recurs every `anomaly_interval_seconds` (six hours by default): four 6273 credential denials followed by one 6272 grant for `finance.admin` from station `DA-7A-11-B2-6F-48`. Each decision is 30 seconds apart, so the five-event sequence spans two minutes. Every episode has fresh native `EventRecordID` values. The selected wireless profile carries `AccountSessionIdentifier: -`, so it does not supply a session key. Correlate on `winlog.event_data.SubjectUserName`, `CallingStationID`, `ClientName`, and `ProxyPolicyName` within a five-minute window. The same account and station also produce ordinary grants and occasional denials in both modes; one account, station, event ID, reason code, or policy alone is not an anomaly marker.
 
 `ClientIPAddress` identifies the RADIUS client or access point, not the user's device. `CallingStationID` identifies the station MAC, while `CalledStationID` contains the access point BSSID and SSID. The sequence does not imply a policy change. Set `anomaly_mode: false` for background decisions without the five-event chain.
 
@@ -26,7 +26,8 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `anomaly_mode` | `true` | Include the failure-to-success chain; `false` emits only background |
+| `anomaly_mode` | `true` | Include recurring failure-to-success episodes; `false` emits only background |
+| `anomaly_interval_seconds` | `21600` | Time between episode starts; the first follows one interval; use a positive value above 150 seconds |
 | `host_name` | `nps01.corp.example` | NPS server name |
 | `domain` | `CORP` | Account domain |
 | `radius_client_name` | `office-wifi-ap` | RADIUS client name |
@@ -47,19 +48,19 @@ The shipped configuration writes to `output/events.json` and needs no output par
 Run from the content-packs repository root:
 
 ```bash
-eventum generate --path generators/identity-microsoft-nps/generator.yml --id microsoft-nps --live-mode false
-eventum generate --path generators/identity-microsoft-nps/generator.yml --id microsoft-nps --live-mode true
+uv run --project ../eventum eventum generate --path generators/identity-microsoft-nps/generator.yml --id microsoft-nps --live-mode false
+uv run --project ../eventum eventum generate --path generators/identity-microsoft-nps/generator.yml --id microsoft-nps --live-mode true
 ```
 
-The first command generates as fast as possible until interrupted. Live mode emits one event every 30 seconds. Eventum croniter reads seconds from the sixth cron field (`*/30`).
+For a finite batch, copy `generator.yml` beside the original, add `start` and `end` to `input.cron`, and use `--live-mode false --keep-order true`. Without these bounds, the first command generates as fast as possible until interrupted. Live mode emits one event every 30 seconds. Eventum croniter reads seconds from the sixth cron field (`*/30`).
 
 ## Sample Output
 
-This complete 6272 event was copied from a final generated run:
+This complete 6272 grant was copied from the first episode of the final default/anomaly-on run:
 
 ```json
 {
-  "@timestamp": "2026-09-25T16:50:30+00:00",
+  "@timestamp": "2026-09-27T06:02:30+00:00",
   "client": {
     "ip": "10.20.1.20"
   },
@@ -73,7 +74,7 @@ This complete 6272 event was copied from a final generated run:
     ],
     "code": "6272",
     "kind": "event",
-    "original": "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Security-Auditing\" Guid=\"{54849625-5478-4994-A5BA-3E3B0328C30D}\"/><EventID>6272</EventID><Version>1</Version><Level>0</Level><Task>12552</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2026-09-25T16:50:30.000000000Z\"/><EventRecordID>210001</EventRecordID><Correlation/><Execution ProcessID=\"584\" ThreadID=\"4712\"/><Channel>Security</Channel><Computer>nps01.corp.example</Computer><Security/></System><EventData><Data Name=\"SubjectUserSid\">S-1-5-21-3124921703-1242075836-1035668124-1111</Data><Data Name=\"SubjectUserName\">olga</Data><Data Name=\"SubjectDomainName\">CORP</Data><Data Name=\"FullyQualifiedSubjectUserName\">CORP\\olga</Data><Data Name=\"SubjectMachineSID\">S-1-0-0</Data><Data Name=\"SubjectMachineName\">-</Data><Data Name=\"FullyQualifiedSubjectMachineName\">-</Data><Data Name=\"MachineInventory\">-</Data><Data Name=\"CalledStationID\">00-19-92-74-3C-A1:CORP</Data><Data Name=\"CallingStationID\">DA-7A-11-45-D8-1F</Data><Data Name=\"NASIPv4Address\">10.20.1.20</Data><Data Name=\"NASIPv6Address\">-</Data><Data Name=\"NASIdentifier\">office-wifi-ap</Data><Data Name=\"NASPortType\">Wireless - IEEE 802.11</Data><Data Name=\"NASPort\">0</Data><Data Name=\"ClientName\">office-wifi-ap</Data><Data Name=\"ClientIPAddress\">10.20.1.20</Data><Data Name=\"ProxyPolicyName\">Corporate WiFi RADIUS</Data><Data Name=\"NetworkPolicyName\">Corporate WiFi</Data><Data Name=\"AuthenticationProvider\">Windows</Data><Data Name=\"AuthenticationServer\">nps01.corp.example</Data><Data Name=\"AuthenticationType\">PEAP</Data><Data Name=\"EAPType\">Microsoft: Secured password (EAP-MSCHAP v2)</Data><Data Name=\"AccountSessionIdentifier\">-</Data><Data Name=\"QuarantineState\">Full Access</Data><Data Name=\"QuarantineSessionIdentifier\">-</Data><Data Name=\"LoggingResult\">Accounting information was written to the local log file.</Data></EventData></Event>",
+    "original": "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Security-Auditing\" Guid=\"{54849625-5478-4994-A5BA-3E3B0328C30D}\"/><EventID>6272</EventID><Version>1</Version><Level>0</Level><Task>12552</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2026-09-27T06:02:30.000000000Z\"/><EventRecordID>210726</EventRecordID><Correlation/><Execution ProcessID=\"584\" ThreadID=\"4712\"/><Channel>Security</Channel><Computer>nps01.corp.example</Computer><Security/></System><EventData><Data Name=\"SubjectUserSid\">S-1-5-21-3124921703-1242075836-1035668124-1120</Data><Data Name=\"SubjectUserName\">finance.admin</Data><Data Name=\"SubjectDomainName\">CORP</Data><Data Name=\"FullyQualifiedSubjectUserName\">CORP\\finance.admin</Data><Data Name=\"SubjectMachineSID\">S-1-0-0</Data><Data Name=\"SubjectMachineName\">-</Data><Data Name=\"FullyQualifiedSubjectMachineName\">-</Data><Data Name=\"MachineInventory\">-</Data><Data Name=\"CalledStationID\">00-19-92-74-3C-A1:CORP</Data><Data Name=\"CallingStationID\">DA-7A-11-B2-6F-48</Data><Data Name=\"NASIPv4Address\">10.20.1.20</Data><Data Name=\"NASIPv6Address\">-</Data><Data Name=\"NASIdentifier\">office-wifi-ap</Data><Data Name=\"NASPortType\">Wireless - IEEE 802.11</Data><Data Name=\"NASPort\">0</Data><Data Name=\"ClientName\">office-wifi-ap</Data><Data Name=\"ClientIPAddress\">10.20.1.20</Data><Data Name=\"ProxyPolicyName\">Corporate WiFi RADIUS</Data><Data Name=\"NetworkPolicyName\">Corporate WiFi</Data><Data Name=\"AuthenticationProvider\">Windows</Data><Data Name=\"AuthenticationServer\">nps01.corp.example</Data><Data Name=\"AuthenticationType\">PEAP</Data><Data Name=\"EAPType\">Microsoft: Secured password (EAP-MSCHAP v2)</Data><Data Name=\"AccountSessionIdentifier\">-</Data><Data Name=\"QuarantineState\">Full Access</Data><Data Name=\"QuarantineSessionIdentifier\">-</Data><Data Name=\"LoggingResult\">Accounting information was written to the local log file.</Data></EventData></Event>",
     "outcome": "success",
     "provider": "Microsoft-Windows-Security-Auditing",
     "type": [
@@ -95,16 +96,16 @@ This complete 6272 event was copied from a final generated run:
       "10.20.1.20"
     ],
     "user": [
-      "olga"
+      "finance.admin"
     ]
   },
   "source": {
-    "mac": "DA-7A-11-45-D8-1F"
+    "mac": "DA-7A-11-B2-6F-48"
   },
   "user": {
     "domain": "CORP",
-    "id": "S-1-5-21-3124921703-1242075836-1035668124-1111",
-    "name": "olga"
+    "id": "S-1-5-21-3124921703-1242075836-1035668124-1120",
+    "name": "finance.admin"
   },
   "winlog": {
     "channel": "Security",
@@ -115,12 +116,12 @@ This complete 6272 event was copied from a final generated run:
       "AuthenticationServer": "nps01.corp.example",
       "AuthenticationType": "PEAP",
       "CalledStationID": "00-19-92-74-3C-A1:CORP",
-      "CallingStationID": "DA-7A-11-45-D8-1F",
+      "CallingStationID": "DA-7A-11-B2-6F-48",
       "ClientIPAddress": "10.20.1.20",
       "ClientName": "office-wifi-ap",
       "EAPType": "Microsoft: Secured password (EAP-MSCHAP v2)",
       "FullyQualifiedSubjectMachineName": "-",
-      "FullyQualifiedSubjectUserName": "CORP\\olga",
+      "FullyQualifiedSubjectUserName": "CORP\\finance.admin",
       "LoggingResult": "Accounting information was written to the local log file.",
       "MachineInventory": "-",
       "NASIPv4Address": "10.20.1.20",
@@ -135,8 +136,8 @@ This complete 6272 event was copied from a final generated run:
       "SubjectDomainName": "CORP",
       "SubjectMachineName": "-",
       "SubjectMachineSID": "S-1-0-0",
-      "SubjectUserName": "olga",
-      "SubjectUserSid": "S-1-5-21-3124921703-1242075836-1035668124-1111"
+      "SubjectUserName": "finance.admin",
+      "SubjectUserSid": "S-1-5-21-3124921703-1242075836-1035668124-1120"
     },
     "event_id": "6272",
     "keywords": [
@@ -144,9 +145,9 @@ This complete 6272 event was copied from a final generated run:
     ],
     "opcode": "Info",
     "provider_name": "Microsoft-Windows-Security-Auditing",
-    "record_id": "210001",
+    "record_id": "210726",
     "task": "Network Policy Server",
-    "time_created": "2026-09-25T16:50:30.000000000Z"
+    "time_created": "2026-09-27T06:02:30.000000000Z"
   }
 }
 ```
