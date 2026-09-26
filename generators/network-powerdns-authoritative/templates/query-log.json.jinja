@@ -1,36 +1,73 @@
 {%- for key in ['to_reconnaissance', 'to_enumeration', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
 {%- set stage = vars.stage -%}
-{%- set client = module.rand.choice(['10.20.30.11', '10.20.30.12', '10.20.30.13', '10.20.30.14']) -%}
-{%- set label = module.rand.choice(['www', 'mail', 'vpn', 'api', 'ns1']) -%}
-{%- set qname = label ~ '.' ~ params.zone_name -%}
-{%- set qtype = module.rand.weighted_choice(['A', 'AAAA', 'SOA', 'MX'], [75, 12, 8, 5]) -%}
-{%- if qtype in ['SOA', 'MX'] -%}{%- set qname = params.zone_name -%}{%- endif -%}
-{%- set cache = module.rand.weighted_choice(['HIT', 'MISS'], [72, 28]) -%}
+{%- set epoch = timestamp.timestamp() | int -%}
+{%- set routine_count = shared.get('routine_count', 0) -%}
+{%- set clients = ['10.20.30.11', '10.20.30.12', '10.20.30.13', '10.20.30.14', params.suspicious_client_ip] -%}
+{%- set client = module.rand.choice(clients) -%}
+{%- set qtype = module.rand.weighted_choice(['A', 'AAAA', 'SOA', 'NS', 'MX', 'TXT'], [68, 14, 7, 4, 4, 3]) -%}
+{%- set qname = module.rand.choice(['www', 'mail', 'vpn', 'api', 'ns1', 'ns2', 'app', 'portal', 'sso', 'status', 'cdn', 'git', 'docs', 'monitor', 'backup']) ~ '.' ~ params.zone_name -%}
+{%- if qtype in ['SOA', 'NS', 'MX', 'TXT'] -%}{%- set qname = params.zone_name -%}{%- endif -%}
 {%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 65 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('recon_count', 0) -%}{%- do shared.set('to_reconnaissance', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+  {%- set routine_count = routine_count + 1 -%}
+  {%- do shared.set('routine_count', routine_count) -%}
+  {%- if routine_count % 7 == 0 -%}{%- set client = params.suspicious_client_ip -%}{%- endif -%}
+  {%- if routine_count % 35 == 0 -%}
+    {%- set qtype = 'A' -%}
+    {%- set qname = 'health-' ~ '%05d'|format(routine_count) ~ '-' ~ module.rand.string.hex(8) ~ '.' ~ params.zone_name -%}
+  {%- endif -%}
+  {%- if routine_count in [14, 28, 42] -%}
+    {%- set client = params.suspicious_client_ip -%}
+    {%- set qname = params.zone_name -%}
+    {%- set qtype = {14: 'SOA', 28: 'NS', 42: 'TXT'}[routine_count] -%}
+  {%- endif -%}
+  {%- if params.anomaly_mode -%}
+    {%- set next_due = shared.get('next_anomaly_epoch', none) -%}
+    {%- if next_due is none -%}
+      {%- do shared.set('next_anomaly_epoch', epoch + params.anomaly_interval_hours * 3600) -%}
+    {%- elif epoch >= next_due -%}
+      {%- do shared.set('next_anomaly_epoch', epoch + params.anomaly_interval_hours * 3600) -%}
+      {%- do shared.set('recon_count', 0) -%}
+      {%- do shared.set('to_reconnaissance', true) -%}
+    {%- endif -%}
+  {%- endif -%}
 {%- elif stage == 'reconnaissance' -%}
-  {%- set client = params.suspicious_client_ip -%}{%- set qname = params.zone_name -%}{%- set cache = 'MISS' -%}
-  {%- set count = shared.get('recon_count', 0) + 1 -%}{%- do shared.set('recon_count', count) -%}
+  {%- set client = params.suspicious_client_ip -%}
+  {%- set qname = params.zone_name -%}
+  {%- set count = shared.get('recon_count', 0) + 1 -%}
+  {%- do shared.set('recon_count', count) -%}
   {%- set qtype = ['SOA', 'NS', 'TXT'][count - 1] -%}
-  {%- if count >= 3 -%}{%- do shared.set('enumeration_count', 0) -%}{%- do shared.set('to_enumeration', true) -%}{%- endif -%}
+  {%- if count == 3 -%}
+    {%- do shared.set('enumeration_count', 0) -%}
+    {%- do shared.set('to_enumeration', true) -%}
+  {%- endif -%}
 {%- else -%}
-  {%- set client = params.suspicious_client_ip -%}{%- set qtype = 'A' -%}{%- set cache = 'MISS' -%}
-  {%- set count = shared.get('enumeration_count', 0) + 1 -%}{%- do shared.set('enumeration_count', count) -%}
-  {%- set qname = ('%02d'|format(count)) ~ module.rand.string.hex(20) ~ '.' ~ params.zone_name -%}
-  {%- if count >= 12 -%}{%- do shared.set('enumeration_count', 0) -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+  {%- set client = params.suspicious_client_ip -%}
+  {%- set qtype = 'A' -%}
+  {%- set count = shared.get('enumeration_count', 0) + 1 -%}
+  {%- do shared.set('enumeration_count', count) -%}
+  {%- set qname = 'health-' ~ '%05d'|format(routine_count + count) ~ '-' ~ module.rand.string.hex(8) ~ '.' ~ params.zone_name -%}
+  {%- if count == 12 -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
 {%- endif -%}
+{%- set cache_key = qname ~ '|' ~ qtype ~ '|0|512' -%}
+{%- set active_cache = [] -%}
+{%- set cache_ns = namespace(hit=false) -%}
+{%- for item in shared.get('packet_cache', []) -%}
+  {%- if item[1] > epoch -%}
+    {%- do active_cache.append(item) -%}
+    {%- if item[0] == cache_key -%}{%- set cache_ns.hit = true -%}{%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if not cache_ns.hit -%}{%- do active_cache.append([cache_key, epoch + 20]) -%}{%- endif -%}
+{%- if active_cache|length > 128 -%}{%- do active_cache.pop(0) -%}{%- endif -%}
+{%- do shared.set('packet_cache', active_cache) -%}
+{%- set cache = 'HIT' if cache_ns.hit else 'MISS' -%}
 {%- set message = "Remote " ~ client ~ " wants '" ~ qname ~ "|" ~ qtype ~ "', do = 0, bufsize = 512: packetcache " ~ cache -%}
-{%- set original = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.host_name ~ ' pdns_server[2367]: ' ~ message -%}
+{%- set original = timestamp.strftime('%b') ~ ' ' ~ '%2d'|format(timestamp.day) ~ ' ' ~ timestamp.strftime('%H:%M:%S') ~ ' ' ~ message -%}
 {%- set event = {
   '@timestamp': timestamp.isoformat(),
   'ecs': {'version': '8.17.0'},
   'event': {'kind': 'event', 'category': ['network'], 'type': ['info'], 'action': 'dns-query', 'original': original},
   'host': {'name': params.host_name},
-  'process': {'name': 'pdns_server', 'pid': 2367},
   'source': {'ip': client},
   'related': {'ip': [client]},
   'dns': {'type': 'query', 'question': {'name': qname, 'type': qtype}},
