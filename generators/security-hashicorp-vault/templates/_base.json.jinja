@@ -1,34 +1,38 @@
+{%- macro hmac(value) -%}
+{{- 'hmac-sha256:' ~ module.hmac.new(shared.get('device_salt').encode(), value.encode(), module.hashlib.sha256).hexdigest() -}}
+{%- endmacro -%}
 {%- macro render(native, actor, ip) -%}
-{%- set offset = shared.get('log_offset', 0) -%}
-{%- set serialized = native|tojson -%}
-{%- do shared.set('log_offset', offset + (serialized|length) + 1) -%}
+{%- set offset = shared.get('log_offset') -%}
+{%- set serialized = module.json.dumps(native, ensure_ascii=false, separators=(',', ':')) -%}
+{%- do shared.set('log_offset', offset + (serialized.encode('utf-8') | length) + 1) -%}
+{%- set at = module.datetime.datetime.fromisoformat(native.time.replace('Z', '+00:00')) -%}
 {%- set failure = native.error is defined -%}
-{%- set category = ['configuration'] if native.request.path.startswith('sys/audit/') else (['authentication'] if native.request.path.startswith('auth/') else ['iam']) -%}
+{%- set parsed = dict(native) -%}
+{%- do parsed.pop('time') -%}
+{%- set types = ['info', 'end'] if native.request.operation == 'delete' else (['info'] if native.request.operation == 'update' else ['info', 'start']) -%}
 {%- set doc = {
-    '@timestamp': timestamp.isoformat(),
+    '@timestamp': at.isoformat(),
     'agent': {'ephemeral_id': params.collector_ephemeral_id, 'id': params.collector_id,
               'name': params.vault_host, 'type': 'filebeat', 'version': params.collector_version},
     'data_stream': {'dataset': 'hashicorp_vault.audit', 'namespace': 'default', 'type': 'logs'},
     'ecs': {'version': '8.17.0'},
     'elastic_agent': {'id': params.collector_id, 'snapshot': false, 'version': params.collector_version},
     'event': {'action': native.request.operation, 'agent_id_status': 'verified',
-              'category': category, 'dataset': 'hashicorp_vault.audit',
-              'id': native.request.id, 'ingested': timestamp.isoformat(),
+              'category': ['authentication'], 'dataset': 'hashicorp_vault.audit',
+              'id': native.request.id, 'ingested': (at + module.datetime.timedelta(milliseconds=200)).isoformat(),
               'kind': 'event', 'original': serialized,
-              'outcome': 'unknown' if native.type == 'request' else ('failure' if failure else 'success'),
-              'type': ['denied'] if failure else ['info']},
-    'hashicorp_vault': {'audit': native},
+              'outcome': 'failure' if failure else 'success', 'type': types},
+    'hashicorp_vault': {'audit': parsed},
     'host': {'architecture': 'x86_64', 'containerized': false,
              'hostname': params.vault_host, 'id': 'f25e61f1c11d44bd9aee4a28a664ec18',
-             'ip': [params.vault_ip], 'mac': ['02-42-0A-14-02-12'],
-             'name': params.vault_host,
+             'ip': [params.vault_ip], 'mac': ['02-42-0A-14-02-12'], 'name': params.vault_host,
              'os': {'codename': 'bookworm', 'family': 'debian', 'kernel': '6.1.0',
                     'name': 'Debian', 'platform': 'debian', 'type': 'linux', 'version': '12'}},
     'input': {'type': 'filestream'},
     'log': {'file': {'path': '/var/log/vault/audit.json'}, 'offset': offset},
-    'tags': ['hashicorp-vault-audit'],
-    'source': {'ip': ip}, 'related': {'ip': [ip], 'user': [actor]},
-    'user': {'name': actor}
+    'tags': ['hashicorp-vault-audit'], 'source': {'ip': ip, 'port': native.request.remote_port},
+    'related': {'ip': [ip], 'user': [actor]}, 'user': {'name': actor}
 } -%}
-{{- doc|tojson -}}
+{%- if failure -%}{%- do doc.update(dict(message=native.error)) -%}{%- endif -%}
+{{- doc | tojson -}}
 {%- endmacro -%}

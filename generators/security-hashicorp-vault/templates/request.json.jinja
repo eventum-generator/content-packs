@@ -1,55 +1,116 @@
-{%- from 'templates/_base.json.jinja' import render with context -%}
-{%- set flow_no = shared.get('flow_no', 0) + 1 -%}
-{%- do shared.set('flow_no', flow_no) -%}
-{%- set stage = flow_no % 120 -%}
-{%- set attack = params.anomaly_mode and stage >= 1 and stage <= 11 -%}
-{%- if attack -%}
-  {%- set actor = params.suspicious_actor -%}
-  {%- set ip = params.suspicious_ip -%}
-  {%- if stage <= 10 -%}
-    {%- set operation = 'read' -%}
-    {%- set path = params.secret_mount ~ '/data/payroll/employee-' ~ stage -%}
+{%- from 'templates/_base.json.jinja' import render, hmac with context -%}
+{%- set now = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set clock = now.timestamp() -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- if not module.math.isfinite(interval) or interval < 6 or interval > 8760 -%}
+  {{- module.builtins.float('anomaly_interval_hours must be between 6 and 8760') -}}
+{%- endif -%}
+{%- if not shared.get('identities') -%}
+  {%- set people = [
+    dict(actor='svc-api', ip='10.20.8.12', entity='49263c43-35ab-4df6-a747-1715203590ba'),
+    dict(actor='svc-billing', ip='10.20.8.31', entity='09ae6e74-f30a-4713-83a5-c8be3496bdbe'),
+    dict(actor='alice', ip='10.20.9.18', entity='e60a5c72-a56d-4ff4-b16a-45c3bceea453'),
+    dict(actor=params.suspicious_actor, ip=params.suspicious_ip, entity='96fa6c68-63af-43dc-a9ea-f59556f4b5ea')
+  ] -%}
+  {%- for person in people -%}
+    {%- set issue = now - module.datetime.timedelta(hours=loop.index) -%}
+    {%- do person.update(dict(token='s.synthetic-service-' ~ loop.index, accessor='synthetic-accessor-' ~ loop.index, issue=issue, expires=issue.timestamp() + 86400, renew_due=issue.timestamp() + 43200, last_renewal=none, last_payroll=clock - 900, port=51000 + loop.index)) -%}
+  {%- endfor -%}
+  {%- do shared.update(dict(identities=people, provisioned=(now - module.datetime.timedelta(days=1)).isoformat().replace('+00:00','Z'), next_episode=clock + interval * 3600, episode=none, episode_cursor=3, payroll_offset=0, general_cursor=0, device_salt='6e3d1588-aaf1-47ec-b267-29419a7c30e1', log_offset=0)) -%}
+{%- endif -%}
+{%- set people = shared.get('identities') -%}
+{%- set selected = namespace(index=-1, kind='', secret_index=-1) -%}
+{%- set episode = shared.get('episode') -%}
+{%- if episode -%}
+  {%- set selected.index = episode.index -%}
+  {%- if episode.step < 10 -%}
+    {%- set selected.kind = 'read' -%}
+    {%- set selected.secret_index = 12 + (episode.offset + episode.step) % 40 -%}
   {%- else -%}
-    {%- set operation = 'delete' -%}
-    {%- set path = 'sys/audit/file' -%}
+    {%- set selected.kind = 'delete' -%}
   {%- endif -%}
+  {%- do episode.update(dict(step=episode.step + 1)) -%}
+  {%- if episode.step == 11 -%}{%- do shared.set('episode', none) -%}{%- endif -%}
 {%- else -%}
-  {%- set actor = module.rand.choice(['svc-api', 'svc-billing', 'alice']) -%}
-  {%- set ip = module.rand.choice(['10.20.8.12', '10.20.8.31', '10.20.9.18']) -%}
-  {%- set operation = module.rand.weighted_choice(['read', 'list', 'update'], [78, 15, 7]) -%}
-  {%- if operation == 'read' -%}
-    {%- set path = module.rand.choice([params.secret_mount ~ '/data/app/api-key', params.secret_mount ~ '/data/billing/db', 'auth/token/lookup-self']) -%}
-  {%- elif operation == 'list' -%}
-    {%- set path = params.secret_mount ~ '/metadata/app' -%}
-  {%- else -%}
-    {%- set path = 'auth/token/renew-self' -%}
+  {# Mandatory visible half-period maintenance precedes new work. #}
+  {%- for person in people -%}
+    {%- if clock >= person.renew_due -%}
+      {%- set selected.index = loop.index0 -%}
+      {%- set selected.kind = 'renew' -%}
+      {%- break -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set headroom = namespace(ok=true) -%}
+  {%- for person in people -%}
+    {%- if person.renew_due - clock <= 360 -%}{%- set headroom.ok = false -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set eligible = namespace(index=-1) -%}
+  {%- if selected.index < 0 and params.anomaly_mode and clock >= shared.get('next_episode') and headroom.ok -%}
+    {%- for offset in range(4) -%}
+      {%- set index = (shared.get('episode_cursor') + offset) % 4 -%}
+      {%- if clock - people[index].last_payroll >= 900 -%}
+        {%- set eligible.index = index -%}
+        {%- break -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if selected.index < 0 and eligible.index >= 0 -%}
+    {%- set selected.index = eligible.index -%}
+    {%- set selected.kind = 'read' -%}
+    {%- set selected.secret_index = 12 + shared.get('payroll_offset') -%}
+    {%- do shared.set('episode', dict(index=selected.index, step=1, offset=shared.get('payroll_offset'))) -%}
+    {%- do shared.set('episode_cursor', (selected.index + 1) % 4) -%}
+    {%- do shared.set('payroll_offset', (shared.get('payroll_offset') + 7) % 40) -%}
+    {%- do shared.set('next_episode', clock + interval * 3600) -%}
+  {%- elif selected.index < 0 -%}
+    {%- set selected.index = module.rand.weighted_choice([0, 1, 2, 3], [45, 25, 20, 10]) -%}
+    {%- set selected.kind = module.rand.weighted_choice(['read', 'list', 'lookup', 'delete'], [80, 10, 9, 1]) -%}
+    {%- if selected.kind == 'read' -%}
+      {%- if clock - people[selected.index].last_payroll >= 900 and module.rand.chance(0.4) -%}
+        {%- set selected.secret_index = module.rand.number.integer(12, 51) -%}
+      {%- else -%}
+        {%- set selected.secret_index = shared.get('general_cursor') -%}
+        {%- do shared.set('general_cursor', (selected.secret_index + 1) % 12) -%}
+      {%- endif -%}
+    {%- endif -%}
   {%- endif -%}
 {%- endif -%}
-{%- set id = module.rand.crypto.uuid4() -%}
-{%- set entity_id = '96fa6c68-63af-43dc-a9ea-f59556f4b5ea' if attack else {'svc-api':'49263c43-35ab-4df6-a747-1715203590ba','svc-billing':'09ae6e74-f30a-4713-83a5-c8be3496bdbe','alice':'e60a5c72-a56d-4ff4-b16a-45c3bceea453'}[actor] -%}
-{%- set digest = module.hashlib.sha256(actor.encode()).hexdigest() -%}
-{%- set accessor = 'hmac-sha256:' ~ digest -%}
-{%- set token = 'hmac-sha256:' ~ module.hashlib.sha256((actor ~ ':token').encode()).hexdigest() -%}
-{%- set auth = {
-    'accessor': accessor, 'client_token': token,
-    'display_name': 'userpass-' ~ actor, 'entity_id': entity_id,
-    'metadata': {'username': actor},
-    'policies': ['default', 'payroll-reader'] if attack else ['default'],
-    'token_policies': ['default', 'payroll-reader'] if attack else ['default'],
-    'token_type': 'service'
-} -%}
-{%- set mount_type = 'system' if path.startswith('sys/') else ('token' if path.startswith('auth/') else 'kv') -%}
-{%- set request = {
-    'id': id, 'operation': operation, 'namespace': {'id': 'root'},
-    'client_token': token, 'client_token_accessor': accessor,
-    'path': path, 'remote_address': ip,
-    'remote_port': module.rand.number.integer(49152, 65535),
-    'mount_type': mount_type,
-    'mount_point': 'sys/' if mount_type == 'system' else ('auth/token/' if mount_type == 'token' else params.secret_mount ~ '/')
-} -%}
-{%- set native = {'time': timestamp.isoformat(), 'type': 'request',
-                  'auth': auth, 'request': request} -%}
-{%- do shared.set('current', {'auth': auth, 'request': request,
-                               'actor': actor, 'ip': ip,
-                               'denied': attack and stage == 11}) -%}
-{{- render(native, actor, ip) -}}
+{%- set person = people[selected.index] -%}
+{%- set denied = selected.kind == 'delete' -%}
+{%- if selected.kind == 'read' -%}
+  {%- set relative = samples.secrets[selected.secret_index].path -%}
+  {%- set path = params.secret_mount ~ '/data/' ~ relative -%}
+  {%- set operation = 'read' -%}
+  {%- if selected.secret_index >= 12 -%}{%- do person.update(dict(last_payroll=clock)) -%}{%- endif -%}
+{%- elif selected.kind == 'list' -%}
+  {%- set relative = module.rand.choice(['app', 'billing', 'payroll']) -%}
+  {%- set path = params.secret_mount ~ '/metadata/' ~ relative -%}
+  {%- set operation = 'list' -%}
+{%- elif selected.kind in ['lookup', 'renew'] -%}
+  {%- set path = 'auth/token/' ~ ('lookup-self' if selected.kind == 'lookup' else 'renew-self') -%}
+  {%- set operation = 'read' if selected.kind == 'lookup' else 'update' -%}
+{%- else -%}
+  {%- set path = 'sys/audit/file' -%}
+  {%- set operation = 'delete' -%}
+{%- endif -%}
+{%- set token = hmac(person.token) -%}
+{%- set accessor = hmac(person.accessor) -%}
+{%- set policies = ['default', 'training-reader'] -%}
+{%- set results = dict(allowed=not denied) -%}
+{%- if not denied -%}
+  {%- set policy_name = 'default' if selected.kind in ['lookup', 'renew'] else 'training-reader' -%}
+  {# Preserve newAuth make(len)+append behavior in tagged v1.18.0. #}
+  {%- do results.update(dict(granting_policies=[dict(type=''), dict(name=policy_name, namespace_id='root', type='acl')])) -%}
+{%- endif -%}
+{%- set auth = dict(accessor=accessor, client_token=token, display_name='userpass-' ~ person.actor, entity_id=person.entity, metadata=dict(username=person.actor), policies=policies, policy_results=results, token_policies=policies, token_issue_time=person.issue.isoformat().replace('+00:00','Z'), token_ttl=86400, token_type='service') -%}
+{%- set mount = dict(accessor='kv_78c4bc20', class='secret', point=params.secret_mount ~ '/', type='kv') if selected.kind in ['read', 'list'] else (dict(accessor='auth_token_1684c220', class='auth', point='auth/token/', type='token') if not denied else dict(accessor='system_55b7b520', class='secret', point='sys/', type='system')) -%}
+{%- set request = dict(client_id=person.entity, client_token=token, client_token_accessor=accessor, id=module.rand.crypto.uuid4(), mount_class=mount.class, mount_point=mount.point, mount_type=mount.type, namespace=dict(id='root'), operation=operation, path=path, remote_address=person.ip, remote_port=person.port, request_uri='/v1/' ~ module.urllib.parse.quote(path, safe='/')) -%}
+{# Update existence checking routes renew-self before request auditing.
+   Read/list/lookup gain this accessor only after their successful route. #}
+{%- if selected.kind == 'renew' -%}{%- do request.update(dict(mount_accessor=mount.accessor)) -%}{%- endif -%}
+{%- set error = '1 error occurred:\n\t* permission denied\n\n' -%}
+{%- set native = dict(auth=auth) -%}
+{%- if denied -%}{%- do native.update(dict(error=error)) -%}{%- endif -%}
+{%- do native.update(dict(request=request, time=now.isoformat().replace('+00:00','Z'), type='request')) -%}
+{%- do shared.set('current', dict(auth=auth, request=request, index=selected.index, kind=selected.kind, secret_index=selected.secret_index, relative=relative if relative is defined else '', denied=denied, error=error, now=now, mount_accessor=mount.accessor)) -%}
+{{- render(native, person.actor, person.ip) -}}

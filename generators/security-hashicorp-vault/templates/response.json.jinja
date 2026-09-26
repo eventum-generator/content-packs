@@ -1,12 +1,42 @@
-{%- from 'templates/_base.json.jinja' import render with context -%}
+{%- from 'templates/_base.json.jinja' import render, hmac with context -%}
 {%- set flow = shared.get('current') -%}
-{%- set native = {'time': timestamp.isoformat(), 'type': 'response',
-                  'auth': flow.auth, 'request': flow.request,
-                  'response': {'mount_type': flow.request.mount_type,
-                               'mount_point': flow.request.mount_point}} -%}
-{%- if flow.denied -%}
-  {%- do native.update({'error': 'permission denied'}) -%}
-{%- elif flow.request.operation == 'read' and flow.request.path.startswith(params.secret_mount ~ '/data/') -%}
-  {%- do native.response.update({'data': {'data': {'value': 'hmac-sha256:' ~ module.hashlib.sha256(flow.request.path.encode()).hexdigest()}}}) -%}
+{%- set now = flow.now + module.datetime.timedelta(milliseconds=50) -%}
+{%- set person = shared.get('identities')[flow.index] -%}
+{%- set response = dict(mount_class=flow.request.mount_class, mount_point=flow.request.mount_point, mount_type=flow.request.mount_type) -%}
+{%- set response_request = dict(flow.request) -%}
+{%- if not flow.denied -%}
+  {%- do response_request.update(dict(mount_accessor=flow.mount_accessor)) -%}
+  {%- do response.update(dict(mount_accessor=flow.mount_accessor)) -%}
 {%- endif -%}
-{{- render(native, flow.actor, flow.ip) -}}
+{%- if flow.denied -%}
+  {%- do response.update(dict(data=dict(error=hmac(flow.error)))) -%}
+{%- elif flow.kind == 'read' -%}
+  {%- set source = samples.secrets[flow.secret_index] -%}
+  {%- set metadata = dict(created_time=hmac(shared.get('provisioned')), custom_metadata=none, deletion_time=hmac(''), destroyed=false, version=1) -%}
+  {%- do response.update(dict(data=dict(data=dict(value=hmac(source.value)), metadata=metadata))) -%}
+{%- elif flow.kind == 'list' -%}
+  {%- set keys = [] -%}
+  {%- for source in samples.secrets -%}
+    {%- if source.path.startswith(flow.relative ~ '/') -%}
+      {%- do keys.append(source.path.split('/')[-1]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set hashed_keys = [] -%}
+  {%- for key in keys | sort -%}{%- do hashed_keys.append(hmac(key)) -%}{%- endfor -%}
+  {%- do response.update(dict(data=dict(keys=hashed_keys))) -%}
+{%- elif flow.kind == 'lookup' -%}
+  {%- set data = dict(accessor=hmac(person.accessor), creation_time=person.issue.timestamp() | int, creation_ttl=86400, display_name=hmac('userpass-' ~ person.actor), entity_id=hmac(person.entity), expire_time=module.datetime.datetime.fromtimestamp(person.expires, module.datetime.timezone.utc).isoformat().replace('+00:00','Z'), explicit_max_ttl=0, id=hmac(person.token), issue_time=person.issue.isoformat().replace('+00:00','Z'), meta=dict(username=hmac(person.actor)), num_uses=0, orphan=true, path=hmac('auth/userpass/login/' ~ person.actor), period=86400, policies=[hmac('default'), hmac('training-reader')], renewable=true, ttl=(person.expires - flow.now.timestamp()) | int, type=hmac('service')) -%}
+  {%- if person.last_renewal -%}
+    {%- do data.update(dict(last_renewal=person.last_renewal.isoformat().replace('+00:00','Z'), last_renewal_time=person.last_renewal.timestamp() | int)) -%}
+  {%- endif -%}
+  {%- do response.update(dict(data=data)) -%}
+{%- elif flow.kind == 'renew' -%}
+  {%- set renewed_auth = dict(accessor=hmac(person.accessor), client_token=hmac(person.token), display_name='userpass-' ~ person.actor, entity_id=person.entity, metadata=dict(username=person.actor), policies=['default', 'training-reader'], token_policies=['default', 'training-reader'], token_issue_time=person.issue.isoformat().replace('+00:00','Z'), token_ttl=86400, token_type='service') -%}
+  {%- do response.update(dict(auth=renewed_auth)) -%}
+  {%- do person.update(dict(expires=now.timestamp() + 86400, renew_due=now.timestamp() + 43200, last_renewal=now)) -%}
+{%- endif -%}
+{%- set native = dict(auth=flow.auth) -%}
+{%- if flow.denied -%}{%- do native.update(dict(error=flow.error)) -%}{%- endif -%}
+{%- do native.update(dict(request=response_request, response=response, time=now.isoformat().replace('+00:00','Z'), type='response')) -%}
+{{- render(native, person.actor, person.ip) -}}
+{%- do shared.pop('current') -%}
