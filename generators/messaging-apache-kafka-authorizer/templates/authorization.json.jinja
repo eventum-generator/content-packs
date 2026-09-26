@@ -1,36 +1,226 @@
-{%- for key in ['to_probe', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- if stage == 'routine' -%}
-  {%- set principal = module.rand.choice(['User:svc-metrics', 'User:svc-web', 'User:analyst']) -%}
-  {%- set client = module.rand.choice(['10.40.3.11', '10.40.3.12', '10.40.3.13']) -%}
-  {%- set resource = module.rand.choice(['orders-archive', 'metrics-internal', 'unknown-topic']) -%}
-  {%- set operation = module.rand.weighted_choice(['READ', 'WRITE'], [85, 15]) -%}
-  {%- set request = 'Fetch' if operation == 'READ' else 'Produce' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 45 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('probe_count', 0) -%}{%- do shared.set('to_probe', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-{%- else -%}
-  {%- set count = shared.get('probe_count', 0) + 1 -%}
-  {%- set principal = params.suspicious_principal -%}
-  {%- set client = params.suspicious_client_ip -%}
-  {%- set resource = params.sensitive_topic -%}
-  {%- set operation = ['READ', 'WRITE', 'ALTER_CONFIGS', 'DELETE'][count - 1] -%}
-  {%- set request = ['Fetch', 'Produce', 'AlterConfigs', 'DeleteTopics'][count - 1] -%}
-  {%- if count >= 4 -%}{%- do shared.set('probe_count', 0) -%}{%- do shared.set('to_routine', true) -%}{%- else -%}{%- do shared.set('probe_count', count) -%}{%- endif -%}
+{#- Kafka 3.9.0 StandardAuthorizer INFO topic denials, one 10 s input tick
+    at most one record. All clock values are integer milliseconds. -#}
+{#- Jinja has no raise statement: a missing-key lookup through the
+    standard library aborts the render with the message as the key. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{%- set tz = module.datetime.timezone.utc -%}
+{%- set utc = timestamp.astimezone(tz) -%}
+{%- set now = (utc.timestamp() * 1000) | round | int -%}
+{%- set rand = module.rand -%}
+{%- set num = module.rand.number -%}
+{%- set ln = module.math.log -%}
+{%- set ops = ['READ', 'WRITE', 'ALTER_CONFIGS', 'DELETE'] -%}
+{%- set apis = {'READ': 'Fetch', 'WRITE': 'Produce', 'ALTER_CONFIGS': 'AlterConfigs', 'DELETE': 'DeleteTopics'} -%}
+{%- set ipv4 = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}' -%}
+{%- if shared.get('clients') is none -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean -%}
+    {{- invalid('anomaly_interval_hours must be numeric') -}}
+  {%- endif -%}
+  {%- if not module.math.isfinite(params.anomaly_interval_hours) or not 1 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- invalid('anomaly_interval_hours must be finite in 1..8760') -}}
+  {%- endif -%}
+  {%- if params.broker_host is not string or not module.re.fullmatch('[A-Za-z0-9][A-Za-z0-9.-]{0,252}', params.broker_host) -%}
+    {{- invalid('broker_host must be an ASCII hostname') -}}
+  {%- endif -%}
+  {%- if not 2 <= samples.clients | length <= 64 -%}
+    {{- invalid('clients sample must hold 2..64 clients') -}}
+  {%- endif -%}
+  {%- set clients = [] -%}
+  {%- set index = {} -%}
+  {%- for row in samples.clients -%}
+    {%- if row.principal is not string or not module.re.fullmatch('User:[A-Za-z0-9._-]{1,64}', row.principal) or row.principal in index -%}
+      {{- invalid('client principals must be distinct User principals') -}}
+    {%- endif -%}
+    {%- if row.ip is not string or not module.re.fullmatch(ipv4, row.ip) -%}
+      {{- invalid('client ip must be a dotted-quad IPv4 string') -}}
+    {%- endif -%}
+    {%- if row.bursts_per_day is not number or row.bursts_per_day is boolean or not 1 <= row.bursts_per_day <= 1440 -%}
+      {{- invalid('bursts_per_day must be a number in 1..1440') -}}
+    {%- endif -%}
+    {%- set idle = 86400000 / row.bursts_per_day -%}
+    {%- do index.update({row.principal: clients | length}) -%}
+    {%- do clients.append({'principal': row.principal, 'ip': row.ip, 'idle': idle, 'bag': [], 'pairs': {}, 'cursor': 0, 'next': now + (num.floating(0, idle) | int), 'item': none, 'left': 0, 'used': [], 'recent': [], 'last': none, 'frozen': false}) -%}
+  {%- endfor -%}
+  {%- for row in samples.denials -%}
+    {%- if row.principal not in index -%}
+      {{- invalid('denial principal is not a listed client') -}}
+    {%- endif -%}
+    {%- if row.topic is not string or not module.re.fullmatch('[A-Za-z0-9._-]{1,249}', row.topic) or row.topic in ['.', '..'] -%}
+      {{- invalid('denial topic must satisfy Kafka topic syntax') -}}
+    {%- endif -%}
+    {%- if row.operation not in ops -%}
+      {{- invalid('denial operation must be READ, WRITE, ALTER_CONFIGS or DELETE') -}}
+    {%- endif -%}
+    {%- if row.weight is not integer or row.weight is boolean or not 1 <= row.weight <= 50 -%}
+      {{- invalid('denial weight must be an integer in 1..50') -}}
+    {%- endif -%}
+    {%- set client = clients[index[row.principal]] -%}
+    {%- if row.operation in client.pairs.get(row.topic, []) -%}
+      {{- invalid('denial rows must be distinct per principal, topic and operation') -}}
+    {%- endif -%}
+    {%- do client.pairs.update({row.topic: client.pairs.get(row.topic, []) + [row.operation]}) -%}
+    {%- for _ in range(row.weight) -%}
+      {%- do client.bag.append([row.topic, row.operation]) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set pool = [] -%}
+  {%- for client in clients -%}
+    {%- if not client.bag -%}
+      {{- invalid('every client needs at least one denial row') -}}
+    {%- endif -%}
+    {%- do client.update({'bag': rand.shuffle(client.bag)}) -%}
+    {%- for topic, attempted in client.pairs | dictsort -%}
+      {%- if attempted | length == 4 -%}
+        {%- do pool.append([index[client.principal], topic]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- if params.anomaly_mode and pool | length < 2 -%}
+    {{- invalid('anomaly_mode needs two client/topic pairs with all four operations') -}}
+  {%- endif -%}
+  {%- do shared.update({'clients': clients, 'pool': rand.shuffle(pool), 'pool_cursor': 0, 'next_episode': now + (params.anomaly_interval_hours * 3600000) | int + num.integer(0, 600000), 'next_decoy': now + (num.exponential(1 / 21600) * 1000) | int, 'pending': none, 'active': none}) -%}
 {%- endif -%}
-{%- set message = 'Principal = ' ~ principal ~ ' is Denied operation = ' ~ operation ~ ' from host = ' ~ client ~ ' on resource = Topic:LITERAL:' ~ resource ~ ' for request = ' ~ request ~ ' with resourceRefCount = 1 based on rule DefaultDeny' -%}
-{%- set original = '[' ~ timestamp.strftime('%Y-%m-%d %H:%M:%S,') ~ ('%03d'|format(timestamp.microsecond // 1000)) ~ '] INFO ' ~ message ~ ' (kafka.authorizer.logger)' -%}
-{%- set event = {
-  '@timestamp': timestamp.isoformat(),
+{%- if shared.get('cadence_failed') or (shared.get('last_tick') is not none and now - shared.get('last_tick') != 10000) -%}
+  {%- do shared.set('cadence_failed', true) -%}
+  {{- invalid('selected source requires ordered ten-second timestamps') -}}
+{%- endif -%}
+{%- do shared.set('last_tick', now) -%}
+{%- set tick_end = now + 10000 -%}
+{%- set clients = shared.get('clients') -%}
+{%- set out = namespace(client=none, topic=none, op=none, t=none) -%}
+{#- Sequences: a scheduled episode (all four operations) or, in both
+    modes, a near miss (the first or last three). Each reserves its actor
+    and never overlaps another sequence. -#}
+{%- set pool = shared.get('pool') -%}
+{%- if params.anomaly_mode and shared.get('active') is none and shared.get('pending') is none and shared.get('next_episode') < tick_end -%}
+  {%- set pick = pool[shared.get('pool_cursor')] -%}
+  {%- if shared.get('pool_cursor') + 1 < pool | length -%}
+    {%- do shared.set('pool_cursor', shared.get('pool_cursor') + 1) -%}
+  {%- else -%}
+    {%- set reshuffled = rand.shuffle(pool) -%}
+    {%- if reshuffled[0] == pick -%}
+      {%- set reshuffled = reshuffled[1:] + reshuffled[:1] -%}
+    {%- endif -%}
+    {%- do shared.update({'pool': reshuffled, 'pool_cursor': 0}) -%}
+  {%- endif -%}
+  {%- set actor = clients[pick[0]] -%}
+  {%- do actor.update({'frozen': true, 'item': none, 'left': 0}) -%}
+  {%- set due = shared.get('next_episode') -%}
+  {%- if actor.last is not none and actor.last + 20000 > due -%}
+    {%- set due = actor.last + 20000 -%}
+  {%- endif -%}
+  {%- do shared.set('pending', {'actor': pick[0], 'topic': pick[1], 'ops': ops, 'kind': 'episode', 'due': due}) -%}
+{%- endif -%}
+{%- if pool and shared.get('active') is none and shared.get('pending') is none and shared.get('next_decoy') < tick_end and (not params.anomaly_mode or shared.get('next_episode') - tick_end > 600000) -%}
+  {%- set pick = rand.choice(pool) -%}
+  {%- set actor = clients[pick[0]] -%}
+  {%- set variant = rand.choice([ops[:3], ops[1:]]) -%}
+  {%- if actor.recent and actor.recent[-1][0] == 'READ' and actor.recent[-1][1] == pick[1] and now - actor.recent[-1][2] <= 600000 -%}
+    {%- set variant = ops[:3] -%}
+  {%- endif -%}
+  {%- do actor.update({'frozen': true, 'item': none, 'left': 0}) -%}
+  {%- set due = shared.get('next_decoy') -%}
+  {%- if actor.last is not none and actor.last + 20000 > due -%}
+    {%- set due = actor.last + 20000 -%}
+  {%- endif -%}
+  {%- do shared.set('pending', {'actor': pick[0], 'topic': pick[1], 'ops': variant, 'kind': 'decoy', 'due': due}) -%}
+{%- endif -%}
+{%- set pending = shared.get('pending') -%}
+{%- if pending is not none and pending.due < tick_end -%}
+  {%- do shared.update({'active': {'actor': pending.actor, 'topic': pending.topic, 'ops': pending.ops, 'kind': pending.kind, 'step': 0, 'due': pending.due}, 'pending': none}) -%}
+{%- endif -%}
+{%- set active = shared.get('active') -%}
+{%- if active is not none and active.due < tick_end -%}
+  {%- set out.client = clients[active.actor] -%}
+  {%- set out.topic = active.topic -%}
+  {%- set out.op = active.ops[active.step] -%}
+  {%- set out.t = [active.due, now] | max -%}
+  {%- if active.kind == 'episode' and active.step == 0 -%}
+    {%- do shared.set('next_episode', out.t + (params.anomaly_interval_hours * 3600000) | int + num.integer(0, 600000)) -%}
+  {%- endif -%}
+  {%- if active.step + 1 == active.ops | length -%}
+    {%- do shared.set('active', none) -%}
+    {%- if active.kind == 'decoy' -%}
+      {%- do shared.set('next_decoy', out.t + (num.exponential(1 / 21600) * 1000) | int) -%}
+    {%- endif -%}
+    {%- do out.client.update({'frozen': false, 'used': [], 'next': out.t + (num.clamp(num.lognormal(ln(out.client.idle / 1000) - 0.5, 1.0), 60, 8 * out.client.idle / 1000) * 1000) | int + num.integer(0, 999)}) -%}
+  {%- else -%}
+    {%- do active.update({'step': active.step + 1, 'due': out.t + (num.triangular(20, 80, 35) * 1000) | int + num.integer(0, 999)}) -%}
+  {%- endif -%}
+{%- else -%}
+  {#- Ordinary: the client due earliest in this tick, if any. -#}
+  {%- set pick = namespace(client=none) -%}
+  {%- for client in clients -%}
+    {%- if not client.frozen and client.next < tick_end and (pick.client is none or client.next < pick.client.next) -%}
+      {%- set pick.client = client -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if pick.client is none -%}
+    {%- do dispatch.drop() -%}
+  {%- endif -%}
+  {%- set client = pick.client -%}
+  {%- set out.client = client -%}
+  {%- set out.t = client.next if client.next >= now else now + num.integer(0, 9999) -%}
+  {%- if client.item is none -%}
+    {%- set item = client.bag[client.cursor] -%}
+    {%- if client.cursor + 1 < client.bag | length -%}
+      {%- do client.update({'cursor': client.cursor + 1}) -%}
+    {%- else -%}
+      {%- do client.update({'cursor': 0, 'bag': rand.shuffle(client.bag)}) -%}
+    {%- endif -%}
+    {%- set admin = item[1] in ['ALTER_CONFIGS', 'DELETE'] -%}
+    {%- set size = rand.weighted_choice([1, 2, 3], [70, 25, 5]) if admin else rand.weighted_choice([1, 2, 3, 4, 5, 6, 7, 8], [30, 22, 16, 11, 8, 6, 4, 3]) -%}
+    {%- do client.update({'item': item, 'left': size, 'used': [item[1]]}) -%}
+  {%- endif -%}
+  {%- set out.topic = client.item[0] -%}
+  {%- set out.op = client.item[1] -%}
+  {#- Ordinary traffic never completes the exact episode shape. -#}
+  {%- set recent = client.recent -%}
+  {%- if out.op == 'DELETE' and recent | length == 3 and recent | map(attribute=0) | list == ['READ', 'WRITE', 'ALTER_CONFIGS'] and recent | map(attribute=1) | unique | list == [out.topic] and out.t - recent[0][2] <= 300000 -%}
+    {%- set out.op = 'ALTER_CONFIGS' -%}
+  {%- endif -%}
+  {%- do client.update({'left': client.left - 1}) -%}
+  {%- if client.left > 0 -%}
+    {%- set gap = num.clamp(num.lognormal(ln(45), 0.6), 15, 300) if out.op in ['ALTER_CONFIGS', 'DELETE'] else num.clamp(num.lognormal(ln(25), 0.6), 5, 180) -%}
+    {%- do client.update({'next': out.t + (gap * 1000) | int + num.integer(0, 999)}) -%}
+  {%- else -%}
+    {%- set others = client.pairs[out.topic] | reject('in', client.used + [out.op]) | list -%}
+    {%- if client.used | length < 3 and others and rand.chance(0.3) -%}
+      {%- set follow = rand.choice(others) -%}
+      {%- set size = rand.weighted_choice([1, 2, 3], [70, 25, 5]) if follow in ['ALTER_CONFIGS', 'DELETE'] else rand.weighted_choice([1, 2, 3, 4, 5, 6, 7, 8], [30, 22, 16, 11, 8, 6, 4, 3]) -%}
+      {%- do client.update({'item': [out.topic, follow], 'left': size, 'used': client.used + [follow], 'next': out.t + (num.clamp(num.lognormal(ln(90), 0.7), 20, 600) * 1000) | int + num.integer(0, 999)}) -%}
+    {%- else -%}
+      {%- do client.update({'item': none, 'used': [], 'next': out.t + (num.clamp(num.lognormal(ln(client.idle / 1000) - 0.5, 1.0), 60, 8 * client.idle / 1000) * 1000) | int + num.integer(0, 999)}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set current = out.client -%}
+{%- do current.update({'last': out.t}) -%}
+{%- do current.recent.append([out.op, out.topic, out.t]) -%}
+{%- if current.recent | length > 3 -%}
+  {%- do current.recent.pop(0) -%}
+{%- endif -%}
+{%- set when = module.datetime.datetime.fromtimestamp(out.t // 1000, tz) + module.datetime.timedelta(milliseconds=out.t % 1000) -%}
+{%- set created = when + module.datetime.timedelta(milliseconds=(num.clamp(num.lognormal(ln(400), 0.7), 20, 8000)) | int) -%}
+{%- set ingested = created + module.datetime.timedelta(milliseconds=(num.clamp(num.lognormal(ln(900), 0.6), 50, 20000)) | int) -%}
+{%- set message = 'Principal = ' ~ current.principal ~ ' is Denied operation = ' ~ out.op ~ ' from host = ' ~ current.ip ~ ' on resource = Topic:LITERAL:' ~ out.topic ~ ' for request = ' ~ apis[out.op] ~ ' with resourceRefCount = 1 based on rule DefaultDeny' -%}
+{%- set original = '[' ~ when.strftime('%Y-%m-%d %H:%M:%S,') ~ ('%03d' | format(out.t % 1000)) ~ '] INFO ' ~ message ~ ' (kafka.authorizer.logger)' -%}
+{%- set iso = '%Y-%m-%dT%H:%M:%S.' -%}
+{{- {
+  '@timestamp': when.strftime(iso) ~ ('%03d' | format(when.microsecond // 1000)) ~ 'Z',
   'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'category': ['iam'], 'type': ['denied'], 'action': 'authorization-denied', 'outcome': 'failure', 'original': original},
+  'event': {'kind': 'event', 'category': ['api'], 'type': ['denied'], 'action': 'authorization-denied', 'outcome': 'failure', 'original': original, 'created': created.strftime(iso) ~ ('%03d' | format(created.microsecond // 1000)) ~ 'Z', 'ingested': ingested.strftime(iso) ~ ('%03d' | format(ingested.microsecond // 1000)) ~ 'Z', 'timezone': '+00:00'},
   'host': {'name': params.broker_host},
   'log': {'level': 'INFO', 'logger': 'kafka.authorizer.logger'},
-  'user': {'name': principal[5:]},
-  'source': {'ip': client},
-  'related': {'ip': [client], 'user': [principal[5:]]},
-  'kafka': {'principal': principal, 'operation': operation, 'resource': {'type': 'Topic', 'pattern_type': 'LITERAL', 'name': resource}, 'request': request, 'resource_ref_count': 1, 'rule': 'DefaultDeny', 'authorization_result': 'Denied'}
-} -%}
-{{- event | tojson -}}
+  'message': message,
+  'tags': ['preserve_original_event'],
+  'user': {'name': current.principal[5:]},
+  'source': {'ip': current.ip},
+  'related': {'ip': [current.ip], 'user': [current.principal[5:]]},
+  'kafka': {'principal': current.principal, 'operation': out.op, 'resource': {'type': 'Topic', 'pattern_type': 'LITERAL', 'name': out.topic}, 'request': apis[out.op], 'resource_ref_count': 1, 'rule': 'DefaultDeny', 'authorization_result': 'Denied', 'log': {'class': 'kafka.authorizer.logger', 'component': 'unknown'}}
+} | tojson -}}
