@@ -25,13 +25,13 @@ The field selection is explicit. Microsoft documents that 2026 Windows updates a
 | `/api/status` | 12% of ordinary slots | 200.0 |
 | Missing `/favicon-old.ico` | 5% of ordinary slots | 404.0, Win32 2 |
 | `/admin/` directory | 1% of ordinary slots | 403.14 |
-| `/backup/`, `/admin/`, `/exports/`, `/exports/payroll.csv` | One separated request to each per background day | 404.0, 403.14, 403.14, 200.0 |
+| `/backup/`, `/admin/`, `/exports/`, `/exports/payroll.csv` | One separated request to each per 2,880 ordinary slots | 404.0, 403.14, 403.14, 200.0 |
 
 Weights are synthetic workload values, not measured IIS traffic. One small site emits one request every 30 seconds, about 2,880 requests per day. The fixed background requests use the same client, User-Agent, paths and account as the anomaly but are separated by hours.
 
 ## Anomaly Chain
 
-`event.template.params.anomaly_mode` defaults to `true`. After 240 routine requests, approximately two hours, the generator inserts one four-request sequence from `198.51.100.77`, with 30 seconds between requests:
+`event.template.params.anomaly_mode` defaults to `true`. The generator inserts a four-request sequence from `198.51.100.77` every two hours, with 30 seconds between requests. The first starts two hours and 30 seconds after the first generated event. Change `anomaly_interval_hours` to adjust the recurrence; values below 0.5 hours are clamped to 0.5 hours. Scheduling uses the generated UTC timestamps, so fast sample generation preserves the same event-time interval:
 
 1. `GET /backup/` returns `404 0 2`.
 2. `GET /admin/` returns `403 14 0`.
@@ -40,7 +40,9 @@ Weights are synthetic workload values, not measured IIS traffic. One small site 
 
 A rule can correlate path enumeration followed by access to a sensitive export from the same `c-ip` within two minutes. The W3C access row does not show how the client acquired credentials or how many bytes were downloaded. No single request distinguishes anomaly mode: all four request shapes also occur in background. This correlation assumes IIS sees the client directly; behind a load balancer, `c-ip` can be the proxy address unless a separate forwarded-client field is logged.
 
-Set `anomaly_mode: false` to generate only background. The close four-request sequence is omitted.
+Episodes reuse the same client and service account, modeling repeated enumeration and sensitive access. This W3C profile has no request or session identifier; each episode is distinguished by its timestamp window. Ordinary copies of these requests are separated by 600 ordinary slots, approximately five hours. The ordinary-slot counter cycles after 2,880 slots, and scheduling retains only the next due timestamp and a temporary transition flag.
+
+Set `anomaly_mode: false` to generate only background. The close four-request sequence is omitted, while the same client, account, paths, User-Agent and status combinations still occur independently.
 
 ## Parameters
 
@@ -54,7 +56,7 @@ Edit `event.template.params` in `generator.yml`:
 | `server_port` | `443` | `s-port` |
 | `anomaly_source_ip` | `198.51.100.77` | Client used in both modes for the four sensitive requests |
 | `anomaly_user` | `CONTOSO\svc-reports` | `cs-username` on authorized export requests in both modes |
-| `anomaly_delay_events` | `240` | Routine requests before the one enabled-mode chain |
+| `anomaly_interval_hours` | `2` | Hours between anomaly episode starts, minimum 0.5; first starts one 30-second slot after this initial wait |
 | `anomaly_mode` | `true` | Add the close four-request sequence |
 
 ### Output Parameters
@@ -76,7 +78,7 @@ Use `--live-mode false` for a fast local sample run.
 This complete event was copied from the enabled-mode validation run:
 
 ```json
-{"@timestamp": "2026-09-25T19:19:30+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": "success", "duration": 99000000, "original": "2026-09-25 19:19:30 10.20.0.10 GET /exports/payroll.csv - 443 CONTOSO\\svc-reports 198.51.100.77 curl/8.5.0 - 200 0 0 99"}, "host": {"name": "WEB-IIS-01", "ip": "10.20.0.10"}, "source": {"ip": "198.51.100.77"}, "destination": {"ip": "10.20.0.10", "port": 443}, "http": {"request": {"method": "GET"}, "response": {"status_code": 200}}, "url": {"path": "/exports/payroll.csv"}, "user_agent": {"original": "curl/8.5.0"}, "iis": {"access": {"sub_status": 0, "win32_status": 0}}, "user": {"name": "CONTOSO\\svc-reports"}}
+{"@timestamp": "2026-09-25T02:02:00+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": "success", "duration": 487000000, "original": "2026-09-25 02:02:00 10.20.0.10 GET /exports/payroll.csv - 443 CONTOSO\\svc-reports 198.51.100.77 curl/8.5.0 - 200 0 0 487"}, "host": {"name": "WEB-IIS-01", "ip": "10.20.0.10"}, "source": {"ip": "198.51.100.77"}, "destination": {"ip": "10.20.0.10", "port": 443}, "http": {"request": {"method": "GET"}, "response": {"status_code": 200}}, "url": {"path": "/exports/payroll.csv"}, "user_agent": {"original": "curl/8.5.0"}, "iis": {"access": {"sub_status": 0, "win32_status": 0}}, "user": {"name": "CONTOSO\\svc-reports"}}
 ```
 
 ## References
