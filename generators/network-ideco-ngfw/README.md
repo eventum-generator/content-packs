@@ -15,11 +15,11 @@ Shares are synthetic workload settings, not measured device rates. Background `f
 
 ## Anomaly Chain
 
-The default `utm-vpn-authd` jail records six `Found` messages for `198.51.100.25` on consecutive seconds, then `NOTICE [...] Ban` for the same IP. The first `Found` is a normal routine record; five more and the ban form a one-shot FSM chain. Background uses the same jail, `Found` and `Ban` actions, and the target IP appears in traffic. Its other bans follow slower findings for different IPs. A detector can flag six findings followed by a ban for one source and jail in a short window.
+About every `anomaly_interval_hours` (default: 2), the `utm-vpn-authd` jail records six `Found` messages for `198.51.100.25` on consecutive seconds, then `NOTICE [...] Ban` for the same IP. The first `Found` is an ordinary scheduled record; five more and the ban form one episode. The same IP may return after its 45-minute ban expires. Background uses the same jail, `Found` and `Ban` actions, and the target IP occurs in both traffic and isolated `Found` records; other sources are banned after six slower findings. A detector can flag six findings followed by a ban for one source and jail in a short window.
 
 The model uses a 45-minute hold after the target ban and stops emitting its traffic during that interval. [Ideco's v21 fail2ban guidance](https://docs.ideco.ru/pdf/v21/ru-ngfw-settings-server-management-additionally.pdf) describes six failed password attempts within 15 minutes and a 45-minute block. The v22 guide shows `Found` and `Ban` syntax but does not confirm that threshold or hold time for each jail. These timings are scenario assumptions, not assertions about every v22 installation.
 
-`anomaly_mode` defaults to `true`. Set it to `false` for background only. The chain occurs once after at least `anomaly_after_events` routine records, including its first finding. It waits for a non-fail2ban background slot so ordinary six-finding sequences retain their own records. Background-only mode can include one isolated `Found` for the target IP, but never its rapid sequence or target `Ban`.
+`anomaly_mode` defaults to `true`. Set it to `false` for background only. The rapid sequence recurs on the target's ordinary `Found` slot after each configured interval, so its start can lag the interval by at most twenty minutes. The 45-minute modeled ban suppresses target traffic and findings; an interval longer than that hold allows the same IP to return. Background-only mode still emits isolated target `Found` records about every twenty minutes and slow `Found`/`Ban` series for other IPs, but never the target's rapid sequence.
 
 ## Parameters
 
@@ -29,8 +29,8 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Purpose |
 |---|---|---|
-| `anomaly_mode` | `true` | Include the one-shot rapid-findings chain |
-| `anomaly_after_events` | `220` | Minimum routine-record count before the target's first `Found` |
+| `anomaly_mode` | `true` | Include recurring rapid-findings episodes |
+| `anomaly_interval_hours` | `2` | Hours between episode eligibility; use a positive value above 0.75 to allow the modeled ban to expire |
 | `ngfw_host` | `ideco-ngfw-01` | Hostname in the displayed Syslog record |
 | `ngfw_ip` | `10.50.0.1` | NGFW observer IP and INPUT destination |
 | `internal_source_ip` | `10.50.1.20` | One ordinary LAN source |
@@ -46,7 +46,7 @@ The shipped configuration writes `output/events.json` and needs no endpoint para
 
 ## Usage
 
-From the content-packs repository root, set `input[0].cron.start` and `input[0].cron.end` for a finite batch run. For example, `2026-09-25T00:00:00+03:00` and `2026-09-25T00:06:00+03:00` produce 361 records and the default chain.
+From the content-packs repository root, set `input[0].cron.start` and `input[0].cron.end` for a finite batch run. For example, `2026-09-25T00:00:00+00:00` and `2026-09-25T04:10:00+00:00` produce 15,001 records and two complete default episodes.
 
 ```bash
 uv run --project ../eventum eventum generate --path generators/network-ideco-ngfw/generator.yml --id ideco-ngfw --live-mode false
@@ -60,10 +60,10 @@ uv run --project ../eventum eventum generate --path generators/network-ideco-ngf
 
 ## Sample Output
 
-This synthetic event was copied from a finite generator run. It is not a vendor-captured record.
+This synthetic event was copied from the first episode in a four-hour finite generator run. It is not a vendor-captured record.
 
 ```json
-{"@timestamp": "2026-09-24T21:03:39+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "fail2ban_found", "category": ["intrusion_detection"], "dataset": "ideco.ngfw_syslog", "kind": "event", "original": "2026-09-24T21:03:39+00:00 ideco-ngfw-01 fail2ban - - - INFO [utm-vpn-authd] Found 198.51.100.25 - 2026-09-24 21:03:39", "type": ["info"]}, "ideco": {"ngfw": {"fields": {"action": "Found", "found_at": "2026-09-24 21:03:39", "jail": "utm-vpn-authd", "src_ip": "198.51.100.25"}, "service": "fail2ban"}}, "message": "INFO [utm-vpn-authd] Found 198.51.100.25 - 2026-09-24 21:03:39", "observer": {"hostname": "ideco-ngfw-01", "ip": "10.50.0.1", "product": "NGFW Novum", "vendor": "Ideco"}, "related": {"ip": ["198.51.100.25"]}, "source": {"ip": "198.51.100.25"}}
+{"@timestamp": "2026-09-25T02:00:00+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "fail2ban_found", "category": ["intrusion_detection"], "dataset": "ideco.ngfw_syslog", "kind": "event", "original": "2026-09-25T02:00:00+00:00 ideco-ngfw-01 fail2ban - - - INFO [utm-vpn-authd] Found 198.51.100.25 - 2026-09-25 02:00:00", "type": ["info"]}, "ideco": {"ngfw": {"fields": {"action": "Found", "found_at": "2026-09-25 02:00:00", "jail": "utm-vpn-authd", "src_ip": "198.51.100.25"}, "service": "fail2ban"}}, "message": "INFO [utm-vpn-authd] Found 198.51.100.25 - 2026-09-25 02:00:00", "observer": {"hostname": "ideco-ngfw-01", "ip": "10.50.0.1", "product": "NGFW Novum", "vendor": "Ideco"}, "related": {"ip": ["198.51.100.25"]}, "source": {"ip": "198.51.100.25"}}
 ```
 
 `event.original` is the displayed Syslog message shape without network framing; the output file itself contains ECS JSON. To ingest native Syslog messages, extract `event.original`. Syslog can be sent over TCP or UDP according to the vendor guide; this pack does not model wire framing, priority metadata or collector delivery.
