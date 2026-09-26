@@ -1,0 +1,137 @@
+{%- set step = vars.step -%}
+{%- if step == 'routine' -%}
+  {%- set n = (shared.get('routine_count', 0) % 1000000) + 1 -%}
+  {%- do shared.set('routine_count', n) -%}
+  {%- set slot = n % 100 -%}
+  {%- set now = timestamp.timestamp() -%}
+  {%- set target_found = (n - 1) % 1200 == 0
+      and now >= shared.get('target_ban_until', 0) -%}
+  {%- set next_due = shared.get('next_anomaly_epoch', none) -%}
+  {%- if params.anomaly_mode and next_due is none -%}
+    {%- do shared.set('next_anomaly_epoch', now
+        + params.anomaly_interval_hours * 3600) -%}
+  {%- endif -%}
+  {%- set trigger = params.anomaly_mode and target_found
+      and next_due is not none and now >= next_due -%}
+  {%- if trigger -%}
+    {%- do shared.set('next_anomaly_epoch', now
+        + params.anomaly_interval_hours * 3600) -%}
+    {%- do shared.set('start_anomaly', true) -%}
+  {%- endif -%}
+  {%- if target_found or slot in [17, 31, 45, 59, 73, 87] -%}
+    {%- set kind = 'found' -%}
+  {%- elif slot == 96 -%}
+    {%- set kind = 'ban' -%}
+  {%- else -%}
+    {%- set kind = 'traffic' -%}
+  {%- endif -%}
+  {%- set src = params.target_source_ip if target_found
+      else '203.0.113.' ~ (42 + (((n - 1) // 100) % 200)) -%}
+{%- else -%}
+  {%- do shared.pop('start_anomaly', none) -%}
+  {%- set kind = 'ban' if step == 'ban' else 'found' -%}
+  {%- set src = params.target_source_ip -%}
+  {%- if step == 'ban' -%}
+    {%- do shared.set('target_ban_until', timestamp.timestamp() + 2700) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set service = 'traffic-journal' if kind == 'traffic' else 'fail2ban' -%}
+{%- if kind == 'traffic' -%}
+  {%- if n % 11 == 0
+      and timestamp.timestamp() >= shared.get('target_ban_until', 0) -%}
+    {%- set src = params.target_source_ip -%}
+    {%- set src_zone = 'WAN' -%}
+  {%- elif n % 4 == 0 -%}
+    {%- set src = '203.0.113.' ~ (42 + ((n // 100) % 200)) -%}
+    {%- set src_zone = 'WAN' -%}
+  {%- else -%}
+    {%- set src = params.internal_source_ip if n % 3
+        else '10.50.1.21' -%}
+    {%- set src_zone = 'LAN' -%}
+  {%- endif -%}
+  {%- if src_zone == 'WAN' -%}
+    {%- set dst = params.ngfw_ip -%}
+    {%- set dst_zone = 'NGFW' -%}
+    {%- set dst_port = 443 if n % 3 else 22 -%}
+    {%- set table = 'inp' -%}
+  {%- else -%}
+    {%- set dst = params.external_destination_ip if n % 3
+        else '198.51.100.11' -%}
+    {%- set dst_zone = 'WAN' -%}
+    {%- set dst_port = [443, 80, 53][n % 3] -%}
+    {%- set table = 'fwd' -%}
+  {%- endif -%}
+  {%- set protocol = 'UDP' if dst_port == 53 else 'TCP' -%}
+  {%- set result = 'drop' if n % 10 in [3, 9] else 'accept' -%}
+  {%- set action = 'l7_inspection' if result == 'accept'
+      and n % 13 == 0 and dst_port == 443 else result -%}
+  {%- set rule_id = {'fwd': {'accept': '2', 'drop': '4'},
+      'inp': {'accept': '7', 'drop': '9'}}[table][result] -%}
+  {%- set src_port = module.rand.number.integer(32768, 60999) -%}
+  {%- set flow_id = timestamp.strftime('%Y%m%d%H%M%S')
+      ~ '%02d' | format(n % 100) -%}
+  {%- set inspected = action == 'l7_inspection' -%}
+  {%- set native = {'result': result, 'rule_id': rule_id,
+      'table': table, 'action': action,
+      'ips_profile': 'default-ips' if inspected else '',
+      'ips_action': 'accept' if inspected else 'absent',
+      'ips_signature_id': '',
+      'dpi_profile': 'default-dpi' if inspected else '',
+      'dpi_action': 'accept' if inspected else 'absent',
+      'dpi_app': 'https' if inspected else '',
+      'dpi_protocol': 'HTTPS' if inspected else '',
+      'protocol': protocol, 'src_ip': src,
+      'src_port': src_port | string, 'src_zone': src_zone,
+      'dst_ip': dst, 'dst_port': dst_port | string,
+      'dst_zone': dst_zone, 'flow_id': flow_id} -%}
+  {%- set pairs = [] -%}
+  {%- for key, value in native.items() -%}
+    {%- do pairs.append(key ~ ':' ~ value) -%}
+  {%- endfor -%}
+  {%- set body = pairs | join(', ') -%}
+  {%- set event = {'dataset': 'ideco.ngfw_syslog', 'kind': 'event',
+      'category': ['network'],
+      'type': ['connection', 'allowed'] if result == 'accept'
+          else ['connection', 'denied'],
+      'action': 'traffic_' ~ result,
+      'id': flow_id} -%}
+  {%- set source = {'ip': src, 'port': src_port} -%}
+{%- elif kind == 'found' -%}
+  {%- set body = 'INFO [' ~ params.fail2ban_jail ~ '] Found '
+      ~ src ~ ' - ' ~ timestamp.strftime('%Y-%m-%d %H:%M:%S') -%}
+  {%- set native = {'jail': params.fail2ban_jail,
+      'action': 'Found', 'src_ip': src,
+      'found_at': timestamp.strftime('%Y-%m-%d %H:%M:%S')} -%}
+  {%- set event = {'dataset': 'ideco.ngfw_syslog', 'kind': 'event',
+      'category': ['intrusion_detection'], 'type': ['info'],
+      'action': 'fail2ban_found'} -%}
+  {%- set source = {'ip': src} -%}
+{%- else -%}
+  {%- set body = 'NOTICE [' ~ params.fail2ban_jail ~ '] Ban '
+      ~ src -%}
+  {%- set native = {'jail': params.fail2ban_jail,
+      'action': 'Ban', 'src_ip': src} -%}
+  {%- set event = {'dataset': 'ideco.ngfw_syslog', 'kind': 'event',
+      'category': ['intrusion_detection'], 'type': ['denied'],
+      'action': 'fail2ban_ban'} -%}
+  {%- set source = {'ip': src} -%}
+{%- endif -%}
+{%- set raw = timestamp.isoformat() ~ ' ' ~ params.ngfw_host
+    ~ ' ' ~ service ~ ' - - - ' ~ body -%}
+{%- do event.update({'original': raw}) -%}
+{%- set record = {'@timestamp': timestamp.isoformat(),
+    'ecs': {'version': '8.17.0'}, 'event': event,
+    'message': body,
+    'observer': {'hostname': params.ngfw_host,
+        'ip': params.ngfw_ip, 'vendor': 'Ideco',
+        'product': 'NGFW Novum'},
+    'source': source,
+    'related': {'ip': [src]},
+    'ideco': {'ngfw': {'service': service, 'fields': native}}
+} -%}
+{%- if kind == 'traffic' -%}
+  {%- do record.update({'destination': {'ip': dst, 'port': dst_port},
+      'network': {'transport': protocol | lower, 'type': 'ipv4'}}) -%}
+  {%- do record['related']['ip'].append(dst) -%}
+{%- endif -%}
+{{ record | tojson }}
