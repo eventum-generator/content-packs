@@ -3,7 +3,7 @@
 {%- endfor -%}
 {%- set stage = vars.stage -%}
 {%- set event_time = timestamp + module.datetime.timedelta(
-    seconds=module.rand.number.integer(1, 45),
+    seconds=module.rand.number.integer(0, 2),
     milliseconds=module.rand.number.integer(0, 999)) -%}
 {%- set ingest_time = event_time + module.datetime.timedelta(
     seconds=module.rand.number.integer(1, 4)) -%}
@@ -26,6 +26,7 @@
 {%- set resource_type = none -%}
 {%- set resource_path = none -%}
 {%- set representation = none -%}
+{%- set target_id = params.target_user_id -%}
 {%- set error = none -%}
 {%- set session_id = none -%}
 {%- set code_id = none -%}
@@ -35,12 +36,23 @@
 {%- if stage == 'routine' -%}
   {%- set n = (n % 1000000) + 1 -%}
   {%- do shared.set('routine_count', n) -%}
+  {%- set active_session = shared.get('active_session') -%}
+  {%- if active_session is not none and not active_session.tokenized
+      and event_time.timestamp() - active_session.login_epoch >= 60 -%}
+    {%- do shared.pop('active_session') -%}
+  {%- endif -%}
   {%- if n % 107 == 22 and shared.get('role_assigned', true) -%}
     {%- set kind = 'ADMIN_EVENT' -%}
     {%- set op = 'DELETE' -%}
+    {%- set delete_count = shared.get('delete_count', 0) -%}
+    {%- set target_id = params.target_user_id if delete_count == 0
+        else module.rand.crypto.uuid4() -%}
+    {%- do shared.set('delete_count', (delete_count % 1000000) + 1) -%}
+    {%- do shared.set('current_target_id', target_id) -%}
   {%- elif n % 107 == 0 and not shared.get('role_assigned', true) -%}
     {%- set kind = 'ADMIN_EVENT' -%}
     {%- set op = 'CREATE' -%}
+    {%- set target_id = shared.get('current_target_id') -%}
   {%- elif n % 119 == 0 -%}
     {%- set kind = 'ADMIN_EVENT' -%}
     {%- set op = 'UPDATE' -%}
@@ -72,7 +84,8 @@
     {%- set session_id = module.rand.crypto.uuid4() -%}
     {%- set code_id = session_id -%}
     {%- do shared.set('active_session', {'name': name, 'id': uid, 'ip': ip,
-          'client': client, 'session_id': session_id, 'tokenized': false}) -%}
+          'client': client, 'session_id': session_id, 'tokenized': false,
+          'login_epoch': event_time.timestamp()}) -%}
   {%- elif kind == 'CODE_TO_TOKEN' or kind == 'LOGOUT' -%}
     {%- set active = shared.get('active_session') -%}
     {%- set name = active.name -%}
@@ -90,7 +103,15 @@
       {%- do shared.pop('active_session') -%}
     {%- endif -%}
   {%- endif -%}
-  {%- if params.anomaly_mode and n >= params.anomaly_after_events and not shared.get('role_assigned', true) and not shared.get('anomaly_done', false) -%}
+  {%- set interval = [params.anomaly_interval_events, 1] | max -%}
+  {%- if params.anomaly_mode and n >= params.anomaly_after_events
+      and (n - params.anomaly_after_events) % interval == 0 -%}
+    {%- do shared.set('episode_due', true) -%}
+  {%- endif -%}
+  {%- if params.anomaly_mode and shared.get('episode_due', false)
+      and not shared.get('role_assigned', true) -%}
+    {%- do shared.pop('episode_due') -%}
+    {%- do shared.set('episode_target_id', shared.get('current_target_id')) -%}
     {%- do shared.set('spray_count', 0) -%}
     {%- do shared.set('to_spray', true) -%}
   {%- endif -%}
@@ -133,11 +154,12 @@
 {%- elif stage == 'role_grant' -%}
   {%- set kind = 'ADMIN_EVENT' -%}
   {%- set op = 'CREATE' -%}
+  {%- set target_id = shared.get('episode_target_id') -%}
   {%- do shared.set('to_audit_change', true) -%}
 {%- else -%}
   {%- set kind = 'ADMIN_EVENT' -%}
   {%- set op = 'UPDATE' -%}
-  {%- do shared.set('anomaly_done', true) -%}
+  {%- do shared.pop('episode_target_id', none) -%}
   {%- do shared.set('to_routine', true) -%}
 {%- endif -%}
 {%- if op is not none -%}
@@ -149,7 +171,7 @@
   {%- set ip = params.suspicious_ip -%}
   {%- set client = 'security-admin-console' -%}
   {%- set resource_type = 'REALM' if op == 'UPDATE' else 'REALM_ROLE_MAPPING' -%}
-  {%- set resource_path = 'events/config' if op == 'UPDATE' else 'users/' ~ params.target_user_id ~ '/role-mappings/realm' -%}
+  {%- set resource_path = 'events/config' if op == 'UPDATE' else 'users/' ~ target_id ~ '/role-mappings/realm' -%}
   {%- if op == 'UPDATE' -%}
     {%- set representation = ({'eventsEnabled': true, 'adminEventsEnabled': true,
           'adminEventsDetailsEnabled': true, 'eventsListeners': ['jboss-logging'],
@@ -189,7 +211,7 @@
     {%- set message = message ~ ', auth_method=' ~ ('openid-connect'|tojson)
         ~ ', auth_type=' ~ ('code'|tojson)
         ~ ', response_type=' ~ ('code'|tojson)
-        ~ ', redirect_uri=' ~ ('https://sso.corp.example/callback'|tojson)
+        ~ ', redirect_uri=' ~ (params.redirect_uri|tojson)
         ~ ', consent=' ~ ('no_consent_required'|tojson)
         ~ ', code_id=' ~ (code_id|tojson)
         ~ ', username=' ~ (name|tojson)
@@ -232,7 +254,7 @@
   {%- set login = {'type': kind} -%}
   {%- if kind == 'LOGIN' or kind == 'LOGIN_ERROR' -%}
     {%- do login.update({'auth_method': 'openid-connect', 'auth_type': 'code',
-       'redirect_uri': 'https://sso.corp.example/callback'}) -%}
+       'redirect_uri': params.redirect_uri}) -%}
   {%- endif -%}
   {%- if code_id is not none -%}
     {%- do login.update({'code_id': code_id}) -%}
@@ -242,7 +264,7 @@
     {%- do kc.update({'session': {'id': session_id}}) -%}
   {%- endif -%}
 {%- endif -%}
-{%- set related_users = [uid, params.target_user_id] if op == 'CREATE' or op == 'DELETE' else [uid] -%}
+{%- set related_users = [uid, target_id] if op == 'CREATE' or op == 'DELETE' else [uid] -%}
 {%- set doc = {
     '@timestamp': event_time.isoformat(),
     'agent': {'ephemeral_id': params.collector_ephemeral_id, 'id': params.collector_id,
@@ -273,6 +295,6 @@
   {%- do doc.user.update({'name': name}) -%}
 {%- endif -%}
 {%- if op == 'CREATE' or op == 'DELETE' -%}
-  {%- do doc.update({'user': {'id': uid, 'target': {'id': params.target_user_id}}}) -%}
+  {%- do doc.update({'user': {'id': uid, 'target': {'id': target_id}}}) -%}
 {%- endif -%}
 {{- doc|tojson -}}
