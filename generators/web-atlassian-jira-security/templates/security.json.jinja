@@ -1,64 +1,249 @@
-{%- for flag in ['to_failure_1', 'to_failure_2', 'to_failure_3', 'to_failure_4', 'to_captcha', 'to_passed', 'to_logout', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 48 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}
-      {%- do shared.set('chain_session', module.rand.string.letters_lowercase(7)) -%}
-      {%- do shared.set('to_failure_1', true) -%}
-    {%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['passed', 'failed', 'logout'], [65, 20, 15]) -%}
-  {%- set actor = module.rand.choice(['alice', 'bob', 'carol', 'david']) -%}
-  {%- set ip = module.rand.choice(['10.20.4.11', '10.20.4.12', '10.20.4.13', '10.20.4.14']) -%}
-  {%- set session = module.rand.string.letters_lowercase(7) -%}
-  {%- set failure_count = 1 -%}
-{%- else -%}
-  {%- set actor = params.target_user -%}
-  {%- set ip = params.suspect_ip -%}
-  {%- if stage.startswith('failure_') -%}
-    {%- set kind = 'failed' -%}
-    {%- set failure_count = stage[-1] | int -%}
-    {%- do shared.set('to_failure_' ~ (failure_count + 1), true) if failure_count < 4 else shared.set('to_captcha', true) -%}
-  {%- else -%}
-    {%- set kind = stage -%}
-    {%- set failure_count = 4 -%}
-    {%- if stage == 'captcha' -%}{%- do shared.set('to_passed', true) -%}
-    {%- elif stage == 'passed' -%}{%- do shared.set('to_logout', true) -%}
-    {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{#- atlassian-jira-security.log lines (Jira Data Center 9.5+, Log4j2
+    layout) wrapped in ECS JSON; the raw line is in event.original.
+    One input tick per second; each tick emits the earliest due source
+    line stamped with its own time, or drops. Every workstation runs an
+    independent random login schedule. Timing is tracked in
+    milliseconds; the native millisecond fraction is carried per line. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, truncated by redrawing; returns ms. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- module.builtins.int(([ns.v, hi] | min) * 1000) -}}
+{%- endmacro -%}
+{%- macro typo_gap() -%}{{- d(2, 8, 0.8, 180) -}}{%- endmacro -%}
+{%- macro guess_gap() -%}{{- d(5, 13, 0.7, 150) -}}{%- endmacro -%}
+{%- macro session_len() -%}{{- d(60, 2400, 1.0, 32400) -}}{%- endmacro -%}
+{%- macro absence() -%}{{- d(120, 9000, 1.1, 216000) -}}{%- endmacro -%}
+{%- macro retry_later() -%}{{- d(30, 900, 1.0, 21600) -}}{%- endmacro -%}
+{%- macro sid() -%}{{- module.random.choices('abcdefghijklmnopqrstuvwxyz0123456789', k=module.rand.number.integer(6, 7)) | join -}}{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 1, 'le': 8760}},
+    'host_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'}},
+    'context_path': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^/[A-Za-z0-9._~/-]{0,64}$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {#- Workstations. Each account normally signs in from its own
+      address, sometimes from a neighbouring desk (hot-desking: the
+      previous and next account in the list) or through the shared VPN
+      pool, so every workstation address carries several accounts. -#}
+  {%- set actors = [
+    {'login': 'admin', 'ip': '10.20.4.11'},
+    {'login': 'agrant', 'ip': '10.20.4.12'},
+    {'login': 'charlie', 'ip': '10.20.4.13'},
+    {'login': 'bkuznetsov', 'ip': '10.20.4.14'},
+    {'login': 'evolkova', 'ip': '10.20.4.15'},
+    {'login': 'mfrolov', 'ip': '10.20.5.21'},
+    {'login': 'osmirnova', 'ip': '10.20.5.22'},
+    {'login': 'pnovak', 'ip': '10.20.5.23'},
+    {'login': 'rlee', 'ip': '10.20.6.31'},
+    {'login': 'tmorozova', 'ip': '10.20.6.32'}
+  ] -%}
+  {%- set vpn = ['10.20.9.51', '10.20.9.52', '10.20.9.53'] -%}
+  {%- set queue = [] -%}
+  {%- for a in actors -%}
+    {%- do a.update({'state': 'idle', 'since': now - 86400000}) -%}
+    {%- do queue.append({'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (absence() | int)), 'k': 'wake', 'a': loop.index0}) -%}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+  {%- do shared.update({'queue': queue, 'actors': actors, 'vpn': vpn,
+    'req_seq': module.rand.number.integer(40, 400), 'last_ms': now - 1,
+    'ep_last_t': none, 'ep_last_ip': none,
+    'ep_start': now + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min))}) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- set actors = shared.get('actors') -%}
+{%- set vpn = shared.get('vpn') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+{#- Episode start: the first tick at or after due (which already carries
+    a random delay) with an account idle for at least 30 minutes that
+    was not the previous
+    target. The attacker address is one the target already uses in
+    ordinary traffic - a neighbouring desk or a VPN address - other
+    than the previous episode's. The next due is
+    one interval after this start (no catch-up). -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_start') -%}
+  {%- set ct = [] -%}
+  {%- for i in range(actors | length) if actors[i].state == 'idle' and now - actors[i].since >= 1800000 and i != shared.get('ep_last_t') -%}{%- do ct.append(i) -%}{%- endfor -%}
+  {%- if ct -%}
+    {%- set ti = module.rand.choice(ct) -%}
+    {%- set pool = [] -%}
+    {%- set n = actors | length -%}
+    {%- for x in [actors[(ti - 1) % n].ip, actors[(ti + 1) % n].ip] + vpn if x != shared.get('ep_last_ip') -%}{%- do pool.append(x) -%}{%- endfor -%}
+    {%- set aip = module.rand.choice(pool) -%}
+    {%- set start = now + module.rand.number.integer(0, 2000) -%}
+    {%- do queue.append({'due': start, 'k': 'ep', 'a': ti, 'ip': aip, 'st': 'open', 'sess': sid()}) -%}
+    {%- do shared.update({'ep_last_t': ti, 'ep_last_ip': aip, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min))}) -%}
   {%- endif -%}
-  {%- set session = shared.get('chain_session') if kind != 'logout' else module.rand.string.letters_lowercase(7) -%}
 {%- endif -%}
-{%- if kind == 'failed' -%}
-  {%- set message = "The user '" ~ actor ~ "' has FAILED authentication. Failure count equals " ~ failure_count -%}
-  {%- set username = 'anonymous' -%}
-  {%- set action = 'authentication-failed' -%}
-  {%- set event_type = ['start'] -%}
-{%- elif kind == 'captcha' -%}
-  {%- set message = "The user '" ~ actor ~ "' is required to answer a CAPTCHA elevated security check. Failure count equals 4" -%}
-  {%- set username = 'anonymous' -%}
-  {%- set action = 'captcha-required' -%}
-  {%- set event_type = ['denied'] -%}
-{%- elif kind == 'passed' -%}
-  {%- set message = "The user '" ~ actor ~ "' has PASSED authentication." -%}
-  {%- set username = actor -%}
-  {%- set action = 'authentication-passed' -%}
-  {%- set event_type = ['start'] -%}
+{%- if not queue or (queue | map(attribute='due') | min) > now -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(64) if out.row is none and queue and (queue | map(attribute='due') | min) <= now -%}
+  {%- set pick = namespace(item=none) -%}
+  {%- for item in queue if pick.item is none or item.due < pick.item.due -%}{%- set pick.item = item -%}{%- endfor -%}
+  {%- set item = pick.item -%}
+  {%- do queue.remove(item) -%}
+  {%- set rec = [item.due, shared.get('last_ms')] | max -%}
+  {%- set new = [] -%}
+  {%- set r = namespace(row=none) -%}
+  {%- if item.k == 'wake' -%}
+    {#- Build one ordinary sign-in for this account: an anonymous
+        session, zero to three mistyped attempts, then a successful
+        login and a later logout; or three failures, a fourth attempt
+        refused by the CAPTCHA check (failure count 4), and the account
+        gives up without a successful login (the guard that keeps the
+        full chain out of the background). -#}
+    {%- set a = actors[item.a] -%}
+    {%- set login = a.login -%}
+    {%- set n = actors | length -%}
+    {%- set src = module.rand.weighted_choice(['own', 'desk', 'vpn'], [70, 16, 14]) -%}
+    {%- set ip = a.ip if src == 'own' else (module.rand.choice([actors[(item.a - 1) % n].ip, actors[(item.a + 1) % n].ip]) if src == 'desk' else module.rand.choice(vpn)) -%}
+    {%- set nf = module.rand.weighted_choice([0, 1, 2, 3, 4], [64, 16, 9, 7, 4]) -%}
+    {%- set s0 = sid() -%}
+    {%- set t = namespace(v=rec) -%}
+    {%- do a.update({'state': 'busy'}) -%}
+    {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'created', 'login': login, 'ip': ip, 'sid_col': '-', 'sid_new': s0, 'user': 'anonymous', 'url': 'login', 'block': 'new'}) -%}
+    {%- set gave_up = namespace(v=false) -%}
+    {%- for i in range(1, nf + 1) -%}
+      {%- set t.v = t.v + (typo_gap() | int) -%}
+      {%- if i < 4 -%}
+        {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'fail_auth', 'login': login, 'ip': ip, 'sid_col': s0, 'user': 'anonymous', 'url': 'login', 'fc': i, 'block': 'new'}) -%}
+      {%- else -%}
+        {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'captcha', 'login': login, 'ip': ip, 'sid_col': s0, 'user': 'anonymous', 'url': 'login', 'fc': 4, 'block': 'new'}) -%}
+        {%- set gave_up.v = true -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if gave_up.v -%}
+      {#- Give up after the CAPTCHA check: the abandoned anonymous
+          session is torn down, but no successful login follows - the
+          guard that keeps the full chain out of the background. -#}
+      {%- set t.v = t.v + (typo_gap() | int) -%}
+      {%- set sg = sid() -%}
+      {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'destroyed', 'login': login, 'ip': ip, 'sid_col': s0, 'user': 'anonymous', 'url': 'login', 'block': 'new'}) -%}
+      {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'created', 'login': login, 'ip': ip, 'sid_col': s0, 'user': 'anonymous', 'url': 'login', 'sid_new': sg, 'block': 'same'}) -%}
+      {%- do new.append({'due': t.v + (retry_later() | int), 'k': 'wake', 'a': item.a}) -%}
+    {%- else -%}
+      {%- set t.v = t.v + (typo_gap() | int) -%}
+      {%- set s1 = sid() -%}
+      {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'destroyed', 'login': login, 'ip': ip, 'sid_col': s0, 'user': 'anonymous', 'url': 'login', 'block': 'new'}) -%}
+      {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'created', 'login': login, 'ip': ip, 'sid_col': s0, 'user': 'anonymous', 'url': 'login', 'sid_new': s1, 'block': 'same'}) -%}
+      {%- do new.append({'due': t.v, 'k': 'line', 'kind': 'passed', 'login': login, 'ip': ip, 'sid_col': s0, 'user': login, 'url': 'login', 'block': 'same'}) -%}
+      {%- set lo = t.v + (session_len() | int) -%}
+      {%- set s2 = sid() -%}
+      {%- do new.append({'due': lo, 'k': 'line', 'kind': 'destroyed', 'login': login, 'ip': ip, 'sid_col': s1, 'user': login, 'url': 'logout', 'block': 'new'}) -%}
+      {%- do new.append({'due': lo, 'k': 'line', 'kind': 'created', 'login': login, 'ip': ip, 'sid_col': s1, 'user': login, 'url': 'logout', 'sid_new': s2, 'block': 'same'}) -%}
+      {%- do new.append({'due': lo, 'k': 'line', 'kind': 'logout', 'login': login, 'ip': ip, 'sid_col': s1, 'user': login, 'url': 'logout', 'block': 'same'}) -%}
+      {%- do new.append({'due': lo + (absence() | int), 'k': 'wake', 'a': item.a}) -%}
+    {%- endif -%}
+  {%- elif item.k == 'ep' -%}
+    {#- Episode: three failed logins for the target account from the
+        attacker address (failure counts 1-3), a fourth attempt refused
+        by the CAPTCHA check (count 4), a successful login for the
+        target from that address in the same anonymous session, then a
+        logout. The account's own schedule is left untouched. -#}
+    {%- set login = actors[item.a].login -%}
+    {%- set ip = item.ip -%}
+    {%- if item.st == 'open' -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'created', 'login': login, 'ip': ip, 'sid_col': '-', 'sid_new': item.sess, 'user': 'anonymous', 'url': 'login', 'block': 'new'}) -%}
+      {%- do new.append(dict(item, due=rec + (guess_gap() | int), st='fail', fc=1)) -%}
+    {%- elif item.st == 'fail' -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'fail_auth', 'login': login, 'ip': ip, 'sid_col': item.sess, 'user': 'anonymous', 'url': 'login', 'fc': item.fc, 'block': 'new'}) -%}
+      {%- if item.fc >= 3 -%}
+        {%- do new.append(dict(item, due=rec + (guess_gap() | int), st='captcha')) -%}
+      {%- else -%}
+        {%- do new.append(dict(item, due=rec + (guess_gap() | int), fc=item.fc + 1)) -%}
+      {%- endif -%}
+    {%- elif item.st == 'captcha' -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'captcha', 'login': login, 'ip': ip, 'sid_col': item.sess, 'user': 'anonymous', 'url': 'login', 'fc': 4, 'block': 'new'}) -%}
+      {%- do new.append(dict(item, due=rec + (guess_gap() | int), st='pass')) -%}
+    {%- elif item.st == 'pass' -%}
+      {%- set s1 = sid() -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'destroyed', 'login': login, 'ip': ip, 'sid_col': item.sess, 'user': 'anonymous', 'url': 'login', 'block': 'new'}) -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'created', 'login': login, 'ip': ip, 'sid_col': item.sess, 'user': 'anonymous', 'url': 'login', 'sid_new': s1, 'block': 'same'}) -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'passed', 'login': login, 'ip': ip, 'sid_col': item.sess, 'user': login, 'url': 'login', 'block': 'same'}) -%}
+      {%- do new.append(dict(item, due=rec + (session_len() | int), st='logout', s1=s1)) -%}
+    {%- elif item.st == 'logout' -%}
+      {%- set s2 = sid() -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'destroyed', 'login': login, 'ip': ip, 'sid_col': item.s1, 'user': login, 'url': 'logout', 'block': 'new'}) -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'created', 'login': login, 'ip': ip, 'sid_col': item.s1, 'user': login, 'url': 'logout', 'sid_new': s2, 'block': 'same'}) -%}
+      {%- do new.append({'due': rec, 'k': 'line', 'ep': 1, 'kind': 'logout', 'login': login, 'ip': ip, 'sid_col': item.s1, 'user': login, 'url': 'logout', 'block': 'same'}) -%}
+    {%- endif -%}
+  {%- elif item.k == 'line' -%}
+    {%- set r.row = item -%}
+    {%- if item.kind in ['logout', 'captcha'] and not item.get('ep') -%}
+      {%- for a in actors if a.login == item.login -%}{%- do a.update({'state': 'idle', 'since': rec}) -%}{%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- do queue.extend(new) -%}
+  {%- if r.row is not none -%}
+    {%- set last = shared.get('last_ms') -%}
+    {%- set t_ms = [rec, last + module.rand.number.integer(1, 40)] | max if r.row.block == 'new' else last + module.rand.number.integer(1, 12) -%}
+    {%- do shared.update({'last_ms': t_ms}) -%}
+    {%- set out.row = dict(r.row, t_ms=t_ms) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set row = out.row -%}
+{%- set login = row.login -%}
+{%- set ip = row.ip -%}
+{%- set t = module.datetime.datetime.fromtimestamp(row.t_ms // 1000, module.datetime.timezone.utc) -%}
+{%- set frac = '%03d' | format(row.t_ms % 1000) -%}
+{%- set stamp = t.strftime('%Y-%m-%d %H:%M:%S') ~ ',' ~ frac ~ '+0000' -%}
+{%- set iso = t.strftime('%Y-%m-%dT%H:%M:%S') ~ '.' ~ frac ~ '000+00:00' -%}
+{%- set thread = 'http-nio-8080-exec-' ~ module.rand.number.integer(1, 25) -%}
+{%- if row.block == 'new' -%}
+  {%- set seq = shared.get('req_seq') + module.rand.weighted_choice([1, 2, 3], [82, 13, 5]) -%}
+  {%- do shared.update({'req_seq': seq}) -%}
+  {%- set conc = module.rand.weighted_choice([1, 2, 3], [88, 9, 3]) -%}
+  {%- do shared.update({'blk_req': seq, 'blk_conc': conc, 'blk_thread': thread}) -%}
+  {%- set request_id = (t.hour * 60 + t.minute) ~ 'x' ~ seq ~ 'x' ~ conc -%}
 {%- else -%}
-  {%- set message = "The user '" ~ actor ~ "' has logged out." -%}
-  {%- set username = actor -%}
-  {%- set action = 'logout' -%}
-  {%- set event_type = ['end'] -%}
+  {%- set thread = shared.get('blk_thread') -%}
+  {%- set request_id = (t.hour * 60 + t.minute) ~ 'x' ~ shared.get('blk_req') ~ 'x' ~ shared.get('blk_conc') -%}
 {%- endif -%}
-{%- set request_seq = shared.get('request_seq', 100) + 1 -%}
-{%- do shared.set('request_seq', 100 if request_seq >= 999999 else request_seq) -%}
-{%- set request_id = '1054x' ~ request_seq ~ 'x1' -%}
-{%- set url = '/secure/Logout!default.jspa' if kind == 'logout' else '/login.jsp' -%}
-{%- set context = '/jira' ~ url ~ ('; user: ' ~ actor if kind == 'logout' else '') -%}
-{%- set stamp = timestamp.strftime('%Y-%m-%d %H:%M:%S,%f')[:23] ~ '+0000' -%}
-{%- set original = stamp ~ ' http-nio-8080-exec-12 url: ' ~ context ~ ' ' ~ username ~ ' ' ~ request_id ~ ' ' ~ session ~ ' ' ~ ip ~ ' ' ~ url ~ ' ' ~ message -%}
-{%- set event = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['authentication'], 'type': event_type, 'action': action, 'original': original}, 'host': {'name': params.host_name}, 'process': {'thread': {'name': 'http-nio-8080-exec-12'}}, 'log': {'file': {'path': 'atlassian-jira-security.log'}}, 'source': {'ip': ip}, 'user': {'name': username}, 'related': {'ip': [ip], 'user': [actor]}, 'jira': {'security': {'target_user': actor, 'session_id': session, 'request_id': request_id, 'request_url': url, 'context_url': context, 'message': message}}} -%}
-{%- if kind in ['failed', 'captcha'] -%}{%- do event.jira.security.update({'failure_count': failure_count}) -%}{%- endif -%}
-{%- if stage == 'logout' -%}{%- do shared.pop('chain_session', none) -%}{%- endif -%}
+{%- set base = params.context_path ~ ('/secure/Logout!default.jspa' if row.url == 'logout' else '/login.jsp') -%}
+{%- set path = '/secure/Logout!default.jspa' if row.url == 'logout' else '/login.jsp' -%}
+{%- set ctx = base ~ ('; user: ' ~ login if row.url == 'logout' else '') -%}
+{%- set sess_field = row.sid_col -%}
+{%- if row.kind == 'created' -%}
+  {%- set message = 'HttpSession created [' ~ row.sid_new ~ ']' -%}
+  {%- set action = 'session-created' -%}
+  {%- set category = ['session'] -%}
+  {%- set etype = ['creation'] -%}
+{%- elif row.kind == 'destroyed' -%}
+  {%- set message = 'HttpSession [' ~ row.sid_col ~ "] destroyed for '" ~ row.user ~ "'" -%}
+  {%- set action = 'session-destroyed' -%}
+  {%- set category = ['session'] -%}
+  {%- set etype = ['end'] -%}
+{%- elif row.kind == 'fail_auth' -%}
+  {%- set message = "The user '" ~ login ~ "' has FAILED authentication.  Failure count equals " ~ row.fc -%}
+  {%- set action = 'authentication-failed' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set etype = ['start'] -%}
+{%- elif row.kind == 'captcha' -%}
+  {%- set message = "The user '" ~ login ~ "' is required to answer a CAPTCHA elevated security check.  Failure count equals 4" -%}
+  {%- set action = 'captcha-required' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set etype = ['denied'] -%}
+{%- elif row.kind == 'passed' -%}
+  {%- set message = "The user '" ~ login ~ "' has PASSED authentication." -%}
+  {%- set action = 'authentication-passed' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set etype = ['start'] -%}
+{%- else -%}
+  {%- set message = "The user '" ~ login ~ "' has logged out." -%}
+  {%- set action = 'logout' -%}
+  {%- set category = ['authentication'] -%}
+  {%- set etype = ['end'] -%}
+{%- endif -%}
+{%- set original = stamp ~ ' ' ~ thread ~ ' url: ' ~ ctx ~ ' ' ~ row.user ~ ' ' ~ request_id ~ ' ' ~ sess_field ~ ' ' ~ ip ~ ' ' ~ path ~ ' ' ~ message -%}
+{%- set outcome = 'failure' if row.kind in ['fail_auth', 'captcha'] else 'success' -%}
+{%- set event = {'@timestamp': iso, 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': category, 'type': etype, 'action': action, 'outcome': outcome, 'original': original}, 'host': {'name': params.host_name}, 'process': {'thread': {'name': thread}}, 'log': {'file': {'path': 'atlassian-jira-security.log'}}, 'source': {'ip': ip}, 'user': {'name': row.user}, 'related': {'ip': [ip], 'user': [login] if login != row.user else [row.user]}, 'jira': {'security': {'target_user': login, 'session_id': sess_field, 'request_id': request_id, 'request_url': path, 'context_url': ctx, 'message': message}}} -%}
+{%- if row.kind in ['fail_auth', 'captcha'] -%}{%- do event.jira.security.update({'failure_count': row.fc}) -%}{%- endif -%}
+{%- if row.kind == 'created' -%}{%- do event.jira.security.update({'new_session_id': row.sid_new}) -%}{%- endif -%}
 {{- event | tojson -}}
