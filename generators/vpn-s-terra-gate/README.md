@@ -98,7 +98,7 @@ eventum generate --path generators/vpn-s-terra-gate/generator.yml --id s-terra-g
 - Only INFO-and-above lines of a remote-access concentrator are generated: no DEBUG exchange details, no site-to-site peers, no re-keying, no DPD or lifetime expiry, no RADIUS/XAUTH, certificate or KERNEL filter messages. Every session ends with client deletions.
 - The syslog clock is UTC and the line carries no year or time zone, as in the BSD format. The office-hours curve assumes Moscow time; there is no weekday/weekend difference. One record per second at most.
 - The first episode is due one interval after generation starts, so its hour depends on the start time. Rates, user counts, addresses and behavior are training assumptions, not measured production volume. No Elastic integration exists for this source, so the ECS mapping is an assumption. Compatibility with SIEM normalizers for S-Terra is not tested.
-- The published raw line has two spaces between the host name and `vpnsvc:`; the pack writes one, as in the catalog notation.
+- The published raw line has two spaces between the host name and `vpnsvc:`; the pack writes one.
 
 ## Sample Output
 
