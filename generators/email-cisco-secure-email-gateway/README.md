@@ -123,8 +123,8 @@ The `ready` line of the first episode message in the final `anomaly_mode: true` 
 - The background guard uses a window 10 s wider than the 40-minute chain window, so lines that a busy second pushes into the next one cannot complete a chain in background.
 - Not covered: TLS, SMTP authentication, per-connection message reuse, delayed (soft-bounce) delivery, DLP, AMP, URL filtering, message filters, `Subject` with double quotes, and log levels other than `Info`.
 - SPF, DKIM and DMARC pass for legitimate inbound senders and are not logged for spam senders.
-
 - At short intervals (8 h and below) episodes add enough clusters of large messages that the rate of closely spaced large messages per sender rises measurably above a background-only run; at the default 24 h it does not.
+
 ## References
 
 - [Cisco AsyncOS 16.5 for Secure Email Gateway, Logging](https://www.cisco.com/c/en/us/td/docs/security/esa/esa16-5/user_guide/b_ESA_Admin_Guide_16-5/b_ESA_Admin_Guide_12_1_chapter_0100111.html)
