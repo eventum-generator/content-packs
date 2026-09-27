@@ -1,0 +1,340 @@
+{#- Netskope tenant events forwarded by the Cloud Exchange Log Shipper
+    Syslog plugin (v4.1.x, CEF, default mapping): application events
+    (user activity in sanctioned cloud apps through the Netskope Client)
+    and admin audit events (admin console logins, inline policy
+    deletions). The raw syslog line is in event.original. One input tick
+    per second; each tick emits the earliest due record or drops.
+    Internal times are in microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set hq = module.heapq -%}
+{%- set sec = 1000000 -%}
+{%- set minute = 60 * sec -%}
+{%- set hour = 3600 * sec -%}
+{#- Chain window: an admin who deleted an inline policy does not make a
+    third cloud-storage download inside this window in background. -#}
+{%- set window = 30 * minute -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro count(med, sig) -%}
+  {#- Number of repeated activities in one task (skewed, >= 1). -#}
+  {{- [[module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig)), 1] | max, 30] | min -}}
+{%- endmacro -%}
+{%- macro app_row(due, u, act, app, ep, b) -%}
+  {{- push(due, {'k': 'row', 'u': u.i, 'kind': 'app', 'act': act, 'app': app, 'ep': ep, 'b': b}) -}}
+{%- endmacro -%}
+{%- macro audit_row(due, u, act) -%}
+  {{- push(due, {'k': 'row', 'u': u.i, 'kind': 'audit', 'act': act, 'ep': false}) -}}
+{%- endmacro -%}
+{%- macro storage_app(u) -%}
+  {#- One of the user's cloud-storage apps, by the user's own weights. -#}
+  {%- set names = [] -%}
+  {%- set w = [] -%}
+  {%- for a, x in u.apps.items() if shared.get('apps')[a].cat == 'Cloud Storage' -%}{%- do names.append(a) -%}{%- do w.append(x) -%}{%- endfor -%}
+  {{- module.rand.weighted_choice(names, w) -}}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'tenant_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[^|\\r\\n]+$'}},
+    'log_source_identifier': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^\\S+$'}},
+    'email_domain': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[a-z0-9-]+(\\.[a-z0-9-]+)+$'}},
+    'user_count': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 10, 'le': 500}},
+    'admin_count': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 2, 'le': 20}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {#- Sanctioned apps: category, Cloud Confidence Index and Level, the
+      site value, URL host and front-end addresses (synthetic values). -#}
+  {%- set apps = {
+    'Box': {'cat': 'Cloud Storage', 'cci': 89, 'ccl': 'high', 'host': 'app.box.com', 'dst': ['192.0.2.10', '192.0.2.11', '192.0.2.12']},
+    'Google Drive': {'cat': 'Cloud Storage', 'cci': 92, 'ccl': 'excellent', 'host': 'drive.google.com', 'dst': ['192.0.2.20', '192.0.2.21', '192.0.2.22']},
+    'Microsoft OneDrive for Business': {'cat': 'Cloud Storage', 'cci': 93, 'ccl': 'excellent', 'host': 'example-my.sharepoint.com', 'dst': ['192.0.2.30', '192.0.2.31']},
+    'Dropbox': {'cat': 'Cloud Storage', 'cci': 84, 'ccl': 'high', 'host': 'www.dropbox.com', 'dst': ['192.0.2.40', '192.0.2.41']},
+    'Slack': {'cat': 'Collaboration', 'cci': 83, 'ccl': 'high', 'host': 'example.slack.com', 'dst': ['192.0.2.50', '192.0.2.51', '192.0.2.52']},
+    'Microsoft Teams': {'cat': 'Collaboration', 'cci': 91, 'ccl': 'excellent', 'host': 'teams.microsoft.com', 'dst': ['192.0.2.60', '192.0.2.61']},
+    'Salesforce': {'cat': 'Customer Relationship Management', 'cci': 94, 'ccl': 'excellent', 'host': 'example.my.salesforce.com', 'dst': ['192.0.2.70', '192.0.2.71']}
+  } -%}
+  {#- Activity weights and repeat laws per category. Activities are
+      from Netskope's documented activity vocabulary. -#}
+  {%- set acts = {
+    'Cloud Storage': [['View', 'Download', 'Upload', 'Edit', 'Share', 'Move', 'Rename', 'Copy', 'Login Successful'], [28, 24, 14, 12, 5, 4, 3, 2, 8]],
+    'Collaboration': [['View', 'Join', 'Upload', 'Download', 'Login Successful', 'Logout'], [40, 14, 12, 14, 14, 6]],
+    'Customer Relationship Management': [['View', 'View All', 'Download', 'Login Successful', 'Logout'], [45, 15, 10, 22, 8]]
+  } -%}
+  {%- set firsts = ['alex', 'maria', 'john', 'olga', 'david', 'anna', 'peter', 'elena', 'sam', 'irina', 'mark', 'julia', 'paul', 'nina', 'tom', 'lena', 'omar', 'sofia', 'ivan', 'grace', 'leo', 'dana', 'raj', 'emma', 'ken', 'mia', 'noah', 'zoe'] -%}
+  {%- set lasts = ['smith', 'jones', 'brown', 'miller', 'davis', 'garcia', 'wilson', 'moore', 'taylor', 'clark', 'lewis', 'walker', 'hall', 'young', 'king', 'wright', 'scott', 'green', 'baker', 'adams', 'nelson', 'hill', 'campbell', 'mitchell', 'roberts', 'carter', 'phillips', 'evans', 'turner', 'parker'] -%}
+  {%- set devices = [['Windows Device', 'Windows 10', 'Chrome'], ['Windows Device', 'Windows 11', 'Chrome'], ['Windows Device', 'Windows 11', 'Firefox'], ['Mac Device', 'Sonoma', 'Safari'], ['Mac Device', 'Sonoma', 'Chrome']] -%}
+  {%- set offices = ['198.51.100.10', '198.51.100.11', '198.51.100.12'] -%}
+  {%- set users = [] -%}
+  {%- set seen = [] -%}
+  {%- for i in range(params.user_count) -%}
+    {%- set nm = namespace(v=none) -%}
+    {%- for _ in range(40) if nm.v is none -%}
+      {%- set c = module.rand.choice(firsts) ~ '.' ~ module.rand.choice(lasts) -%}
+      {%- if c not in seen -%}{%- set nm.v = c -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if nm.v is none -%}{%- set nm.v = module.rand.choice(firsts) ~ '.' ~ module.rand.choice(lasts) ~ i -%}{%- endif -%}
+    {%- do seen.append(nm.v) -%}
+    {#- Each user works with a few apps: at least one cloud storage and
+        one collaboration app, with personal weights. -#}
+    {%- set ua = {} -%}
+    {%- do ua.update({module.rand.weighted_choice(['Box', 'Google Drive', 'Microsoft OneDrive for Business', 'Dropbox'], [40, 20, 30, 10]): module.rand.number.lognormal(0, 0.6)}) -%}
+    {%- do ua.update({module.rand.weighted_choice(['Slack', 'Microsoft Teams'], [45, 55]): module.rand.number.lognormal(0, 0.6)}) -%}
+    {%- for a in ['Box', 'Google Drive', 'Microsoft OneDrive for Business', 'Dropbox', 'Slack', 'Microsoft Teams', 'Salesforce'] if a not in ua and module.rand.chance(0.3) -%}
+      {%- do ua.update({a: module.rand.number.lognormal(-0.7, 0.6)}) -%}
+    {%- endfor -%}
+    {%- set dev = module.rand.weighted_choice(devices, [30, 30, 10, 20, 10]) -%}
+    {%- set br = {} -%}
+    {%- for a in ua -%}{%- do br.update({a: 'Native' if a in ['Microsoft OneDrive for Business', 'Box', 'Slack', 'Microsoft Teams'] and module.rand.chance(0.35) else dev[2]}) -%}{%- endfor -%}
+    {%- do users.append({'i': i, 'email': nm.v ~ '@' ~ params.email_domain, 'office': module.rand.choice(offices), 'home': '203.0.113.' ~ module.rand.number.integer(2, 254), 'remote': module.rand.number.floating(0.05, 0.5), 'pace': module.rand.number.lognormal(0, 0.35), 'cpace': module.rand.number.lognormal(0, 0.35), 'apps': ua, 'browser': br, 'device': dev[0], 'os': dev[1], 'admin': false, 'on': false, 'sid': 0, 'end': 0, 'src': none, 'sess': {}, 'dels': [], 'cut': []}) -%}
+  {%- endfor -%}
+  {%- set admins = [] -%}
+  {%- set order = [] -%}
+  {%- for u in users -%}{%- do order.append(u.i) -%}{%- endfor -%}
+  {%- do module.random.shuffle(order) -%}
+  {%- for i in order[:params.admin_count] -%}{%- do users[i].update({'admin': true}) -%}{%- do admins.append(i) -%}{%- endfor -%}
+  {%- do shared.update({'queue': [], 'seq': 0, 'users': users, 'apps': apps, 'acts': acts, 'admins': admins, 'cuts': 0}) -%}
+  {%- for u in users -%}
+    {#- First session starts somewhere inside one typical off-duty gap. -#}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(15 * 3600, 0.4) | int)), {'k': 'session', 'u': u.i}) -}}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'ep_last': none, 'ep_due': now + hour + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- set users = shared.get('users') -%}
+{%- set apps = shared.get('apps') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode: once due, the episode is armed. The next background admin
+    console visit that deletes an inline policy, by an admin other than
+    the previous episode's, becomes the episode: the visit is performed
+    exactly as usual, and its follow-up is a burst of downloads from one
+    of the admin's usual cloud-storage apps. If no such deletion comes
+    within min(interval / 4, 6 h), an on-duty admin other than the
+    previous episode's (weighted by console activity) makes an ordinary
+    console visit with a deletion at a random time inside that window.
+    The next due time is one interval after the episode's deletion plus a
+    new random delay; missed episodes are not replayed. -#}
+{%- macro visit(t0, u, force) -%}
+  {#- Admin console visit: login (sometimes again after a timeout),
+      sometimes one or two inline policy deletions. -#}
+  {{- audit_row(t0, u, 'Login Successful') -}}
+  {%- set t = namespace(v=t0) -%}
+  {%- if module.rand.chance(0.12) -%}
+    {%- set t.v = t.v + (ln(4 * 60, 1.0) | int) -%}
+    {{- audit_row(t.v, u, 'Login Successful') -}}
+  {%- endif -%}
+  {%- if force or module.rand.chance(0.55) -%}
+    {%- set t.v = t.v + (ln(3 * 60, 0.9) | int) -%}
+    {%- set first = t.v -%}
+    {{- audit_row(t.v, u, 'Deleted Inline Policy') -}}
+    {%- if module.rand.chance(0.25) -%}
+      {%- set t.v = t.v + (ln(60, 0.9) | int) -%}
+      {{- audit_row(t.v, u, 'Deleted Inline Policy') -}}
+    {%- endif -%}
+    {#- Follow-up a few minutes after the last deletion (delay redrawn
+        while above 15 min). In background the admin sometimes checks
+        the change: views or downloads one or two files in a storage
+        app. An episode instead downloads a burst of at least three
+        files, its size drawn from the background download-count law. -#}
+    {%- set d = namespace(v=ln(4 * 60, 0.8) | int) -%}
+    {%- for _ in range(40) if d.v > 15 * minute -%}{%- set d.v = ln(4 * 60, 0.8) | int -%}{%- endfor -%}
+    {%- set app = storage_app(u) -%}
+    {%- set e = namespace(v=t.v + d.v) -%}
+    {%- set b = shared.get('seq') -%}
+    {%- if shared.get('ep_armed') and u.i != shared.get('ep_last') -%}
+      {%- set k = namespace(v=count(1.5, 0.9) | int) -%}
+      {%- for _ in range(200) if k.v < 3 -%}{%- set k.v = count(1.5, 0.9) | int -%}{%- endfor -%}
+      {%- for _ in range([k.v, 3] | max) -%}
+        {{- app_row(e.v, u, 'Download', app, true, b) -}}
+        {%- set e.v = e.v + (ln(20, 0.9) | int) -%}
+      {%- endfor -%}
+      {%- do shared.update({'ep_armed': false, 'ep_last': u.i, 'ep_due': first + interval + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
+    {%- elif module.rand.chance(0.5) -%}
+      {%- set act = 'Download' if module.rand.chance(0.5) else 'View' -%}
+      {%- for _ in range(module.rand.weighted_choice([1, 2], [65, 35])) -%}
+        {{- app_row(e.v, u, act, app, false, b) -}}
+        {%- set e.v = e.v + (ln(20, 0.9) | int) -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {%- set cyc = shared.get('ep_cyc', 0) + 1 -%}
+  {%- set limit = now + ([interval // 4, 6 * hour] | min) -%}
+  {%- do shared.update({'ep_armed': true, 'ep_due': now + 100000 * hour, 'ep_cyc': cyc, 'ep_limit': limit}) -%}
+  {{- push(now + module.rand.number.integer(0, limit - now), {'k': 'fallback', 'u': 0, 'cyc': cyc}) -}}
+{%- endif -%}
+{%- if now < queue[0][0] -%}
+  {%- do shared.set('next_due', queue[0][0]) -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(32) if out.row is none and queue and queue[0][0] <= now -%}
+  {%- set top = hq.heappop(queue) -%}
+  {%- set due = top[0] -%}
+  {%- set item = top[2] -%}
+  {%- set u = users[item.u] -%}
+  {%- if item.k == 'row' -%}
+    {%- if item.act == 'Deleted Inline Policy' -%}
+      {%- set keep = [] -%}
+      {%- for d in u.dels if due - d[0] <= window -%}{%- do keep.append(d) -%}{%- endfor -%}
+      {%- do keep.append([due, 0]) -%}
+      {%- do u.update({'dels': keep}) -%}
+      {%- set out.row = item -%}
+    {%- elif item.act == 'Download' and apps[item.app].cat == 'Cloud Storage' -%}
+      {#- Guard: in background, an admin who deleted an inline policy
+          within the chain window makes at most two cloud-storage
+          downloads in it; a burst that would make a third ends at the
+          second (its remaining rows are not emitted). -#}
+      {%- set active = [] -%}
+      {%- for d in u.dels if due - d[0] <= window -%}{%- do active.append(d) -%}{%- endfor -%}
+      {%- do u.update({'dels': active}) -%}
+      {%- set full = namespace(v=item.b in u.cut) -%}
+      {%- for d in active if d[1] >= 2 -%}{%- set full.v = true -%}{%- endfor -%}
+      {%- if full.v and not item.ep -%}
+        {%- if item.b not in u.cut -%}
+          {%- do u.cut.append(item.b) -%}
+          {%- if u.cut | length > 20 -%}{%- do u.cut.pop(0) -%}{%- endif -%}
+          {%- do shared.set('cuts', shared.get('cuts') + 1) -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- for d in active -%}{%- do d.__setitem__(1, d[1] + 1) -%}{%- endfor -%}
+        {%- set out.row = item -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- set out.row = item -%}
+    {%- endif -%}
+  {%- elif item.k == 'session' -%}
+    {#- Work session: egress address for the session (office or home),
+        app tasks and, for admins, console visits until it ends. -#}
+    {%- set sid = u.sid + 1 -%}
+    {%- set dur = ln(8.5 * 3600, 0.35) | int -%}
+    {%- do u.update({'sid': sid, 'on': true, 'end': due + dur, 'src': u.home if module.rand.chance(u.remote) else u.office}) -%}
+    {{- push(due + (ln(4 * 60, 1.0) | int), {'k': 'task', 'u': u.i, 'sid': sid}) -}}
+    {%- if u.admin -%}{{- push(due + module.builtins.int((ln(2 * 3600, 0.9) | int) * u.cpace), {'k': 'console', 'u': u.i, 'sid': sid}) -}}{%- endif -%}
+    {{- push(due + dur, {'k': 'end', 'u': u.i, 'sid': sid}) -}}
+  {%- elif item.k == 'end' and u.sid == item.sid -%}
+    {%- do u.update({'on': false}) -%}
+    {%- set off = ln(15 * 3600, 0.45) | int -%}
+    {%- if module.rand.chance(0.08) -%}{%- set off = off + (ln(40 * 3600, 0.5) | int) -%}{%- endif -%}
+    {{- push(due + off, {'k': 'session', 'u': u.i}) -}}
+  {%- elif item.k == 'task' and u.on and u.sid == item.sid -%}
+    {#- One app task: sometimes a sign-in, then one activity repeated a
+        skewed number of times in quick succession. -#}
+    {%- set names = [] -%}
+    {%- set w = [] -%}
+    {%- for a, x in u.apps.items() -%}{%- do names.append(a) -%}{%- do w.append(x) -%}{%- endfor -%}
+    {%- set app = module.rand.weighted_choice(names, w) -%}
+    {%- set table = shared.get('acts')[apps[app].cat] -%}
+    {%- set act = module.rand.weighted_choice(table[0], table[1]) -%}
+    {%- set t = namespace(v=due) -%}
+    {%- set b = shared.get('seq') -%}
+    {%- set s = u.sess.get(app) -%}
+    {%- if act != 'Login Successful' and (s is none or due - s[1] > 15 * minute) and module.rand.chance(0.3) -%}
+      {{- app_row(t.v, u, 'Login Successful', app, false, b) -}}
+      {%- set t.v = t.v + (ln(15, 0.8) | int) -%}
+    {%- endif -%}
+    {%- set n = (count(1.5, 0.9) if act == 'Download' else count(2, 0.9) if act in ['View', 'View All'] else count(1.2, 0.7) if act in ['Upload', 'Edit'] else 1) | int -%}
+    {%- for _ in range(n) -%}
+      {{- app_row(t.v, u, act, app, false, b) -}}
+      {%- set t.v = t.v + (ln(20, 0.9) | int) -%}
+    {%- endfor -%}
+    {{- push(due + module.builtins.int((ln(16 * 60, 1.0) | int) * u.pace), item) -}}
+  {%- elif item.k == 'console' and u.on and u.sid == item.sid -%}
+    {{- visit(due, u, false) -}}
+    {{- push(due + module.builtins.int((ln(2 * 3600, 0.9) | int) * u.cpace), item) -}}
+  {%- elif item.k == 'fallback' and shared.get('ep_armed') and item.cyc == shared.get('ep_cyc') -%}
+    {%- set elig = [] -%}
+    {%- set ew = [] -%}
+    {%- for i in shared.get('admins') if users[i].on and i != shared.get('ep_last') -%}{%- do elig.append(i) -%}{%- do ew.append(1.0 / users[i].cpace) -%}{%- endfor -%}
+    {%- set limit = shared.get('ep_limit') -%}
+    {%- if elig -%}
+      {{- visit(due, users[module.rand.weighted_choice(elig, ew)], true) -}}
+    {%- elif due < limit - minute -%}
+      {{- push(due + module.rand.number.integer(0, limit - due), item) -}}
+    {%- else -%}
+      {#- Nobody eligible on duty inside the window: try again soon. -#}
+      {{- push(due + (ln(20 * 60, 0.8) | int), item) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- do shared.set('next_due', queue[0][0] if queue else now + sec) -%}
+{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set row = out.row -%}
+{%- set u = users[row.u] -%}
+{%- set epoch = module.builtins.int(ts.timestamp()) -%}
+{%- set iso = ts.strftime('%Y-%m-%dT%H:%M:%SZ') -%}
+{#- Cloud Exchange stamps the syslog header when it sends the batch,
+    some time after the event. -#}
+{%- set sent = ts + module.datetime.timedelta(seconds=module.builtins.int(module.rand.number.lognormal(module.math.log(50), 0.7)) + 1) -%}
+{%- set pieces = [] -%}
+{%- if row.kind == 'audit' -%}
+  {%- if row.act == 'Deleted Inline Policy' -%}
+    {%- set sev = 'High' -%}
+    {%- set ecs_ev = {'category': ['configuration'], 'type': ['deletion']} -%}
+  {%- else -%}
+    {%- set sev = 'Medium' -%}
+    {%- set ecs_ev = {'category': ['authentication'], 'type': ['start'], 'outcome': 'success'} -%}
+  {%- endif -%}
+  {%- do pieces.extend(['auditLogEvent=' ~ row.act, 'auditType=admin_audit_logs', 'suser=' ~ u.email, 'timestamp=' ~ epoch]) -%}
+  {%- set header = 'Netskope|' ~ params.tenant_name ~ '|NULL|audit|NULL|' ~ sev -%}
+  {%- set ns = {'type': 'admin_audit_logs', 'audit_log_event': row.act} -%}
+{%- else -%}
+  {%- set app = namespace(v=row.app) -%}
+  {%- set a = apps[app.v] -%}
+  {%- set s = u.sess.get(app.v) -%}
+  {%- if s is none or now - s[1] > 15 * minute -%}
+    {%- set s = [module.rand.number.integer(1000000000000000000, 9199999999999999999), now] -%}
+    {%- do u.sess.update({app.v: s}) -%}
+  {%- endif -%}
+  {%- do s.__setitem__(1, now) -%}
+  {%- set dst = module.rand.choice(a.dst) -%}
+  {%- set rid = module.rand.string.hex(12) -%}
+  {%- set path = {
+    'Box': '/file/' ~ module.rand.number.integer(100000000000, 999999999999),
+    'Google Drive': '/file/d/' ~ module.rand.string.letters(1) ~ module.rand.string.hex(27),
+    'Microsoft OneDrive for Business': '/personal/' ~ u.email.split('@')[0].replace('.', '_') ~ '/Documents/' ~ rid,
+    'Dropbox': '/home/' ~ rid,
+    'Slack': '/files/' ~ rid,
+    'Microsoft Teams': '/l/file/' ~ rid,
+    'Salesforce': '/lightning/r/' ~ module.rand.string.hex(15)
+  }[app.v] -%}
+  {%- set url = a.host ~ ('/' if row.act in ['Login Successful', 'Logout'] else path) -%}
+  {%- do pieces.extend(['act=' ~ row.act, 'appSessionId=' ~ s[0], 'appcategory=' ~ a.cat, 'applicationType=nspolicy', 'browser=' ~ u.browser[app.v], 'cci=' ~ a.cci, 'ccl=' ~ a.ccl, 'device=' ~ u.device, 'dst=' ~ dst, 'os=' ~ u.os, 'requestClientApplication=' ~ app.v, 'sourceServiceName=' ~ app.v, 'src=' ~ u.src, 'suser=' ~ u.email, 'timestamp=' ~ epoch, 'url=' ~ url]) -%}
+  {%- set header = 'Netskope|' ~ params.tenant_name ~ '|NULL|application|NULL|Unknown' -%}
+  {%- if row.act in ['Login Successful', 'Logout'] -%}
+    {%- set ecs_ev = {'category': ['authentication'], 'type': ['start' if row.act == 'Login Successful' else 'end']} -%}
+    {%- if row.act == 'Login Successful' -%}{%- do ecs_ev.update({'outcome': 'success'}) -%}{%- endif -%}
+  {%- elif row.act == 'Join' -%}
+    {%- set ecs_ev = {'category': ['session'], 'type': ['start']} -%}
+  {%- else -%}
+    {%- set ecs_ev = {'category': ['file'], 'type': [{'Upload': 'creation', 'Copy': 'creation', 'Edit': 'change', 'Move': 'change', 'Rename': 'change', 'Share': 'change'}.get(row.act, 'access')]} -%}
+  {%- endif -%}
+  {%- set ns = {'type': 'nspolicy', 'activity': row.act, 'app': app.v, 'appcategory': a.cat, 'site': app.v, 'cci': a.cci | string, 'ccl': a.ccl, 'device': u.device, 'os': u.os, 'browser': u.browser[app.v], 'app_session_id': s[0] | string} -%}
+{%- endif -%}
+{%- set raw = '<14>' ~ sent.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.log_source_identifier ~ ' CEF:0|' ~ header ~ '|' ~ (pieces | sort(case_sensitive=true) | join(' ')) -%}
+{%- do ecs_ev.update({'kind': 'event', 'action': row.act, 'original': raw}) -%}
+{%- set event = {
+  '@timestamp': iso,
+  'ecs': {'version': '8.17.0'},
+  'event': ecs_ev,
+  'log': {'syslog': {'hostname': params.log_source_identifier, 'priority': 14}},
+  'netskope': ns,
+  'user': {'email': u.email},
+  'related': {'user': [u.email]}
+} -%}
+{%- if row.kind == 'app' -%}
+  {%- do event.update({'source': {'ip': u.src}, 'destination': {'ip': dst}, 'url': {'original': url}}) -%}
+  {%- do event.related.update({'ip': [u.src, dst]}) -%}
+{%- endif -%}
+{{- event | tojson -}}
