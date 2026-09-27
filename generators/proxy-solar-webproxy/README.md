@@ -25,7 +25,7 @@ Each user acts as an independent random process with a skewed activity weight. B
 
 **Recurrence.** Episodes recur on source time every `anomaly_interval_hours` (default 24, allowed 1-8760). The first episode is due one interval after the first message. Once due, an episode starts after a random delay (exponential, mean 20 minutes); the next one is due one interval after that actual start, and missed intervals are not caught up. At the default 24 h interval each start drifts only by its random delay, so consecutive episodes fall near the same hour of day.
 
-**Variation.** Each episode uses a different user and a different blocked file-sharing site from the previous one, a random number of denials (two or more), random retry gaps, a random storage target and a lognormal upload size. Every user, site, address, method and status in the chain also appears in ordinary traffic of both modes; outside episodes, two or more denied uploads by one user are never followed by a sanctioned upload within an hour.
+**Variation.** Each episode uses a different user and a different blocked file-sharing site from the previous one, a random number of denials (two to ten), random retry gaps, a random storage target and a lognormal upload size. Every user, site, address, method and status in the chain also appears in ordinary traffic of both modes; outside episodes, two or more denied uploads by one user are never followed by a sanctioned upload within an hour.
 
 **Detection idea.** Per `user.name`, alert when two or more `http-denied` POSTs to one host are followed within 30 minutes by an allowed POST upload to a different host. This flags possible circumvention of an upload block. The log does not show file contents, so it is a correlation, not proof that the same data was uploaded.
 
@@ -45,7 +45,7 @@ Edit `event.template.params` in `generator.yml`:
 | `syslog_utc_offset_hours` | `3` | Local time offset of the syslog header and of the working-hours load curve; `req-time` stays UTC |
 | `account_domain` | `CORP` | `acc-domain` value |
 | `client_prefix` | `10.20.4.` | Prefix of user addresses |
-| `client_first` | `21` | Last octet of the first user address; users get consecutive addresses |
+| `client_first` | `21` | Last octet of the first user address; users get consecutive addresses (`client_first` plus the user count must stay at most 255) |
 | `users` | 30 logins | `acc-name` values, at least 4 |
 | `groups` | `Employees`, `Finance`, `Engineering`, `Sales` | `acc-groups` values, one per user, drawn at start with a skew toward the first |
 | `decrypt_rule` | `https` | Name of the TLS inspection rule that leads `flt-rules` for HTTPS requests |
@@ -90,6 +90,7 @@ The final upload of the first episode, copied byte for byte from the final defau
 - Only URL-list blocks are modelled. Antivirus, DLP, category, schedule and quota blocks, reverse-proxy mode and authentication failures are not generated.
 - Host names use reserved test domains and documentation address ranges; users and groups are synthetic. Traffic ratios are scenario choices, since Solar does not publish them.
 - Compatibility with third-party `siem-log` normalizers has not been tested.
+- The allowed upload of an episode follows its last denial within 20 minutes; ordinary uploads after denials have no such cap (about 1% of them come later).
 
 ## References
 
