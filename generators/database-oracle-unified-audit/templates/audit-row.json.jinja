@@ -1,187 +1,470 @@
-{%- set event_no = shared.get('event_no', 0) + 1 -%}
-{%- do shared.set('event_no', event_no) -%}
-{%- set sessions = shared.get('sessions', {}) -%}
-{%- set attack_step = shared.get('attack_step', 0) -%}
-{%- set force_target_logoff = false -%}
-{%- set target_key = params.target_user ~ '@' ~ params.attacker_host -%}
-{%- if params.anomaly_mode and attack_step == 0 and event_no >=
-    shared.get('next_anomaly_at', params.anomaly_after_events + 1) -%}
-  {%- if target_key in sessions -%}
-    {%- set force_target_logoff = true -%}
-  {%- else -%}
-    {%- set attack_step = 1 -%}
-    {%- do shared.set('next_anomaly_at',
-        event_no + params.anomaly_interval_events) -%}
-  {%- endif -%}
-{%- endif -%}
-{%- if attack_step > 0 -%}
-  {%- do shared.set('attack_step', 0 if attack_step == 8
-      else attack_step + 1) -%}
-{%- endif -%}
-{%- set username = none -%}
-{%- set userhost = none -%}
-{%- set os_username = 'svc_app' -%}
-{%- set program = 'JDBC Thin Client' -%}
-{%- set action = none -%}
-{%- set workload = 'reporting' -%}
-{%- set role = none -%}
-{%- set target = none -%}
-{%- set return_code = 0 -%}
-{%- if force_target_logoff -%}
-  {%- set username = params.target_user -%}
-  {%- set userhost = params.attacker_host -%}
-  {%- set os_username = 'ops' -%}
-  {%- set program = 'sqlplus' -%}
-  {%- set workload = 'finance' -%}
-  {%- set action = 'LOGOFF' -%}
-{%- elif 1 <= attack_step <= 8 -%}
-  {%- set username = params.target_user -%}
-  {%- set userhost = params.attacker_host -%}
-  {%- set os_username = 'ops' -%}
-  {%- set program = 'sqlplus' -%}
-  {%- set workload = 'finance' -%}
-  {%- if attack_step <= 4 -%}
-    {%- set action = 'LOGON' -%}
-    {%- set return_code = 1017 -%}
-  {%- elif attack_step == 5 -%}
-    {%- set action = 'LOGON' -%}
-  {%- elif attack_step == 6 -%}
-    {%- set action = 'SELECT' -%}
-  {%- elif attack_step == 7 -%}
-    {%- set action = 'GRANT' -%}
-    {%- set role = 'PAYROLL_READ' -%}
-    {%- set target = params.grantee -%}
-  {%- else -%}
-    {%- set action = 'LOGOFF' -%}
-  {%- endif -%}
-{%- elif event_no in [20, 40, 80, 120, 160, 200, 220, 240] -%}
-  {%- set os_username = 'ops' -%}
-  {%- set program = 'sqlplus' -%}
-  {%- if event_no <= 160 -%}
-    {%- set username = params.target_user -%}
-    {%- set userhost = params.attacker_host -%}
-    {%- set workload = 'finance' -%}
-    {%- if event_no == 160 -%}
-      {%- set action = 'LOGON' -%}
-      {%- set return_code = 1017 -%}
-    {%- elif event_no == 20 -%}
-      {%- set action = 'SELECT' if target_key in sessions else 'LOGON' -%}
-    {%- elif event_no == 40 -%}
-      {%- set action = 'SELECT' if target_key in sessions else 'LOGON' -%}
-    {%- elif event_no == 80 -%}
-      {%- set action = 'GRANT' if target_key in sessions else 'LOGON' -%}
-      {%- if action == 'GRANT' -%}
-        {%- set role = 'PAYROLL_READ' -%}
-        {%- set target = 'BI_ANALYST' -%}
-      {%- endif -%}
-    {%- else -%}
-      {%- set action = 'LOGOFF' if target_key in sessions else 'LOGON' -%}
+{#- Oracle Database 19c UNIFIED_AUDIT_TRAIL, a 22-column projection read by
+    a polling connector and serialized as one JSON object per row. One 1 s
+    input tick renders at most one row (the earliest due item).
+    Background: independent per-actor session processes (applications,
+    analysts, administrators). Episode: repeated failed logons for an
+    administrator from one host, a successful logon, a payroll read and a
+    PAYROLL_READ grant in that session; a later session revokes it. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{%- macro lgn(median_s, sigma) -%}
+  {{- (module.rand.number.lognormal(module.math.log(median_s), sigma) * 1000) | int + module.rand.number.integer(0, 999) -}}
+{%- endmacro -%}
+{#- Follow-up revoke session law: "<ops before>,<ops after>" the revoke. -#}
+{%- macro fu_law(ops_med) -%}
+  {{- (1 if module.rand.chance(0.3) else 0) ~ ',' ~ (0 if module.rand.chance(0.4) else [1, (module.rand.number.lognormal(module.math.log(ops_med), 0.8) | round | int)] | max) -}}
+{%- endmacro -%}
+{#- Episode start in [lo, hi) ms by rejection against the background
+    administrator activity curve (1.0 at 07-18 UTC, 0.3 otherwise);
+    `squared` weights by curve^2 + 0.05 instead of the curve. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set ns = namespace(t=lo, done=false) -%}
+  {%- for i in range(400) if not ns.done -%}
+    {%- set ns.t = module.rand.number.integer(lo, hi - 1) -%}
+    {%- set h = (ns.t // 3600000) % 24 -%}
+    {%- set c = 1.0 if 7 <= h < 18 else 0.3 -%}
+    {%- if module.rand.number.floating(0, 1) < ((c * c + 0.05) / 1.05 if squared else c) -%}
+      {%- set ns.done = true -%}
     {%- endif -%}
-  {%- else -%}
-    {%- set username = 'SEC_ADMIN' -%}
-    {%- set userhost = 'admin01.corp.example' -%}
-    {%- set sec_key = username ~ '@' ~ userhost -%}
-    {%- if event_no == 200 -%}
-      {%- set action = 'SELECT' if sec_key in sessions else 'LOGON' -%}
-    {%- elif event_no == 220 -%}
-      {%- set action = 'GRANT' if sec_key in sessions else 'LOGON' -%}
-      {%- if action == 'GRANT' -%}
-        {%- set role = 'APP_REPORTER' -%}
-        {%- set target = params.grantee -%}
+  {%- endfor -%}
+  {{- ns.t -}}
+{%- endmacro -%}
+{#- Next arrival of a Poisson process with the given peak mean gap; with
+    `diurnal`, candidates outside 07-18 UTC are kept with probability 0.3. -#}
+{%- macro nhpp(t0, mean_s, diurnal) -%}
+  {%- set ns = namespace(t=t0, done=false) -%}
+  {%- for i in range(400) if not ns.done -%}
+    {%- set ns.t = ns.t + (module.rand.number.exponential(1 / mean_s) * 1000) | int -%}
+    {%- set h = (ns.t // 3600000) % 24 -%}
+    {%- if not diurnal or 7 <= h < 18 or module.rand.number.floating(0, 1) < 0.3 -%}
+      {%- set ns.done = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- ns.t + module.rand.number.integer(0, 999) -}}
+{%- endmacro -%}
+{%- set tz = module.datetime.timezone.utc -%}
+{%- set now = (timestamp.astimezone(tz).timestamp() * 1000) | round | int -%}
+{%- set tick_end = now + 1000 -%}
+{%- set rand = module.rand -%}
+{%- set num = module.rand.number -%}
+{%- set window_ms = 1800000 -%}
+{%- set roles_all = ['PAYROLL_READ', 'APP_REPORTER', 'HR_VIEW', 'SALES_READ'] -%}
+{%- set grantees = ['REPORT_USER', 'BI_ANALYST', 'HR_ANALYST', 'AUDIT_RO', 'FIN_ANALYST'] -%}
+{%- if shared.get('actors') is none -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean or not 6 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- invalid('anomaly_interval_hours must be a number in 6..8760') -}}
+  {%- endif -%}
+  {%- if params.database_id is not integer or params.database_id is boolean or params.database_id < 1 -%}
+    {{- invalid('database_id must be a positive integer') -}}
+  {%- endif -%}
+  {%- set menus = {'reporting': [['sel_sales', 85], ['sel_hr', 15]], 'hr': [['sel_hr', 70], ['upd_hr', 30]], 'finance': [['sel_pay', 80], ['sel_sales', 20]]} -%}
+  {%- set actors = [] -%}
+  {%- for c in samples.clients -%}
+    {%- do actors.append({'kind': 'app', 'user': c.username, 'hosts': [c.userhost], 'hw': [1], 'os': c.os_username, 'progs': [c.program], 'spd': 12, 'ops_med': 12, 'gap_med': 3,
+        'fail': 0.004, 'rfail': 0.75, 'retry': 0.9, 'retry_med': 4, 'gap_sigma': 0.9, 'diurnal': false, 'menu': menus[c.workload]}) -%}
+  {%- endfor -%}
+  {%- set people = [
+    ['human', 'REPORT_USER', ['wkst-012.corp.example', 'wkst-013.corp.example'], [6, 4], 'kpatel', 8, 5, 45, [['sel_sales', 80], ['sel_hr', 20]]],
+    ['human', 'BI_ANALYST', ['wkst-020.corp.example'], [1], 'lgarcia', 9, 6, 40, [['sel_sales', 70], ['sel_hr', 30]]],
+    ['human', 'HR_ANALYST', ['wkst-031.corp.example'], [1], 'aokafor', 8, 5, 50, [['sel_hr', 75], ['upd_hr', 25]]],
+    ['human', 'AUDIT_RO', ['wkst-040.corp.example', 'jump01.corp.example'], [7, 3], 'sdubois', 5, 4, 60, [['sel_hr', 40], ['sel_sales', 35], ['sel_pay', 25]]],
+    ['human', 'FIN_ANALYST', ['wkst-052.corp.example'], [1], 'tnakamura', 8, 5, 45, [['sel_pay', 55], ['sel_sales', 45]]],
+    ['admin', 'FINANCE_DBA', ['wkst-091.corp.example', 'jump01.corp.example', 'wkst-044.corp.example'], [5, 3, 2], 'mnovak', 10, 4, 40, []],
+    ['admin', 'SEC_ADMIN', ['admin01.corp.example', 'jump01.corp.example'], [6, 4], 'jlee', 8, 4, 40, []],
+    ['admin', 'DBA_MARTIN', ['wkst-077.corp.example', 'jump01.corp.example'], [6, 4], 'pmartin', 7, 4, 40, []],
+    ['admin', 'DBA_CHEN', ['wkst-083.corp.example', 'jump01.corp.example'], [7, 3], 'wchen', 6, 4, 40, []]
+  ] -%}
+  {#- Two independent session processes per person: people keep a second
+      session (another window or tool) open alongside the first one. -#}
+  {%- for p in people -%}
+    {%- for share in [0.5, 0.5] -%}
+    {%- do actors.append({'kind': p[0], 'user': p[1], 'hosts': p[2], 'hw': p[3], 'os': p[4], 'progs': ['sqlplus', 'SQL Developer'], 'spd': p[5] * share, 'ops_med': p[6], 'gap_med': p[7],
+        'fail': 0.2, 'rfail': 0.55, 'retry': 0.85, 'retry_med': 12, 'gap_sigma': 1.3, 'diurnal': true,
+        'menu': p[8] if p[8] else [['sel_pay', 22], ['sel_hr', 16], ['sel_sales', 14], ['upd_hr', 8], ['grant', 10], ['revoke', 8]]}) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- for a in actors -%}
+    {%- do a.update({'phase': 'idle', 'next': nhpp(now, 86400 / a.spd, a.diurnal) | int, 'host': a.hosts[0], 'prog': a.progs[0], 'sess': none, 'ops_left': 0, 'fails': 0, 'followups': []}) -%}
+  {%- endfor -%}
+  {%- set held = {} -%}
+  {%- for i in range(6) -%}
+    {%- do held.update({rand.choice(roles_all) ~ '|' ~ rand.choice(grantees): {'ep': false, 'until': now + num.integer(0, 43200000)}}) -%}
+  {%- endfor -%}
+  {%- set interval_ms = (params.anomaly_interval_hours * 3600000) | int -%}
+  {%- set first_start = pick_start(now, now + [interval_ms, 86400000] | min, false) | int -%}
+  {%- do shared.update({'actors': actors, 'held': held, 'hist': {}, 'ep': none, 'last_ep': none,
+      'sid': num.integer(3000000000, 3100000000), 'next_due': first_start, 'ep_start': first_start}) -%}
+  {%- do shared.set('min_next', actors | map(attribute='next') | min) -%}
+{%- endif -%}
+{%- set actors = shared.get('actors') -%}
+{%- set held = shared.get('held') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set ep = shared.get('ep') -%}
+{%- set ep_ready = params.anomaly_mode and ep is none and now + 1000 > shared.get('ep_start') -%}
+{%- if shared.get('min_next') >= tick_end and not ep_ready and (ep is none or ep.due >= tick_end) -%}
+  {%- do dispatch.drop() -%}
+{%- endif -%}
+{#- Episode start: the start time was drawn when the previous episode began
+    (due = previous actual start + interval, then a random delay). -#}
+{%- if ep_ready -%}
+  {%- set last = shared.get('last_ep') or {'key': none, 'grantee': none} -%}
+  {%- set admins = actors | selectattr('kind', 'equalto', 'admin') | list -%}
+  {%- set cands = [] -%}
+  {%- set cw = [] -%}
+  {%- for a in admins -%}
+    {%- for i in range(a.hosts | length) -%}
+      {%- if a.user ~ '|' ~ a.hosts[i] != last.key -%}
+        {%- do cands.append([a, a.hosts[i]]) -%}
+        {%- do cw.append(a.spd * a.hw[i] / (a.hw | sum)) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set free = [] -%}
+  {%- for g in grantees if ('PAYROLL_READ|' ~ g) not in held and g != last.grantee -%}
+    {%- do free.append(g) -%}
+  {%- endfor -%}
+  {%- if free -%}
+    {%- set pick = rand.weighted_choice(cands, cw) -%}
+    {%- set a = pick[0] -%}
+    {%- set grantee = rand.choice(free) -%}
+    {%- set n = namespace(f=3) -%}
+    {%- for i in range(5) if n.f == 3 + i and rand.chance(a.rfail) -%}
+      {%- set n.f = n.f + 1 -%}
+    {%- endfor -%}
+    {%- set queue = ['F'] * n.f + ['S'] -%}
+    {%- if rand.chance(0.3) -%}
+      {%- do queue.append('menu') -%}
+    {%- endif -%}
+    {%- do queue.extend(['sel_pay'] * rand.weighted_choice([1, 2, 3], [55, 30, 15])) -%}
+    {%- do queue.append('grant_ep') -%}
+    {%- if rand.chance(0.35) -%}
+      {%- do queue.append('menu') -%}
+    {%- endif -%}
+    {#- Restoration follows the ordinary grant law: half the grants get a
+        follow-up revoke session by the same admin and host, the rest
+        become ordinary held grants that any administrator revokes. -#}
+    {%- set restore = rand.chance(0.5) -%}
+    {%- set law = fu_law(a.ops_med).split(',') -%}
+    {%- do queue.append('logoff') -%}
+    {%- if restore -%}
+      {%- do queue.extend(['wait', 'L'] + ['menu'] * (law[0] | int) + ['revoke_ep'] + ['menu'] * (law[1] | int) + ['logoff']) -%}
+    {%- endif -%}
+    {%- do held.update({'PAYROLL_READ|' ~ grantee: {'ep': true}}) -%}
+    {%- set ep = {'a': a, 'host': pick[1], 'prog': rand.choice(a.progs) if pick[1] != 'jump01.corp.example' else 'sqlplus', 'grantee': grantee, 'queue': queue, 'sess': none, 'fails': 0, 'restore': restore,
+        'due': [shared.get('ep_start'), now] | max} -%}
+    {#- Next due = actual start + interval; the start is drawn in a window
+        of width w = min(interval / 4, 6 h) centred on the due time. -#}
+    {%- set interval_ms = (params.anomaly_interval_hours * 3600000) | int -%}
+    {%- set next_due = ep.due + interval_ms -%}
+    {%- set half_w = ([interval_ms // 4, 21600000] | min) // 2 -%}
+    {%- do shared.update({'ep': ep, 'last_ep': {'key': a.user ~ '|' ~ pick[1], 'grantee': grantee}, 'next_due': next_due, 'ep_start': pick_start(next_due - half_w, next_due + half_w, true) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Pick the earliest due item in this tick. -#}
+{%- set pick = namespace(a=none, due=none) -%}
+{%- for a in actors -%}
+  {%- if a.next < tick_end and (pick.due is none or a.next < pick.due) -%}
+    {%- set pick.a = a -%}
+    {%- set pick.due = a.next -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if ep is not none and ep.due < tick_end and (pick.due is none or ep.due < pick.due) -%}
+  {%- set pick.a = 'episode' -%}
+  {%- set pick.due = ep.due -%}
+{%- endif -%}
+{%- if pick.a is none -%}
+  {%- do dispatch.drop() -%}
+{%- endif -%}
+{%- set o = namespace(t=pick.due if pick.due >= now else now + num.integer(0, 999), user=none, host=none, os=none, prog=none, op=none, rc=0, role=none, target=none, sess=none) -%}
+{#- GRANT guard: a PAYROLL_READ grant that would complete failed x3 ->
+    logon -> payroll read -> grant in this session (same user|host,
+    SESSIONID of logon, read and grant) within the chain window gets
+    another role (target change only). -#}
+{%- macro chain_prefix(events, t, window_ms, sid) -%}
+  {%- set ns = namespace(p=none, s=none, f=0) -%}
+  {%- for e in events | reverse -%}
+    {%- if e[0] >= t - window_ms -%}
+      {%- if ns.p is none -%}
+        {%- if e[1] == 'P' and e[2] == sid -%}{%- set ns.p = e[0] -%}{%- endif -%}
+      {%- elif ns.s is none -%}
+        {%- if e[1] == 'S' and e[2] == sid -%}{%- set ns.s = e[0] -%}{%- endif -%}
+      {%- elif e[1] == 'F' -%}{%- set ns.f = ns.f + 1 -%}{%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- 'yes' if ns.f >= 3 else 'no' -}}
+{%- endmacro -%}
+{%- set item = none -%}
+{%- if pick.a == 'episode' -%}
+  {%- set a = ep.a -%}
+  {%- set item = ep.queue.pop(0) -%}
+  {%- set o.user = a.user -%}
+  {%- set o.host = ep.host -%}
+  {%- set o.os = a.os -%}
+  {%- if item == 'wait' -%}
+    {%- do ep.update({'due': o.t + (lgn(2700, 0.7) | int)}) -%}
+    {%- do dispatch.drop() -%}
+  {%- endif -%}
+  {%- if item == 'L' and ep.fails == 0 -%}
+    {%- do ep.update({'prog': rand.choice(a.progs) if ep.host != 'jump01.corp.example' else 'sqlplus'}) -%}
+  {%- endif -%}
+  {%- set o.prog = ep.prog -%}
+  {%- set o.sess = ep.sess -%}
+  {%- if item == 'F' -%}
+    {%- set o.op = 'LOGON' -%}
+    {%- set o.rc = 1017 -%}
+  {%- elif item == 'L' -%}
+    {#- Restoration logon: same attempt law as an ordinary session. -#}
+    {%- set o.op = 'LOGON' -%}
+    {%- if rand.chance(a.fail if ep.fails == 0 else a.rfail) -%}
+      {%- set o.rc = 1017 -%}
+      {%- do ep.queue.insert(0, 'L') -%}
+      {%- if rand.chance(a.retry) -%}
+        {%- do ep.update({'fails': ep.fails + 1, 'due': o.t + (lgn(a.retry_med, 0.8) | int)}) -%}
+      {%- else -%}
+        {%- do ep.update({'fails': 0, 'due': nhpp(o.t, 86400 / a.spd, a.diurnal) | int}) -%}
       {%- endif -%}
     {%- else -%}
-      {%- set action = 'LOGOFF' if sec_key in sessions else 'LOGON' -%}
+      {%- do ep.update({'fails': 0, 'sess': {'sid': 0, 'entry': 0, 'stmt': 0}}) -%}
+      {%- set o.sess = ep.sess -%}
+    {%- endif -%}
+  {%- elif item == 'S' -%}
+    {%- set o.op = 'LOGON' -%}
+    {%- do ep.update({'sess': {'sid': 0, 'entry': 0, 'stmt': 0}}) -%}
+    {%- set o.sess = ep.sess -%}
+  {%- elif item == 'logoff' -%}
+    {%- set o.op = 'LOGOFF' -%}
+  {%- elif item == 'grant_ep' -%}
+    {%- set o.op = 'GRANT' -%}
+    {%- set o.role = 'PAYROLL_READ' -%}
+    {%- set o.target = ep.grantee -%}
+    {%- if not ep.restore -%}
+      {%- do held.update({'PAYROLL_READ|' ~ ep.grantee: {'ep': false, 'until': o.t + (lgn(21600, 1.0) | int)}}) -%}
+    {%- endif -%}
+  {%- elif item == 'revoke_ep' -%}
+    {%- set o.op = 'REVOKE' -%}
+    {%- set o.role = 'PAYROLL_READ' -%}
+    {%- set o.target = ep.grantee -%}
+    {%- do held.pop('PAYROLL_READ|' ~ ep.grantee, none) -%}
+  {%- elif item == 'menu' -%}
+    {%- set o.op = 'draw' -%}
+  {%- else -%}
+    {%- set o.op = item -%}
+  {%- endif -%}
+  {%- if not ep.queue -%}
+    {%- do shared.set('ep', none) -%}
+  {%- elif item == 'L' and o.rc == 1017 -%}
+  {%- else -%}
+    {%- set nxt = ep.queue[0] -%}
+    {%- if nxt in ['F', 'S'] and item == 'F' -%}
+      {%- do ep.update({'due': o.t + (lgn(a.retry_med, 0.8) | int)}) -%}
+    {%- elif nxt == 'wait' -%}
+      {%- do ep.update({'due': o.t}) -%}
+    {%- elif item in ['S', 'L'] -%}
+      {%- do ep.update({'due': o.t + (lgn(a.gap_med * 0.5, a.gap_sigma) | int)}) -%}
+    {%- else -%}
+      {%- do ep.update({'due': o.t + (lgn(a.gap_med, a.gap_sigma) | int)}) -%}
     {%- endif -%}
   {%- endif -%}
 {%- else -%}
-  {%- if event_no > 300 and module.rand.number.integer(1, 100) <= 3 -%}
-    {%- set username = params.target_user -%}
-    {%- set userhost = params.attacker_host -%}
-    {%- set os_username = 'ops' -%}
-    {%- set program = 'sqlplus' -%}
-    {%- set workload = 'finance' -%}
+  {%- set a = pick.a -%}
+  {%- set o.user = a.user -%}
+  {%- set o.os = a.os -%}
+  {%- set mean_s = 86400 / a.spd -%}
+  {%- if a.phase == 'idle' -%}
+    {%- if a.fails == 0 -%}
+      {%- set fu = a.followups | selectattr('due', 'le', o.t) | list -%}
+      {%- if fu -%}
+        {%- do a.update({'host': fu[0].host}) -%}
+      {%- else -%}
+        {%- do a.update({'host': rand.weighted_choice(a.hosts, a.hw)}) -%}
+      {%- endif -%}
+      {%- do a.update({'prog': rand.choice(a.progs) if a.host != 'jump01.corp.example' else 'sqlplus'}) -%}
+    {%- endif -%}
+    {%- set o.host = a.host -%}
+    {%- set o.prog = a.prog -%}
+    {%- set o.op = 'LOGON' -%}
+    {%- if rand.chance(a.fail if a.fails == 0 else a.rfail) -%}
+      {%- set o.rc = 1017 -%}
+      {%- if rand.chance(a.retry) -%}
+        {%- do a.update({'fails': a.fails + 1, 'next': o.t + (lgn(a.retry_med, 0.8) | int)}) -%}
+      {%- else -%}
+        {%- do a.update({'fails': 0, 'next': nhpp(o.t, mean_s, a.diurnal) | int}) -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- set fus = a.followups | selectattr('due', 'le', o.t) | selectattr('host', 'equalto', a.host) | list -%}
+      {%- set queue = [] -%}
+      {%- if fus -%}
+        {#- Follow-up revoke session: shared law with the episode. -#}
+        {%- set law = fu_law(a.ops_med).split(',') -%}
+        {%- set queue = ['menu'] * (law[0] | int) -%}
+        {%- for f in fus -%}
+          {%- do queue.append(f.pair) -%}
+          {%- do a.followups.remove(f) -%}
+        {%- endfor -%}
+        {%- set nops = law[1] | int -%}
+      {%- else -%}
+        {%- set nops = [1, (num.lognormal(module.math.log(a.ops_med), 0.8) | round | int)] | max -%}
+      {%- endif -%}
+      {%- do a.update({'phase': 'session', 'fails': 0, 'sess': {'sid': 0, 'entry': 0, 'stmt': 0}, 'queue': queue, 'ops_left': nops, 'next': o.t + (lgn(a.gap_med * 0.5, a.gap_sigma) | int)}) -%}
+      {%- set o.sess = a.sess -%}
+    {%- endif -%}
   {%- else -%}
-    {%- set client = samples.clients.pick() -%}
-    {%- set username = client.username -%}
-    {%- set userhost = client.userhost -%}
-    {%- set os_username = client.os_username -%}
-    {%- set program = client.program -%}
-    {%- set workload = client.workload -%}
-  {%- endif -%}
-  {%- set key = username ~ '@' ~ userhost -%}
-  {%- if key not in sessions -%}
-    {%- set action = 'LOGON' -%}
-  {%- else -%}
-    {%- set roll = module.rand.number.integer(1, 100) -%}
-    {%- if roll <= 3 -%}{%- set action = 'LOGOFF' -%}
-    {%- elif workload == 'finance' and roll <= 4 -%}
-      {%- set action = 'GRANT' -%}
-      {%- set role = 'PAYROLL_READ' -%}
-      {%- set target = 'BI_ANALYST' -%}
-    {%- elif workload == 'hr' and roll <= 13 -%}{%- set action = 'UPDATE' -%}
-    {%- else -%}{%- set action = 'SELECT' -%}{%- endif -%}
+    {%- set o.host = a.host -%}
+    {%- set o.prog = a.prog -%}
+    {%- set o.sess = a.sess -%}
+    {%- if a.queue -%}
+      {%- set q = a.queue.pop(0) -%}
+      {%- if q != 'menu' and q in held and not held[q].ep -%}
+        {%- set o.op = 'REVOKE' -%}
+        {%- set o.role = q.split('|')[0] -%}
+        {%- set o.target = q.split('|')[1] -%}
+        {%- do held.pop(q) -%}
+      {%- else -%}
+        {%- set o.op = 'draw' -%}
+      {%- endif -%}
+    {%- elif a.ops_left > 0 -%}
+      {%- do a.update({'ops_left': a.ops_left - 1}) -%}
+      {%- set o.op = 'draw' -%}
+    {%- else -%}
+      {%- set o.op = 'LOGOFF' -%}
+    {%- endif -%}
   {%- endif -%}
 {%- endif -%}
-{%- set key = username ~ '@' ~ userhost -%}
-{%- if action == 'LOGON' -%}
-  {%- set sessionid = shared.get('next_sessionid', 100000) + 1 -%}
-  {%- do shared.set('next_sessionid', sessionid) -%}
+{#- Menu statement, shared by ordinary and episode sessions. -#}
+{#- Administrators stop granting while 12 of the 20 role|grantee pairs
+    are held, so a guarded grant always has another free role. -#}
+{%- if o.op == 'draw' -%}
+  {%- set free_pairs = [] -%}
+  {%- for r in roles_all -%}
+    {%- for g in grantees -%}
+      {%- if r ~ '|' ~ g not in held -%}{%- do free_pairs.append(r ~ '|' ~ g) -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set held_bg = held | dictsort | rejectattr('1.ep') | selectattr('1.until', 'le', o.t) | map(attribute=0) | list -%}
+  {%- set weights = [] -%}
+  {%- for m in a.menu -%}
+    {%- do weights.append(0 if (m[0] == 'grant' and (held | length) >= 12) or (m[0] == 'revoke' and not held_bg) else m[1]) -%}
+  {%- endfor -%}
+  {%- set o.op = rand.weighted_choice(a.menu, weights)[0] -%}
+  {%- if o.op == 'grant' -%}
+    {%- set pair = rand.choice(free_pairs) -%}
+    {%- if pair.startswith('PAYROLL_READ|') and chain_prefix(hist.get(o.user ~ '|' ~ o.host, []), o.t, window_ms, o.sess.sid) == 'yes' -%}
+      {%- set alt = [] -%}
+      {%- for fp in free_pairs if not fp.startswith('PAYROLL_READ|') -%}{%- do alt.append(fp) -%}{%- endfor -%}
+      {%- set pair = rand.choice(alt) if alt else pair -%}
+    {%- endif -%}
+    {%- set o.op = 'GRANT' -%}
+    {%- set o.role = pair.split('|')[0] -%}
+    {%- set o.target = pair.split('|')[1] -%}
+    {%- do held.update({pair: {'ep': false, 'until': o.t + (lgn(21600, 1.0) | int)}}) -%}
+    {%- if rand.chance(0.5) and a.followups | length < 3 -%}
+      {%- set fdue = o.t + (lgn(2700, 0.7) | int) -%}
+      {%- do a.followups.append({'pair': pair, 'host': o.host, 'due': fdue}) -%}
+      {%- do held[pair].update({'until': fdue + (lgn(21600, 1.0) | int)}) -%}
+      {%- if a.phase == 'idle' and a.fails == 0 and fdue < a.next -%}
+        {%- do a.update({'next': fdue}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif o.op == 'revoke' -%}
+    {%- set pair = rand.choice(held_bg) -%}
+    {%- set o.op = 'REVOKE' -%}
+    {%- set o.role = pair.split('|')[0] -%}
+    {%- set o.target = pair.split('|')[1] -%}
+    {%- do held.pop(pair) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if pick.a != 'episode' and a.phase == 'session' -%}
+  {%- if o.op == 'LOGOFF' -%}
+    {%- set nxt = nhpp(o.t, 86400 / a.spd, a.diurnal) | int -%}
+    {%- set due_fu = a.followups | map(attribute='due') | list -%}
+    {%- if due_fu and due_fu | min < nxt -%}
+      {%- set nxt = [due_fu | min, o.t + 1000] | max + num.integer(0, 999) -%}
+    {%- endif -%}
+    {%- do a.update({'phase': 'idle', 'sess': none, 'next': nxt}) -%}
+  {%- elif o.op != 'LOGON' -%}
+    {%- do a.update({'next': o.t + (lgn(a.gap_med, a.gap_sigma) | int)}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- do shared.set('min_next', actors | map(attribute='next') | min) -%}
+{#- Session bookkeeping: new SESSIONID per connection attempt. -#}
+{%- set sid_now = shared.get('sid') + num.integer(1, 60) -%}
+{%- if o.op == 'LOGON' -%}
+  {%- do shared.set('sid', sid_now) -%}
+  {%- set sid = sid_now -%}
   {%- set entry_id = 1 -%}
   {%- set statement_id = 1 -%}
-  {%- if return_code == 0 -%}
-    {%- do sessions.update({key: {'sessionid': sessionid, 'entry': 1, 'statement': 1}}) -%}
+  {%- if o.rc == 0 -%}
+    {%- do o.sess.update({'sid': sid, 'entry': 1, 'stmt': 1}) -%}
   {%- endif -%}
 {%- else -%}
-  {%- set session = sessions[key] -%}
-  {%- set sessionid = session.sessionid -%}
-  {%- set entry_id = session.entry + 1 -%}
-  {%- set statement_id = session.statement + 1 -%}
-  {%- if action == 'LOGOFF' -%}
-    {%- do sessions.pop(key) -%}
-  {%- else -%}
-    {%- do sessions.update({key: {'sessionid': sessionid, 'entry': entry_id, 'statement': statement_id}}) -%}
-  {%- endif -%}
+  {%- set sid = o.sess.sid -%}
+  {%- set entry_id = o.sess.entry + 1 -%}
+  {%- set statement_id = o.sess.stmt + 1 + rand.weighted_choice([0, 1, 2, 3, 5], [60, 20, 10, 6, 4]) -%}
+  {%- do o.sess.update({'entry': entry_id, 'stmt': statement_id}) -%}
 {%- endif -%}
-{%- do shared.set('sessions', sessions) -%}
+{#- Statement text. -#}
 {%- set schema = none -%}
 {%- set object = none -%}
 {%- set sql = none -%}
-{%- if action == 'SELECT' -%}
-  {%- if workload == 'finance' -%}
-    {%- set schema = 'FINANCE' -%}
-    {%- set object = 'PAYROLL' -%}
-    {%- set sql = 'SELECT EMPLOYEE_ID, BANK_ACCOUNT FROM FINANCE.PAYROLL' -%}
-  {%- elif workload == 'hr' -%}
-    {%- set schema = 'HR' -%}
-    {%- set object = 'EMPLOYEES' -%}
-    {%- set sql = 'SELECT EMPLOYEE_ID, DEPARTMENT_ID FROM HR.EMPLOYEES WHERE DEPARTMENT_ID = 50' -%}
-  {%- else -%}
-    {%- set schema = 'REPORTING' -%}
-    {%- set object = 'DAILY_SALES' -%}
-    {%- set sql = 'SELECT SALE_DATE, NET_AMOUNT FROM REPORTING.DAILY_SALES WHERE REGION_ID = 4' -%}
-  {%- endif -%}
-{%- elif action == 'UPDATE' -%}
-  {%- set schema = 'HR' -%}
-  {%- set object = 'EMPLOYEES' -%}
-  {%- set sql = "UPDATE HR.EMPLOYEES SET PHONE_NUMBER = '515.123.4567' WHERE EMPLOYEE_ID = 100" -%}
-{%- elif action == 'GRANT' -%}
-  {%- set sql = 'GRANT ' ~ role ~ ' TO ' ~ target -%}
+{%- set dept = rand.choice(['10', '20', '30', '50', '60', '80', '90', '100', '110']) -%}
+{%- set emp = num.integer(100, 206) | string -%}
+{%- if o.op == 'sel_sales' -%}
+  {%- set schema = 'REPORTING' -%}{%- set object = 'DAILY_SALES' -%}
+  {%- set sql = rand.weighted_choice(['SELECT SALE_DATE, NET_AMOUNT FROM REPORTING.DAILY_SALES WHERE REGION_ID = ' ~ num.integer(1, 12),
+      "SELECT REGION_ID, SUM(NET_AMOUNT) FROM REPORTING.DAILY_SALES WHERE SALE_DATE >= DATE '2026-09-01' GROUP BY REGION_ID"], [70, 30]) -%}
+  {%- set o.op = 'SELECT' -%}
+{%- elif o.op == 'sel_hr' -%}
+  {%- set schema = 'HR' -%}{%- set object = 'EMPLOYEES' -%}
+  {%- set sql = rand.weighted_choice(['SELECT EMPLOYEE_ID, LAST_NAME, DEPARTMENT_ID FROM HR.EMPLOYEES WHERE DEPARTMENT_ID = ' ~ dept,
+      'SELECT EMPLOYEE_ID, EMAIL, PHONE_NUMBER FROM HR.EMPLOYEES WHERE EMPLOYEE_ID = ' ~ emp], [60, 40]) -%}
+  {%- set o.op = 'SELECT' -%}
+{%- elif o.op == 'upd_hr' -%}
+  {%- set schema = 'HR' -%}{%- set object = 'EMPLOYEES' -%}
+  {%- set sql = "UPDATE HR.EMPLOYEES SET PHONE_NUMBER = '515.123." ~ num.integer(1000, 9999) ~ "' WHERE EMPLOYEE_ID = " ~ emp -%}
+  {%- set o.op = 'UPDATE' -%}
+{%- elif o.op == 'sel_pay' -%}
+  {%- set schema = 'FINANCE' -%}{%- set object = 'PAYROLL' -%}
+  {%- set sql = rand.weighted_choice(['SELECT EMPLOYEE_ID, NET_PAY, BANK_ACCOUNT FROM FINANCE.PAYROLL WHERE EMPLOYEE_ID = ' ~ emp,
+      "SELECT DEPARTMENT_ID, SUM(NET_PAY) FROM FINANCE.PAYROLL WHERE PAY_PERIOD = '2026-09' GROUP BY DEPARTMENT_ID",
+      'SELECT EMPLOYEE_ID, BANK_ACCOUNT FROM FINANCE.PAYROLL WHERE DEPARTMENT_ID = ' ~ dept], [45, 25, 30]) -%}
+  {%- set o.op = 'SELECT' -%}
+{%- elif o.op == 'GRANT' -%}
+  {%- set sql = 'GRANT ' ~ o.role ~ ' TO ' ~ o.target -%}
+{%- elif o.op == 'REVOKE' -%}
+  {%- set sql = 'REVOKE ' ~ o.role ~ ' FROM ' ~ o.target -%}
 {%- endif -%}
-{%- set policy = 'ORA_LOGON_FAILURES' if return_code == 1017 else 'APP_SESSION_AUDIT' if action in ['LOGON', 'LOGOFF'] else 'APP_DATA_AUDIT' if action in ['SELECT', 'UPDATE'] else 'ORA_ACCOUNT_MGMT' -%}
-{%- if program == 'sqlplus' -%}{%- set program = ('sqlplus@' ~ userhost ~ ' (TNS V1-V3)')[:48] -%}{%- endif -%}
-{%- set clock = timestamp.strftime('%Y-%m-%d %H:%M:%S.%f') -%}
-{%- set row = {
+{#- Guard history: failed/successful logons and payroll reads per
+    administrator user|host, kept for the chain window only. -#}
+{%- if a.kind == 'admin' -%}
+  {%- set hkey = o.user ~ '|' ~ o.host -%}
+  {%- set kind = 'F' if o.rc == 1017 else ('S' if o.op == 'LOGON' else ('P' if object == 'PAYROLL' else none)) -%}
+  {%- if kind -%}
+    {%- set kept = hist.get(hkey, []) | selectattr('0', 'ge', o.t - window_ms) | list -%}
+    {%- do kept.append([o.t, kind, sid]) -%}
+    {%- do hist.update({hkey: kept}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set policy = 'ORA_LOGON_FAILURES' if o.rc == 1017 else ('APP_SESSION_AUDIT' if o.op in ['LOGON', 'LOGOFF'] else ('APP_DATA_AUDIT' if o.op in ['SELECT', 'UPDATE'] else 'ORA_ACCOUNT_MGMT')) -%}
+{%- set program = ('sqlplus@' ~ o.host ~ ' (TNS V1-V3)')[:48] if o.prog == 'sqlplus' else o.prog -%}
+{%- set us = o.t * 1000 + num.integer(0, 999) -%}
+{%- set when = module.datetime.datetime.fromtimestamp(us // 1000000, tz) + module.datetime.timedelta(microseconds=us % 1000000) -%}
+{%- set clock = when.strftime('%Y-%m-%d %H:%M:%S.%f') -%}
+{{- {
   'AUDIT_TYPE': 'Standard',
-  'SESSIONID': sessionid,
+  'SESSIONID': sid,
   'ENTRY_ID': entry_id,
   'STATEMENT_ID': statement_id,
   'EVENT_TIMESTAMP': clock,
   'EVENT_TIMESTAMP_UTC': clock,
-  'ACTION_NAME': action,
-  'RETURN_CODE': return_code,
-  'DBUSERNAME': username,
-  'OS_USERNAME': os_username,
-  'USERHOST': userhost,
+  'ACTION_NAME': o.op,
+  'RETURN_CODE': o.rc,
+  'DBUSERNAME': o.user,
+  'OS_USERNAME': o.os,
+  'USERHOST': o.host,
   'CLIENT_PROGRAM_NAME': program,
   'DBID': params.database_id,
   'INSTANCE_ID': 1,
@@ -189,9 +472,8 @@
   'OBJECT_NAME': object,
   'SQL_TEXT': sql,
   'SQL_BINDS': none,
-  'ROLE': role,
-  'TARGET_USER': target,
+  'ROLE': o.role,
+  'TARGET_USER': o.target,
   'UNIFIED_AUDIT_POLICIES': policy,
-  'CURRENT_USER': username if return_code == 0 else none
-} -%}
-{{- row | tojson -}}
+  'CURRENT_USER': o.user if o.rc == 0 else none
+} | tojson -}}
