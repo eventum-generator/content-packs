@@ -1,78 +1,256 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- if chain -%}
-  {%- set step = tick - params.anomaly_interval_events -%}
-  {%- set kind = ['nat_view', 'object_create', 'policy_save', 'task_complete'][step] -%}
-  {%- set actor_ip = params.unusual_admin_ip -%}
-{%- else -%}
-  {# Individual management changes also occur during normal administration. #}
-  {%- if tick % 17 == 0 -%}
-    {%- set kind = 'object_create' -%}
-  {%- elif tick % 17 == 5 -%}
-    {%- set kind = 'policy_save' -%}
-  {%- elif tick % 17 == 10 -%}
-    {%- set kind = 'task_complete' -%}
-  {%- else -%}
-    {%- set kind = module.rand.weighted_choice(['nat_view', 'object_view', 'login'], [65, 25, 10]) -%}
+{#- Cisco Secure Firewall Management Center 7.4 audit Syslog records (the
+    FMC-originating line of Cisco TechNote 221019) wrapped in ECS JSON.
+    One input tick per second; each tick emits the earliest due record,
+    stamped with its own millisecond time, or drops. Every administrator
+    runs an independent random schedule of web-interface sessions; policy
+    saves queue the system pre-deploy task records. Durations are in
+    milliseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
+{%- set guard_ms = 14400000 -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, upper tail redrawn; returns ms. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- ([ns.v, hi] | min) * 1000 -}}
+{%- endmacro -%}
+{%- macro ms(v) -%}{{- module.builtins.int(v | float) -}}{%- endmacro -%}
+{%- macro op_gap() -%}{{- d(1.5, 22, 1.0, 1800) -}}{%- endmacro -%}
+{%- macro absence(med_h) -%}{{- d(0, med_h * 3600, 1.0, med_h * 3600 * 25) -}}{%- endmacro -%}
+{%- if shared.get('admins') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'management_center': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set admins = [] -%}
+  {%- for row in samples.admins -%}
+    {%- do admins.append({'user': row.user, 'ip': row.ip, 'alt_ip': row.alt_ip, 'med': row.median_hours, 'stage': 'idle', 'ops': [], 'sip': row.ip, 'episode': false, 'resume': none, 'last_op': none, 'last_policy': none, 'hist': [], 'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (absence(row.median_hours) | float))}) -%}
+  {%- endfor -%}
+  {%- set policies = [] -%}
+  {%- for row in samples.nat_policies -%}{%- do policies.append(row if row is string else row[0]) -%}{%- endfor -%}
+  {%- set prefixes = [] -%}
+  {%- for row in samples.object_prefixes -%}{%- do prefixes.append(row if row is string else row[0]) -%}{%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+  {%- do shared.update({'admins': admins, 'policies': policies, 'prefixes': prefixes, 'objects': {}, 'sys': [], 'last_ms': now - 1, 'next_due': admins | map(attribute='due') | min, 'ep_active': false, 'ep_last_admin': none, 'ep_last_policy': none, 'ep_start': now + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min))}) -%}
+{%- endif -%}
+{%- set admins = shared.get('admins') -%}
+{%- set policies = shared.get('policies') -%}
+{%- set objects = shared.get('objects') -%}
+{%- set sysq = shared.get('sys') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+{%- macro fresh_object() -%}
+  {%- set ns = namespace(name=none) -%}
+  {%- for _ in range(12) if ns.name is none -%}
+    {%- set cand = module.rand.choice(shared.get('prefixes')) ~ '-' ~ module.rand.number.integer(10, 999) -%}
+    {%- if cand not in objects -%}{%- set ns.name = cand -%}{%- endif -%}
+  {%- endfor -%}
+  {{- ns.name or '' -}}
+{%- endmacro -%}
+{#- Episode start: the first tick at or after due + random delay with an
+    administrator out of session (weighted by own session rate, not the
+    previous episode's, no own session due within 3 h). The episode is
+    an extra session: the administrator's own schedule resumes unchanged
+    afterwards, other administrators are untouched. The next due is one
+    interval after this start. -#}
+{%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') -%}
+  {%- set ca = [] -%}
+  {%- for a in admins -%}
+    {%- if a.stage == 'idle' and loop.index0 != shared.get('ep_last_admin') and a.due > now + 10800000 -%}{%- do ca.append(loop.index0) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if ca -%}
+    {%- set cw = [] -%}
+    {%- for i in ca -%}{%- do cw.append(1.0 / admins[i].med) -%}{%- endfor -%}
+    {%- set ai = module.rand.weighted_choice(ca, cw) -%}
+    {%- set pc = [] -%}
+    {%- for p in policies if p != shared.get('ep_last_policy') -%}{%- do pc.append(p) -%}{%- endfor -%}
+    {%- set policy = module.rand.choice(pc) -%}
+    {%- set a = admins[ai] -%}
+    {%- set start = now + module.rand.number.integer(0, 999) -%}
+    {#- Same op kinds and gaps as an ordinary session: views around a
+        create, a save of one NAT policy, more views, and a second save
+        of the same policy (the change reverted). -#}
+    {%- set ops = [] -%}
+    {%- for _ in range(module.rand.number.integer(0, 2)) -%}{%- do ops.append([module.rand.weighted_choice(['view_nat', 'view_editor', 'view_dash'], [28, 26, 16]), none]) -%}{%- endfor -%}
+    {%- do ops.append(['create', none]) -%}
+    {%- for _ in range(module.rand.number.integer(0, 2)) -%}{%- do ops.append([module.rand.weighted_choice(['view_nat', 'view_editor', 'view_dash'], [28, 26, 16]), none]) -%}{%- endfor -%}
+    {%- do ops.append(['save', policy]) -%}
+    {%- for _ in range(module.rand.number.integer(0, 4)) -%}{%- do ops.append([module.rand.weighted_choice(['view_nat', 'view_editor', 'view_dash'], [28, 26, 16]), none]) -%}{%- endfor -%}
+    {%- do ops.append(['save', policy]) -%}
+    {%- for _ in range(module.rand.number.integer(0, 2)) -%}{%- do ops.append([module.rand.weighted_choice(['view_nat', 'view_editor', 'view_dash'], [28, 26, 16]), none]) -%}{%- endfor -%}
+    {%- do a.update({'episode': true, 'resume': a.due, 'due': start, 'pending_ops': ops}) -%}
+    {%- do shared.update({'ep_active': true, 'ep_last_admin': ai, 'ep_last_policy': policy, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min)), 'next_due': [shared.get('next_due'), start] | min}) -%}
   {%- endif -%}
-  {%- set actor_ip = params.unusual_admin_ip if tick % 11 == 0 else module.rand.choice(['10.1.1.10', '10.26.166.110']) -%}
 {%- endif -%}
-{%- if kind == 'nat_view' -%}
-  {%- set component = 'sfdccsm' -%}
-  {%- set detail = 'Devices > NAT > NGFW NAT Policy Editor, Page View' -%}
-  {%- set action = 'nat_policy_page_view' -%}
-  {%- set category = ['web'] -%}
-  {%- set event_type = ['access'] -%}
-{%- elif kind == 'object_view' -%}
-  {%- set component = 'sfdccsm' -%}
-  {%- set detail = 'Devices > NAT, Page View' -%}
-  {%- set action = 'nat_page_view' -%}
-  {%- set category = ['web'] -%}
-  {%- set event_type = ['access'] -%}
-{%- elif kind == 'login' -%}
-  {%- set component = 'ActionQueueScrape.pl' -%}
-  {%- set detail = 'Login, Login Success' -%}
-  {%- set action = 'login_success' -%}
-  {%- set category = ['authentication'] -%}
-  {%- set event_type = ['start'] -%}
-{%- elif kind == 'object_create' -%}
-  {%- set component = 'sfdccsm' -%}
-  {%- set detail = 'Objects > Object Management > NetworkObject, create ' ~ params.network_object -%}
-  {%- set action = 'network_object_create' -%}
-  {%- set category = ['configuration'] -%}
-  {%- set event_type = ['creation'] -%}
-{%- elif kind == 'policy_save' -%}
-  {%- set component = 'sfdccsm' -%}
-  {%- set detail = 'Devices > NAT > NAT Policy Editor, Save Policy ' ~ params.nat_policy -%}
-  {%- set action = 'nat_policy_save' -%}
-  {%- set category = ['configuration'] -%}
-  {%- set event_type = ['change'] -%}
+{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- macro chain_done(a, policy, t) -%}
+  {#- True when this administrator created an object and then saved the
+      policy within the guard window, so saving it again now would
+      complete the anomaly sequence. -#}
+  {%- set ns = namespace(created=false, hit=false) -%}
+  {%- for h in a.hist if t - h[0] <= guard_ms -%}
+    {%- if h[1] == 'create' -%}{%- set ns.created = true -%}
+    {%- elif h[1] == 'save' and h[2] == policy and ns.created -%}{%- set ns.hit = true -%}{%- endif -%}
+  {%- endfor -%}
+  {{- 'y' if ns.hit else '' -}}
+{%- endmacro -%}
+{%- set out = namespace(kind=none, user=none, uip=none, sender=none, target=none, rec=0) -%}
+{%- for _ in range(24) if out.kind is none and shared.get('next_due') <= now -%}
+  {%- set pick = namespace(i=none) -%}
+  {%- for i in range(admins | length) if pick.i is none or admins[i].due < admins[pick.i].due -%}{%- set pick.i = i -%}{%- endfor -%}
+  {%- set sys_due = (sysq | map(attribute='0') | min) if sysq else none -%}
+  {%- if sys_due is not none and sys_due <= admins[pick.i].due -%}
+    {#- System record queued by a policy save. -#}
+    {%- set sq = namespace(j=0) -%}
+    {%- for j in range(sysq | length) if sysq[j][0] < sysq[sq.j][0] -%}{%- set sq.j = j -%}{%- endfor -%}
+    {%- set item = sysq.pop(sq.j) -%}
+    {%- set rec = [item[0], shared.get('last_ms') + 1] | max -%}
+    {%- if item[1] == 'login' -%}
+      {%- do sysq.append([rec + ms(d(0.2, 1.1, 0.6, 9)) | int, 'task']) -%}
+      {%- set out.kind = 'sys_login' -%}{%- set out.user = 'csm_processes' -%}{%- set out.uip = 'Default User IP' -%}
+    {%- else -%}
+      {%- set out.kind = 'task' -%}{%- set out.user = 'admin' -%}{%- set out.uip = 'localhost' -%}
+    {%- endif -%}
+    {%- set out.sender = 'ActionQueueScrape.pl' -%}{%- set out.rec = rec -%}
+    {%- do shared.set('last_ms', rec) -%}
+  {%- else -%}
+    {%- set a = admins[pick.i] -%}
+    {%- set rec = [a.due, shared.get('last_ms') + 1] | max -%}
+    {%- set frame = namespace(kind=none, target=none, gap=none) -%}
+    {%- if a.stage == 'idle' -%}
+      {%- set ops = [] -%}
+      {%- if a.episode -%}
+        {%- do ops.extend(a.pending_ops) -%}
+      {%- else -%}
+        {%- set cnt = namespace(n=1, go=true) -%}
+        {%- for _ in range(19) if cnt.go -%}
+          {%- if module.rand.chance(0.78) -%}{%- set cnt.n = cnt.n + 1 -%}{%- else -%}{%- set cnt.go = false -%}{%- endif -%}
+        {%- endfor -%}
+        {%- for _ in range(cnt.n) -%}
+          {%- do ops.append([module.rand.weighted_choice(['view_nat', 'view_editor', 'view_dash', 'create', 'save'], [28, 26, 16, 12, 18]), none]) -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- do a.update({'stage': 'sess', 'ops': ops, 'last_op': none, 'sip': a.ip if module.rand.chance(0.85) else a.alt_ip}) -%}
+      {#- A session opens on the dashboard or on the NAT list. -#}
+      {%- set frame.kind = module.rand.weighted_choice(['view_dash', 'view_nat'], [55, 45]) -%}
+    {%- elif a.ops -%}
+      {%- set op = a.ops.pop(0) -%}
+      {%- set kind = op[0] -%}
+      {%- if kind == 'reload' -%}
+        {#- The editor page is shown again right after a save. -#}
+        {%- set frame.kind = 'view_editor' -%}
+      {%- elif kind == 'create' -%}
+        {%- set name = fresh_object() -%}
+        {%- if name -%}
+          {%- do objects.update({name: rec}) -%}
+          {%- for k in objects | list if objects | length > 1500 -%}{%- do objects.pop(k) -%}{%- endfor -%}
+          {%- set frame.kind = 'create' -%}{%- set frame.target = name -%}
+          {%- if not a.episode and module.rand.chance(0.55) -%}
+            {#- The new object is put into a NAT rule later in the session. -#}
+            {%- do a.ops.insert(module.rand.number.integer(0, a.ops | length), ['save', none]) -%}
+          {%- endif -%}
+        {%- else -%}
+          {%- set frame.kind = 'view_nat' -%}
+        {%- endif -%}
+      {%- elif kind == 'save' -%}
+        {%- if a.last_op != 'view_editor' -%}
+          {#- Saving happens from the policy editor. -#}
+          {%- do a.ops.insert(0, op) -%}
+          {%- set frame.kind = 'view_editor' -%}
+        {%- else -%}
+          {%- if op[1] is not none -%}
+            {%- set policy = op[1] -%}
+          {%- elif a.last_policy is not none and module.rand.chance(0.5) -%}
+            {%- set policy = a.last_policy -%}
+          {%- else -%}
+            {%- set policy = module.rand.choice(policies) -%}
+          {%- endif -%}
+          {%- if a.episode or not chain_done(a, policy, rec) -%}
+            {%- set frame.kind = 'save' -%}{%- set frame.target = policy -%}
+            {%- do a.update({'last_policy': policy}) -%}
+            {%- do a.ops.insert(0, ['reload', none]) -%}
+            {%- set frame.gap = ms(d(0.05, 0.35, 0.6, 0.95)) | int -%}
+            {%- if module.rand.chance(0.85) -%}
+              {%- do sysq.append([rec + ms(d(4, 16, 0.5, 120)) | int, 'login']) -%}
+            {%- endif -%}
+            {%- if not a.episode and module.rand.chance(0.22) -%}
+              {#- Saved again later in the session (a rule fixed or reverted). -#}
+              {%- do a.ops.insert(module.rand.number.integer(1, a.ops | length), ['save', policy]) -%}
+            {%- endif -%}
+          {%- else -%}
+            {%- set frame.kind = 'view_editor' -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- set frame.kind = kind -%}
+      {%- endif -%}
+    {%- else -%}
+      {#- Session end: the web interface writes no record. -#}
+      {%- do a.update({'stage': 'idle'}) -%}
+      {%- if a.episode -%}
+        {%- do a.update({'episode': false, 'pending_ops': none}) -%}
+        {%- do shared.update({'ep_active': false}) -%}
+        {%- do a.update({'due': [a.resume, rec + 1] | max}) -%}
+      {%- else -%}
+        {%- do a.update({'due': rec + ms(absence(a.med)) | int}) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if frame.kind is not none -%}
+      {%- do a.update({'last_op': frame.kind, 'due': rec + (frame.gap if frame.gap is not none else ms(op_gap()) | int)}) -%}
+      {%- if frame.kind in ['create', 'save'] -%}{%- do a.hist.append([rec, frame.kind, frame.target]) -%}{%- endif -%}
+      {#- Bounded guard memory: this administrator's changes of the last 4 h. -#}
+      {%- for _ in range(a.hist | length) if a.hist and rec - a.hist[0][0] > guard_ms -%}{%- do a.hist.pop(0) -%}{%- endfor -%}
+      {%- set out.kind = frame.kind -%}{%- set out.user = a.user -%}{%- set out.uip = a.sip -%}{%- set out.target = frame.target -%}{%- set out.rec = rec -%}
+      {%- set out.sender = 'mojo_server.pl' if frame.kind == 'view_dash' else 'sfdccsm' -%}
+      {%- do shared.set('last_ms', rec) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set dues = admins | map(attribute='due') | list -%}
+  {%- if sysq -%}{%- do dues.append(sysq | map(attribute='0') | min) -%}{%- endif -%}
+  {%- do shared.set('next_due', dues | min) -%}
+{%- endfor -%}
+{%- if out.kind is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set moment = (ts + module.datetime.timedelta(milliseconds=out.rec - now)).replace(microsecond=0) -%}
+{%- set policy = none -%}{%- set object_name = none -%}
+{%- if out.kind == 'view_dash' -%}
+  {%- set subsystem = '/ui/ddd/' -%}{%- set message = 'Page View' -%}
+  {%- set action = 'page-view' -%}{%- set cat = ['web'] -%}{%- set typ = ['access'] -%}
+{%- elif out.kind == 'view_nat' -%}
+  {%- set subsystem = 'Devices > NAT' -%}{%- set message = 'Page View' -%}
+  {%- set action = 'page-view' -%}{%- set cat = ['web'] -%}{%- set typ = ['access'] -%}
+{%- elif out.kind == 'view_editor' -%}
+  {%- set subsystem = 'Devices > NAT > NGFW NAT Policy Editor' -%}{%- set message = 'Page View' -%}
+  {%- set action = 'page-view' -%}{%- set cat = ['web'] -%}{%- set typ = ['access'] -%}
+{%- elif out.kind == 'create' -%}
+  {%- set subsystem = 'Objects > Object Management > NetworkObject' -%}{%- set message = 'create ' ~ out.target -%}
+  {%- set object_name = out.target -%}
+  {%- set action = 'network-object-create' -%}{%- set cat = ['configuration'] -%}{%- set typ = ['creation'] -%}
+{%- elif out.kind == 'save' -%}
+  {%- set subsystem = 'Devices > NAT > NAT Policy Editor' -%}{%- set message = 'Save Policy ' ~ out.target -%}
+  {%- set policy = out.target -%}
+  {%- set action = 'nat-policy-save' -%}{%- set cat = ['configuration'] -%}{%- set typ = ['change'] -%}
+{%- elif out.kind == 'sys_login' -%}
+  {%- set subsystem = 'Login' -%}{%- set message = 'Login Success' -%}
+  {%- set action = 'login-success' -%}{%- set cat = ['authentication'] -%}{%- set typ = ['start'] -%}
 {%- else -%}
-  {%- set component = 'ActionQueueScrape.pl' -%}
-  {%- set detail = 'Task Queue, Successful task completion : Pre-deploy Global Configuration Generation' -%}
-  {%- set action = 'predeploy_config_generation_complete' -%}
-  {%- set category = ['configuration'] -%}
-  {%- set event_type = ['end'] -%}
+  {%- set subsystem = 'Task Queue' -%}{%- set message = 'Successful task completion : Pre-deploy Global Configuration Generation' -%}
+  {%- set action = 'task-completion' -%}{%- set cat = ['configuration'] -%}{%- set typ = ['info'] -%}
 {%- endif -%}
-{%- set actor = 'admin@localhost' if kind == 'task_complete' else ('csm_processes@Default User IP' if kind == 'login' else 'admin@' ~ actor_ip) -%}
-{%- set raw = event_time.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.management_center
-  ~ ': [FMC-AUDIT] ' ~ component ~ ': ' ~ actor ~ ', ' ~ detail -%}
-{%- set event_obj = {'kind': 'event', 'dataset': 'cisco.fmc.audit',
-  'category': category, 'type': event_type, 'action': action,
-  'code': 'FMC-AUDIT', 'original': raw} -%}
-{%- if kind == 'login' -%}
-  {%- do event_obj.update({'outcome': 'success'}) -%}
+{%- set header = moment.strftime('%b ') ~ ('%02d' | format(moment.day)) ~ moment.strftime(' %H:%M:%S') -%}
+{%- set original = header ~ ' ' ~ params.management_center ~ ': [FMC-AUDIT] ' ~ out.sender ~ ': ' ~ out.user ~ '@' ~ out.uip ~ ', ' ~ subsystem ~ ', ' ~ message -%}
+{%- set audit = {'tag': 'FMC-AUDIT', 'sender': out.sender, 'user': out.user, 'user_ip': out.uip, 'subsystem': subsystem, 'message': message} -%}
+{%- if policy is not none -%}{%- do audit.update({'policy': policy}) -%}{%- endif -%}
+{%- if object_name is not none -%}{%- do audit.update({'object': object_name}) -%}{%- endif -%}
+{%- set event = {'kind': 'event', 'module': 'cisco_fmc', 'dataset': 'cisco_fmc.audit', 'category': cat, 'type': typ, 'action': action, 'original': original} -%}
+{%- if out.kind in ['sys_login', 'task'] -%}{%- do event.update({'outcome': 'success'}) -%}{%- endif -%}
+{%- set related = {'user': [out.user], 'hosts': [params.management_center]} -%}
+{%- set payload = {'@timestamp': moment.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': event, 'observer': {'hostname': params.management_center, 'vendor': 'Cisco', 'product': 'Secure Firewall Management Center', 'version': '7.4.0'}, 'process': {'name': out.sender}, 'user': {'name': out.user}, 'message': subsystem ~ ', ' ~ message, 'cisco': {'fmc': {'audit': audit}}} -%}
+{%- if out.kind not in ['sys_login', 'task'] -%}
+  {%- do payload.update({'source': {'ip': out.uip}}) -%}
+  {%- do related.update({'ip': [out.uip]}) -%}
 {%- endif -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
-  'ecs': {'version': '8.17.0'}, 'event': event_obj,
-  'observer': {'name': params.management_center, 'vendor': 'Cisco', 'product': 'Secure Firewall Management Center'},
-  'user': {'name': 'csm_processes' if kind == 'login' else 'admin'},
-  'cisco': {'fmc': {'audit': {'component': component, 'detail': detail}}}} -%}
-{%- if kind not in ['task_complete', 'login'] -%}
-  {%- do record.update({'source': {'ip': actor_ip}, 'related': {'ip': [actor_ip]}}) -%}
-{%- endif -%}
-{{ record | tojson }}
+{%- do payload.update({'related': related}) -%}
+{{- module.json.dumps(payload, sort_keys=true) -}}
