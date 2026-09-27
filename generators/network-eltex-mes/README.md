@@ -1,51 +1,51 @@
 # Eltex MES Switch Syslog
 
-Generates ECS JSON carrying selected MES5324 syslog **message bodies** in `event.original` and `message`. Bodies follow the official [MES23xx/MES33xx/MES35xx/MES5324 message catalog](https://eltex.ru/storage/upload_center/files/46/MES23xx_MES33xx_MES35xx_MES5324_Log_reference.pdf). The catalog has no firmware identifier. Configuration and hardware assumptions use the same-family [4.0.27.3 operation manual](https://eltex.ru/storage/upload_center/files/60/MES_Series_user_manual_4.0.27.3.pdf). This is not an exact 4.0.27.3 live capture or a full syslog transport generator. Eltex ESR routing logs are a separate product stream.
-
-## Source Profile
-
-One MES5324 has eight selected `te1/0/*` interfaces initially up, four dual-rate target ports initially configured for 10G, and 52 pre-existing MAC entries. Forty-eight endpoints share four downstream ports; four selected endpoints use distinct target ports. The primary target is configurable. Existing VLAN membership and dual-rate optics/peers permitting 1G and 10G are explicit inventory assumptions. No MAC move, interface creation or VLAN creation is implied.
-
-HTTPS management with local-user-table authentication is enabled. Both configured users are existing administrators authorized for the selected maintenance operations. AAA login and link logging, MAC-change notifications and an informational-or-more-detailed exported logging threshold are assumed enabled. Local file logging is enabled and export aggregation is disabled. The selected local password lockout threshold is five consecutive failures. Ordinary isolated failures are followed by success, and episodes contain only three failures before success. The profile needs no account unlock event.
-
-There are two configured syslog destinations: an unchanged retained collector, modeled as `10.40.0.20` in the default inventory, and the configurable auxiliary receiver `syslog_server_ip`. Only the auxiliary receiver is removed and visibly re-added. Continued delivery to the retained collector is therefore coherent. The generator emits neither collector framing nor the retained destination as a native event field. Keep those destinations distinct when changing the scenario.
-
-The stream selects FDB learning/clearing notifications amid unlogged endpoint traffic and maintenance. It tracks each selected entry's presence, but does not implement packet traffic, exact MAC aging deadlines, SNMP batching or all entries on a live switch. Background removals represent selected aging/clearing transitions; learn events require an absent entry and an up port. An endpoint held during port maintenance cannot be relearned before that port's visible Up and restoration. Initial state and unobserved traffic are scenario assumptions, not reconstructed vendor history.
+Generates syslog messages of one Eltex MES5324 access switch as ECS JSON: HTTPS administrator logins, interface speed and link changes, MAC table notifications and logging configuration changes. The native message body is kept verbatim in `event.original` and `message`, in the forms of the official [MES23xx/MES33xx/MES35xx/MES5324 syslog message catalog](https://eltex.ru/storage/upload_center/files/46/MES23xx_MES33xx_MES35xx_MES5324_Log_reference.pdf). Eltex ESR router logs are a separate stream.
 
 ## Event Types
 
-| Native class | Meaning in this profile |
-|---|---|
-| `BRG_MACNTFY-I-MAC_CHANGED` | Learn an absent selected MAC or remove a present entry |
-| `AAA-W-REJECT` | Reject HTTPS local-user-table authentication |
-| `AAA-I-CONNECT` | Accept that authentication and open the selected session |
-| `AAA-I-DISCONNECT` | Terminate the existing same-user/source session |
-| `LINK-N-PortConfRecover` | Report a configured speed of 1G or 10G |
-| `LINK-W-Down` / `LINK-W-Up` | Change the selected interface's current link state |
-| `SYSLOG-N-CLEARLOGGINGFILE` | Clear the local logging file |
-| `SYSLOG-N-NOSYSLOGSERVER` | Remove the existing auxiliary receiver |
-| `SYSLOG-N-NEWSYSLOGSERVER` | Re-add that absent receiver |
+Measured on a 120-hour default capture (`anomaly_mode: true`, 6,304 events). All classes occur in both modes.
 
-Ten native classes use one stateful template. All occur in both modes. Every 30 minutes, ordinary maintenance rotates among port maintenance, file clearing, auxiliary-receiver maintenance and one failed-then-successful login. Both administrators and all four targets also participate in ordinary work. Port maintenance visibly restores speed/link/MAC before disconnecting; auxiliary-receiver maintenance re-adds its destination two minutes after deletion. These routines do not combine three failures, port disruption, file clearing and receiver deletion into the complete episode.
+| Native class | `event.action` | Share | Category |
+|---|---|---:|---|
+| `BRG_MACNTFY-I-MAC_CHANGED` (`Removed`) | `mac_removed` | 41.4% | network |
+| `BRG_MACNTFY-I-MAC_CHANGED` (`learnt`) | `mac_learned` | 41.4% | network |
+| `AAA-I-CONNECT` | `login_accepted` | 2.6% | authentication |
+| `AAA-I-DISCONNECT` | `session_terminated` | 2.6% | authentication |
+| `LINK-W-Down` | `interface_down` | 2.5% | network |
+| `LINK-W-Up` | `interface_up` | 2.5% | network |
+| `AAA-W-REJECT` | `login_rejected` | 1.9% | authentication |
+| `SYSLOG-N-CLEARLOGGINGFILE` | `logging_file_cleared` | 1.6% | configuration |
+| `LINK-N-PortConfRecover` | `interface_speed_changed` | 1.6% | configuration, network |
+| `SYSLOG-N-NOSYSLOGSERVER` | `syslog_server_deleted` | 1.0% | configuration |
+| `SYSLOG-N-NEWSYSLOGSERVER` | `syslog_server_added` | 1.0% | configuration |
 
-One record every 30 seconds gives 120 records/hour or 2,880 records/day for a half-open day. The sixth cron field is seconds. Cadence, ordinary maintenance intervals, target rotation and traffic selection are synthetic workload choices, not measured Eltex production frequencies.
+The switch has eight ports: four access uplinks (`te1/0/1`-`te1/0/4`, twelve MAC addresses each) and four dual-rate 1G/10G server ports (`te1/0/5`-`te1/0/8`, three MAC addresses each, configured for 10G). Every endpoint, port and administrator follows its own random schedule; there is no fixed period, rotation or global wave.
+
+- **MAC table.** Each MAC address is learnt and later removed (aging) after lognormal present and absent times. A Down removes every present address of that port one by one within seconds; after Up the addresses are learnt again.
+- **Links.** Ports flap on their own (Down, then Up after seconds to minutes).
+- **Administrators.** Six administrators (`samples/admins.json`) log in over HTTPS with the local user table every few hours. About a third of logins start with one to four mistyped passwords a few seconds apart; some attempts are abandoned and retried later. Consecutive failures stay below the configured lockout threshold (1 to 5). A session holds zero to several operations tens of seconds apart: a speed change on a server port (1G; the link drops and half the time comes back at 1G), a port shutdown and re-enable, a logging file clear, or removal of the auxiliary syslog receiver. Changed state is restored within the session or, if the session ends first, by whichever administrator logs in next: speed back to 10G, Up, receiver re-added.
+
+One input tick per second emits the earliest due event with its own millisecond timestamp, or nothing. Rates, durations and operation mix are synthetic workload choices, not measured Eltex production frequencies.
 
 ## Anomaly Chain
 
-`anomaly_mode: true` is the default. The first episode becomes eligible after `anomaly_interval_hours`, default 24 hours. Adjacent episodes alternate administrator/source tuples and rotate the four existing MAC/port targets. Native classes have no session or campaign identifier; no invented ID, mode tag or actor is appended to configuration messages.
+`anomaly_mode` defaults to `true`. With `false` the generator emits only the background above, which never holds the complete chain; every step still occurs there on its own and in partial sequences (about four runs of three or more failures by one administrator per day, followed by success, speed changes, port drops, file clears and receiver removals in ordinary sessions).
 
-1. Three HTTPS authentication rejections for one existing administrator/source occur 30 seconds apart, followed by acceptance.
-2. The same switch reports target speed 1G, then that port Down and its present MAC Removed.
-3. The local logging file is cleared, the auxiliary receiver is removed, and the accepted session disconnects. Ten records span four minutes 30 seconds.
-4. Fifteen minutes after receiver deletion, the other administrator opens a new session. Speed 10G, Up, MAC learning, auxiliary-receiver addition and disconnect are visible in order. Receiver addition occurs 17 minutes after deletion. Recovery completes 21 minutes 30 seconds after the first rejection.
+Sequence, one episode:
 
-An absent target MAC is first visibly learned on an up port, so an episode can start up to one tick late. The next due time is measured from the actual first rejection. Ordinary administration is postponed during the recovery hold and near the next due time, avoiding overlapping selected sessions and preventing a due episode from starving. Missed episodes are not replayed in a catch-up burst. A finite run can end inside an ordinary trace or episode; it does not silently reset state at the tail.
+1. Three `AAA-W-REJECT` for one administrator and source, seconds apart.
+2. `AAA-I-CONNECT` for the same user and source.
+3. `LINK-N-PortConfRecover` sets a server port to 1G; `LINK-W-Down` for that port follows within seconds, then `MAC_CHANGED Removed` for its addresses.
+4. `SYSLOG-N-CLEARLOGGINGFILE` clears the local logging file.
+5. `SYSLOG-N-NOSYSLOGSERVER` removes the auxiliary receiver, then the session disconnects.
+6. Restoration follows the ordinary repair path: the next administrator to log in sets the port back to 10G (Up and relearning follow) and re-adds the receiver. Measured from about 2 minutes to about 7.5 hours after the episode across the final and review captures; the delay depends on the next administrator login.
 
-Detection can correlate repeated failures and success by native user/source/destination, then speed/link/MAC and logging operations by switch, port and time. `PortConfRecover` is documented as a configured-speed change result. Its name is not treated as a recovery command, and its body proves neither who changed it nor why the link subsequently went down. Actorless configuration lines support temporal/device correlation, not attribution to the preceding user. Clearing a local file does not erase already exported records, and deleting an auxiliary receiver does not establish complete audit suppression.
+Linking fields: `user.name` and `source.ip` for steps 1-2, `interface.name` for step 3, `observer.name` and time for the actorless configuration lines. The native configuration messages carry no user, so attribution to the preceding login is temporal only. Measured episode spans: about 2 to 13 minutes. All gaps are drawn from the same distributions as background typing and operations.
 
-`anomaly_mode: false` removes the combined rapid sequence. Both modes retain the same actors, ports, MACs, VLANs, 1G/10G values, file clearing and receiver removal/addition. Recurring episodes reuse physical inventory plausibly rather than inventing new native identities.
+Recurrence: the first episode is due `anomaly_interval_hours` after the first event (default 24, minimum 6). The episode starts at a random delay of up to 30 minutes (up to an eighth of the interval for short intervals) after it is due, on the first moment an idle administrator and a server port that is up at 10G with a present MAC are available; it waits otherwise. The next episode is due one interval after the actual start. Missed episodes are not replayed. Each episode picks a different administrator and server port than the previous one, at random. The episode administrator is one whose own next login is more than an hour away, and that schedule resumes unchanged, so the episode suspends or shifts no background activity, except that ordinary receiver deletions on the episode port are skipped while the episode runs, and the episode waits until the receiver is present. Measured: 4 episodes in 120 hours at 24 hours (start gaps 24.5, 24.5 and 25.2 hours), 9 in 120 hours at 12 hours.
 
-State is bounded: 52 inventory/presence slots, eight link slots, four speed slots, one selected session, one held target, one recovery context, a pending plan of at most ten records and scalar schedule/cursor values. Completed episodes and historical sessions are not retained.
+Detection idea: within one hour, a run of three or more failed logins by one account followed by success, then on the same switch a port speed change, link loss and MAC removal on that port, a logging file clear and removal of a syslog destination. Each step alone, and any shorter prefix, is ordinary administration here.
 
 ## Parameters
 
@@ -53,112 +53,64 @@ State is bounded: 52 inventory/presence slots, eight link slots, four speed slot
 
 Edit `event.template.params` in `generator.yml`:
 
-| Parameter | Default | Purpose |
+| Parameter | Default | Description |
 |---|---|---|
-| `switch_name`, `switch_ip` | `mes-access-01`, `10.40.0.11` | Synthetic switch inventory |
-| `normal_user`, `normal_source_ip` | `netops`, `10.40.1.25` | First existing administrator/source, active in both modes |
-| `unusual_user`, `unusual_source_ip` | `admin`, `10.99.4.21` | Second existing administrator/source, active in both modes |
-| `target_port`, `target_mac`, `target_vlan` | `te1/0/5`, `e0:d9:e3:2c:19:b0`, `20` | First of four maintenance/episode target tuples |
-| `syslog_server_ip` | `10.40.0.12` | Auxiliary receiver, separate from the retained collector |
-| `anomaly_interval_hours` | `24` | Positive finite hours between actual starts; values below 6 clamp to 6 |
-| `anomaly_mode` | `true` | Include periodic combined episodes; false emits ordinary activity |
+| `switch_name` | `mes-access-01` | Switch name in `observer.name` and `observer.hostname` |
+| `switch_ip` | `10.40.0.11` | Switch address; destination of administrator logins |
+| `syslog_server_ip` | `10.40.0.12` | Auxiliary syslog receiver removed and re-added; the collector receiving this stream is a second destination that is never changed |
+| `anomaly_mode` | `true` | Include periodic anomaly episodes; `false` gives background only |
+| `anomaly_interval_hours` | `24` | Hours between episode starts; 6 to 8760, smaller values fail validation |
 
-Keep count one and the shipped 30-second cadence for documented timing. Fractional hours begin on the first tick at or after their due time, with an additional tick if target-MAC preparation is needed. Usernames and switch names must be nonempty ASCII labels without whitespace, commas, quotes, backslashes or newlines. Use distinct administrator names/source tuples. Supply valid IPv4, MAC and VLAN values. The primary target must be a valid distinct `te1/0/1..24` port, separate from fixed `te1/0/1..4` and `te1/0/6..8`, and its MAC must not duplicate another sample. VLAN must already exist and be allowed on that port. The 52 rows in `samples/endpoints.json` are fixed profile inventory; changing its cardinality or target ordering requires adapting the model. Sample `02:*` addresses are synthetic locally administered MACs; the primary default reproduces the vendor's illustrative MAC.
+Administrators and endpoints come from `samples/admins.json` (user, source IP) and `samples/endpoints.json` (MAC, VLAN, port, role `access` or `server`). The generator needs at least two administrators and two `server` ports for episode rotation.
 
 ### Output Parameters
 
-The local file output requires no credentials or top-level substitutions. Change `output.file.path`, or replace the output plugin for your SIEM. A collector requiring the native message body must receive `event.original`, rather than the outer ECS JSON.
+The shipped output writes `output/events.json` and needs no credentials. To send events elsewhere, replace the output and pass values through top-level placeholders, for example:
+
+```yaml
+output:
+  - opensearch:
+      hosts:
+        - ${params.opensearch_host}
+      username: ${params.opensearch_user}
+      password: ${secrets.opensearch_password}
+      index: eltex-mes
+```
+
+A collector that expects the native syslog body should read `event.original`.
 
 ## Usage
 
-From the content-packs repository root:
+Live mode:
 
 ```bash
-flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/network-eltex-mes/generator.yml --id mes --live-mode true --keep-order true
+eventum generate --path generators/network-eltex-mes/generator.yml --id mes --live-mode true
 ```
 
-For a finite 48-hour-and-30-minute batch covering two default episodes and their recovery:
+Batch mode, as fast as possible (the cron input runs until stopped unless `start` and `end` are set on it):
 
 ```bash
-uv run --project ../eventum python - <<'PYCONFIG'
-from pathlib import Path
-import yaml
-root = Path('generators/network-eltex-mes')
-config = yaml.safe_load((root / 'generator.yml').read_text())
-config['input'][0]['cron'].update(
-    start='2026-09-25T00:00:00+00:00',
-    end='2026-09-27T00:30:00+00:00',
-)
-(root / '.finite.yml').write_text(yaml.safe_dump(config, sort_keys=False))
-PYCONFIG
-flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/network-eltex-mes/.finite.yml --id mes-finite --live-mode false --keep-order true
-rm generators/network-eltex-mes/.finite.yml
+eventum generate --path generators/network-eltex-mes/generator.yml --id mes --live-mode false
 ```
-
-The finite command exits normally and writes 5,821 records. ECS timestamps are normalized to UTC, including a Europe/Moscow CLI/input. Native bodies contain no time field; the outer timestamp is the synthetic event clock, not a fabricated source timestamp or transport header.
 
 ## Sample Output
 
-The following synthetic event is copied exactly from the final default-on capture. It is not a live vendor capture:
+An episode's first failed login, copied from the default capture:
 
 ```json
-{
-  "@timestamp": "2026-09-26T00:02:00+00:00",
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "eltex": {
-    "mes": {
-      "component": "LINK",
-      "details": {
-        "interface": {
-          "speed": "1G"
-        }
-      },
-      "mnemonic": "PortConfRecover",
-      "severity_code": "N"
-    }
-  },
-  "event": {
-    "action": "interface_speed_changed",
-    "category": [
-      "configuration",
-      "network"
-    ],
-    "dataset": "eltex.mes.syslog",
-    "kind": "event",
-    "module": "eltex",
-    "original": "LINK-N-PortConfRecover: Port te1/0/5 configured to speed 1G",
-    "outcome": "unknown",
-    "type": [
-      "change"
-    ]
-  },
-  "interface": {
-    "name": "te1/0/5"
-  },
-  "log": {
-    "level": "notice"
-  },
-  "message": "LINK-N-PortConfRecover: Port te1/0/5 configured to speed 1G",
-  "observer": {
-    "hostname": "mes-access-01",
-    "ip": [
-      "10.40.0.11"
-    ],
-    "model": "MES5324",
-    "name": "mes-access-01",
-    "product": "MES",
-    "type": "switch",
-    "vendor": "Eltex"
-  }
-}
+{"@timestamp": "2026-09-21T00:29:09.760+00:00", "destination": {"ip": "10.40.0.11"}, "ecs": {"version": "8.17.0"}, "eltex": {"mes": {"component": "AAA", "details": {"connection": {"auth_method": "local user table", "type": "https"}}, "mnemonic": "REJECT", "severity_code": "W"}}, "event": {"action": "login_rejected", "category": ["authentication"], "dataset": "eltex.mes.syslog", "kind": "event", "module": "eltex", "original": "AAA-W-REJECT: New https connection for user netops, source 10.40.1.25 destination 10.40.0.11, local user table REJECTED.", "outcome": "failure", "type": ["start", "denied"]}, "log": {"level": "warning"}, "message": "AAA-W-REJECT: New https connection for user netops, source 10.40.1.25 destination 10.40.0.11, local user table REJECTED.", "observer": {"hostname": "mes-access-01", "ip": ["10.40.0.11"], "model": "MES5324", "name": "mes-access-01", "product": "MES", "type": "switch", "vendor": "Eltex"}, "source": {"ip": "10.40.1.25"}, "user": {"name": "netops"}}
 ```
 
-## Validation and Evidence Limits
+## Limitations
 
-Four final finite 96h30 runs emitted 11,581 records each. Default 24-hour recurrence yielded four complete episodes and recoveries; custom 12-hour recurrence yielded eight. Both disabled captures contained zero full episodes. Custom parameters changed switch, both users/IPs, target MAC/port/VLAN and auxiliary receiver, with +03 input normalized to UTC. Streaming checks covered documented body grammar, punctuation/severity, native-to-ECS fields, session/FDB/link/speed/receiver state, lockout threshold, source-time cadence and recovery, actor/target variation and ordinary action overlap.
+- The catalog carries no firmware version and shows message bodies only. No syslog priority, timestamp, hostname or transport framing is emitted; `@timestamp` is the synthetic event time. `observer.model`, the inventory and the parsed `eltex.mes.details` fields are normalization, not source fields.
+- The catalog gives a complete example of `Removed` only; the learning form uses the parameter value `learnt` from the catalog table, so its exact capitalization in a live record is unconfirmed. The catalog labels `Up` Informational while its example uses `LINK-W-Up`; the example is followed.
+- Only HTTPS logins are modeled. The link drop after a speed change, the flush of MAC notifications on Down and aging-driven removals are modeled behavior, not documented event timing.
+- Configuration lines (speed, file clear, receiver) name no user; which session made them is not in the source.
+- No live capture, exact-build trace or maintained Elastic integration for Eltex MES was available for comparison.
 
-The actual original 69,481-record trace demonstrates the prior cron burst error, redundant FDB transitions, repeated receiver deletion without addition, repeated port-down/speed states and unclosed selected sessions. The corrected traces pass those checks. Mutations changing both native and normalized MAC state or receiver action together are rejected by lifecycle checks, independently of field equality.
+## References
 
-Catalog examples establish complete AAA, speed, Down/Up, MAC removal and local-file/receiver message bodies. Learning uses the catalog's lowercase `learnt` parameter value; a complete native learning example was not found. The Up entry calls severity Informational while its complete example uses `LINK-W-Up`; this profile preserves the example's W prefix. The catalog is unversioned, while the 4.0.27.3 manual supports configuration/hardware assumptions only. Exact installed-build bytes, learning capitalization in a live record, full correlated capture, wire transport envelope and live SIEM parsing remain **BLOCKED_RAW_EVIDENCE**. A bounded search inspected the official catalog, current same-family download/manual and older 4.0.22 manual; it does not certify full native parity. Fifteen selected body identity/parameter fields are represented, which is field coverage rather than a realism score. No dedicated maintained Elastic MES sample was available. `observer.model`, inventory, parsed details and ECS outcomes are synthetic normalization; actorless events retain `event.outcome: unknown`.
+- [MES23xx/MES33xx/MES35xx/MES5324 syslog message catalog](https://eltex.ru/storage/upload_center/files/46/MES23xx_MES33xx_MES35xx_MES5324_Log_reference.pdf)
+- [MES series operation manual 4.0.27.3](https://eltex.ru/storage/upload_center/files/60/MES_Series_user_manual_4.0.27.3.pdf) - password lockout after 1-5 consecutive failures, SFP+ 1G/10G, `logging host`, MAC aging 300 s
+- [MES2324 downloads](https://eltex.ru/download/mes2324/)
