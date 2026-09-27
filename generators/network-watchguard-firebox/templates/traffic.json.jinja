@@ -1,71 +1,346 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 5) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- set kind = 'vpn_deny' if chain else module.rand.weighted_choice(['web_allow', 'ping_deny'], [85, 15]) -%}
-{%- set stamp = event_time.strftime('%Y-%m-%d %H:%M:%S') -%}
-{%- if kind == 'web_allow' -%}
-  {%- set source_ip = module.rand.choice(['10.0.1.2', '10.0.1.3', '10.0.1.4']) -%}
-  {%- set dest_ip = module.rand.choice(['203.0.113.11', '203.0.113.12']) -%}
-  {%- set source_port = module.rand.number.integer(40000, 60000) -%}
-  {%- set dest_port = 80 -%}
-  {%- set action = 'Allow' -%}
-  {%- set code = '3000-0176' -%}
-  {%- set transport = 'tcp' -%}
-  {%- set policy = 'HTTP-proxy.1-00' -%}
-  {%- set raw = stamp ~ ' Allow ' ~ source_ip ~ ' ' ~ dest_ip
-    ~ ' http/tcp ' ~ source_port ~ ' 80 Trusted External Allowed (' ~ policy ~ ')'
-    ~ ' proc_id="firewall" rc="406" msg_id="3000-0176"'
-    ~ ' src_ip_nat="198.51.100.10" flags="SDdF" duration="14"'
-    ~ ' sent_pkts="10" rcvd_pkts="5" sent_bytes="564" rcvd_bytes="785"' -%}
+{#- One WatchGuard Firebox logging traffic messages as they appear in
+    Traffic Monitor (and on a Syslog server). Each one-second tick
+    emits at most one record: the earliest due record of a queue fed
+    by independent per-host random processes. The anomaly episode only
+    adds records for one external address and never removes, delays
+    or reschedules background records or their arrival processes. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window_s = 3600 -%}
+{%- set fbx = params.firebox_external_ip -%}
+{%- set scan_ports = [22, 23, 25, 80, 445, 1433, 3306, 3389, 8080, 9007] -%}
+{%- set scan_weights = [20, 10, 6, 9, 10, 5, 4, 14, 8, 6] -%}
+{%- set services = {22: 'ssh', 23: 'telnet', 25: 'smtp', 80: 'http', 443: 'https',
+    445: 'microsoft-ds', 1433: 'ms-sql-s', 3306: 'mysql', 3389: 'ms-wbt-server',
+    8080: 'webcache'} -%}
+{#- Initial TTL, SYN window sizes and TCP header offset per OS. -#}
+{%- set stacks = {'windows': [128, [64240, 65535, 8192], 8],
+    'linux': [64, [64240, 29200], 10], 'macos': [64, [65535], 11],
+    'scanner': [255, [1024, 65535], 5]} -%}
+
+{#- Per-host activity weights: log-normal quantiles in random order,
+    so which host is busy changes from run to run but the spread of
+    activity across hosts does not. -#}
+{%- macro spread(n, sigma) -%}
+  {%- set nd = module.statistics.NormalDist(0, sigma) -%}
+  {%- set out = [] -%}
+  {%- for i in range(n) -%}
+    {%- do out.append(module.math.exp(nd.inv_cdf((i + 0.5) / n)) | string) -%}
+  {%- endfor -%}
+  {{- module.rand.shuffle(out) | join(',') -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.client_count < 8 or params.remote_count < 20
+      or params.client_first + params.client_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set checked = module.ipaddress.IPv4Address(fbx) -%}
+  {%- set hosts = {} -%}
+  {%- set clients = [] -%}
+  {%- for n in range(params.client_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- set os = module.rand.weighted_choice(['windows', 'linux', 'macos'], [78, 8, 14]) -%}
+    {%- do clients.append(ip) -%}
+    {%- do hosts.update({ip: {'os': os, 'hops': module.rand.weighted_choice([0, 1], [70, 30])}}) -%}
+  {%- endfor -%}
+  {#- External addresses. About 70% are remote users behind home
+      routers and carrier NAT: they connect to the SSL VPN portal and,
+      through other devices behind the same address, send stray
+      packets to one or two ports. The rest are hosting and scanning
+      ranges: they send most unsolicited packets, including all bursts
+      over three or more ports, and log in to the portal rarely (a VPS
+      or jump host of a user). -#}
+  {%- set remotes = [] -%}
+  {%- for n in range(params.remote_count * 3) -%}
+    {%- if remotes | length < params.remote_count -%}
+      {%- set ip = module.rand.choice(['192.0.2.', '198.51.100.']) ~ module.rand.number.integer(1, 254) -%}
+      {%- if ip not in remotes and ip != fbx -%}
+        {%- do remotes.append(ip) -%}
+        {%- do hosts.update({ip: {'os': module.rand.weighted_choice(['windows', 'linux', 'macos'],
+            [55, 30, 15]), 'hops': module.rand.number.integer(6, 22)}}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if remotes | length < params.remote_count -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set client_w = spread(params.client_count, 1.2).split(',') | map('float') | list -%}
+  {%- set n_scan = (params.remote_count * 0.3) | round | int -%}
+  {%- set classes = module.rand.shuffle(['scan'] * n_scan + ['user'] * (params.remote_count - n_scan)) -%}
+  {%- set sq = spread(params.remote_count, 1.0).split(',') | map('float') | list -%}
+  {%- set vq = spread(params.remote_count, 1.0).split(',') | map('float') | list -%}
+  {%- set scan_w = [] -%}
+  {%- set vpn_w = [] -%}
+  {%- for c in classes -%}
+    {%- do scan_w.append(sq[loop.index0] * (2.3 if c == 'scan' else 1.0)) -%}
+    {%- do vpn_w.append(vq[loop.index0] * (0.1 if c == 'scan' else 1.0)) -%}
+  {%- endfor -%}
+  {%- set web = [] -%}
+  {%- for n in range(40) -%}
+    {%- do web.append('203.0.113.' ~ module.rand.number.integer(1, 199)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'hosts': hosts, 'clients': clients,
+      'client_w': client_w, 'remotes': remotes, 'scan_w': scan_w, 'vpn_w': vpn_w,
+      'classes': classes,
+      'web': web, 'q': [], 'hist': {},
+      'next_due': now + (interval * 3600) | int, 'start_at': none, 'last_actor': none}) -%}
+{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set load = (1.5 if 7 <= hour < 17 else (0.8 if 17 <= hour < 21
+    else 0.3)) / 0.883 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Unsolicited TCP packets from one external address: 1-3 SYNs on
+    each of the given ports of the Firebox external address, sent by a
+    stateless scanner or by an ordinary TCP stack. The same law serves
+    background and the episode. Returns the time of the last packet. -#}
+{%- macro probe(src, ports, episode) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- set tool = module.rand.chance(0.6) -%}
+  {%- for port in ports -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(15, 1.2) | int -%}{%- endif -%}
+    {%- for a in range(module.rand.weighted_choice([1, 2, 3], [65, 25, 10])) -%}
+      {%- if not loop.first -%}{%- set t.v = t.v + gap(3, 0.5) | int -%}{%- endif -%}
+      {%- do q.append({'due': t.v, 'kind': 'ext_deny', 's': {'src': src, 'port': port,
+          'episode': episode, 'tool': tool}}) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {{- t.v -}}
+{%- endmacro -%}
+
+{%- macro pick_ports(k) -%}
+  {%- set ports = scan_ports | list -%}
+  {%- set weights = scan_weights | list -%}
+  {%- set out = [] -%}
+  {%- for n in range(k) -%}
+    {%- set p = module.rand.weighted_choice(ports, weights) -%}
+    {%- set i = ports.index(p) -%}
+    {%- do ports.pop(i) -%}{%- do weights.pop(i) -%}
+    {%- do out.append(p) -%}
+  {%- endfor -%}
+  {{- out | join(',') -}}
+{%- endmacro -%}
+
+{#- 1. Background arrivals: merged Poisson streams of independent
+    hosts, each arrival picking its host by a fixed random weight. -#}
+{%- if module.rand.chance(0.05 * load) -%}
+  {%- set c = module.rand.weighted_choice(shared.get('clients'), shared.get('client_w')) -%}
+  {%- set dst = module.rand.choice(shared.get('web')[:[(module.rand.number.exponential(0.1)) | int + 1, 40] | min]) -%}
+  {%- if module.rand.chance(0.85) -%}
+    {%- do q.append({'due': now, 'kind': 'out_allow', 's': {'src': c, 'dst': dst}}) -%}
+  {%- else -%}
+    {%- do q.append({'due': now + gap(4, 1.3) | int, 'kind': 'proxy_end',
+        's': {'src': c, 'dst': dst, 'start': now}}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if module.rand.chance(0.0015) -%}
+  {%- set c = module.rand.weighted_choice(shared.get('clients'), shared.get('client_w')) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for n in range(module.rand.weighted_choice([1, 2, 4], [50, 20, 30])) -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(1, 0.4) | int -%}{%- endif -%}
+    {%- do q.append({'due': t.v, 'kind': 'ping_deny', 's': {'src': c}}) -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- if module.rand.chance(0.009) -%}
+  {#- Internet background radiation: scanners, worms, stale clients. -#}
+  {#- The one- to two-port ratio is the same for both address
+      classes, so a one-port and a two-port burst come from the same
+      mixture of addresses. -#}
+  {%- set i = module.rand.weighted_choice(range(shared.get('remotes') | length) | list, shared.get('scan_w')) -%}
+  {%- set r = shared.get('remotes')[i] -%}
+  {%- if shared.get('classes')[i] == 'scan' -%}
+    {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5], [39, 21, 20, 12, 8]) -%}
+  {%- else -%}
+    {%- set k = module.rand.weighted_choice([1, 2], [65, 35]) -%}
+  {%- endif -%}
+  {%- set last = probe(r, pick_ports(k).split(',') | map('int') | list, false) -%}
+{%- endif -%}
+{%- if module.rand.chance(0.0035 * load) -%}
+  {#- A remote user opens the SSL VPN portal or tunnel. -#}
+  {%- set r = module.rand.weighted_choice(shared.get('remotes'), shared.get('vpn_w')) -%}
+  {%- do q.append({'due': now, 'kind': 'vpn_allow', 's': {'src': r, 'episode': false,
+      'burst': module.rand.weighted_choice([0, 1, 2], [60, 28, 12])}}) -%}
+{%- endif -%}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, never catching up. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set pool = namespace(r=[], w=[]) -%}
+    {%- for ip in shared.get('remotes') -%}
+      {%- if ip != shared.get('last_actor') and shared.get('classes')[loop.index0] == 'scan' -%}
+        {%- do pool.r.append(ip) -%}{%- do pool.w.append(shared.get('scan_w')[loop.index0]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set r = module.rand.weighted_choice(pool.r, pool.w) -%}
+    {%- set k = module.rand.weighted_choice([3, 4, 5], [60, 28, 12]) -%}
+    {%- set last = probe(r, pick_ports(k).split(',') | map('int') | list, true) | int -%}
+    {%- do q.append({'due': last + gap(180, 0.8) | int, 'kind': 'vpn_allow',
+        's': {'src': r, 'episode': true,
+        'burst': module.rand.weighted_choice([0, 1, 2], [60, 28, 12])}}) -%}
+    {%- do shared.update({'start_at': none, 'last_actor': r,
+        'next_due': now + (interval * 3600) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due record, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+{%- set s = e.s -%}
+{%- set kind = e.kind -%}
+
+{#- Per external address: last denied time per port, pruned to the
+    chain window, so the state is bounded by addresses x ports. -#}
+{%- for k in hist | list -%}
+  {%- set ports = hist[k] -%}
+  {%- for p in ports | list -%}
+    {%- if ports[p] < now - window_s -%}{%- do ports.pop(p) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if not ports -%}{%- do hist.pop(k) -%}{%- endif -%}
+{%- endfor -%}
+
+{%- if kind == 'vpn_allow' and not s.episode
+    and hist.get(s.src, {}).values() | select('ge', now - window_s) | list | length >= 3 -%}
+  {#- Guard on the final chain step only. The rare ordinary portal
+      login of a scanning address within an hour of its own scan over
+      three or more ports keeps its time and address and becomes what
+      such an address otherwise sends: a SYN to the former portal port,
+      denied. Its follow-up connections are not made. -#}
+  {%- set kind = 'ext_deny' -%}
+  {%- set s = {'src': s.src, 'port': 9007, 'episode': false, 'tool': false} -%}
+{%- endif -%}
+{%- if kind == 'ext_deny' -%}
+  {%- do hist.setdefault(s.src, {}).update({s.port: now}) -%}
+{%- endif -%}
+{%- if kind == 'vpn_allow' and s.burst > 0 -%}
+  {%- do q.append({'due': now + gap(25, 1.0) | int, 'kind': 'vpn_allow',
+      's': {'src': s.src, 'episode': s.episode, 'burst': s.burst - 1}}) -%}
+{%- endif -%}
+
+{#- Traffic Monitor line. Field order follows the vendor examples. -#}
+{%- set stamp = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set host = hosts[s.src] -%}
+{%- set stack = stacks['scanner' if s.get('tool') else host.os] -%}
+{%- set ttl = stack[0] - host.hops -%}
+{%- set sport = module.rand.number.integer(1024, 65535) if s.get('tool')
+    else module.rand.number.integer(49152, 65535) -%}
+{%- set nat = none -%}
+{%- set flags = none -%}
+{%- set duration = none -%}
+{%- set counters = none -%}
+{%- if kind == 'out_allow' -%}
+  {%- set dst = s.dst -%}{%- set dport = 443 -%}{%- set proto = 'tcp' -%}
+  {%- set in_if = params.trusted_interface -%}{%- set out_if = params.external_interface -%}
+  {%- set action = 'Allow' -%}{%- set policy = 'Outgoing-00' -%}
+  {%- set rc = '100' -%}{%- set code = '3000-0148' -%}{%- set nat = fbx -%}
+  {%- set offset = stack[2] -%}
+  {%- set tcp_info = 'offset ' ~ offset ~ ' S ' ~ module.rand.number.integer(1, 4294967295)
+      ~ ' win ' ~ module.rand.choice(stack[1]) -%}
+  {%- set head = 'Allow ' ~ s.src ~ ' ' ~ dst ~ ' https/tcp ' ~ sport ~ ' 443 ' ~ in_if ~ ' ' ~ out_if
+      ~ ' Allowed ' ~ (20 + 4 * offset) ~ ' ' ~ ttl ~ ' (' ~ policy ~ ')' -%}
+  {%- set tail = ' proc_id="firewall" rc="100" src_ip_nat="' ~ nat ~ '" tcp_info="' ~ tcp_info
+      ~ '" msg_id="3000-0148"' -%}
+{%- elif kind == 'proxy_end' -%}
+  {%- set dst = s.dst -%}{%- set dport = 80 -%}{%- set proto = 'tcp' -%}
+  {%- set in_if = params.trusted_interface -%}{%- set out_if = params.external_interface -%}
+  {%- set action = 'Allow' -%}{%- set policy = 'HTTP-proxy-00' -%}
+  {%- set rc = '406' -%}{%- set code = '3000-0176' -%}{%- set nat = fbx -%}
+  {%- set duration = now - s.start -%}
+  {%- set rcvd_b = (module.rand.number.lognormal(module.math.log(6000), 1.6)) | int + 300 -%}
+  {%- set sent_b = (module.rand.number.lognormal(module.math.log(700), 0.7)) | int + 200 -%}
+  {%- set rcvd_p = (rcvd_b / module.rand.number.floating(1100, 1460)) | round(0, 'ceil') | int + 2 -%}
+  {%- set sent_p = [(sent_b / 536) | round(0, 'ceil') | int + 3, (rcvd_p / module.rand.number.floating(1.6, 2.2)) | int] | max -%}
+  {%- set sent_b = [sent_b, sent_p * 40] | max -%}
+  {%- set flags = module.rand.weighted_choice(['SDdF', 'SD'], [92, 8]) -%}
+  {%- set counters = [sent_p, rcvd_p, sent_b, rcvd_b] -%}
+  {%- set head = 'Allow ' ~ s.src ~ ' ' ~ dst ~ ' http/tcp ' ~ sport ~ ' 80 ' ~ in_if ~ ' ' ~ out_if
+      ~ ' Allowed (' ~ policy ~ ')' -%}
+  {%- set tail = ' proc_id="firewall" rc="406" msg_id="3000-0176" src_ip_nat="' ~ nat
+      ~ '" flags="' ~ flags ~ '" duration="' ~ duration ~ '" sent_pkts="' ~ sent_p
+      ~ '" rcvd_pkts="' ~ rcvd_p ~ '" sent_bytes="' ~ sent_b ~ '" rcvd_bytes="' ~ rcvd_b ~ '"' -%}
 {%- elif kind == 'ping_deny' -%}
-  {%- set source_ip = module.rand.choice(['10.0.1.131', '10.0.1.132']) -%}
-  {%- set dest_ip = '10.0.1.1' -%}
-  {%- set source_port = none -%}
-  {%- set dest_port = none -%}
-  {%- set action = 'Deny' -%}
-  {%- set code = '3000-0148' -%}
-  {%- set transport = 'icmp' -%}
-  {%- set policy = 'Ping-00' -%}
-  {%- set raw = stamp ~ ' Deny ' ~ source_ip ~ ' ' ~ dest_ip
-    ~ ' echo-request/icmp Trusted Firebox Denied 84 64 (' ~ policy ~ ')'
-    ~ ' proc_id="firewall" rc="101" msg_id="3000-0148"'
-    ~ ' type="8" duration="0" sent_pkts="1" rcvd_pkts="0"'
-    ~ ' sent_bytes="84" rcvd_bytes="0"' -%}
+  {%- set dst = params.firebox_trusted_ip -%}{%- set dport = none -%}{%- set sport = none -%}
+  {%- set proto = 'icmp' -%}
+  {%- set in_if = params.trusted_interface -%}{%- set out_if = 'Firebox' -%}
+  {%- set action = 'Deny' -%}{%- set policy = 'Ping-00' -%}
+  {%- set rc = '101' -%}{%- set code = '3000-0148' -%}
+  {%- set plen = 60 if host.os == 'windows' else 84 -%}
+  {%- set duration = 0 -%}
+  {%- set counters = [1, 0, plen, 0] -%}
+  {%- set head = 'Deny ' ~ s.src ~ ' ' ~ dst ~ ' echo-request/icmp ' ~ in_if ~ ' Firebox Denied '
+      ~ plen ~ ' ' ~ ttl ~ ' (' ~ policy ~ ')' -%}
+  {%- set tail = ' proc_id="firewall" rc="101" msg_id="3000-0148" type="8" duration="0"'
+      ~ ' sent_pkts="1" rcvd_pkts="0" sent_bytes="' ~ plen ~ '" rcvd_bytes="0"' -%}
 {%- else -%}
-  {%- set source_ip = params.vpn_source_ip -%}
-  {%- set dest_ip = params.vpn_firebox_ip -%}
-  {%- set source_port = 31069 + (tick - params.anomaly_interval_events) -%}
-  {%- set dest_port = params.vpn_port -%}
-  {%- set action = 'Deny' -%}
-  {%- set code = '3000-0148' -%}
-  {%- set transport = 'tcp' -%}
-  {%- set policy = 'Unhandled External Packet-00' -%}
-  {%- set raw = stamp ~ ' Deny ' ~ source_ip ~ ' ' ~ dest_ip
-    ~ ' ' ~ dest_port ~ '/tcp ' ~ source_port ~ ' ' ~ dest_port
-    ~ ' External1 Firebox Denied 52 51 (' ~ policy ~ ')'
-    ~ ' proc_id="firewall" rc="101" msg_id="3000-0148"'
-    ~ ' tcp_info="offset 8 S 2192251295 win 65535"' -%}
+  {%- set dst = fbx -%}{%- set proto = 'tcp' -%}
+  {%- set in_if = params.external_interface -%}{%- set out_if = 'Firebox' -%}
+  {%- set offset = stack[2] -%}
+  {%- set tcp_info = 'offset ' ~ offset ~ ' S ' ~ module.rand.number.integer(1, 4294967295)
+      ~ ' win ' ~ module.rand.choice(stack[1]) -%}
+  {%- if kind == 'vpn_allow' -%}
+    {%- set dport = 443 -%}{%- set action = 'Allow' -%}{%- set policy = 'WatchGuard SSLVPN-00' -%}
+    {%- set rc = '100' -%}{%- set code = '3000-0148' -%}
+    {%- set head = 'Allow ' ~ s.src ~ ' ' ~ dst ~ ' https/tcp ' ~ sport ~ ' 443 ' ~ in_if ~ ' Firebox'
+        ~ ' Allowed ' ~ (20 + 4 * offset) ~ ' ' ~ ttl ~ ' (' ~ policy ~ ')' -%}
+    {%- set tail = ' proc_id="firewall" rc="100" tcp_info="' ~ tcp_info ~ '" msg_id="3000-0148"' -%}
+  {%- else -%}
+    {%- set dport = s.port -%}{%- set action = 'Deny' -%}{%- set policy = 'Unhandled External Packet-00' -%}
+    {%- set rc = '101' -%}{%- set code = '3000-0148' -%}
+    {%- set head = 'Deny ' ~ s.src ~ ' ' ~ dst ~ ' ' ~ services.get(dport, dport | string) ~ '/tcp '
+        ~ sport ~ ' ' ~ dport ~ ' ' ~ in_if ~ ' Firebox Denied ' ~ (20 + 4 * offset) ~ ' ' ~ ttl
+        ~ ' (' ~ policy ~ ')' -%}
+    {%- set tail = ' proc_id="firewall" rc="101" msg_id="3000-0148" tcp_info="' ~ tcp_info ~ '"' -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set source_obj = {'ip': source_ip} -%}
-{%- set destination_obj = {'ip': dest_ip} -%}
-{%- if source_port is not none -%}
-  {%- do source_obj.update({'port': source_port}) -%}
+{%- set raw = stamp.strftime('%Y-%m-%d %H:%M:%S') ~ ' ' ~ head ~ tail -%}
+
+{#- ECS document. -#}
+{%- set event = {'kind': 'event', 'dataset': 'watchguard.firebox.traffic',
+  'category': ['network'], 'type': ['connection', 'allowed' if action == 'Allow' else 'denied']
+  if kind != 'proxy_end' else ['connection', 'end', 'allowed'],
+  'action': 'traffic_' ~ action | lower, 'code': code, 'original': raw} -%}
+{%- if duration is not none -%}{%- do event.update({'duration': duration * 1000000000}) -%}{%- endif -%}
+{%- set source = {'ip': s.src} -%}
+{%- set destination = {'ip': dst} -%}
+{%- if sport is not none -%}{%- do source.update({'port': sport}) -%}{%- endif -%}
+{%- if dport is not none -%}{%- do destination.update({'port': dport}) -%}{%- endif -%}
+{%- set related = [s.src, dst] -%}
+{%- if nat -%}
+  {%- do source.update({'nat': {'ip': nat}}) -%}
+  {%- do related.append(nat) -%}
 {%- endif -%}
-{%- if dest_port is not none -%}
-  {%- do destination_obj.update({'port': dest_port}) -%}
+{%- set network = {'transport': proto} -%}
+{%- if counters -%}
+  {%- do source.update({'packets': counters[0], 'bytes': counters[2]}) -%}
+  {%- do destination.update({'packets': counters[1], 'bytes': counters[3]}) -%}
+  {%- do network.update({'packets': counters[0] + counters[1], 'bytes': counters[2] + counters[3]}) -%}
 {%- endif -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
-  'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'dataset': 'watchguard.firebox.traffic',
-    'category': ['network'], 'type': ['allowed' if action == 'Allow' else 'denied'],
-    'action': 'traffic_' ~ action.lower(), 'code': code, 'original': raw},
-  'observer': {'name': params.device_name, 'vendor': 'WatchGuard', 'product': 'Firebox'},
-  'source': source_obj, 'destination': destination_obj,
-  'network': {'transport': transport},
-  'rule': {'name': policy},
-  'related': {'ip': [source_ip, dest_ip]},
-  'watchguard': {'firebox': {'reason': policy, 'return_code': '406' if action == 'Allow' else '101'}}} -%}
+{%- set wg = {'disposition': action, 'process': 'firewall', 'return_code': rc,
+  'src_interface': in_if, 'dst_interface': out_if} -%}
+{%- if flags -%}{%- do wg.update({'flags': flags}) -%}{%- endif -%}
+{%- set record = {'@timestamp': stamp.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': event,
+  'observer': {'name': params.device_name, 'vendor': 'WatchGuard', 'product': 'Firebox',
+    'type': 'firewall', 'ingress': {'interface': {'name': in_if}},
+    'egress': {'interface': {'name': out_if}}},
+  'source': source, 'destination': destination, 'network': network,
+  'rule': {'name': policy}, 'related': {'ip': related | unique | list},
+  'watchguard': {'firebox': wg}} -%}
 {{ record | tojson }}
