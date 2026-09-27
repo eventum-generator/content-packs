@@ -49,35 +49,44 @@ append_output:
       - fd.typechar
 ```
 
-Standard rule output supplies the remaining fields, including shell `exe_flags`, sensitive-read ancestor names, and API connection/port/protocol fields. `proc.pid` and `proc.ppid` are host PIDs, not invented Kubernetes user identities. `proc.pid.ts`/`proc.ppid.ts` are integer epoch nanoseconds. Read alerts represent successful read-mode opens of `/etc/shadow` with a nonnegative real FD. API alerts represent `connect` attempts to the DNS-identified API service; they do not establish HTTP success, token authorization, transferred data or compromise.
+Standard rule output supplies the remaining fields, including shell `exe_flags`, sensitive-read ancestor names, and API connection/port/protocol fields. `proc.pid` and `proc.ppid` are host PIDs, not invented Kubernetes user identities. `proc.pid.ts`/`proc.ppid.ts` are integer epoch nanoseconds. Read alerts represent successful read-mode opens of `/etc/shadow` with a nonnegative real FD. API alerts represent `connect` attempts to the DNS-identified API service by curl (`/version` or API discovery `/api`) from a session shell or from the application entrypoint `sh`; they do not establish HTTP success, token authorization, transferred data or compromise.
 
 Complete older native JSON examples exist for all three classes: maintained Elastic 2024 fixtures and Falco's official 2021 API example. The current tagged rules/engine/field sources specify the selected output. **BLOCKED_RAW_EVIDENCE:** exact Falco 0.45.0/rules 5.2.0 full native records with this `append_output`, a coherent full process trace and a live parser run were not obtained. Older records are format evidence, not current-version capture parity. Synthetic runtime topology, process creation/exit, command selection and traffic distribution are modeling assumptions.
 
 ## Event Types
 
-| Native rule | Syscall / condition | Priority | Ordinary selection | ECS category/type |
-|---|---|---|---|---|
-| Terminal shell in container | `execve`, bash, nonzero tty, container-entrypoint parent | Notice | Weight6; also emitted when the current shell expires | process/start |
-| Read sensitive file untrusted | `openat`, read mode, valid FD, nontrusted Python | Warning | Weight3 | file/access |
-| Contact K8S API Server From Container | `connect`, IPv4, API DNS name, nonallowlisted container | Notice | Weight1; every sixth eligible pod visit requests this class | network/connection |
+Shares are measured on the final default `anomaly_mode: true` run (4 days, 5866 alerts, 4 episodes).
 
-One selected alert is emitted per minute, with 0..999 ms source jitter. An ordinary pod is eligible at most once per 10 minutes. Shell lifetime and eligibility override the weights, so they are not output percentages. The reviewed default on run produced 3771 shell, 408 read and 402 API alerts in 4581 rows. All three classes, both command variants, all 50 containers and their common root actors occur in ordinary activity in both modes. These are background **alerts**, including permitted maintenance that triggers the selected rules.
+| Native rule | Syscall / condition | Priority | Origin | Share | ECS category/type |
+|---|---|---|---|---:|---|
+| Terminal shell in container | `execve`, bash, nonzero tty, `containerd-shim` exec-point parent | Notice | Interactive exec session start | 14.7% | process/start |
+| Read sensitive file untrusted | `openat`, read mode, valid FD, nontrusted Python | Warning | Child of a session shell | 35.3% | file/access |
+| Contact K8S API Server From Container | `connect`, IPv4, API DNS name, nonallowlisted container | Notice | Child of a session shell (`/version` 27.2%, `/api` 2.8%) | 30.0% | network/connection |
+| Contact K8S API Server From Container | same | Notice | Application entrypoint `sh`, tty 0 (`/version` 12.5%, `/api` 7.5%) | 20.0% | network/connection |
 
-Native `event.original` is a complete JSON object with UTC/nanosecond time, the exact tagged standard output plus selected suffix, lexicographically sorted tags/keys, and unchanged native field types. The outer event follows the pinned Elastic Falco integration's relevant ECS mappings with field preservation. Native event-time nanoseconds become normalized milliseconds. Native process-start nanoseconds are preserved, while outer ECS `process.start`/`process.parent.start` are explicitly converted to UTC ISO dates instead of copying ns directly into date fields. This is a documented normalization correction, not exact pipeline-output parity. The normalized fields omit the ancestor-name/exec-flag keys unconditionally removed by that pipeline; the complete native fields remain in `event.original`. Agent/host/ingest/file metadata, including `event.agent_id_status: verified`, are explicitly supplied synthetic collector context. That status does not demonstrate live collector verification. Whole UTF-8 lines accumulate separately for each sensor; rotation resets the next complete line to offset 0 at 100 MiB. No source sequence or outcome is invented.
+Background is stochastic and independent per pod. Each of the 50 pods has its own activity weight and runs its own interactive exec-session process with lognormal gaps (about 180 sessions/day in total). A session raises the shell alert, then its bash children raise shadow reads (55%) and API contacts (45%) at lognormal gaps until the session ends (lognormal duration, median 10 min). Several sessions of one pod may overlap. Independently, every pod's application entrypoint contacts the API server (about 240 contacts/day in total). Both follow one UTC hour-of-day profile: working hours, nights at 10-22%, weekends at 35%. Rows carry their own microsecond event time plus a random nanosecond remainder.
+
+Ordinary traffic in both modes therefore contains repeated alerts of one pod within minutes, shell -> read and shell -> API lineage pairs, read -> API pairs of the same shell, and pod-level shell -> read -> API triples. These are background **alerts**, including permitted maintenance that triggers the selected rules.
+
+Native `event.original` is a complete JSON object with UTC/nanosecond time, the exact tagged standard output plus selected suffix, lexicographically sorted tags/keys, and unchanged native field types. The outer event follows the pinned Elastic Falco integration's relevant ECS mappings with field preservation. Native event-time nanoseconds become normalized milliseconds. Native process-start nanoseconds are preserved, while outer ECS `process.start`/`process.parent.start` are explicitly converted to UTC ISO dates instead of copying ns directly into date fields. This is a documented normalization correction, not exact pipeline-output parity. The normalized fields omit the ancestor-name/exec-flag keys unconditionally removed by that pipeline; the complete native fields remain in `event.original`. Agent/host/ingest/file metadata, including `event.agent_id_status: verified`, are explicitly supplied synthetic collector context. That status does not demonstrate live collector verification. `event.ingested` trails the alert by a lognormal pipeline delay (median 1.8 s). Whole UTF-8 lines accumulate separately for each sensor; rotation resets the next complete line to offset 0 at 100 MiB. No source sequence or outcome is invented.
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`. Every 12 hours, after the selected target is eligible, one container emits:
+`anomaly_mode` defaults to `true`; `false` emits the same background only, with no complete chain. One episode, all in one container:
 
-1. A new interactive bash shell with native PID/start and a permitted `containerd-shim` parent.
-2. After 60 seconds, a new Python child of that observed shell opens `/etc/shadow` for reading.
-3. After another 60 seconds, a new curl child of the same shell attempts a connection to the Kubernetes API service.
+1. A new interactive bash shell (`Terminal shell in container`) with a new host PID, the pod's `containerd-shim` parent and a terminal.
+2. A Python child of that shell opens `/etc/shadow` for reading (`Read sensitive file untrusted`).
+3. A curl child of the same shell queries API discovery `https://kubernetes.default.svc.cluster.local/api` (`Contact K8S API Server From Container`).
 
-Join by sensor/container/pod, `proc.ppid`→the observed shell's `proc.pid`, matching `proc.ppid.ts`→`proc.pid.ts`, and the inherited tty. A complete episode spans 120 seconds. Detection can correlate interactive entry, sensitive-file access and unexpected API contact inside that window. It does not identify the Kubernetes user who invoked exec.
+Linking fields: `container.id` (same pod and sensor), step 2/3 `proc.ppid` = step 1 `proc.pid`, `proc.ppid.ts` = step 1 `proc.pid.ts`, and the inherited `proc.tty`. Step gaps use the background child-gap distributions, conditioned on the whole chain fitting inside 280 s; the detection window is 300 s from the shell.
 
-Targets rotate by 11 slots over the 50-container inventory. Shell/child PIDs are newly allocated per sensor and command variants/tty/ephemeral ports vary from the same pools used by ordinary alerts. The next due time is measured from the actual first shell, with no catch-up bursts. Minute ticks and the target's 10 minute cooldown can postpone an episode by up to about 11 minutes. `anomaly_mode: false` retains all constituent rules/signatures but its per-pod cooldown prevents a complete short-window chain.
+**Recurrence.** The first episode starts at a point of the first min(interval, 24 h) of the run, drawn from the background hour-of-day/weekday profile. Each next one is due `anomaly_interval_hours` after the actual start of the previous one, with no catch-up; its start is drawn from the window [due - w/2, due + w/2], w = min(interval / 4, 6 h), weighted by the squared session profile plus a 0.02 floor. While no pod qualifies (see below), a start is postponed in random 1-30 min steps; this happens only in the first hours of a run. In a 36-day default run (36 episodes, gaps 21.2-26.7 h), episode starts fell 0% / 22% / 69% / 8% into 00-06 / 06-12 / 12-18 / 18-24 UTC against 5.5% / 35% / 46% / 14% of background shells; 31% fell on weekends against 13% of shells, because a daily interval cannot skip a weekend day. A start drawn into the night stays near night hours for several days, where the profile is nearly flat: the final 4-day default run began at 01:51 and all four of its episodes started between 01:00 and 06:00.
 
-The source is a selected-alert subset: existing ordinary terminal parents may predate the finite capture, and Python/curl creation plus all process exits are unlogged. A current shell remains live for at most 30 minutes; replacing it models its prior unlogged exit. Persistent shim contexts are exec-point parents, not a claim that every shell is the container init process. No container recreation or exit alert is fabricated. State is bounded by 50 inventory/shell/cooldown/visit slots, five PID counters/collector offsets, one pending three-record trace and scalar cursors. PID allocation skips live parent contexts; it uses the same 100000..2000000 range in both modes.
+**Variation.** The pod is drawn by the background session weights and never repeats the previous episode's pod. It must already have shown, in its own background, a terminal, both shell and read commands and an `/api` query; the episode reuses a tty, shell command and read command from that history, so every pod|value pair of the chain also occurs in ordinary traffic. PIDs, process start offsets, FDs, ports and gaps are drawn from the same pools as background.
+
+**Background guard.** A session child's API query that follows a shadow-read child of the same shell at most 300 s after that shell queries `/version`; from 300 s on it queries `/api` at the ordinary 12%. The guard keeps event times, pod and lineage and changes only that final step's queried path, so the ordered shell -> read -> `/api` lineage within 300 s is the only episode-only pattern. In the 36-day default run the `/api` share of such queries by shell age was 0.000 up to 300 s, then 0.125 / 0.122 / 0.124 / 0.115 / 0.132 for 300-450 / 450-600 / 600-900 / 900-1200 / 1200-1800 s.
+
+**Detection idea.** Correlate per container: a terminal shell, then a sensitive-file read by its child, then API discovery by a child of the same shell, within 5 minutes. It does not identify the Kubernetes user who invoked exec.
 
 ## Reference Field Coverage
 
@@ -107,15 +116,15 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `anomaly_mode` | `true` | Enable periodic complete episodes; false retains ordinary alerts |
-| `anomaly_interval_hours` | `12` | Finite interval in hours, minimum 1; smaller values clamp to 1 |
+| `anomaly_mode` | `true` | Enable recurring complete episodes; `false` keeps background alerts only |
+| `anomaly_interval_hours` | `24` | Hours between episode due times, 1 to 8760; other values fail validation |
 | `api_server_ip` | `10.96.0.1` | IPv4 address of the selected API DNS service, used in both modes |
 | `agent_version` | `8.13.3` | Synthetic Elastic Agent version |
 | `ecs_version` | `8.17.0` | ECS version |
 | `data_stream_namespace` | `lab-k8s` | Data-stream namespace |
 | `log_path` | `/var/log/falco/events.log` | Synthetic collector source-file path |
 
-The persistent50-container/five-node inventory is in `samples/pods.csv`. Keep exactly 50 rows, IPv4 pod/service addresses and distinct sensor/container contexts when editing it.
+The persistent 50-container/five-node inventory is in `samples/pods.csv`. Keep IPv4 pod addresses and distinct sensor/container contexts when editing it. Session and entrypoint rates, the hour-of-day profile and the 300 s detection window are template constants.
 
 ### Output Parameters
 
@@ -123,223 +132,35 @@ The shipped configuration writes JSON lines to `output/events.json` and needs no
 
 ## Usage
 
-From the content-packs repository, run live generation:
+Live generation:
 
 ```bash
-flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/security-falco/generator.yml --id falco --live-mode true --keep-order true
+eventum generate --path generators/security-falco/generator.yml --id falco --live-mode true --keep-order true
 ```
 
-For a finite batch, copy `generator.yml` beside the original as `finite.yml`, set `input[0].cron.start` to `2026-09-01T00:00:00+03:00` and `end` to `2026-09-02T00:20:00+03:00`, then run:
+For a finite batch, add `start: "2026-09-14T00:00:00Z"` and `end: "2026-09-18T00:00:00Z"` under `input[0].cron` in a copy of `generator.yml` beside the original, then run:
 
 ```bash
-flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/security-falco/finite.yml --id falco-batch --live-mode false --keep-order true
+eventum generate --path generators/security-falco/finite.yml --id falco-batch --live-mode false --keep-order true
 ```
 
-This 24h20 window contains 1461 input ticks and two complete default episodes, allowing cooldown postponement. Source output is UTC even when the input bounds have another offset. Set `anomaly_mode: false` in the copy for ordinary alerts only. Hour/day scheduling is source-time simulation in batch mode; the batch does not wait 24 hours. Keep `--keep-order true` for this stateful chronological output; the asynchronous writer otherwise may emit batches in completion order.
+Four days of source time produce about 6000 alerts and four default episodes. Set `anomaly_mode: false` in the copy for background only. Keep `--keep-order true`: output is stateful and chronological.
+
+## Limitations
+
+- Source evidence: exact Falco 0.45.0/rules 5.2.0 native records with this `append_output`, a coherent full process trace and a live parser run were not obtained (see Source Profile).
+- Only three rules are modeled; process exits, container lifecycle and all other rules are absent. Python/curl children and entrypoint `sh` are the only non-shell processes.
+- Rates, the hour-of-day profile, session shapes and the `/version`/`/api` mix are modeling assumptions, not measured cluster statistics.
+- At the start of a run the first episode may wait until some pod has background history for every chain value.
+- Episode hours follow the squared session profile, which favors peak hours more than background does; a daily interval cannot thin weekends, and a start drawn into the night can stay near night hours for several days (see Recurrence).
+- The episode pod is weighted like background sessions but restricted to pods with that history, which slightly favors active pods.
 
 ## Sample Output
 
-Complete synthetic event copied from the reviewed default run, row 723. It is not a captured vendor record:
+The final step of the first episode from the final default run (row 36), byte-exact. It is synthetic, not a captured vendor record:
 
 ```json
-{
-  "@timestamp": "2026-09-01T09:02:00.573+00:00",
-  "agent": {
-    "ephemeral_id": "ef48dd34-7392-4eea-a6c2-0db179650001",
-    "id": "ef48dd34-7392-4eea-a6c2-0db179650001",
-    "name": "elastic-agent-worker-01",
-    "type": "filebeat",
-    "version": "8.13.3"
-  },
-  "container": {
-    "id": "a4c8e0200001",
-    "name": "payments-app"
-  },
-  "data_stream": {
-    "dataset": "falco.alerts",
-    "namespace": "lab-k8s",
-    "type": "logs"
-  },
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "elastic_agent": {
-    "id": "ef48dd34-7392-4eea-a6c2-0db179650001",
-    "snapshot": false,
-    "version": "8.13.3"
-  },
-  "event": {
-    "agent_id_status": "verified",
-    "category": [
-      "file"
-    ],
-    "dataset": "falco.alerts",
-    "ingested": "2026-09-01T09:02:00.573+00:00",
-    "kind": "alert",
-    "original": "{\"hostname\":\"worker-01\",\"output\":\"2026-09-01T09:02:00.573000000+0000: Warning Sensitive file opened for reading by non-trusted program | file=/etc/shadow gparent=containerd-shim ggparent=containerd gggparent=systemd evt_type=openat user=root user_uid=0 user_loginuid=-1 process=python3 proc_exepath=/usr/bin/python3.10 parent=bash command=python3 /opt/maintenance/check_shadow.py terminal=34819 container_id=a4c8e0200001 container_name=payments-app\",\"output_fields\":{\"container.id\":\"a4c8e0200001\",\"container.image.repository\":\"registry.example.test/payments/app\",\"container.image.tag\":\"2.4.1\",\"container.name\":\"payments-app\",\"evt.category\":\"file\",\"evt.failed\":false,\"evt.is_open_read\":true,\"evt.rawres\":9,\"evt.time.iso8601\":1788253320573000000,\"evt.type\":\"openat\",\"fd.name\":\"/etc/shadow\",\"fd.num\":9,\"fd.type\":\"file\",\"fd.typechar\":\"f\",\"k8s.ns.name\":\"payments\",\"k8s.pod.name\":\"payments-app-7df86c5d4-01\",\"proc.aname[2]\":\"containerd-shim\",\"proc.aname[3]\":\"containerd\",\"proc.aname[4]\":\"systemd\",\"proc.cmdline\":\"python3 /opt/maintenance/check_shadow.py\",\"proc.exepath\":\"/usr/bin/python3.10\",\"proc.name\":\"python3\",\"proc.pid\":100480,\"proc.pid.ts\":1788253320553000000,\"proc.pname\":\"bash\",\"proc.ppid\":100479,\"proc.ppid.ts\":1788253260553000000,\"proc.tty\":34819,\"user.loginuid\":-1,\"user.name\":\"root\",\"user.uid\":0},\"priority\":\"Warning\",\"rule\":\"Read sensitive file untrusted\",\"source\":\"syscall\",\"tags\":[\"T1555\",\"container\",\"filesystem\",\"host\",\"maturity_stable\",\"mitre_credential_access\"],\"time\":\"2026-09-01T09:02:00.573000000Z\"}",
-    "provider": "syscall",
-    "severity": 47,
-    "timezone": "+00:00",
-    "type": [
-      "access"
-    ]
-  },
-  "falco": {
-    "hostname": "worker-01",
-    "output": "2026-09-01T09:02:00.573000000+0000: Warning Sensitive file opened for reading by non-trusted program | file=/etc/shadow gparent=containerd-shim ggparent=containerd gggparent=systemd evt_type=openat user=root user_uid=0 user_loginuid=-1 process=python3 proc_exepath=/usr/bin/python3.10 parent=bash command=python3 /opt/maintenance/check_shadow.py terminal=34819 container_id=a4c8e0200001 container_name=payments-app",
-    "output_fields": {
-      "container": {
-        "id": "a4c8e0200001",
-        "image": {
-          "repository": "registry.example.test/payments/app",
-          "tag": "2.4.1"
-        },
-        "name": "payments-app"
-      },
-      "evt": {
-        "category": "file",
-        "failed": false,
-        "is_open_read": true,
-        "rawres": 9,
-        "time": {
-          "iso8601": 1788253320573
-        },
-        "type": "openat"
-      },
-      "fd": {
-        "name": "/etc/shadow",
-        "num": 9,
-        "type": "file",
-        "typechar": "f"
-      },
-      "k8s": {
-        "ns": {
-          "name": "payments"
-        },
-        "pod": {
-          "name": "payments-app-7df86c5d4-01"
-        }
-      },
-      "proc": {
-        "cmdline": "python3 /opt/maintenance/check_shadow.py",
-        "exepath": "/usr/bin/python3.10",
-        "name": "python3",
-        "pid": {
-          "ts": 1788253320553000000
-        },
-        "pname": "bash",
-        "ppid": {
-          "ts": 1788253260553000000
-        },
-        "tty": 34819
-      },
-      "process": {
-        "parent": {
-          "pid": 100479
-        },
-        "pid": 100480
-      },
-      "user": {
-        "loginuid": -1,
-        "name": "root",
-        "uid": "0"
-      }
-    },
-    "priority": "Warning",
-    "rule": "Read sensitive file untrusted",
-    "source": "syscall",
-    "tags": [
-      "T1555",
-      "container",
-      "filesystem",
-      "host",
-      "maturity_stable",
-      "mitre_credential_access"
-    ],
-    "time": "2026-09-01T09:02:00.573000000Z"
-  },
-  "falco.container.mounts": null,
-  "file": {
-    "path": "/etc/shadow",
-    "type": "file"
-  },
-  "host": {
-    "architecture": "x86_64",
-    "containerized": true,
-    "hostname": "worker-01",
-    "id": "ef48dd34-7392-4eea-a6c2-0db179650001",
-    "ip": [
-      "10.20.0.11"
-    ],
-    "mac": [
-      "02-42-ac-14-00-01"
-    ],
-    "name": "worker-01",
-    "os": {
-      "codename": "jammy",
-      "family": "debian",
-      "kernel": "5.15.0-91-generic",
-      "name": "Ubuntu",
-      "platform": "ubuntu",
-      "type": "linux",
-      "version": "22.04"
-    }
-  },
-  "input": {
-    "type": "log"
-  },
-  "log": {
-    "file": {
-      "path": "/var/log/falco/events.log"
-    },
-    "offset": 171724
-  },
-  "message": "Read sensitive file untrusted",
-  "observer": {
-    "hostname": "worker-01",
-    "product": "falco",
-    "type": "sensor",
-    "vendor": "sysdig"
-  },
-  "orchestrator": {
-    "namespace": "payments",
-    "resource": {
-      "name": "payments-app-7df86c5d4-01",
-      "type": "pod"
-    }
-  },
-  "process": {
-    "command_line": "python3 /opt/maintenance/check_shadow.py",
-    "executable": "/usr/bin/python3.10",
-    "name": "python3",
-    "parent": {
-      "name": "bash",
-      "pid": 100479,
-      "start": "2026-09-01T09:01:00.553+00:00"
-    },
-    "pid": 100480,
-    "start": "2026-09-01T09:02:00.553+00:00",
-    "user": {
-      "id": "0",
-      "name": "root"
-    }
-  },
-  "related": {
-    "hosts": [
-      "worker-01"
-    ]
-  },
-  "rule": {
-    "name": "Read sensitive file untrusted"
-  },
-  "tags": [
-    "preserve_original_event",
-    "preserve_falco_fields"
-  ],
-  "threat.technique.id": [
-    "T1555"
-  ]
-}
+{"@timestamp": "2026-09-14T01:53:03.793+00:00", "agent": {"ephemeral_id": "ef48dd34-7392-4eea-a6c2-0db179650002", "id": "ef48dd34-7392-4eea-a6c2-0db179650002", "name": "elastic-agent-worker-02", "type": "filebeat", "version": "8.13.3"}, "container": {"id": "a4c8e0200020", "name": "inventory-app"}, "data_stream": {"dataset": "falco.alerts", "namespace": "lab-k8s", "type": "logs"}, "destination": {"address": "10.96.0.1", "ip": "10.96.0.1", "port": 443}, "ecs": {"version": "8.17.0"}, "elastic_agent": {"id": "ef48dd34-7392-4eea-a6c2-0db179650002", "snapshot": false, "version": "8.13.3"}, "event": {"agent_id_status": "verified", "category": ["network"], "dataset": "falco.alerts", "ingested": "2026-09-14T01:53:05.218+00:00", "kind": "alert", "original": "{\"hostname\":\"worker-02\",\"output\":\"2026-09-14T01:53:03.793525823+0000: Notice Unexpected connection to K8s API Server from container | connection=10.244.2.42:53399-\u003e10.96.0.1:443 lport=53399 rport=443 fd_type=ipv4 fd_proto=tcp evt_type=connect user=root user_uid=0 user_loginuid=-1 process=curl proc_exepath=/usr/bin/curl parent=bash command=curl -ks https://kubernetes.default.svc.cluster.local/api terminal=34816 container_id=a4c8e0200020 container_name=inventory-app\",\"output_fields\":{\"container.id\":\"a4c8e0200020\",\"container.image.repository\":\"registry.example.test/inventory/app\",\"container.image.tag\":\"2.4.1\",\"container.name\":\"inventory-app\",\"evt.category\":\"net\",\"evt.time.iso8601\":1789350783793525823,\"evt.type\":\"connect\",\"fd.l4proto\":\"tcp\",\"fd.lip\":\"10.244.2.42\",\"fd.lport\":53399,\"fd.name\":\"10.244.2.42:53399-\u003e10.96.0.1:443\",\"fd.rip\":\"10.96.0.1\",\"fd.rport\":443,\"fd.sip\":\"10.96.0.1\",\"fd.sip.name\":\"kubernetes.default.svc.cluster.local\",\"fd.type\":\"ipv4\",\"fd.typechar\":\"4\",\"k8s.ns.name\":\"inventory\",\"k8s.pod.name\":\"inventory-app-7df86c5d4-02\",\"proc.cmdline\":\"curl -ks https://kubernetes.default.svc.cluster.local/api\",\"proc.exepath\":\"/usr/bin/curl\",\"proc.name\":\"curl\",\"proc.pid\":132326,\"proc.pid.ts\":1789350783688301937,\"proc.pname\":\"bash\",\"proc.ppid\":132293,\"proc.ppid.ts\":1789350682519064431,\"proc.tty\":34816,\"user.loginuid\":-1,\"user.name\":\"root\",\"user.uid\":0},\"priority\":\"Notice\",\"rule\":\"Contact K8S API Server From Container\",\"source\":\"syscall\",\"tags\":[\"T1565\",\"container\",\"k8s\",\"maturity_stable\",\"mitre_discovery\",\"network\"],\"time\":\"2026-09-14T01:53:03.793525823Z\"}", "provider": "syscall", "severity": 47, "timezone": "+00:00", "type": ["connection"]}, "falco": {"hostname": "worker-02", "output": "2026-09-14T01:53:03.793525823+0000: Notice Unexpected connection to K8s API Server from container | connection=10.244.2.42:53399-\u003e10.96.0.1:443 lport=53399 rport=443 fd_type=ipv4 fd_proto=tcp evt_type=connect user=root user_uid=0 user_loginuid=-1 process=curl proc_exepath=/usr/bin/curl parent=bash command=curl -ks https://kubernetes.default.svc.cluster.local/api terminal=34816 container_id=a4c8e0200020 container_name=inventory-app", "output_fields": {"container": {"id": "a4c8e0200020", "image": {"repository": "registry.example.test/inventory/app", "tag": "2.4.1"}, "name": "inventory-app"}, "destination": {"ip": "10.96.0.1"}, "evt": {"category": "net", "time": {"iso8601": 1789350783793}, "type": "connect"}, "fd": {"l4proto": "tcp", "lport": 53399, "name": "10.244.2.42:53399-\u003e10.96.0.1:443", "rport": 443, "sip": {"name": "kubernetes.default.svc.cluster.local"}, "type": "ipv4", "typechar": "4"}, "k8s": {"ns": {"name": "inventory"}, "pod": {"name": "inventory-app-7df86c5d4-02"}}, "proc": {"cmdline": "curl -ks https://kubernetes.default.svc.cluster.local/api", "exepath": "/usr/bin/curl", "name": "curl", "pid": {"ts": 1789350783688301937}, "pname": "bash", "ppid": {"ts": 1789350682519064431}, "tty": 34816}, "process": {"parent": {"pid": 132293}, "pid": 132326}, "server": {"ip": "10.96.0.1"}, "source": {"ip": "10.244.2.42"}, "user": {"loginuid": -1, "name": "root", "uid": "0"}}, "priority": "Notice", "rule": "Contact K8S API Server From Container", "source": "syscall", "tags": ["T1565", "container", "k8s", "maturity_stable", "mitre_discovery", "network"], "time": "2026-09-14T01:53:03.793525823Z"}, "falco.container.mounts": null, "host": {"architecture": "x86_64", "containerized": true, "hostname": "worker-02", "id": "ef48dd34-7392-4eea-a6c2-0db179650002", "ip": ["10.20.0.12"], "mac": ["02-42-ac-14-00-02"], "name": "worker-02", "os": {"codename": "jammy", "family": "debian", "kernel": "5.15.0-91-generic", "name": "Ubuntu", "platform": "ubuntu", "type": "linux", "version": "22.04"}}, "input": {"type": "log"}, "log": {"file": {"path": "/var/log/falco/events.log"}, "offset": 24188}, "message": "Contact K8S API Server From Container", "observer": {"hostname": "worker-02", "product": "falco", "type": "sensor", "vendor": "sysdig"}, "orchestrator": {"namespace": "inventory", "resource": {"name": "inventory-app-7df86c5d4-02", "type": "pod"}}, "process": {"command_line": "curl -ks https://kubernetes.default.svc.cluster.local/api", "executable": "/usr/bin/curl", "name": "curl", "parent": {"name": "bash", "pid": 132293, "start": "2026-09-14T01:51:22.519+00:00"}, "pid": 132326, "start": "2026-09-14T01:53:03.688+00:00", "user": {"id": "0", "name": "root"}}, "related": {"hosts": ["worker-02"]}, "rule": {"name": "Contact K8S API Server From Container"}, "server": {"address": "10.96.0.1", "domain": "kubernetes.default.svc.cluster.local", "ip": "10.96.0.1"}, "source": {"address": "10.244.2.42", "ip": "10.244.2.42", "port": 53399}, "tags": ["preserve_original_event", "preserve_falco_fields"], "threat.technique.id": ["T1565"]}
 ```
 
 ## References
