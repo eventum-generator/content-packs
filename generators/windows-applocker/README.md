@@ -8,7 +8,9 @@ and installers under an enforced AppLocker policy: signed binaries in
 (8002/8005), while executables and scripts launched from user-writable
 folders (`Downloads`, `Desktop`, `%TEMP%`, roaming profiles) are blocked
 (8004/8007). Three hosts run the policy in Audit-only mode for scripts, so
-their would-be blocks surface as 8006 instead.
+their would-be blocks surface as 8006 instead. Two administrators
+(`adm.tkachenko`, `adm.lindqvist`) log on to random hosts for short visits;
+the default admin rules allow what they launch from user folders.
 
 ## Run
 
