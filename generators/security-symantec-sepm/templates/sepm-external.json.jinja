@@ -1,48 +1,300 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
-{%- if chain -%}
-  {%- set kind = ['admin_login', 'policy_edit', 'policy_edit', 'client_policy_download'][step] -%}
-  {%- set admin = params.target_admin -%}
-  {%- set policy = params.target_policy -%}
-  {%- set client = params.target_client -%}
-{%- else -%}
-  {%- set kind = module.rand.weighted_choice(['admin_login', 'policy_add', 'client_policy_download'], [15, 10, 75]) -%}
-  {%- set admin = module.rand.choice(['admin-one', 'admin-two']) -%}
-  {%- set policy = module.rand.choice(['Workstation AV Policy', 'Server AV Policy']) -%}
-  {%- set client = module.rand.choice(['ws-office-01.example.test', 'ws-office-02.example.test', 'srv-web-01.example.test']) -%}
+{#- Symantec Endpoint Protection Manager 14.3 external-log payloads
+    (Administrative, Policy and Agent Activity logs, labelled comma-
+    delimited layout) wrapped in ECS JSON like the Elastic
+    symantec_endpoint integration output. One input tick per second;
+    each tick emits the earliest due record, stamped with its own
+    millisecond time, or drops. Every administrator runs an independent
+    random schedule of console sessions; every client an independent
+    schedule of log uploads; policy edits make the clients of the
+    assigned groups download the policy. Durations are milliseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
+{%- set guard_ms = 7260000 -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, upper tail redrawn; returns ms. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- ([ns.v, hi] | min) * 1000 -}}
+{%- endmacro -%}
+{%- macro ms(v) -%}{{- module.builtins.int(v | float) -}}{%- endmacro -%}
+{%- macro absence(med_h) -%}{{- d(0, med_h * 3600, 1.0, med_h * 3600 * 25) -}}{%- endmacro -%}
+{%- macro retry_gap() -%}{{- d(2, 9, 0.8, 900) -}}{%- endmacro -%}
+{%- macro op_gap() -%}{{- d(5, 75, 1.0, 1200) -}}{%- endmacro -%}
+{%- macro log_gap(med_min) -%}{{- d(20, med_min * 60, 0.9, 43200) -}}{%- endmacro -%}
+{%- macro au_gap() -%}{{- d(0, 108000, 1.0, 1728000) -}}{%- endmacro -%}
+{%- if shared.get('admins') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'site_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[^,\r\n]{1,64}$'}},
+    'server_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$'}},
+    'sepm_domain': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[^,\r\n]{1,64}$'}},
+    'machine_domain': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set admins = [] -%}
+  {%- for row in samples.admins -%}
+    {%- do admins.append({'user': row.user, 'med': row.median_hours, 'stage': 'idle', 'ops': [], 'episode': false, 'resume': none, 'last_policy': none, 'hist': [], 'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (absence(row.median_hours) | float))}) -%}
+  {%- endfor -%}
+  {%- set clients = [] -%}
+  {%- for row in samples.clients -%}
+    {%- set med_min = module.rand.number.floating(20, 80) -%}
+    {%- do clients.append({'host': row.host, 'user': row.user, 'group': row.group, 'med': med_min, 'log': now + module.builtins.int(module.rand.number.floating(0, 1) * (log_gap(med_min) | float)), 'au': now + module.builtins.int(module.rand.number.floating(0, 1) * (au_gap() | float)), 'dl': none}) -%}
+  {%- endfor -%}
+  {%- set policies = [] -%}
+  {%- for row in samples.policies -%}
+    {%- do policies.append({'name': row.name, 'type': row.type, 'groups': row.groups | list, 'weight': row.weight}) -%}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+  {%- set delay_max = [14400000, interval / 6] | min -%}
+  {%- do shared.update({'admins': admins, 'clients': clients, 'policies': policies, 'groups_added': [], 'last_ms': now - 1, 'next_due': now, 'ep_active': false, 'ep_last_admin': none, 'ep_last_policy': none, 'ep_start': now + module.builtins.int(module.rand.number.floating(0, delay_max))}) -%}
 {%- endif -%}
-{%- if kind == 'admin_login' -%}
-  {%- set description = 'Administrator log on succeeded' -%}
-  {%- set dataset = 'symantec.sepm_administrative' -%}
-  {%- set fields = [params.site_name, params.server_name, params.sepm_domain, admin, description] -%}
-  {%- set category = 'authentication' -%}
-  {%- set type = 'start' -%}
-{%- elif kind in ['policy_edit', 'policy_add'] -%}
-  {%- set description = '2:The policy was edited' if kind == 'policy_edit' else '0:The policy was added' -%}
-  {%- set dataset = 'symantec.sepm_policy' -%}
-  {%- set fields = [params.site_name, params.server_name, params.sepm_domain, admin, description, policy] -%}
-  {%- set category = 'configuration' -%}
-  {%- set type = 'change' if kind == 'policy_edit' else 'creation' -%}
-{%- else -%}
-  {%- set description = 'The client has downloaded the policy successfully' -%}
-  {%- set dataset = 'symantec.sepm_agent_activity' -%}
-  {%- set fields = [params.site_name, params.server_name, params.sepm_domain, description, client, 'user1', 'EXAMPLE'] -%}
-  {%- set category = 'configuration' -%}
-  {%- set type = 'info' -%}
+{%- set admins = shared.get('admins') -%}
+{%- set clients = shared.get('clients') -%}
+{%- set policies = shared.get('policies') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+{%- set delay_max = [14400000, interval / 6] | min -%}
+{%- set pweights = policies | map(attribute='weight') | list -%}
+{%- macro pick_op(exclude) -%}
+  {#- One console operation: a shared-policy edit (policy index) or a
+      group creation ('g'). -#}
+  {%- if module.rand.chance(0.07) -%}
+    {{- 'g' -}}
+  {%- else -%}
+    {%- set ids = [] -%}{%- set ws = [] -%}
+    {%- for p in policies -%}
+      {%- if loop.index0 != exclude -%}{%- do ids.append(loop.index0) -%}{%- do ws.append(p.weight) -%}{%- endif -%}
+    {%- endfor -%}
+    {{- module.rand.weighted_choice(ids, ws) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro completes(a, pi, t) -%}
+  {#- True when this administrator's recent history holds two failed
+      log-ons, a successful one and an edit of policy pi in that order,
+      all within the chain window (2 h plus 1 min) before t, so editing
+      pi again now would complete the anomaly sequence. -#}
+  {%- set ns = namespace(step=0) -%}
+  {%- for h in a.hist if t - h[0] <= guard_ms -%}
+    {%- if ns.step < 2 and h[1] == 'fail' -%}{%- set ns.step = ns.step + 1 -%}
+    {%- elif ns.step == 2 and h[1] == 'ok' -%}{%- set ns.step = 3 -%}
+    {%- elif ns.step == 3 and h[1] == 'edit' and h[2] == pi -%}{%- set ns.step = 4 -%}{%- endif -%}
+  {%- endfor -%}
+  {{- 'y' if ns.step == 4 else '' -}}
+{%- endmacro -%}
+{#- Episode start: the first tick at or after due with an administrator
+    out of session (weighted by own session rate, not the previous
+    episode's, no own session due within 2 h). The episode is an extra
+    session; the administrator's own schedule resumes unchanged. The next
+    due is one interval plus a random delay after this start. -#}
+{%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') -%}
+  {%- set ca = [] -%}
+  {%- for a in admins -%}
+    {%- if a.stage == 'idle' and loop.index0 != shared.get('ep_last_admin') and a.due > now + 7200000 -%}{%- do ca.append(loop.index0) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if ca -%}
+    {%- set cw = [] -%}
+    {%- for i in ca -%}{%- do cw.append(1.0 / admins[i].med) -%}{%- endfor -%}
+    {%- set ai = module.rand.weighted_choice(ca, cw) -%}
+    {%- set pc = [] -%}{%- set pw = [] -%}
+    {%- for p in policies -%}
+      {%- if loop.index0 != shared.get('ep_last_policy') -%}{%- do pc.append(loop.index0) -%}{%- do pw.append(p.weight) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set pi = module.rand.weighted_choice(pc, pw) -%}
+    {%- set a = admins[ai] -%}
+    {%- set start = now + module.rand.number.integer(0, 999) -%}
+    {#- Log-on attempts as in an ordinary session, but at least two fail;
+        the first operation edits the policy and, after 0-2 other
+        operations, the policy is edited again (the change reverted). -#}
+    {%- set fails = namespace(n=2, go=true) -%}
+    {%- for _ in range(5) if fails.go -%}
+      {%- if module.rand.chance(0.45) -%}{%- set fails.n = fails.n + 1 -%}{%- else -%}{%- set fails.go = false -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set ops = [pi | string] -%}
+    {%- for _ in range(module.rand.number.integer(0, 2)) -%}{%- do ops.append(pick_op(pi) | trim) -%}{%- endfor -%}
+    {%- do ops.append(pi | string) -%}
+    {#- Trailing operations: the same geometric count as a background
+        session (another one follows with probability 0.5). -#}
+    {%- set tail = namespace(go=module.rand.chance(0.5), n=0) -%}
+    {%- for _ in range(12) if tail.go -%}
+      {%- do ops.append(pick_op(pi) | trim) -%}
+      {%- set tail.go = module.rand.chance(0.5) -%}
+    {%- endfor -%}
+    {%- do a.update({'episode': true, 'resume': a.due, 'due': start, 'pending_fails': fails.n, 'pending_ops': ops}) -%}
+    {%- do shared.update({'ep_active': true, 'ep_last_admin': ai, 'ep_last_policy': pi, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(0, delay_max)), 'next_due': [shared.get('next_due'), start] | min}) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set raw = fields | join(',') -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
-  'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'dataset': dataset, 'category': [category],
-    'type': [type], 'action': kind, 'original': raw},
-  'host': {'name': params.server_name},
-  'user': {'name': admin} if kind != 'client_policy_download' else {'name': 'user1'},
-  'symantec': {'sepm': {'site': params.site_name, 'domain': params.sepm_domain,
-    'description': description, 'policy_name': policy if kind in ['policy_edit', 'policy_add'] else none,
-    'client_host': client if kind == 'client_policy_download' else none}}} -%}
-{{ record | tojson }}
+{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set out = namespace(kind=none, admin=none, client=none, policy=none, group=none, rec=0) -%}
+{%- for _ in range(24) if out.kind is none and shared.get('next_due') <= now -%}
+  {#- Earliest due slot: an administrator step or a client record. -#}
+  {%- set pick = namespace(src=none, i=none, slot=none, due=none, c=none) -%}
+  {%- for i in range(admins | length) if pick.due is none or admins[i].due < pick.due -%}
+    {%- set pick.src = 'a' -%}{%- set pick.i = i -%}{%- set pick.due = admins[i].due -%}
+  {%- endfor -%}
+  {%- for c in clients -%}
+    {%- for slot in ['log', 'au', 'dl'] if c[slot] is not none and c[slot] < pick.due -%}
+      {%- set pick.src = 'c' -%}{%- set pick.slot = slot -%}{%- set pick.due = c[slot] -%}{%- set pick.c = c -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set rec = [pick.due, shared.get('last_ms') + 1] | max -%}
+  {%- if pick.src == 'c' -%}
+    {%- set c = pick.c -%}
+    {%- if pick.slot == 'log' -%}
+      {%- set out.kind = 'client_log' -%}
+      {%- do c.update({'log': rec + ms(log_gap(c.med)) | int}) -%}
+    {%- elif pick.slot == 'au' -%}
+      {%- set out.kind = 'au_download' -%}
+      {%- do c.update({'au': rec + ms(au_gap()) | int}) -%}
+    {%- else -%}
+      {%- set out.kind = 'policy_download' -%}
+      {%- do c.update({'dl': none}) -%}
+    {%- endif -%}
+    {%- set out.client = c -%}{%- set out.rec = rec -%}
+    {%- do shared.set('last_ms', rec) -%}
+  {%- else -%}
+    {%- set a = admins[pick.i] -%}
+    {%- set frame = namespace(kind=none) -%}
+    {%- if a.stage == 'idle' -%}
+      {#- Session start: the first log-on attempt. -#}
+      {%- if a.episode -%}
+        {%- do a.update({'stage': 'login', 'fails_left': a.pending_fails, 'ops': a.pending_ops}) -%}
+      {%- else -%}
+        {%- set cnt = namespace(n=0, go=true) -%}
+        {%- for _ in range(12) if cnt.go -%}
+          {%- if module.rand.chance(0.5) -%}{%- set cnt.n = cnt.n + 1 -%}{%- else -%}{%- set cnt.go = false -%}{%- endif -%}
+        {%- endfor -%}
+        {%- set ops = [] -%}
+        {%- for _ in range(cnt.n) -%}{%- do ops.append('?') -%}{%- endfor -%}
+        {%- do a.update({'stage': 'login', 'fails_left': -1, 'ops': ops, 'nfail': 0}) -%}
+      {%- endif -%}
+      {%- do a.update({'nfail': 0}) -%}
+    {%- endif -%}
+    {%- if a.stage == 'login' -%}
+      {%- if a.episode -%}
+        {%- set failed = a.fails_left > 0 -%}
+        {%- do a.update({'fails_left': a.fails_left - 1}) -%}
+      {%- else -%}
+        {%- set failed = module.rand.chance(0.2 if a.nfail == 0 else 0.45) and a.nfail < 7 -%}
+      {%- endif -%}
+      {%- if failed -%}
+        {%- set frame.kind = 'logon_failed' -%}
+        {%- do a.update({'nfail': a.nfail + 1}) -%}
+        {%- if not a.episode and module.rand.chance(0.12) -%}
+          {#- The administrator gives up after this failure. -#}
+          {%- do a.update({'stage': 'idle', 'due': rec + ms(absence(a.med)) | int}) -%}
+        {%- else -%}
+          {%- do a.update({'due': rec + ms(retry_gap()) | int}) -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- set frame.kind = 'logon_ok' -%}
+        {%- do a.update({'stage': 'sess', 'last_policy': none, 'due': rec + ms(op_gap()) | int}) -%}
+      {%- endif -%}
+    {%- elif a.ops -%}
+      {%- set op = a.ops.pop(0) -%}
+      {%- if op == '?' -%}
+        {#- Background operation: re-edit the policy just edited or pick
+            another; never complete the anomaly sequence. -#}
+        {%- if a.last_policy is not none and module.rand.chance(0.35) -%}
+          {%- set op = a.last_policy | string -%}
+        {%- else -%}
+          {%- set op = pick_op(-1) | trim -%}
+        {%- endif -%}
+        {%- if op != 'g' and completes(a, op | int, rec) -%}
+          {#- Same time and action, another policy that does not complete
+              it (a group only if every policy would). -#}
+          {%- set alt = [] -%}{%- set aw = [] -%}
+          {%- for p in policies -%}
+            {%- if loop.index0 != op | int and not completes(a, loop.index0, rec) -%}{%- do alt.append(loop.index0) -%}{%- do aw.append(p.weight) -%}{%- endif -%}
+          {%- endfor -%}
+          {%- set op = (module.rand.weighted_choice(alt, aw) | string) if alt else 'g' -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- if op == 'g' -%}
+        {%- set ga = shared.get('groups_added') -%}
+        {%- set name = module.rand.choice(['Branch', 'Kiosk', 'Lab', 'VDI', 'Remote', 'Test']) ~ '-' ~ module.rand.number.integer(10, 99) -%}
+        {%- do ga.append(name) -%}
+        {%- for _ in range(ga | length) if ga | length > 200 -%}{%- do ga.pop(0) -%}{%- endfor -%}
+        {%- set frame.kind = 'group_added' -%}{%- set out.group = name -%}
+      {%- else -%}
+        {%- set pi = op | int -%}
+        {%- set frame.kind = 'policy_edited' -%}{%- set out.policy = policies[pi] -%}
+        {%- do a.update({'last_policy': pi}) -%}
+        {#- Clients of the assigned groups download the new policy at their
+            next heartbeat; offline clients later. -#}
+        {%- for c in clients if c.group in policies[pi].groups -%}
+          {%- if module.rand.chance(0.88) -%}
+            {%- set dl = rec + module.builtins.int(module.rand.number.floating(0, 300000)) + ms(d(0.3, 2, 0.8, 60)) | int -%}
+          {%- else -%}
+            {%- set dl = rec + ms(d(600, 7200, 1.0, 129600)) | int -%}
+          {%- endif -%}
+          {%- do c.update({'dl': dl if c.dl is none else [c.dl, dl] | min}) -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- do a.update({'due': rec + ms(op_gap()) | int}) -%}
+    {%- else -%}
+      {#- Session end: no record. -#}
+      {%- do a.update({'stage': 'idle'}) -%}
+      {%- if a.episode -%}
+        {%- do a.update({'episode': false, 'pending_ops': none, 'due': [a.resume, rec + 1] | max}) -%}
+        {%- do shared.update({'ep_active': false}) -%}
+      {%- else -%}
+        {%- do a.update({'due': rec + ms(absence(a.med)) | int}) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if frame.kind is not none -%}
+      {%- set hk = {'logon_failed': 'fail', 'logon_ok': 'ok', 'policy_edited': 'edit'}.get(frame.kind) -%}
+      {%- if hk -%}{%- do a.hist.append([rec, hk, a.last_policy if hk == 'edit' else none]) -%}{%- endif -%}
+      {#- Bounded guard memory: this administrator's records of the chain window. -#}
+      {%- for _ in range(a.hist | length) if a.hist and rec - a.hist[0][0] > guard_ms -%}{%- do a.hist.pop(0) -%}{%- endfor -%}
+      {%- set out.kind = frame.kind -%}{%- set out.admin = a.user -%}{%- set out.rec = rec -%}
+      {%- do shared.set('last_ms', rec) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set dues = admins | map(attribute='due') | list -%}
+  {%- for c in clients -%}
+    {%- do dues.append(c.log) -%}{%- do dues.append(c.au) -%}
+    {%- if c.dl is not none -%}{%- do dues.append(c.dl) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('next_due', dues | min) -%}
+{%- endfor -%}
+{%- if out.kind is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set moment = ts + module.datetime.timedelta(milliseconds=out.rec - now) -%}
+{%- set moment = moment.replace(microsecond=(moment.microsecond // 1000) * 1000) -%}
+{%- set head = 'Site: ' ~ params.site_name ~ ',Server: ' ~ params.server_name ~ ',Domain: ' ~ params.sepm_domain -%}
+{%- set log = {'site': params.site_name, 'server': params.server_name} -%}
+{%- set event = {'kind': 'event', 'dataset': 'symantec_endpoint.log'} -%}
+{%- if out.kind in ['logon_failed', 'logon_ok', 'group_added'] -%}
+  {%- if out.kind == 'logon_ok' -%}{%- set desc = 'Administrator log on succeeded' -%}
+  {%- elif out.kind == 'logon_failed' -%}{%- set desc = 'Administrator  log on failed' -%}
+  {%- else -%}{%- set desc = "Group '" ~ out.group ~ "' was added" -%}{%- endif -%}
+  {%- set original = head ~ ',Admin: ' ~ out.admin ~ ',' ~ desc -%}
+  {%- do event.update({'provider': 'Administrative Log'}) -%}
+  {%- if out.kind == 'group_added' -%}
+    {%- do event.update({'action': 'group-added'}) -%}
+  {%- else -%}
+    {%- do event.update({'action': 'admin-logon', 'category': ['authentication'], 'type': ['info'], 'outcome': 'success' if out.kind == 'logon_ok' else 'failure'}) -%}
+  {%- endif -%}
+  {%- do log.update({'domain_name': params.sepm_domain, 'admin': out.admin, 'event_description': desc}) -%}
+  {%- set user = {'name': out.admin, 'domain': params.sepm_domain} -%}
+{%- elif out.kind == 'policy_edited' -%}
+  {%- set desc = 'Policy has been edited: Edited shared ' ~ out.policy.type ~ ' policy: ' ~ out.policy.name -%}
+  {%- set original = head ~ ',Admin: ' ~ out.admin ~ ',Event Description: ' ~ desc ~ ',' ~ out.policy.name -%}
+  {%- do event.update({'provider': 'Policy Log', 'action': 'policy-edited'}) -%}
+  {%- do log.update({'domain_name': params.sepm_domain, 'admin': out.admin, 'event_description': desc, 'policy_name': out.policy.name}) -%}
+  {%- set user = {'name': out.admin, 'domain': params.sepm_domain} -%}
+{%- else -%}
+  {%- set c = out.client -%}
+  {%- set desc = {'client_log': 'The management server received the client log successfully', 'au_download': 'The client has downloaded the auto-upgrade configuration file successfully', 'policy_download': 'The client has downloaded the policy successfully'}[out.kind] -%}
+  {%- set original = 'Site: ' ~ params.site_name ~ ',Server Name: ' ~ params.server_name ~ ',Domain Name: ' ~ params.sepm_domain ~ ',' ~ desc ~ ',' ~ c.host ~ ',' ~ c.user ~ ',' ~ params.machine_domain -%}
+  {%- do event.update({'provider': 'Agent Activity Log', 'action': {'client_log': 'client-log-received', 'au_download': 'auto-upgrade-config-downloaded', 'policy_download': 'policy-downloaded'}[out.kind]}) -%}
+  {%- do log.update({'domain_name': params.machine_domain, 'event_description': desc, 'local_host_name': c.host, 'user_name': c.user}) -%}
+  {%- set user = {'name': c.user, 'domain': params.machine_domain} -%}
+{%- endif -%}
+{%- do event.update({'original': original}) -%}
+{%- set payload = {'@timestamp': moment.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), 'ecs': {'version': '8.11.0'}, 'event': event, 'message': desc, 'symantec_endpoint': {'log': log}, 'user': user} -%}
+{%- if out.client is not none -%}
+  {%- do payload.update({'host': {'hostname': out.client.host, 'name': out.client.host}, 'source': {'domain': out.client.host}}) -%}
+{%- endif -%}
+{{- module.json.dumps(payload, sort_keys=true) -}}
