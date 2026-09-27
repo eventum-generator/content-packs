@@ -1,47 +1,249 @@
-{%- set step = vars.step -%}
-{%- set attack = step.startswith('attack_') -%}
-{%- set starting = step.endswith('start') or step.startswith('attack_start_') -%}
-{%- if step == 'routine_start' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- set n = shared.get('routine_cycles', 0) + 1 -%}
-  {%- if n >= params.anomaly_interval_cycles -%}
-    {%- do shared.set('routine_cycles', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_cycles', n) -%}{%- endif -%}
+{#- Microsoft-Windows-GroupPolicy/Operational: computer policy refreshes
+    (4006/8006/7006 periodic, 4004/8004/7004 manual) and client-side
+    extension processing (4016 start, 5016 success, 7016 error) of a
+    fleet of domain members, as Winlogbeat-style ECS JSON with the raw
+    event XML. One input tick per second; each tick emits the earliest
+    due record, stamped with its own microsecond time, or drops. Every
+    host runs its own refresh schedule. Times are in microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_start')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, truncated by redrawing; returns us. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- module.builtins.int(([ns.v, hi] | min) * 1000000) -}}
+{%- endmacro -%}
+{%- set H = 3600000000 -%}
+{#- Chain window: a background Security extension error is turned into
+    a success when two other hosts already logged one within this
+    window. -#}
+{%- set window = 6 * H -%}
+{%- set sec_id = '{827D319E-6EAC-11D2-A4EA-00C04F79F83A}' -%}
+{%- set cse_ids = {
+  'Registry': '{35378EAC-683F-11D2-A89A-00C04FBBCFA2}',
+  'Security': sec_id,
+  'Audit Policy Configuration': '{F3CCC681-B74C-4060-9F26-CD84525DCA2A}',
+  'Group Policy Registry': '{B087BE9D-ED37-454F-AF9C-04291E351182}',
+  'Group Policy Folders': '{6232C319-91AC-4931-9385-E70C2B099F0E}',
+  'Group Policy Scheduled Tasks': '{AADCED64-746C-4633-A97C-D61349046527}',
+  'EFS recovery': '{B1BE8D72-6EAC-11D2-A4EA-00C04F79F83A}'
+} -%}
+{#- Share of background refreshes in which an extension runs although
+    no GPO changed (synthetic); Security also runs after its own error. -#}
+{%- set cse_p = {'Registry': 0.55, 'Security': 0.2, 'Audit Policy Configuration': 0.15, 'Group Policy Registry': 0.35, 'Group Policy Folders': 0.3, 'Group Policy Scheduled Tasks': 0.3, 'EFS recovery': 0.1} -%}
+{%- set cse_ms = {'Registry': [15, 180, 0.9, 20000], 'Security': [150, 1800, 0.9, 60000], 'Audit Policy Configuration': [5, 60, 0.8, 5000], 'Group Policy Registry': [10, 120, 0.9, 15000], 'Group Policy Folders': [5, 45, 0.8, 5000], 'Group Policy Scheduled Tasks': [10, 150, 0.9, 20000], 'EFS recovery': [3, 30, 0.8, 3000]} -%}
+{%- set order = ['Registry'] + ((cse_ids | dictsort(by='value')) | map(attribute=0) | reject('equalto', 'Registry') | list) -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 12, 'le': 8760}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set hosts = [] -%}
+  {%- set queue = [] -%}
+  {%- for row in samples.hosts -%}
+    {%- set gpos = [] -%}
+    {%- for gi in range(samples.gpos | length) if samples.gpos[gi].scope in ['all', row.role] -%}
+      {%- set g = samples.gpos[gi] -%}
+      {%- if g.name == 'Default Domain Policy' or 'Baseline' in g.name or module.rand.chance(0.6) -%}{%- do gpos.append(gi) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set threads = [] -%}
+    {%- for _ in range(module.rand.number.integer(5, 12)) -%}{%- do threads.append(4 * module.rand.number.integer(100, 4000)) -%}{%- endfor -%}
+    {%- do hosts.append({'name': row.name, 'sam': row.sam, 'gpos': gpos, 'pid': 4 * module.rand.number.integer(200, 3000), 'threads': threads, 'record': module.rand.number.integer(3000, 900000), 'busy': now, 'pending': 0, 'ep_left': 0, 'sec_bad': false}) -%}
+    {%- set i = loop.index0 -%}
+    {%- do queue.append({'due': now + module.rand.number.integer(0, 2 * H), 'k': 'per', 'h': i}) -%}
+    {%- do queue.append({'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (d(3600, 172800, 1.0, 2592000) | int)), 'k': 'marr', 'h': i}) -%}
+    {%- do queue.append({'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (d(7200, 259200, 0.9, 2592000) | int)), 'k': 'flaky', 'h': i}) -%}
+  {%- endfor -%}
+  {%- do queue.append({'due': now + module.rand.number.integer(0, 12 * H), 'k': 'pair', 'h': 0}) -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * H) -%}
+  {%- do shared.update({'queue': queue, 'hosts': hosts, 'last_us': now - 1, 'next_due': queue | map(attribute='due') | min, 'fails': [], 'ep_last': [], 'ep_start': now + H + module.rand.number.integer(0, [H, interval // 8] | min)}) -%}
 {%- endif -%}
-{%- if starting -%}
-  {%- set activity = '{' ~ module.rand.crypto.uuid4() ~ '}' -%}
-  {%- do shared.set('activity',activity) -%}
-  {%- if attack -%}
-    {%- do shared.set('extension_name','Security') -%}
-    {%- do shared.set('extension_id','{827D319E-6EAC-11D2-A4EA-00C04F79F83A}') -%}
-    {%- do shared.set('gpo_name','Corp Security Baseline') -%}
-  {%- else -%}
-    {%- do shared.set('extension_name','Group Policy Folders') -%}
-    {%- do shared.set('extension_id','{6232C319-91AC-4931-9385-E70C2B099F0E}') -%}
-    {%- do shared.set('gpo_name',samples.gpos.pick().name) -%}
+{%- set queue = shared.get('queue') -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * H) -%}
+{#- Episode start: the first tick at or after due + random delay. A
+    change to one Security-bearing GPO breaks its security settings on
+    three hosts that apply it, none of them in the previous episode: the
+    next Security extension run of each host, in whatever refresh its
+    own schedule brings, ends in error and the run after it succeeds, as
+    in a one-error background spell. Up to two background errors of
+    other hosts shortly before may complete the chain earlier; with three
+    hosts the leftovers cannot form a second chain. The next due is one
+    interval after this start; missed episodes are not replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_start') -%}
+  {%- set gpo = module.rand.choice(['Default Domain Policy', 'Workstation Security Baseline', 'Server Security Baseline']) -%}
+  {%- set cand = [] -%}
+  {%- for i in range(hosts | length) if i not in shared.get('ep_last') and hosts[i].pending == 0 and hosts[i].ep_left == 0 and not hosts[i].sec_bad -%}
+    {%- for gi in hosts[i].gpos if samples.gpos[gi].name == gpo -%}{%- do cand.append(i) -%}{%- endfor -%}
+  {%- endfor -%}
+  {%- set k = 3 -%}
+  {%- if cand | length >= k -%}
+    {%- set chosen = module.rand.shuffle(cand)[:k] -%}
+    {%- for i in chosen -%}{%- do hosts[i].update({'ep_left': 1}) -%}{%- endfor -%}
+    {%- do shared.update({'ep_last': chosen, 'ep_start': now + interval + module.rand.number.integer(0, [H, interval // 8] | min)}) -%}
   {%- endif -%}
 {%- endif -%}
-{%- set activity = shared.get('activity') -%}
-{%- set ext = shared.get('extension_name') -%}{%- set extid = shared.get('extension_id') -%}
-{%- set gpo = shared.get('gpo_name') -%}
-{%- set record = (shared.get('record_counter',20000) % 2147483647) + 1 -%}{%- do shared.set('record_counter',record) -%}
-{%- set failed = not starting -%}
-{%- if starting -%}
-  {%- set event_id = 4016 -%}{%- set level = 4 -%}{%- set opcode = 1 -%}
-  {%- set gpo_xml = '<GPO ID="{6C77B631-1580-41B1-B63A-D3D593EB84AC}"><Name>' ~ (gpo|e) ~ '</Name></GPO>' -%}
-  {%- set data = {'CSEExtensionId':extid,'CSEExtensionName':ext,'IsExtensionAsyncProcessing':'false','IsGPOListChanged':'false','GPOListStatusString':'%%4101','DescriptionString':gpo,'ApplicableGPOList':gpo_xml} -%}
-  {%- set action = 'cse-processing-started' -%}{%- set event_type = ['start'] -%}
+{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- macro guid() -%}{{- '{' ~ (module.rand.crypto.uuid4() | string | upper) ~ '}' -}}{%- endmacro -%}
+{%- set out = namespace(row=none, rec=0) -%}
+{%- for _ in range(32) if out.row is none and queue and (queue | map(attribute='due') | min) <= now -%}
+  {%- set pick = namespace(item=none) -%}
+  {%- for item in queue if pick.item is none or item.due < pick.item.due -%}{%- set pick.item = item -%}{%- endfor -%}
+  {%- set item = pick.item -%}
+  {%- do queue.remove(item) -%}
+  {%- set host = hosts[item.h] -%}
+  {%- set refresh = namespace(on=false, manual=false) -%}
+  {%- if item.k == 'row' -%}
+    {%- set out.row = item -%}
+    {%- set out.rec = [item.due, shared.get('last_us') + 1] | max -%}
+    {%- do shared.set('last_us', out.rec) -%}
+  {%- elif item.k == 'per' -%}
+    {#- Background refresh every 90 minutes plus a random 0-30 minute
+        offset; a host that is asleep or off the network skips it. -#}
+    {%- do queue.append({'due': item.due + 90 * 60000000 + module.rand.number.integer(0, 30 * 60000000), 'k': 'per', 'h': item.h}) -%}
+    {%- set refresh.on = not module.rand.chance(0.12) -%}
+  {%- elif item.k == 'marr' -%}
+    {#- An administrator runs gpupdate on the host now and then. -#}
+    {%- do queue.append({'due': item.due + (d(3600, 172800, 1.0, 2592000) | int), 'k': 'marr', 'h': item.h}) -%}
+    {%- do queue.append({'due': item.due, 'k': 'man', 'h': item.h}) -%}
+    {%- if module.rand.chance(0.2) -%}{%- do queue.append({'due': item.due + (d(20, 90, 0.8, 1800) | int), 'k': 'man', 'h': item.h}) -%}{%- endif -%}
+  {%- elif item.k == 'man' -%}
+    {%- set refresh.on = true -%}
+    {%- set refresh.manual = true -%}
+  {%- elif item.k == 'flaky' -%}
+    {#- A background spell in which the next one or two Security runs of
+        the host fail (e.g. a setting that names an unresolvable account
+        or path) before the fault clears. -#}
+    {%- do queue.append({'due': item.due + (d(7200, 259200, 0.9, 2592000) | int), 'k': 'flaky', 'h': item.h}) -%}
+    {%- if host.pending == 0 and host.ep_left == 0 -%}{%- do host.update({'pending': 1 if module.rand.chance(0.5) else 2}) -%}{%- endif -%}
+  {%- elif item.k == 'pair' -%}
+    {#- A shared cause (one GPO setting) breaks the Security run of two
+        hosts that apply the same GPO; each fails at its own next run. -#}
+    {%- do queue.append({'due': item.due + (d(1800, 36000, 0.8, 604800) | int), 'k': 'pair', 'h': 0}) -%}
+    {%- set gpo = module.rand.choice(['Default Domain Policy', 'Workstation Security Baseline', 'Server Security Baseline']) -%}
+    {%- set cand = [] -%}
+    {%- for i in range(hosts | length) if hosts[i].pending == 0 and hosts[i].ep_left == 0 and not hosts[i].sec_bad -%}
+      {%- for gi in hosts[i].gpos if samples.gpos[gi].name == gpo -%}{%- do cand.append(i) -%}{%- endfor -%}
+    {%- endfor -%}
+    {%- if cand | length >= 2 -%}
+      {%- for i in module.rand.shuffle(cand)[:2] -%}{%- do hosts[i].update({'pending': 1}) -%}{%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if refresh.on -%}
+    {%- set t = namespace(v=[item.due, host.busy + (d(0.5, 3, 0.8, 60) | int)] | max, fail=0) -%}
+    {%- set t0 = t.v -%}
+    {%- set activity = guid() -%}
+    {%- set thr = module.rand.choice(host.threads) -%}
+    {%- set ev = 4004 if refresh.manual else 4006 -%}
+    {%- do queue.append({'due': t0, 'k': 'row', 'h': item.h, 'code': ev, 'act': activity, 'thr': thr, 'data': [['PolicyActivityId', activity], ['PrincipalSamName', host.sam], ['IsMachine', '1'], ['IsDomainJoined', 'true'], ['IsBackgroundProcessing', 'false' if refresh.manual else 'true'], ['IsAsyncProcessing', 'false'], ['IsServiceRestart', 'false'], ['ReasonForSyncProcessing', '0']]}) -%}
+    {%- set t.v = t.v + (d(0.3, 2.5, 1.1, 90) | int) -%}
+    {%- for cse in order -%}
+      {%- set glist = [] -%}
+      {%- for gi in host.gpos if cse in samples.gpos[gi].cses -%}{%- do glist.append(samples.gpos[gi]) -%}{%- endfor -%}
+      {%- set sec_due = cse == 'Security' and (host.sec_bad or host.pending > 0 or host.ep_left > 0) -%}
+      {%- if glist and (refresh.manual or sec_due or module.rand.chance(cse_p[cse])) -%}
+        {%- set gxml = namespace(v='', desc='') -%}
+        {%- for g in glist -%}
+          {%- set gxml.v = gxml.v ~ '<GPO ID="' ~ g.id ~ '"><Name>' ~ g.name ~ '</Name></GPO>' -%}
+          {%- set gxml.desc = gxml.desc ~ g.name ~ '\n' -%}
+        {%- endfor -%}
+        {%- do queue.append({'due': t.v, 'k': 'row', 'h': item.h, 'code': 4016, 'act': activity, 'thr': thr, 'data': [['CSEExtensionId', cse_ids[cse]], ['CSEExtensionName', cse], ['IsExtensionAsyncProcessing', 'false'], ['IsGPOListChanged', 'false'], ['GPOListStatusString', '%%4101'], ['DescriptionString', gxml.desc], ['ApplicableGPOList', gxml.v]]}) -%}
+        {%- set m = cse_ms[cse] -%}
+        {%- set elapsed = module.builtins.int((d(m[0] / 1000, m[1] / 1000, m[2], m[3] / 1000) | int) / 1000) -%}
+        {%- set code = 0 -%}
+        {%- if cse == 'Security' -%}
+          {%- set others = [] -%}
+          {%- for f in shared.get('fails') if f[0] >= t.v - window and f[1] != item.h and f[1] not in others -%}{%- do others.append(f[1]) -%}{%- endfor -%}
+          {%- if host.ep_left > 0 -%}
+            {%- set code = 1252 -%}
+            {%- do host.update({'ep_left': host.ep_left - 1}) -%}
+          {%- elif host.pending > 0 -%}
+            {%- if others | length < 2 -%}{%- set code = 1252 -%}{%- endif -%}
+            {%- do host.update({'pending': host.pending - 1 if code else 0}) -%}
+          {%- endif -%}
+          {%- if code -%}{%- do shared.get('fails').append([t.v, item.h]) -%}{%- endif -%}
+          {%- do host.update({'sec_bad': code != 0}) -%}
+        {%- elif cse == 'Audit Policy Configuration' -%}
+          {#- E_PENDING: the audit extension continues asynchronously. -#}
+          {%- set code = 2147483658 -%}
+        {%- endif -%}
+        {%- set t.v = t.v + elapsed * 1000 + module.rand.number.integer(0, 999) -%}
+        {%- do queue.append({'due': t.v, 'k': 'row', 'h': item.h, 'code': 7016 if cse == 'Security' and code else 5016, 'act': activity, 'thr': thr, 'data': [['CSEElaspedTimeInMilliSeconds', elapsed | string], ['ErrorCode', code | string], ['CSEExtensionName', cse], ['CSEExtensionId', cse_ids[cse]]]}) -%}
+        {%- if cse == 'Security' and code -%}{%- set t.fail = code -%}{%- endif -%}
+        {%- set t.v = t.v + (d(0.001, 0.02, 0.9, 2) | int) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set t.v = t.v + (d(0.01, 0.3, 0.9, 10) | int) -%}
+    {%- set end = (7004 if refresh.manual else 7006) if t.fail else (8004 if refresh.manual else 8006) -%}
+    {%- do queue.append({'due': t.v, 'k': 'row', 'h': item.h, 'code': end, 'act': activity, 'thr': thr, 'data': [['PolicyElaspedTimeInSeconds', ((t.v - t0) // 1000000) | string], ['ErrorCode', t.fail | string], ['PrincipalSamName', host.sam], ['IsMachine', '1'], ['IsConnectivityFailure', 'false']]}) -%}
+    {%- do host.update({'busy': t.v}) -%}
+    {#- After a failed refresh an administrator often reruns gpupdate
+        within minutes. -#}
+    {%- if t.fail and module.rand.chance(0.35) -%}
+      {%- do queue.append({'due': t.v + (d(30, 240, 0.8, 1800) | int), 'k': 'man', 'h': item.h}) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {#- Bounded history: errors older than the chain window are dropped. -#}
+  {%- set fails = shared.get('fails') -%}
+  {%- for _ in range(fails | length) if fails and item.due - fails[0][0] > window -%}{%- do fails.pop(0) -%}{%- endfor -%}
+{%- endfor -%}
+{%- do shared.set('next_due', (queue | map(attribute='due') | min) if queue else now + 1000000) -%}
+{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set row = out.row -%}
+{%- set host = hosts[row.h] -%}
+{#- Other Operational records of the same refresh (5340, 5326, 5312,
+    ...; not modeled) take record numbers in between. -#}
+{%- set step = module.rand.number.integer(3, 12) if row.code in [4004, 4006] else module.rand.number.integer(1, 4) -%}
+{%- set record_id = host.record + step -%}
+{%- do host.update({'record': record_id}) -%}
+{%- set moment = ts + module.datetime.timedelta(microseconds=out.rec - now) -%}
+{%- set system_time = moment.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ module.rand.number.integer(0, 9) ~ 'Z' -%}
+{%- set data = {} -%}
+{%- for kv in row.data -%}{%- do data.update({kv[0]: kv[1]}) -%}{%- endfor -%}
+{%- set code = row.code -%}
+{%- set failed = code in [7016, 7006, 7004] -%}
+{%- if code == 4006 or code == 4004 -%}
+  {%- set kind = 'periodic' if code == 4006 else 'manual' -%}
+  {%- set action = kind ~ '-policy-processing-started' -%}
+  {%- set message = ('Starting periodic policy processing for computer ' if code == 4006 else 'Starting manual processing of policy for computer ') ~ data.PrincipalSamName ~ '. \nActivity id: ' ~ data.PolicyActivityId -%}
+  {%- set opcode = [1, 'Start'] -%}{%- set version = 1 -%}
+{%- elif code == 8006 or code == 8004 -%}
+  {%- set action = ('periodic' if code == 8006 else 'manual') ~ '-policy-processing-completed' -%}
+  {%- set message = ('Completed periodic policy processing for computer ' if code == 8006 else 'Completed manual processing of policy for computer ') ~ data.PrincipalSamName ~ ' in ' ~ data.PolicyElaspedTimeInSeconds ~ ' seconds.' -%}
+  {%- set opcode = [2, 'Stop'] -%}{%- set version = 1 -%}
+{%- elif code == 7006 or code == 7004 -%}
+  {%- set action = ('periodic' if code == 7006 else 'manual') ~ '-policy-processing-failed' -%}
+  {%- set message = ('Periodic policy processing failed for computer ' if code == 7006 else 'Manual processing of policy failed for computer ') ~ data.PrincipalSamName ~ ' in ' ~ data.PolicyElaspedTimeInSeconds ~ ' seconds.' -%}
+  {%- set opcode = [2, 'Stop'] -%}{%- set version = 1 -%}
+{%- elif code == 4016 -%}
+  {%- set action = 'cse-processing-started' -%}
+  {%- set message = 'Starting ' ~ data.CSEExtensionName ~ ' Extension Processing. \n\nList of applicable Group Policy objects: (No changes were detected.)\n\n' ~ data.DescriptionString -%}
+  {%- set opcode = [1, 'Start'] -%}{%- set version = 0 -%}
 {%- else -%}
-  {%- set event_id = 7016 -%}{%- set level = 2 -%}{%- set opcode = 2 -%}
-  {%- set data = {'CSEElaspedTimeInMilliSeconds':20984,'ErrorCode':1252,'CSEExtensionName':ext,'CSEExtensionId':extid} -%}
-  {%- set action = 'cse-processing-failed' -%}{%- set event_type = ['error'] -%}
+  {%- set action = 'cse-processing-failed' if failed else 'cse-processing-completed' -%}
+  {%- set message = 'Completed ' ~ data.CSEExtensionName ~ ' Extension Processing in ' ~ data.CSEElaspedTimeInMilliSeconds ~ ' milliseconds.' -%}
+  {%- set opcode = [2, 'Stop'] -%}{%- set version = 0 -%}
 {%- endif -%}
-{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-GroupPolicy" Guid="{AEA1B4FA-97D1-45F2-A64C-4D69FFFD92C9}"/><EventID>' ~ event_id ~ '</EventID><Version>0</Version><Level>' ~ level ~ '</Level><Task>0</Task><Opcode>' ~ opcode ~ '</Opcode><Keywords>0x4000000000000000</Keywords><TimeCreated SystemTime="' ~ timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ '0Z"/><EventRecordID>' ~ record ~ '</EventRecordID><Correlation ActivityID="' ~ activity ~ '"/><Execution ProcessID="1260" ThreadID="1404"/><Channel>Microsoft-Windows-GroupPolicy/Operational</Channel><Computer>' ~ params.host_name ~ '</Computer><Security UserID="S-1-5-18"/></System><EventData>' -%}
-{%- set ns = namespace(xml=xml) -%}
-{%- for key,value in data.items() -%}{%- set ns.xml = ns.xml ~ '<Data Name="' ~ key ~ '">' ~ (value|string|e) ~ '</Data>' -%}{%- endfor -%}
-{%- set xml = ns.xml ~ '</EventData></Event>' -%}
-{%- set evt = {'action':action,'category':['configuration'],'code':event_id|string,'dataset':'windows.group_policy_operational','kind':'event','original':xml,'type':event_type} -%}
-{%- if failed -%}{%- do evt.update({'outcome':'failure'}) -%}{%- endif -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':evt,'group_policy':{'cse':data,'gpo_name':gpo},'host':{'name':params.host_name,'ip':[params.host_ip]},'message':ext ~ ' extension processing ' ~ ('started' if starting else 'failed'),'tags':['group-policy-operational','preserve_original_event'],'winlog':{'activity_id':activity,'channel':'Microsoft-Windows-GroupPolicy/Operational','event_id':event_id,'provider_name':'Microsoft-Windows-GroupPolicy','record_id':record}} -%}
-{{- out | tojson -}}
+{%- set level = [2, 'error'] if failed else [4, 'information'] -%}
+{%- set ns = namespace(xml='') -%}
+{%- for kv in row.data -%}{%- set ns.xml = ns.xml ~ '<Data Name="' ~ kv[0] ~ '">' ~ (kv[1] | e) ~ '</Data>' -%}{%- endfor -%}
+{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-GroupPolicy" Guid="{AEA1B4FA-97D1-45F2-A64C-4D69FFFD92C9}"/><EventID>' ~ code ~ '</EventID><Version>' ~ version ~ '</Version><Level>' ~ level[0] ~ '</Level><Task>0</Task><Opcode>' ~ opcode[0] ~ '</Opcode><Keywords>0x4000000000000000</Keywords><TimeCreated SystemTime="' ~ system_time ~ '"/><EventRecordID>' ~ record_id ~ '</EventRecordID><Correlation ActivityID="' ~ row.act ~ '"/><Execution ProcessID="' ~ host.pid ~ '" ThreadID="' ~ row.thr ~ '"/><Channel>Microsoft-Windows-GroupPolicy/Operational</Channel><Computer>' ~ host.name ~ '</Computer><Security UserID="S-1-5-18"/></System><EventData>' ~ ns.xml ~ '</EventData></Event>' -%}
+{#- ECS configuration allows access/change/creation/deletion/info:
+    a successful completion applied policy (change), the rest is info. -#}
+{%- set etype = ['change'] if opcode[0] == 2 and not failed else ['info'] -%}
+{%- set evt = {'kind': 'event', 'category': ['configuration'], 'type': etype, 'action': action, 'code': code | string, 'provider': 'Microsoft-Windows-GroupPolicy', 'original': xml} -%}
+{%- if opcode[0] == 2 -%}{%- do evt.update({'outcome': 'failure' if failed else 'success'}) -%}{%- endif -%}
+{%- set event = {
+  '@timestamp': moment.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+  'ecs': {'version': '8.17.0'},
+  'event': evt,
+  'host': {'name': host.name},
+  'log': {'level': level[1]},
+  'message': message.rstrip(),
+  'winlog': {'activity_id': row.act, 'channel': 'Microsoft-Windows-GroupPolicy/Operational', 'computer_name': host.name, 'event_data': data, 'event_id': code | string, 'opcode': opcode[1], 'process': {'pid': host.pid, 'thread': {'id': row.thr}}, 'provider_guid': '{AEA1B4FA-97D1-45F2-A64C-4D69FFFD92C9}', 'provider_name': 'Microsoft-Windows-GroupPolicy', 'record_id': record_id | string, 'user': {'identifier': 'S-1-5-18'}, 'version': version}
+} -%}
+{{- event | tojson -}}
