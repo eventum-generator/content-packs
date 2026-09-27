@@ -16,7 +16,7 @@ Measured on a 14-day default capture (`anomaly_mode: true`, 3,100 events). All c
 | `ActionQueueScrape.pl` / `Task Queue`, `Successful task completion : Pre-deploy Global Configuration Generation` (`admin@localhost`) | `task-completion` | 8.8% | configuration |
 | `sfdccsm` / `Objects > Object Management > NetworkObject`, `create <object>` | `network-object-create` | 5.8% | configuration |
 
-Ten administrator accounts (`samples/admins.json`) each follow their own random schedule: sessions every few hours to a few days (lognormal, per-account median 4 to 20 hours between sessions), from the account's usual workstation address or, in about 15% of sessions, a second address. A session opens on the dashboard or the NAT list and holds one to about twenty actions seconds to minutes apart (most often a few):
+Ten administrator accounts (`samples/admins.json`) each follow their own random schedule: sessions every few hours to a few days (lognormal, per-account median 4 to 20 hours between sessions), from the account's usual workstation address or, in about 15% of sessions, a second address. A session opens on the `/ui/ddd/` page or the NAT list and holds one to about twenty actions seconds to minutes apart (most often a few):
 
 - **Page views** of the NAT list, the NAT policy editor and the `/ui/ddd/` web page (the sources do not name that page).
 - **Network object creation** with a new name (`<prefix>-<number>`, prefixes in `generator.yml`). More than half of the creations are followed later in the session by a NAT policy save (the object put into a rule).
