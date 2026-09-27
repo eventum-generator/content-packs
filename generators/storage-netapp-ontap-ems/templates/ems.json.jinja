@@ -1,59 +1,348 @@
-{%- for flag in ['to_failure_1', 'to_failure_2', 'to_failure_3', 'to_lockout', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 36 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_failure_1', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- if count % 12 == 0 -%}
-    {%- set event_name = 'security.invalid.login' -%}
-    {%- set severity = 'alert' -%}
-    {%- set priority = 9 -%}
-    {%- set message = 'Failed to authenticate login attempt to Vserver: ' ~ params.vserver ~ ', username: ' ~ params.incidental_user ~ ', application: ssh.' -%}
-    {%- set user_name = params.incidental_user -%}
-    {%- set category = 'authentication' -%}
-    {%- set event_type = 'start' -%}
-    {%- set outcome = 'failure' -%}
-  {%- else -%}
-    {%- set event_name = 'zapi.snapshot.success' -%}
-    {%- set severity = 'notice' -%}
-    {%- set priority = 13 -%}
-    {%- set snapshot_name = 'auto.' ~ timestamp.strftime('%Y%m%d_%H%M%S') -%}
-    {%- set message = 'Asynchronous creation of Snapshot copy named ' ~ snapshot_name ~ ' in volume ' ~ params.snapshot_volume ~ ' was successful. The Snapshot copy was created 125 milliseconds after the request was received by ZAPI.' -%}
-    {%- set user_name = none -%}
-    {%- set category = 'file' -%}
-    {%- set event_type = 'creation' -%}
-    {%- set outcome = 'success' -%}
+{#- One ONTAP HA pair forwarding EMS notifications (legacy-netapp).
+    Every one-second tick emits at most one record: the earliest due
+    item of a queue fed by independent random processes (per account
+    login sessions, per volume ZAPI Snapshot copies and anti-ransomware
+    maintenance) plus, in anomaly mode, one recurring episode. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- if shared.get('wake', 0) > now -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set thr = params.lockout_attempts | int -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set rnd = module.rand -%}
+{%- set num = module.rand.number -%}
+
+{%- macro lgn(median, sigma) -%}
+{{- [num.lognormal(module.math.log(median), sigma) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Human sessions follow office hours by thinning a Poisson process
+    at the peak rate; service accounts run around the clock. -#}
+{%- macro load(ts) -%}
+  {%- set h = module.datetime.datetime.fromtimestamp(ts, module.datetime.timezone.utc).hour -%}
+{{- 1.0 if 7 <= h < 18 else (0.4 if 18 <= h < 22 else 0.15) -}}
+{%- endmacro -%}
+
+{%- if not shared.get('init', false) -%}
+  {%- if not (6 <= interval <= 8760) or not (2 <= thr <= 10) -%}
+    {{ module.math.sqrt(-1) }}
   {%- endif -%}
-{%- elif stage == 'lockout' -%}
-  {%- set event_name = 'useradmin.lockedout.user' -%}
-  {%- set severity = 'error' -%}
-  {%- set priority = 11 -%}
-  {%- set message = "User '" ~ params.target_user ~ "' is locked out of the appliance for failing authentication '" ~ params.lockout_attempts ~ "' times." -%}
-  {%- set user_name = params.target_user -%}
-  {%- set category = 'authentication' -%}
-  {%- set event_type = 'denied' -%}
-  {%- set outcome = 'failure' -%}
-  {%- do shared.set('to_routine', true) -%}
-{%- else -%}
+  {%- set users = {} -%}
+  {%- for name in params.admin_users -%}
+    {%- set rate = num.floating(10, 20) -%}
+    {%- do users.update({name: {'svc': false, 'rate': rate,
+        'next': now + (num.exponential(rate / 86400)) | int,
+        'fails': 0, 'locked': 0, 'busy': false, 'node': params.nodes[0]}}) -%}
+  {%- endfor -%}
+  {%- for name in params.service_users -%}
+    {%- set rate = num.floating(20, 60) -%}
+    {%- do users.update({name: {'svc': true, 'rate': rate,
+        'app': rnd.weighted_choice(['ontapi', 'http'], [55, 45]),
+        'next': now + (num.exponential(rate / 86400)) | int,
+        'fails': 0, 'locked': 0, 'busy': false, 'node': params.nodes[0]}}) -%}
+  {%- endfor -%}
+  {%- if users | length != (params.admin_users | length) + (params.service_users | length)
+      or params.admin_users | length < 3 or users | length < 4 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set svm_uuid = {} -%}
+  {%- set vols = {} -%}
+  {%- set queue = [] -%}
+  {%- for i in range(samples.volumes | length) -%}
+    {%- set r = samples.volumes[i] -%}
+    {%- if r.vserver not in svm_uuid -%}
+      {%- do svm_uuid.update({r.vserver: rnd.crypto.uuid4()}) -%}
+    {%- endif -%}
+    {%- set dry = rnd.chance(0.2) -%}
+    {%- do vols.update({r.volume: {'svm': r.vserver, 'svm_uuid': svm_uuid[r.vserver],
+        'uuid': rnd.crypto.uuid4(), 'node': r.node,
+        'state': 'dry-run' if dry else 'enabled', 'res': false,
+        'next_snap': now + lgn(3600, 0.9) | int,
+        'next_maint': now + (num.exponential(1 / 172800)) | int}}) -%}
+    {%- if dry -%}
+      {%- do queue.append({'due': now + (num.exponential(1 / 172800)) | int,
+          'k': 'E', 'vol': r.volume}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.update({'init': true, 'users': users, 'vols': vols,
+      'queue': queue, 'hist': [], 'next_due': now + (interval * 3600) | int,
+      'start_at': none, 'last_a': none, 'last_b': none, 'last_v': none}) -%}
+{%- endif -%}
+{%- set users = shared.get('users') -%}
+{%- set vols = shared.get('vols') -%}
+{%- set queue = shared.get('queue') -%}
+{%- set hist = shared.get('hist') -%}
+
+{%- macro session(name, k, ep) -%}
+  {%- set u = users[name] -%}
+  {%- set node = params.nodes[0] if rnd.chance(0.85) or params.nodes | length < 2
+      else rnd.choice(params.nodes[1:]) -%}
+  {%- set app = u.app if u.svc else rnd.weighted_choice(['ssh', 'http'], [72, 28]) -%}
+  {%- set ok = not rnd.chance(0.45 if u.svc else 0.22) -%}
+  {%- do u.update({'busy': true, 'node': node}) -%}
+  {%- do queue.append({'due': now, 'k': 'F', 'u': name, 'left': k, 'app': app,
+      'node': node, 'ok': ok and ep is none, 'ep': ep}) -%}
+{%- endmacro -%}
+
+{#- 1. Independent arrivals. -#}
+{%- for name in users -%}
+  {%- set u = users[name] -%}
+  {%- if now >= u.next -%}
+    {%- set peak = u.rate * (1.0 if u.svc else 2.2) -%}
+    {%- do u.update({'next': now + 1 + (num.exponential(peak / 86400)) | int}) -%}
+    {%- set accept = u.svc or rnd.chance(load(now) | float) -%}
+    {%- if accept and not u.busy and now >= u.locked -%}
+      {%- if u.svc -%}
+        {%- set k = rnd.weighted_choice([0, 1, 2, 3, 4, 6], [920, 25, 17, 14, 12, 12]) -%}
+      {%- else -%}
+        {%- set k = rnd.weighted_choice([0, 1, 2, 3, 4, 5], [830, 85, 40, 25, 12, 8]) -%}
+      {%- endif -%}
+      {%- if k == 0 -%}
+        {%- do u.update({'fails': 0}) -%}
+      {%- else -%}
+        {{- session(name, k, none) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- for vname in vols -%}
+  {%- set v = vols[vname] -%}
+  {%- if now >= v.next_snap -%}
+    {%- do v.update({'next_snap': now + lgn(5400, 0.7) | int}) -%}
+    {%- do queue.append({'due': now, 'k': 'Z', 'vol': vname}) -%}
+  {%- endif -%}
+  {%- if now >= v.next_maint -%}
+    {%- do v.update({'next_maint': now + 1 + (num.exponential(1 / 172800)) | int}) -%}
+    {%- if v.state == 'enabled' and not v.res -%}
+      {%- do queue.append({'due': now, 'k': 'D', 'vol': vname, 'ep': false}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, no catch-up; accounts and volume rotate. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (num.exponential(1 / 1200)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set cand = namespace(a=[], v=[]) -%}
+    {%- for name in params.admin_users -%}
+      {%- set u = users[name] -%}
+      {%- if u.fails == 0 and not u.busy and now >= u.locked and name != shared.get('last_a') -%}
+        {%- do cand.a.append(name) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- for vname in vols -%}
+      {%- if vols[vname].state == 'enabled' and not vols[vname].res
+          and vname != shared.get('last_v') -%}
+        {%- do cand.v.append(vname) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if cand.a and cand.v -%}
+      {%- set a = rnd.choice(cand.a) -%}
+      {%- set vname = rnd.choice(cand.v) -%}
+      {%- do vols[vname].update({'res': true}) -%}
+      {{- session(a, thr, {'role': 'A', 'a': a, 'v': vname}) -}}
+      {%- do shared.update({'start_at': none, 'last_a': a, 'last_v': vname,
+          'next_due': now + (interval * 3600) | int}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Earliest due item. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for q in queue -%}
+  {%- if q.due <= now and q.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = q.due -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{%- set out = namespace(kind=none, user=none, node=none, app=none, vol=none,
+    op=none, snap=none, ms=none) -%}
+{%- if pick.i >= 0 -%}
+  {%- set q = queue[pick.i] -%}
+  {%- if q.k == 'S' -%}
+    {#- Episode: a different account fails shortly after the lockout. -#}
+    {%- set cand = namespace(b=[], any=[]) -%}
+    {%- for name in users -%}
+      {%- set u = users[name] -%}
+      {%- if name != q.ep.a and not u.busy and now >= u.locked and u.fails <= thr - 2 -%}
+        {%- do cand.any.append(name) -%}
+        {%- if name != shared.get('last_b') -%}{%- do cand.b.append(name) -%}{%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set pool = cand.b or cand.any -%}
+    {%- do queue.pop(pick.i) -%}
+    {%- if pool -%}
+      {%- set b = rnd.choice(pool) -%}
+      {%- set room = thr - 1 - users[b].fails -%}
+      {%- set k = [rnd.weighted_choice([1, 2], [60, 40]), room] | min -%}
+      {%- do shared.set('last_b', b) -%}
+      {{- session(b, k, {'role': 'B', 'a': q.ep.a, 'v': q.ep.v}) -}}
+      {%- set q = queue[-1] -%}
+      {%- set pick.i = queue | length - 1 -%}
+    {%- else -%}
+      {%- do queue.append({'due': now + 30, 'k': 'S', 'ep': q.ep}) -%}
+      {%- set q = none -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if q is not none and q.k == 'F' -%}
+    {%- set u = users[q.u] -%}
+    {%- set out.kind = 'F' -%}{%- set out.user = q.u -%}
+    {%- set out.node = q.node -%}{%- set out.app = q.app -%}
+    {%- do u.update({'fails': u.fails + 1}) -%}
+    {%- do hist.append({'t': now, 'a': 'F', 'u': q.u}) -%}
+    {%- do q.update({'left': q.left - 1}) -%}
+    {%- if u.fails >= thr -%}
+      {%- do queue.pop(pick.i) -%}
+      {%- do queue.append({'due': now + rnd.weighted_choice([1, 2, 3], [60, 30, 10]),
+          'k': 'L', 'u': q.u, 'node': q.node, 'ep': q.ep}) -%}
+    {%- elif q.left > 0 -%}
+      {%- do q.update({'due': now + (lgn(40, 0.6) if u.svc else lgn(9, 0.8)) | int}) -%}
+    {%- else -%}
+      {%- do queue.pop(pick.i) -%}
+      {%- do u.update({'busy': false}) -%}
+      {%- if q.ok -%}{%- do u.update({'fails': 0}) -%}{%- endif -%}
+      {%- if q.ep and q.ep.role == 'B' -%}
+        {%- do queue.append({'due': now + lgn(420, 0.6) | int, 'k': 'D',
+            'vol': q.ep.v, 'ep': true}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif q is not none and q.k == 'L' -%}
+    {%- do queue.pop(pick.i) -%}
+    {%- set u = users[q.u] -%}
+    {%- set out.kind = 'L' -%}{%- set out.user = q.u -%}{%- set out.node = q.node -%}
+    {%- do u.update({'busy': false, 'fails': 0, 'locked': now + lgn(7200, 0.8) | int}) -%}
+    {%- do hist.append({'t': now, 'a': 'L', 'u': q.u}) -%}
+    {%- if q.ep and q.ep.role == 'A' -%}
+      {%- do queue.append({'due': now + lgn(180, 0.6) | int, 'k': 'S', 'ep': q.ep}) -%}
+    {%- elif q.ep and q.ep.role == 'B' -%}
+      {%- do queue.append({'due': now + lgn(420, 0.6) | int, 'k': 'D',
+          'vol': q.ep.v, 'ep': true}) -%}
+    {%- endif -%}
+  {%- elif q is not none and q.k == 'D' -%}
+    {%- do queue.pop(pick.i) -%}
+    {%- set v = vols[q.vol] -%}
+    {#- Guard on the final chain step: an ordinary disable that would
+        complete failures(A) >= 2, lockout(A), failure(B != A) within
+        one hour is skipped. -#}
+    {%- set g = namespace(block=false) -%}
+    {%- if not q.ep -%}
+      {%- for h in hist -%}
+        {%- set hi = loop.index0 -%}
+        {%- if not g.block and h.a == 'L' and now - h.t <= 3600 -%}
+          {%- set c = namespace(f=0, b=false) -%}
+          {%- for x in hist -%}
+            {%- if x.a == 'F' and x.u == h.u and loop.index0 < hi and now - x.t <= 3600 -%}
+              {%- set c.f = c.f + 1 -%}
+            {%- endif -%}
+            {%- if x.a == 'F' and x.u != h.u and loop.index0 > hi -%}
+              {%- set c.b = true -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if c.f >= 2 and c.b -%}{%- set g.block = true -%}{%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- if v.state == 'enabled' and not g.block and (q.ep or not v.res) -%}
+      {%- set out.kind = 'A' -%}{%- set out.vol = q.vol -%}{%- set out.op = 'disabled' -%}
+      {%- do v.update({'state': 'disabled', 'res': false}) -%}
+      {%- do queue.append({'due': now + lgn(2700, 0.9) | int, 'k': 'E', 'vol': q.vol}) -%}
+      {%- if q.ep -%}{%- do hist.clear() -%}{%- endif -%}
+    {%- endif -%}
+  {%- elif q is not none and q.k == 'E' -%}
+    {%- do queue.pop(pick.i) -%}
+    {%- set out.kind = 'A' -%}{%- set out.vol = q.vol -%}{%- set out.op = 'enabled' -%}
+    {%- do vols[q.vol].update({'state': 'enabled'}) -%}
+  {%- elif q is not none and q.k == 'Z' -%}
+    {%- do queue.pop(pick.i) -%}
+    {%- set out.kind = 'Z' -%}{%- set out.vol = q.vol -%}
+    {%- set out.snap = 'backup.' ~ timestamp.strftime('%Y-%m-%d_%H%M%S') -%}
+    {%- set out.ms = lgn(160, 0.8) | int -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Bounded history: only the last hour matters to the guard. -#}
+{%- set keep = hist | selectattr('t', 'ge', now - 3600) | list -%}
+{%- if keep | length != hist | length -%}
+  {%- do hist.clear() -%}{%- do hist.extend(keep) -%}
+{%- endif -%}
+
+{#- Next wake-up: the earliest pending time of any process. -#}
+{%- set w = namespace(t=now + 86400) -%}
+{%- for q in queue -%}{%- if q.due < w.t -%}{%- set w.t = q.due -%}{%- endif -%}{%- endfor -%}
+{%- for name in users -%}
+  {%- if users[name].next < w.t -%}{%- set w.t = users[name].next -%}{%- endif -%}
+{%- endfor -%}
+{%- for vname in vols -%}
+  {%- set v = vols[vname] -%}
+  {%- if v.next_snap < w.t -%}{%- set w.t = v.next_snap -%}{%- endif -%}
+  {%- if v.next_maint < w.t -%}{%- set w.t = v.next_maint -%}{%- endif -%}
+{%- endfor -%}
+{%- if params.anomaly_mode -%}
+  {%- set ep_t = shared.get('start_at') if shared.get('start_at') is not none
+      else shared.get('next_due') -%}
+  {%- if ep_t < w.t -%}{%- set w.t = ep_t -%}{%- endif -%}
+{%- endif -%}
+{%- do shared.set('wake', [w.t, now + 1] | max) -%}
+
+{%- if out.kind is none -%}{{ dispatch.drop() }}{%- endif -%}
+
+{%- set user_name = none -%}
+{%- if out.kind == 'F' -%}
   {%- set event_name = 'security.invalid.login' -%}
-  {%- set severity = 'alert' -%}
-  {%- set priority = 9 -%}
-  {%- set message = 'Failed to authenticate login attempt to Vserver: ' ~ params.vserver ~ ', username: ' ~ params.target_user ~ ', application: ssh.' -%}
-  {%- set user_name = params.target_user -%}
-  {%- set category = 'authentication' -%}
-  {%- set event_type = 'start' -%}
+  {%- set severity = 'alert' -%}{%- set priority = 9 -%}
+  {%- set message = 'Failed to authenticate login attempt to Vserver: ' ~ params.cluster_name
+      ~ ', username: ' ~ out.user ~ ', application: ' ~ out.app ~ '.' -%}
+  {%- set ems_params = {'vserver': params.cluster_name, 'userName': out.user,
+      'application': out.app} -%}
+  {%- set node = out.node -%}{%- set user_name = out.user -%}
+  {%- set category = 'authentication' -%}{%- set event_type = 'start' -%}
   {%- set outcome = 'failure' -%}
-  {%- if stage == 'failure_1' -%}{%- do shared.set('to_failure_2', true) -%}
-  {%- elif stage == 'failure_2' -%}{%- do shared.set('to_failure_3', true) -%}
-  {%- else -%}{%- do shared.set('to_lockout', true) -%}{%- endif -%}
+{%- elif out.kind == 'L' -%}
+  {%- set event_name = 'useradmin.lockedout.user' -%}
+  {%- set severity = 'error' -%}{%- set priority = 11 -%}
+  {%- set message = "User '" ~ out.user ~ "' is locked out of the appliance for failing authentication '"
+      ~ thr ~ "' times." -%}
+  {%- set ems_params = {'username': out.user, 'attempts': thr} -%}
+  {%- set node = out.node -%}{%- set user_name = out.user -%}
+  {%- set category = 'authentication' -%}{%- set event_type = 'info' -%}
+  {%- set outcome = 'failure' -%}
+{%- elif out.kind == 'A' -%}
+  {%- set v = vols[out.vol] -%}
+  {%- set event_name = 'arw.volume.state' -%}
+  {%- set severity = 'notice' -%}{%- set priority = 13 -%}
+  {%- set message = 'Anti-ransomware state was changed to "' ~ out.op ~ '" on volume "' ~ out.vol
+      ~ '" (UUID: "' ~ v.uuid ~ '") in Vserver "' ~ v.svm ~ '" (UUID: "' ~ v.svm_uuid ~ '").' -%}
+  {%- set ems_params = {'op': out.op, 'volumeName': out.vol, 'volumeUuid': v.uuid,
+      'vserverName': v.svm, 'vserverUuid': v.svm_uuid} -%}
+  {%- set node = v.node -%}
+  {%- set category = 'configuration' -%}{%- set event_type = 'change' -%}
+  {%- set outcome = 'success' -%}
+{%- else -%}
+  {%- set v = vols[out.vol] -%}
+  {%- set event_name = 'zapi.snapshot.success' -%}
+  {%- set severity = 'notice' -%}{%- set priority = 13 -%}
+  {%- set message = 'Asynchronous creation of Snapshot copy named ' ~ out.snap ~ ' in volume '
+      ~ out.vol ~ ' was successful. The Snapshot copy was created ' ~ out.ms
+      ~ ' milliseconds after the request was received by ZAPI.' -%}
+  {%- set ems_params = {'snapshot': out.snap, 'volume': out.vol, 'time': out.ms} -%}
+  {%- set node = v.node -%}
+  {%- set category = 'configuration' -%}{%- set event_type = 'creation' -%}
+  {%- set outcome = 'success' -%}
 {%- endif -%}
 {%- set day = (' ' if timestamp.day < 10 else '') ~ timestamp.day -%}
 {%- set syslog_time = timestamp.strftime('%b ') ~ day ~ timestamp.strftime(' %H:%M:%S') -%}
-{%- set original = '<' ~ priority ~ '>' ~ syslog_time ~ ' [' ~ params.node_name ~ ':' ~ event_name ~ ':' ~ severity ~ ']: ' ~ message -%}
-{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': [category], 'type': [event_type], 'action': event_name, 'outcome': outcome, 'original': original}, 'host': {'name': params.node_name}, 'log': {'syslog': {'priority': priority, 'facility': {'code': 1, 'name': 'user'}, 'severity': {'code': priority % 8, 'name': severity}}}, 'netapp': {'ems': {'name': event_name, 'severity': severity, 'message': message}}} -%}
-{%- if event_name == 'zapi.snapshot.success' -%}{%- do payload['netapp']['ems'].update({'snapshot': snapshot_name, 'volume': params.snapshot_volume, 'duration_ms': 125}) -%}{%- endif -%}
-{%- if event_name == 'security.invalid.login' -%}{%- do payload['netapp']['ems'].update({'vserver': params.vserver}) -%}{%- endif -%}
-{%- if user_name -%}{%- do payload.update({'user': {'name': user_name}, 'related': {'user': [user_name]}}) -%}{%- endif -%}
+{%- set original = '<' ~ priority ~ '>' ~ syslog_time ~ ' [' ~ node ~ ':' ~ event_name ~ ':'
+    ~ severity ~ ']: ' ~ message -%}
+{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'},
+    'event': {'kind': 'event', 'category': [category], 'type': [event_type],
+    'action': event_name, 'outcome': outcome, 'original': original},
+    'host': {'name': node},
+    'log': {'syslog': {'priority': priority, 'facility': {'code': 1, 'name': 'user'},
+    'severity': {'code': priority % 8, 'name': severity}}},
+    'netapp': {'ems': {'name': event_name, 'severity': severity, 'message': message,
+    'parameters': ems_params}}} -%}
+{%- if user_name -%}
+  {%- do payload.update({'user': {'name': user_name}, 'related': {'user': [user_name]}}) -%}
+{%- endif -%}
 {{- payload | tojson -}}
