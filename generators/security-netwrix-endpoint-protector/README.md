@@ -45,7 +45,7 @@ Edit `event.template.params` in `generator.yml`:
 | `anomaly_interval_hours` | `24` | Hours between episodes (6 to 8760), counted from the previous episode's start |
 | `epp_server` | `epp-01` | Endpoint Protector server name in `observer.name` |
 | `staff_count` | `80` | Number of users and workstations (20 to 1000) |
-| `utc_offset_hours` | `3` | Server time zone (hours from UTC) for `Date/Time(Server)`; head-office workstations use it for `Date/Time(Client)` too |
+| `utc_offset_hours` | `3` | Server time zone (hours from UTC, -12 to 14) for `Date/Time(Server)`; head-office workstations use it for `Date/Time(Client)` too |
 
 ### Output Parameters
 
