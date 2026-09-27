@@ -1,0 +1,358 @@
+{#- One FreeIPA server's 389 Directory Server security log (JSON, one
+    object per line, written by json-c). Each one-second tick emits at
+    most one record: the earliest due one. Users, service accounts,
+    administrators and stray clients are independent random processes;
+    the anomaly episode only queues its own records for one user and
+    never touches the background. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 600 -%}
+{%- set sfx = params.directory_suffix | lower -%}
+{%- set people = ['anna.ivanova', 'pavel.smirnov', 'olga.kim', 'dmitry.orlov',
+    'maria.petrova', 'sergey.volkov', 'elena.sokolova', 'ivan.popov',
+    'natalia.lebedeva', 'alexey.kozlov', 'irina.novikova', 'mikhail.morozov',
+    'tatiana.egorova', 'andrey.pavlov', 'yulia.fedorova', 'nikolai.stepanov',
+    'ksenia.nikolaeva', 'roman.makarov', 'svetlana.zakharova', 'artem.zaitsev',
+    'daria.solovyova', 'kirill.borisov', 'ekaterina.romanova', 'maxim.vasiliev',
+    'polina.gusev', 'denis.titov', 'victoria.kuzmina', 'oleg.belov',
+    'anastasia.komarova', 'vladimir.orlov', 'john.miller', 'sarah.jones',
+    'david.clark', 'emma.wilson', 'lucas.martin', 'sofia.garcia',
+    'noah.brown', 'mia.davis', 'liam.taylor', 'chloe.moore', 'ethan.white',
+    'grace.hall', 'oliver.king', 'zoe.wright'] -%}
+{%- set app_defs = {
+    'gitlab': ['10.20.3.11', true, 'gitlab'],
+    'jenkins': ['10.20.3.12', false, 'jenkins'],
+    'grafana': ['10.20.3.13', true, 'grafana'],
+    'vpn': ['10.20.3.14', true, 'openvpn'],
+    'nextcloud': ['10.20.3.15', false, 'nextcloud'],
+    'portal': ['10.20.3.16', true, 'selfservice']} -%}
+{%- set admin_hosts = ['10.20.5.21', '10.20.5.22', '10.20.5.23'] -%}
+{%- set disabled = [['boris.gromov', 'nextcloud'], ['alina.frolova', 'vpn']] -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- One fixed organisation: per-user activity and application mix come
+      from a fixed seed, so every run models the same directory and only
+      behaviour is random. -#}
+  {%- set rnd = module.random.Random(4617) -%}
+  {%- set users = {} -%}
+  {%- set app_names = app_defs.keys() | list -%}
+  {%- for p in people -%}
+    {%- set n = rnd.choice([1, 2, 2, 3, 3, 4]) -%}
+    {%- set apps = rnd.sample(app_names, n) -%}
+    {%- set aw = [] -%}
+    {%- for a in apps -%}{%- do aw.append(rnd.lognormvariate(0, 0.9)) -%}{%- endfor -%}
+    {%- do users.update({p: {'w': rnd.lognormvariate(0, 0.8), 'apps': apps, 'aw': aw}}) -%}
+  {%- endfor -%}
+  {%- set uw = [] -%}
+  {%- for p in people -%}{%- do uw.append(users[p].w) -%}{%- endfor -%}
+  {%- set counter = module.random.randint(20000, 400000) -%}
+  {%- set pools = {} -%}
+  {%- for a in app_names -%}
+    {%- set slots = [] -%}
+    {%- for i in range(module.random.randint(2, 4)) -%}
+      {%- do slots.append([counter - module.random.randint(50, 9000), module.random.randint(1, 4000)]) -%}
+    {%- endfor -%}
+    {%- do pools.update({a: slots}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'uw': uw,
+      'q': [], 'fails': {}, 'reset': {}, 'conns': {}, 'pools': pools,
+      'broken': {}, 'counter': counter, 'last_new': now, 'sid': 0,
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_user': none}) -%}
+{%- endif -%}
+{%- set users = shared.get('users') -%}
+{%- set q = shared.get('q') -%}
+{%- set fails = shared.get('fails') -%}
+{%- set reset = shared.get('reset') -%}
+{%- set conns = shared.get('conns') -%}
+{%- set pools = shared.get('pools') -%}
+{%- set broken = shared.get('broken') -%}
+{%- macro hload(h) -%}{{ 1.6 if 7 <= h < 17 else (0.7 if 17 <= h < 21 else 0.25) }}{%- endmacro -%}
+{%- set load = (hload(timestamp.astimezone(utc).hour) | float) / 0.89 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{%- macro put(at, ev, dn, ip, msg, conn, op=0, root=false, episode=false, svc=none, keep=none, sess=none) -%}
+  {%- do q.append({'due': at, 'ev': ev, 'dn': dn, 'ip': ip, 'msg': msg, 'conn': conn,
+      'op': op, 'root': root, 'episode': episode, 'svc': svc, 'keep': keep, 'sess': sess}) -%}
+{%- endmacro -%}
+
+{%- macro udn(uid) -%}{{ 'uid=' ~ uid ~ ',cn=users,cn=accounts,' ~ sfx }}{%- endmacro -%}
+
+{#- A user logging in to one application that authenticates with an
+    LDAP simple bind: one new connection per attempt (StartTLS first on
+    some applications, so the bind is op 1). k wrong passwords come
+    first; the session ends in a success or gives up. -#}
+{%- macro login(uid, app, k, succeed, typo, episode=false) -%}
+  {%- set a = app_defs[app] -%}
+  {%- set op = 1 if a[1] else 0 -%}
+  {%- set t = namespace(at=now) -%}
+  {%- if typo -%}
+    {%- set i = module.random.randint(1, uid | length - 2) -%}
+    {%- set bad = uid[:i - 1] ~ uid[i] ~ uid[i - 1] ~ uid[i + 1:] -%}
+    {%- if bad != uid -%}
+      {{- put(t.at, 'BIND_FAILED', udn(bad), a[0], 'NO_SUCH_ENTRY', 'new', op, episode=episode) -}}
+      {%- set t.at = t.at + gap(14, 0.8) | int -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- for i in range(k) -%}
+    {{- put(t.at, 'BIND_FAILED', udn(uid), a[0], 'INVALID_PASSWORD', 'new', op, episode=episode) -}}
+    {%- set t.at = t.at + gap(12, 0.8) | int -%}
+  {%- endfor -%}
+  {%- if succeed -%}
+    {%- set sid = none -%}
+    {%- if app == 'portal' and module.rand.chance(0.07) -%}
+      {%- set sid = shared.get('sid') + 1 -%}{%- do shared.set('sid', sid) -%}
+    {%- endif -%}
+    {{- put(t.at, 'BIND_SUCCESS', udn(uid), a[0], '', 'new', op, episode=episode, keep=sid) -}}
+    {%- if sid is not none -%}
+      {%- set target = udn(uid) if module.rand.chance(0.7)
+          else 'cn=' ~ module.rand.choice(['admins', 'editors', 'trust admins', 'ipausers']) ~ ',cn=groups,cn=accounts,' ~ sfx -%}
+      {{- put(t.at + gap(25, 0.9) | int, 'AUTHZ_ERROR', udn(uid), a[0],
+          'target_dn=(' ~ (target | replace(sfx, params.directory_suffix)) ~ ')', 'sess', episode=episode, sess=sid) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. People: one merged Poisson stream of independent users, weighted
+    per user and per application, modulated by office hours. -#}
+{%- if module.rand.chance(0.011 * load) -%}
+  {%- set uid = module.rand.weighted_choice(people, shared.get('uw')) -%}
+  {%- set app = module.rand.weighted_choice(users[uid].apps, users[uid].aw) -%}
+  {%- set typo = module.rand.chance(0.012) -%}
+  {%- if module.rand.chance(0.07) -%}
+    {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [52, 22, 11, 7, 5, 3]) -%}
+    {{- login(uid, app, k, k <= 4 and module.rand.chance(0.9), typo) -}}
+  {%- else -%}
+    {{- login(uid, app, 0, true, typo) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Service accounts: each application re-binds its lookup account on
+    pooled connections at random times. -#}
+{%- for app, a in app_defs.items() -%}
+  {%- if module.rand.chance(1 / 600) -%}
+    {{- put(now, 'BIND_SUCCESS', 'uid=' ~ a[2] ~ ',cn=sysaccounts,cn=etc,' ~ sfx, a[0], '', 'pool', svc=app) -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if module.rand.chance(0.00012) -%}
+  {#- The provisioning account touching an attribute it may not write. -#}
+  {%- set tgt = module.rand.choice(people) -%}
+  {{- put(now, 'AUTHZ_ERROR', 'uid=selfservice,cn=sysaccounts,cn=etc,' ~ sfx, app_defs.portal[0],
+      'target_dn=(uid=' ~ tgt ~ ',cn=users,cn=accounts,' ~ params.directory_suffix ~ ')', 'pool', svc='portal') -}}
+{%- endif -%}
+
+{#- 3. A stale service password after a rotation: the application keeps
+    reconnecting with the old one until someone fixes its config. -#}
+{%- if module.rand.chance(0.000006) -%}
+  {%- set app = module.rand.choice(app_defs.keys() | list) -%}
+  {%- if broken.get(app, 0) < now -%}
+    {%- set a = app_defs[app] -%}
+    {%- set until = now + gap(1500, 0.8) | int -%}
+    {%- do broken.update({app: until}) -%}
+    {%- set t = namespace(at=now) -%}
+    {%- for i in range(200) if t.at < until -%}
+      {{- put(t.at, 'BIND_FAILED', 'uid=' ~ a[2] ~ ',cn=sysaccounts,cn=etc,' ~ sfx, a[0], 'INVALID_PASSWORD', 'new', 1 if a[1] else 0) -}}
+      {%- set t.at = t.at + gap(40, 0.5) | int -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 4. Administrators binding as Directory Manager from their hosts
+    (ldapmodify -ZZ -D "cn=Directory Manager" -W), with typos. -#}
+{%- if module.rand.chance(0.00008 * load) -%}
+  {%- set ip = module.rand.weighted_choice(admin_hosts, [5, 3, 1]) -%}
+  {%- set t = namespace(at=now) -%}
+  {%- set k = module.rand.weighted_choice([0, 1, 2, 3, 4], [80, 12, 5, 2, 1]) -%}
+  {%- for i in range(k) -%}
+    {{- put(t.at, 'BIND_FAILED', 'cn=directory manager', ip, 'INVALID_PASSWORD', 'new', 1, root=true) -}}
+    {%- set t.at = t.at + gap(12, 0.8) | int -%}
+  {%- endfor -%}
+  {%- if k == 0 or module.rand.chance(0.9) -%}
+    {%- for i in range(module.rand.weighted_choice([1, 2, 3, 4], [50, 25, 15, 10])) -%}
+      {{- put(t.at, 'BIND_SUCCESS', 'cn=directory manager', ip, '', 'new', 1, root=true) -}}
+      {%- set t.at = t.at + gap(90, 1.0) | int -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 5. Disabled accounts whose old devices still try to sign in. -#}
+{%- for d in disabled -%}
+  {%- if module.rand.chance(0.00012) -%}
+    {%- set t = namespace(at=now) -%}
+    {%- for i in range(module.rand.weighted_choice([1, 2, 3, 4], [45, 30, 15, 10])) -%}
+      {{- put(t.at, 'BIND_FAILED', udn(d[0]), app_defs[d[1]][0], 'ACCOUNT_LOCKED', 'new', 1) -}}
+      {%- set t.at = t.at + gap(8, 0.7) | int -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- 6. Anonymous binds (rootDSE discovery) and uncleanly closed
+    connections from ordinary clients. -#}
+{%- if module.rand.chance(0.0006 * load) -%}
+  {%- set ip = module.rand.choice(['10.20.9.5', '10.20.3.11', '10.20.5.21'])
+      if module.rand.chance(0.4) else '10.20.12.' ~ module.random.randint(20, 240) -%}
+  {{- put(now, 'BIND_SUCCESS', '', ip, 'ANONYMOUS_BIND', 'new', 0) -}}
+{%- endif -%}
+{%- if module.rand.chance(0.0002) -%}
+  {%- set pool_ips = ['10.20.3.11', '10.20.3.12', '10.20.3.13', '10.20.3.14', '10.20.3.15',
+      '10.20.3.16', '10.20.5.21', '10.20.5.22', '10.20.9.5'] -%}
+  {%- set ip = module.rand.choice(pool_ips) if module.rand.chance(0.6)
+      else '10.20.12.' ~ module.random.randint(20, 240) -%}
+  {{- put(now, 'TCP_ERROR', none, ip, module.rand.weighted_choice([
+      'Bad Ber Tag or uncleanly closed connection - B1', 'Ber peak tag - B3',
+      'Ber Too Big (nsslapd-maxbersize) - B2'], [95, 4, 1]), 'new') -}}
+{%- endif -%}
+
+{#- 7. Episode: due by source time. At the due time the start is drawn
+    from the background hour-of-day curve within min(interval / 4, 6 h)
+    after it; the next due time counts from the actual start, never
+    catching up. -#}
+{%- if params.anomaly_mode and now >= shared.get('next_due') and shared.get('start_at') is none -%}
+  {%- set top = now - now % 3600 -%}
+  {%- set slots = [] -%}{%- set sw = [] -%}
+  {%- for k in range(8) -%}
+    {%- set a = [top + k * 3600, now] | max -%}
+    {%- set b = [top + (k + 1) * 3600, now + ([interval * 900, 21600] | min) | int] | min -%}
+    {%- if b > a -%}
+      {%- do slots.append([a, b]) -%}
+      {%- do sw.append((hload(module.datetime.datetime.fromtimestamp(a, utc).hour) | float) * (b - a)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(slots, sw) -%}
+  {%- do shared.set('start_at', module.random.randint(slot[0], slot[1] - 1)) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {#- Same per-user and per-application weights as ordinary logins;
+      the previous episode's user and anyone mid-session sit this one
+      out, so episodes rotate and never merge with a real session. -#}
+  {%- set busy = q | map(attribute='dn') | list -%}
+  {%- set ep = namespace(c=[], w=[]) -%}
+  {%- for p in people -%}
+    {%- if p != shared.get('last_user') and udn(p) not in busy -%}
+      {%- set ep.c = ep.c + [p] -%}{%- set ep.w = ep.w + [users[p].w] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ep.c -%}
+    {%- set uid = module.rand.weighted_choice(ep.c, ep.w) -%}
+    {%- set app = module.rand.weighted_choice(users[uid].apps, users[uid].aw) -%}
+    {%- if not fails.get(udn(uid) ~ '|' ~ app_defs[app][0]) -%}
+      {{- login(uid, app, 5, true, false, true) -}}
+      {%- do shared.update({'last_user': uid, 'start_at': none,
+          'next_due': now + (interval * 3600) | int}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 8. Emit the earliest due record, otherwise nothing. -#}
+{%- set sel = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < sel.due -%}{%- set sel.i = loop.index0 -%}{%- set sel.due = e.due -%}{%- endif -%}
+{%- endfor -%}
+{%- if sel.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(sel.i) -%}
+{%- set ev = e.ev -%}
+{%- set msg = e.msg -%}
+{%- set key = (e.dn or '') ~ '|' ~ e.ip -%}
+
+{#- A service account whose password is stale cannot bind. -#}
+{%- if ev == 'BIND_SUCCESS' and e.svc and broken.get(e.svc, 0) > now -%}
+  {%- set ev = 'BIND_FAILED' -%}{%- set msg = 'INVALID_PASSWORD' -%}
+{%- endif -%}
+
+{#- Wrong passwords per (DN, client) in the last 10 minutes. Guard on
+    the final chain step only: an ordinary success after five of them
+    is not written. The episode's own success resets the count. -#}
+{%- set recent = (fails.get(key, []) | select('ge', [now - window, reset.get(key, 0) + 1] | max) | list) -%}
+{%- if ev == 'BIND_FAILED' and msg == 'INVALID_PASSWORD' -%}
+  {%- do recent.append(now) -%}
+{%- endif -%}
+{%- if recent -%}{%- do fails.update({key: recent[-30:]}) -%}{%- elif key in fails -%}{%- do fails.pop(key) -%}{%- endif -%}
+{%- if ev == 'BIND_SUCCESS' and not e.episode and recent | length >= 5 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- if ev == 'BIND_SUCCESS' and e.episode -%}
+  {%- do reset.update({key: now}) -%}
+  {%- if fails.get(key) -%}{%- do fails.pop(key) -%}{%- endif -%}
+{%- endif -%}
+
+{#- Connection numbers: one server-wide counter that also counts the
+    many connections the security log never mentions (SASL/GSSAPI
+    binds from SSSD and the IPA framework). -#}
+{%- macro bump() -%}
+  {%- set idle = now - shared.get('last_new') -%}
+  {%- set c = shared.get('counter') + 1 + (module.rand.number.lognormal(module.math.log(1 + idle * 0.05), 0.6) | int) -%}
+  {%- do shared.update({'counter': c, 'last_new': now}) -%}
+{%- endmacro -%}
+{%- set cn = namespace(id=0, op=e.op) -%}
+{%- if e.conn == 'new' -%}
+  {{- bump() -}}{%- set cn.id = shared.get('counter') -%}
+{%- elif e.conn == 'pool' -%}
+  {%- set slots = pools[e.svc] -%}
+  {%- set s = module.random.randrange(slots | length) -%}
+  {%- if ev != 'AUTHZ_ERROR' and module.rand.chance(0.25) -%}
+    {{- bump() -}}
+    {%- set cn.op = 1 if app_defs[e.svc][1] else 0 -%}
+    {%- do slots.pop(s) -%}{%- do slots.insert(s, [shared.get('counter'), cn.op]) -%}
+  {%- else -%}
+    {%- set cn.op = slots[s][1] + 1 + (module.rand.number.lognormal(module.math.log(12), 1.0) | int) -%}
+    {%- set keep_id = slots[s][0] -%}{%- do slots.pop(s) -%}{%- do slots.insert(s, [keep_id, cn.op]) -%}
+  {%- endif -%}
+  {%- set cn.id = slots[s][0] -%}
+{%- else -%}
+  {%- set c = conns.pop(e.sess, none) -%}
+  {%- if c is none -%}{{ dispatch.drop() }}{%- endif -%}
+  {%- set cn.id = c[0] -%}{%- set cn.op = c[1] + module.rand.weighted_choice([1, 2, 3, 4], [30, 35, 20, 15]) -%}
+{%- endif -%}
+{%- if e.keep is not none and ev == 'BIND_SUCCESS' -%}
+  {%- do conns.update({e.keep: [cn.id, cn.op]}) -%}
+{%- endif -%}
+
+{%- set ns = module.random.randint(0, 999999999) -%}
+{%- set dt = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set nsd = '%09d' | format(ns) -%}
+{%- set date = '[' ~ dt.strftime('%d/%b/%Y:%H:%M:%S') ~ '.' ~ nsd ~ ' +0000] ' -%}
+{%- set utc_time = now ~ '.' ~ nsd -%}
+{%- macro js(v) -%}{{ (v | tojson) | replace('/', '\\/') }}{%- endmacro -%}
+{%- if ev == 'TCP_ERROR' -%}
+  {%- set raw = '{ "date": ' ~ js(date) ~ ', "utc_time": ' ~ js(utc_time) ~ ', "event": ' ~ js(ev)
+      ~ ', "client_ip": ' ~ js(e.ip) ~ ', "server_ip": ' ~ js(params.server_ip) ~ ', "ldap_version": 3, "conn_id": '
+      ~ cn.id ~ ', "msg": ' ~ js(msg) ~ ' }' -%}
+{%- else -%}
+  {%- set raw = '{ "date": ' ~ js(date) ~ ', "utc_time": ' ~ js(utc_time) ~ ', "event": ' ~ js(ev)
+      ~ ', "dn": ' ~ js(e.dn) ~ ', "bind_method": "SIMPLE", "root_dn": ' ~ (e.root | tojson)
+      ~ ', "client_ip": ' ~ js(e.ip) ~ ', "server_ip": ' ~ js(params.server_ip)
+      ~ ', "ldap_version": 3, "conn_id": ' ~ cn.id ~ ', "op_id": ' ~ cn.op ~ ', "msg": ' ~ js(msg) ~ ' }' -%}
+{%- endif -%}
+
+{%- set native = {'event': ev, 'client_ip': e.ip, 'server_ip': params.server_ip,
+    'ldap_version': 3, 'conn_id': cn.id, 'msg': msg} -%}
+{%- if ev != 'TCP_ERROR' -%}
+  {%- do native.update({'dn': e.dn, 'bind_method': 'SIMPLE', 'root_dn': e.root, 'op_id': cn.op}) -%}
+{%- endif -%}
+{%- set outcome = 'success' if ev in ['BIND_SUCCESS', 'HAPROXY_SUCCESS'] else 'failure' -%}
+{%- if ev.startswith('BIND_') -%}
+  {%- set category = ['authentication'] -%}{%- set etype = ['start'] -%}
+{%- elif ev == 'AUTHZ_ERROR' -%}
+  {%- set category = ['iam'] -%}{%- set etype = ['change', 'denied'] -%}
+{%- else -%}
+  {%- set category = ['network'] -%}{%- set etype = ['connection', 'error'] -%}
+{%- endif -%}
+{%- set record = {'@timestamp': dt.strftime('%Y-%m-%dT%H:%M:%S.') ~ nsd[:3] ~ 'Z',
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'module': 'freeipa', 'dataset': 'freeipa.security',
+    'action': ev | lower, 'category': category, 'type': etype, 'outcome': outcome,
+    'original': raw},
+  'host': {'name': params.server_host, 'ip': [params.server_ip]},
+  'log': {'file': {'path': '/var/log/dirsrv/slapd-' ~ params.realm | replace('.', '-') ~ '/security'}},
+  'source': {'ip': e.ip},
+  'related': {'ip': [e.ip, params.server_ip]},
+  'freeipa': {'security': native}} -%}
+{%- if e.dn -%}
+  {%- set uname = e.dn.split(',')[0].split('=', 1)[1] -%}
+  {%- do record.update({'user': {'name': uname}}) -%}
+  {%- do record.related.update({'user': [uname]}) -%}
+{%- endif -%}
+{{ record | tojson }}
