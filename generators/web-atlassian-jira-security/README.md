@@ -24,7 +24,7 @@ Shares describe synthetic traffic, not measured Jira frequencies. Every action a
 An episode is a credential-guessing run against one account from one address: three `authentication-failed` records (failure counts 1-3), a fourth attempt refused by `captcha-required` (failure count 4), then an `authentication-passed` for that account - the compromise - followed later by a logout.
 
 - **Linking fields.** Every step of the run shares one anonymous pre-login `jira.security.session_id`; Jira keeps the anonymous session across attempts and reports it on the successful login too. The failed and CAPTCHA records carry `user.name: anonymous`; the guessed account is in the message and in `jira.security.target_user`. The source IP is constant across the run.
-- **Recurrence.** Episodes recur by source time on a configurable interval (`anomaly_interval_hours`, default 24, minimum 1). The next episode is due one interval after the previous episode's actual start, with no catch-up, and starts after a short random delay past the due time.
+- **Recurrence.** Episodes recur by source time on a configurable interval (`anomaly_interval_hours`, default 24, 1-8760). The first episode is due one interval after the first event plus a random delay of up to 30 minutes (or interval/8 when shorter); each next one is due the same way after the previous episode's actual start, with no catch-up. At the due time the episode starts once an account other than the previous target has been signed out for at least 30 minutes.
 - **Variation.** The target is an account idle for at least 30 minutes, never the previous episode's target. The address is one the target already uses in ordinary traffic - a neighbouring desk or a VPN address - never the previous episode's address. Gaps between attempts and the session length after the compromise are drawn from skewed random distributions.
 - **Detection idea.** Group by `jira.security.session_id`; flag a session with three failed logins and a CAPTCHA refusal followed by a successful login. Ordinary lockouts reach the CAPTCHA refusal but never produce a successful login in that session, so the full ordered run does not occur in the background. Sort by `@timestamp` before applying sequence logic; output line order is not guaranteed.
 
@@ -37,7 +37,7 @@ An episode is a credential-guessing run against one account from one address: th
 | Name | Default | Purpose |
 | --- | --- | --- |
 | `anomaly_mode` | `true` | Weave the credential-guessing episodes into the stream |
-| `anomaly_interval_hours` | `24` | Source-time interval between episodes (minimum 1) |
+| `anomaly_interval_hours` | `24` | Source-time interval between episodes (1-8760) |
 | `host_name` | `jira-dc-01.example.test` | Jira node emitting the log (`host.name`) |
 | `context_path` | `/jira` | Servlet context path prefixing each request URL |
 
