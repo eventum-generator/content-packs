@@ -27,7 +27,7 @@ Each one-second tick emits at most one record: the earliest due request, otherwi
 - **File sharing** (13%): 1-3 denied requests, 25% of them upload POSTs.
 - **Executable downloads** (12%): 1-2 installers; 14% from a tunnel-client host.
 
-Over 78 h an `anomaly_mode: false` capture holds 1,030-1,220 pairs of denials on two different anonymizers by one user within an hour, 120-150 tunnel-client downloads and 55-85 tunnel-client downloads within an hour of an anonymizer denial.
+Over 78 h an `anomaly_mode: false` capture holds 1,030-1,220 pairs of denials on two different anonymizers by one user within an hour, 117-153 tunnel-client downloads and 54-86 tunnel-client downloads within an hour of an anonymizer denial.
 
 ## Anomaly Chain
 
@@ -43,7 +43,7 @@ Linking fields: `user.name` and `source.ip` in all steps; `url.domain` differs b
 
 Recurrence: an episode becomes due every `anomaly_interval_hours` of source time (default 24, minimum 2), first one interval after generation starts. It starts after a random delay (exponential, mean 20 min). The next due time counts from the actual start, so a late episode never causes catch-up. Episodes in the final captures spanned 7-17 minutes at the default interval and 4-55 minutes at 6 h.
 
-Variation: the user differs from the previous episode's, the first anonymizer and the tunnel-client host too; gaps between denials follow the background burst law and the download follows after a log-normal delay (median 7 min). The episode start ignores the day/night load curve, so night episodes stand out more against the lower night background; the episode user is picked uniformly, so rarely active users are over-represented as chain actors. The Filter log records no state that the chain changes, so there is nothing to restore.
+Variation: the user differs from the previous episode's, the first anonymizer and the tunnel-client host too; gaps between denials follow the background burst law and the download follows after a log-normal delay (median 7 min). The episode start ignores the day/night load curve, so night episodes stand out more against the lower night background; the episode user is picked uniformly, so rarely active users are over-represented as chain actors. At the default 24 h interval each start drifts only by its random delay (20 min on average), so consecutive episodes fall near the same hour of day. The Filter log records no state that the chain changes, so there is nothing to restore.
 
 Detection idea: after the web filter blocks a user on two different anonymizers, the same user downloads a tunneling or remote-access client within an hour (filter evasion). Each fragment occurs in background: repeated anonymizer denials, denials on several proxies, tunnel-client downloads and tunnel-client downloads after a single proxy denial. Only the complete sequence is kept out of the background: an ordinary tunnel-client download by a user with denials on two different anonymizers in the last 4,000 s comes from an ordinary software host instead.
 
