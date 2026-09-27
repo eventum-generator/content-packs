@@ -1,36 +1,292 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
-{%- if chain -%}
-  {%- set kind = ['Detected','CleanupFailed','Detected','CleanedUp'][step] -%}
-  {%- set host_name = params.target_host -%}
-  {%- set file_path = params.target_file -%}
-  {%- set threat = params.threat_name -%}
-{%- else -%}
-  {%- set kind = module.rand.weighted_choice(['Detected','CleanedUp','HIPSDetected'], [10, 80, 10]) -%}
-  {%- set host_name = module.rand.choice(['linux-web-01.example.test','linux-dev-02.example.test','linux-db-03.example.test']) -%}
-  {%- set file_path = module.rand.choice(['/tmp/update.sh','/home/user/Downloads/tool.bin','/opt/app/cache/pkg.so']) -%}
-  {%- set threat = module.rand.choice(['Mal/Generic-S','PUA/Generic-A','Troj/Example-B']) -%}
+{#- Sophos Central endpoint events as written by the Sophos Central SIEM
+    Integration script (siem.py 2.1.0, format = cef, endpoint = event),
+    wrapped in ECS JSON with the CEF line in event.original. One input
+    tick per second; each tick emits the earliest due event or drops.
+    Every endpoint runs its own processes: lognormal gaps between
+    detection incidents (auto-cleaned, re-detected, cleanup failed,
+    PUA), update checks and rare automatic user creation. Times are
+    microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- if shared.get('queue') is not none and (not shared.get('queue') or shared.get('queue')[0][0] > now) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set hq = module.heapq -%}
+{%- set sec = 1000000 -%}
+{%- set hour = 3600 * sec -%}
+{#- Guard window: a background CleanedUp is reported as CleanupFailed
+    when the same endpoint saw Detected -> CleanupFailed -> Detected for
+    the same threat and file within this window, so the full chain stays
+    episode-only. -#}
+{%- set guard = 3 * hour -%}
+{%- set incidents_per_day = 150 -%}
+{%- set diurnal = [0.25, 0.25, 0.25, 0.25, 0.25, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.5, 0.4, 0.3, 0.25, 0.25, 0.25] -%}
+{%- set user_dirs = ['Downloads', 'Downloads', 'Downloads', 'Desktop', 'Documents', 'AppData\\Local\\Temp', 'AppData\\Local\\Temp', 'AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup', 'AppData\\Local\\Microsoft\\Windows\\INetCache\\IE'] -%}
+{%- set server_dirs = ['C:\\Windows\\Temp', 'C:\\Windows\\Temp', 'C:\\ProgramData', 'C:\\Users\\Public\\Downloads', 'D:\\Shares\\Finance', 'D:\\Shares\\Projects'] -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro row(a, c, th, p, due, ep) -%}
+  {{- push(due, {'k': 'row', 'a': a, 'c': c, 't': th, 'p': p, 'ep': ep}) -}}
+{%- endmacro -%}
+{%- macro pick_threat(kind) -%}
+  {{- module.rand.weighted_choice(shared.get(kind ~ '_idx'), shared.get(kind ~ '_w')) -}}
+{%- endmacro -%}
+{%- macro pick_path(a, th) -%}
+  {%- set e = shared.get('eps')[a] -%}
+  {%- set f = module.rand.choice(shared.get('threats')[th].files) -%}
+  {%- if e.user -%}
+    {{- 'C:\\Users\\' ~ e.user ~ '\\' ~ module.rand.choice(user_dirs) ~ '\\' ~ f -}}
+  {%- else -%}
+    {{- module.rand.choice(server_dirs) ~ '\\' ~ f -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro incident(a, t0) -%}
+  {%- set kind = module.rand.weighted_choice(['auto', 'redetect', 'fail', 'pua'], [52, 12, 18, 18]) -%}
+  {%- set th = (pick_threat('pua' if kind == 'pua' else 'malware') | int) -%}
+  {%- set p = pick_path(a, th) -%}
+  {%- set t = namespace(v=t0) -%}
+  {%- if kind == 'auto' -%}
+    {#- Detected and cleaned up automatically, sometimes detected again
+        (another copy or on-access after a scan) and cleaned again. -#}
+    {{- row(a, 'D', th, p, t.v, false) -}}
+    {%- set t.v = t.v + (ln(15, 1.0) | int) -%}
+    {{- row(a, 'CU', th, p, t.v, false) -}}
+    {%- if module.rand.chance(0.2) -%}
+      {%- set t.v = t.v + (ln(180, 1.1) | int) -%}
+      {{- row(a, 'D', th, p, t.v, false) -}}
+      {%- set t.v = t.v + (ln(15, 1.0) | int) -%}
+      {{- row(a, 'CU', th, p, t.v, false) -}}
+    {%- endif -%}
+  {%- elif kind == 'redetect' -%}
+    {#- Repeated detections of one file within minutes. -#}
+    {{- row(a, 'D', th, p, t.v, false) -}}
+    {%- for _ in range(module.rand.weighted_choice([1, 2, 3], [60, 30, 10])) -%}
+      {%- set t.v = t.v + (ln(600, 0.8) | int) -%}
+      {{- row(a, 'D', th, p, t.v, false) -}}
+    {%- endfor -%}
+    {%- if module.rand.chance(0.6) -%}
+      {%- set t.v = t.v + (ln(15, 1.0) | int) -%}
+      {{- row(a, 'CU', th, p, t.v, false) -}}
+    {%- endif -%}
+  {%- elif kind == 'fail' -%}
+    {#- Cleanup fails; the file is left alone, cleaned up manually much
+        later, or detected again (with a further failure). -#}
+    {{- row(a, 'D', th, p, t.v, false) -}}
+    {%- set t.v = t.v + (ln(40, 0.9) | int) -%}
+    {{- row(a, 'CF', th, p, t.v, false) -}}
+    {%- set r = module.rand.weighted_choice(['end', 'manual', 'again'], [35, 35, 30]) -%}
+    {%- if r == 'manual' -%}
+      {{- row(a, 'CU', th, p, t.v + (ln(5400, 0.9) | int), false) -}}
+    {%- elif r == 'again' -%}
+      {%- set t.v = t.v + (ln(600, 0.8) | int) -%}
+      {{- row(a, 'D', th, p, t.v, false) -}}
+      {%- if module.rand.chance(0.5) -%}
+        {{- row(a, 'CF', th, p, t.v + (ln(40, 0.9) | int), false) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- else -%}
+    {#- PUA detected; cleanup often needs an administrator. -#}
+    {{- row(a, 'PD', th, p, t.v, false) -}}
+    {%- if module.rand.chance(0.45) -%}
+      {%- set t.v = t.v + (ln(60, 0.9) | int) -%}
+      {{- row(a, 'PCF', th, p, t.v, false) -}}
+      {%- if module.rand.chance(0.2) -%}
+        {{- row(a, 'PD', th, p, t.v + (ln(3600, 1.0) | int), false) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro armed(hist, th, p) -%}
+  {#- 1 when hist holds Detected -> CleanupFailed -> Detected for the
+      threat and file, in order. -#}
+  {%- set st = namespace(s=0) -%}
+  {%- for e in hist if e[2] == th and e[3] == p -%}
+    {%- if st.s == 0 and e[1] == 'D' -%}{%- set st.s = 1 -%}
+    {%- elif st.s == 1 and e[1] == 'CF' -%}{%- set st.s = 2 -%}
+    {%- elif st.s == 2 and e[1] == 'D' -%}{%- set st.s = 3 -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- 1 if st.s == 3 else 0 -}}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 3, 'le': 8760}},
+    'customer_id': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'domain': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- do shared.update({'queue': [], 'seq': 0}) -%}
+  {%- set eps = [] -%}
+  {%- for r in samples.endpoints -%}
+    {%- do eps.append({'host': r.hostname, 'ip': r.ip, 'eid': r.endpoint_id, 'etype': r.endpoint_type, 'user': r.user, 'uid': r.user_id, 'w': r.weight | float, 'hist': []}) -%}
+  {%- endfor -%}
+  {%- set threats = [] -%}
+  {%- for r in samples.threats -%}
+    {%- do threats.append({'name': r.name, 'kind': r.kind, 'files': r.files.split(' '), 'w': r.weight | float}) -%}
+  {%- endfor -%}
+  {%- for kind in ['malware', 'pua'] -%}
+    {%- set idx = [] -%}
+    {%- set ws = [] -%}
+    {%- for i in range(threats | length) if threats[i].kind == kind -%}{%- do idx.append(i) -%}{%- do ws.append(threats[i].w) -%}{%- endfor -%}
+    {%- do shared.update({kind ~ '_idx': idx, kind ~ '_w': ws}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'eps': eps, 'threats': threats, 'ep_idx': range(eps | length) | list, 'ep_w': eps | map(attribute='w') | list, 'ep_last_a': none, 'ep_last_t': none}) -%}
+  {%- set total_w = eps | sum(attribute='w') -%}
+  {%- for a in range(eps | length) -%}
+    {#- Mean incident gap from the endpoint's weight; lognormal sigma
+        1.1. First occurrences are a uniform point of a length-biased
+        gap (median scaled by exp(sigma^2)), so the run starts
+        stationary. -#}
+    {%- set mean_s = 86400 * total_w / (incidents_per_day * eps[a].w) -%}
+    {%- do eps[a].update({'med': mean_s * module.math.exp(-0.605)}) -%}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(eps[a].med * module.math.exp(1.21), 1.1) | int)), {'k': 'inc', 'a': a}) -}}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(14400 * module.math.exp(0.25), 0.5) | int)), {'k': 'upd', 'a': a}) -}}
+    {%- if eps[a].user -%}
+      {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(1296000 * module.math.exp(1.0), 1.0) | int)), {'k': 'uac', 'a': a}) -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if params.anomaly_mode -%}
+    {{- push(now + hour, {'k': 'ep'}) -}}
+  {%- endif -%}
 {%- endif -%}
-{%- set class_id = 'Event::Endpoint::Threat::' ~ kind -%}
-{%- set severity = 8 if kind in ['Detected','CleanupFailed','HIPSDetected'] else 5 -%}
-{%- set raw = 'CEF:0|sophos|sophos central|1.0|' ~ class_id ~ '|'
-  ~ threat ~ '|' ~ severity ~ '|'
-  ~ 'rt=' ~ event_time.isoformat() ~ ' end=' ~ event_time.isoformat()
-  ~ ' dhost=' ~ host_name ~ ' filePath=' ~ file_path
-  ~ ' suser=analyst@example.test' -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
-  'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'alert', 'dataset': 'sophos.central', 'module': 'sophos',
-    'category': ['malware'],
-    'type': ['info'],
-    'code': class_id, 'action': kind, 'original': raw},
-  'host': {'name': host_name},
-  'file': {'path': file_path},
-  'user': {'email': 'analyst@example.test'},
-  'sophos': {'central': {'event_type': class_id, 'severity': severity, 'threat_name': threat}}} -%}
-{{ record | tojson }}
+{%- set q = shared.get('queue') -%}
+{%- set eps = shared.get('eps') -%}
+{%- set threats = shared.get('threats') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{%- set out = namespace(due=none, item=none) -%}
+{%- for _ in range(500) if out.item is none and q and q[0][0] <= now -%}
+  {%- set top = hq.heappop(q) -%}
+  {%- set it = top[2] -%}
+  {%- if it.k == 'inc' -%}
+    {%- set hr = module.datetime.datetime.fromtimestamp(top[0] / 1000000, module.datetime.timezone.utc).hour -%}
+    {%- if eps[it.a].etype == 'server' or module.rand.chance(diurnal[hr]) -%}{{- incident(it.a, top[0]) -}}{%- endif -%}
+    {{- push(top[0] + (ln(eps[it.a].med, 1.1) | int), it) -}}
+  {%- elif it.k == 'upd' -%}
+    {{- row(it.a, 'US', none, none, top[0], false) -}}
+    {{- push(top[0] + (ln(14400, 0.5) | int), it) -}}
+  {%- elif it.k == 'uac' -%}
+    {{- row(it.a, 'UA', none, none, top[0], false) -}}
+    {{- push(top[0] + (ln(1296000, 1.0) | int), it) -}}
+  {%- elif it.k == 'ep' -%}
+    {#- Episode: Detected -> CleanupFailed -> Detected -> CleanedUp for
+        one threat and file on one endpoint. The start is a random
+        delay after the due time; the next due time counts from the
+        actual start. Endpoint and threat rotate. -#}
+    {%- set start = top[0] + module.rand.number.integer(0, [hour, interval // 8] | min) -%}
+    {%- set a = namespace(v=shared.get('ep_last_a')) -%}
+    {%- for _ in range(50) if a.v == shared.get('ep_last_a') -%}{%- set a.v = module.rand.weighted_choice(shared.get('ep_idx'), shared.get('ep_w')) -%}{%- endfor -%}
+    {%- set th = namespace(v=shared.get('ep_last_t')) -%}
+    {%- for _ in range(50) if th.v == shared.get('ep_last_t') -%}{%- set th.v = pick_threat('malware') | int -%}{%- endfor -%}
+    {%- set p = pick_path(a.v, th.v) -%}
+    {%- set t = start -%}
+    {{- row(a.v, 'D', th.v, p, t, true) -}}
+    {%- set t = t + (ln(40, 0.9) | int) -%}
+    {{- row(a.v, 'CF', th.v, p, t, true) -}}
+    {%- set t = t + (ln(600, 0.8) | int) -%}
+    {{- row(a.v, 'D', th.v, p, t, true) -}}
+    {%- set t = t + (ln(15, 1.0) | int) -%}
+    {{- row(a.v, 'CU', th.v, p, t, true) -}}
+    {%- do shared.update({'ep_last_a': a.v, 'ep_last_t': th.v}) -%}
+    {{- push(start + interval, {'k': 'ep'}) -}}
+  {%- else -%}
+    {%- set out.due = top[0] -%}
+    {%- set out.item = it -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.item is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set it = out.item -%}
+{%- set ep = eps[it.a] -%}
+{%- set c = namespace(v=it.c) -%}
+{%- if it.t is not none -%}
+  {%- set keep = ep.hist | selectattr(0, 'ge', out.due - guard) | list -%}
+  {%- if keep | length > 200 -%}{%- set keep = keep[-200:] -%}{%- endif -%}
+  {%- do ep.update({'hist': keep}) -%}
+  {%- if c.v == 'CU' and not it.ep and (armed(keep, it.t, it.p) | int) == 1 -%}{%- set c.v = 'CF' -%}{%- endif -%}
+  {%- do ep.hist.append([out.due, c.v, it.t, it.p]) -%}
+{%- endif -%}
+{#- Event type, group, API severity and description per kind. Threat
+    descriptions follow the "<text>: '<threat>' at '<path>'" form that
+    name_mapping.py splits into detection_identity_name and filePath. -#}
+{%- set types = {
+  'D': ['Event::Endpoint::Threat::Detected', 'MALWARE', 'high', 'Malware detected'],
+  'CU': ['Event::Endpoint::Threat::CleanedUp', 'MALWARE', 'low', 'Malware cleaned up'],
+  'CF': ['Event::Endpoint::Threat::CleanupFailed', 'MALWARE', 'high', 'Manual cleanup required'],
+  'PD': ['Event::Endpoint::Threat::PuaDetected', 'PUA', 'medium', 'PUA detected'],
+  'PCF': ['Event::Endpoint::Threat::PuaCleanupFailed', 'PUA', 'medium', 'Manual PUA cleanup required'],
+  'US': ['Event::Endpoint::UpdateSuccess', 'UPDATING', 'low', 'Update succeeded'],
+  'UA': ['Event::Endpoint::UserAutoCreated', 'PROTECTION', 'low', 'New user added automatically']} -%}
+{%- set ty = types[c.v] -%}
+{%- set source = (params.domain ~ '\\' ~ ep.user) if ep.user else 'n/a' -%}
+{%- if c.v == 'UA' -%}
+  {%- set source = ep.host ~ '\\' ~ ep.user -%}
+{%- endif -%}
+{%- set when = module.datetime.datetime.fromtimestamp(out.due / 1000000, module.datetime.timezone.utc) -%}
+{%- set lag = (ln(1.5, 1.2) | int) if not module.rand.chance(0.02) else (ln(1800, 1.0) | int) -%}
+{%- set created = when + module.datetime.timedelta(microseconds=lag) -%}
+{%- set when_s = when.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d' | format(when.microsecond // 1000) ~ 'Z' -%}
+{%- set created_s = created.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d' | format(created.microsecond // 1000) ~ 'Z' -%}
+{%- set eid = module.rand.crypto.uuid4() -%}
+{%- if it.t is not none -%}
+  {%- set threat = threats[it.t].name -%}
+  {%- set name = ty[3] ~ ": '" ~ threat ~ "' at '" ~ it.p ~ "'" -%}
+{%- elif c.v == 'UA' -%}
+  {%- set threat = none -%}
+  {%- set name = ty[3] ~ ': ' ~ source -%}
+{%- else -%}
+  {%- set threat = none -%}
+  {%- set name = ty[3] -%}
+{%- endif -%}
+{#- The API item as returned by /siem/v1/events (null fields removed),
+    plus the datastream key appended by api_client.py. -#}
+{%- set item = [('source', source), ('severity', ty[2]), ('created_at', created_s), ('source_info_ip', ep.ip), ('customer_id', params.customer_id)] -%}
+{%- if threat is not none -%}{%- do item.append(('threat', threat)) -%}{%- endif -%}
+{%- do item.extend([('endpoint_id', ep.eid), ('endpoint_type', ep.etype)]) -%}
+{%- if ep.uid -%}{%- do item.append(('user_id', ep.uid)) -%}{%- endif -%}
+{%- do item.extend([('when', when_s), ('type', ty[0]), ('location', ep.host), ('group', ty[1]), ('id', eid), ('name', name), ('datastream', 'event')]) -%}
+{#- siem.py CEF: name_mapping splits threat descriptions, the header
+    takes type, name and mapped severity, mapped keys are renamed and
+    move to the end in their original order, values escape = and \. -#}
+{%- set header_name = threat if threat is not none else name -%}
+{%- if threat is not none -%}
+  {%- do item.extend([('detection_identity_name', threat), ('filePath', it.p)]) -%}
+{%- endif -%}
+{%- set cef_map = {'source': 'suser', 'when': 'end', 'user_id': 'duid', 'created_at': 'rt', 'location': 'dhost'} -%}
+{%- set sev_map = {'none': 0, 'low': 1, 'medium': 5, 'high': 8, 'very_high': 10} -%}
+{%- set plain = [] -%}
+{%- set moved = [] -%}
+{%- for k, v in item if k not in ['name', 'type', 'severity'] -%}
+  {%- set val = v.replace('\\', '\\\\').replace('=', '\\=') -%}
+  {%- if k in cef_map -%}{%- do moved.append(cef_map[k] ~ '=' ~ val) -%}{%- else -%}{%- do plain.append(k ~ '=' ~ val) -%}{%- endif -%}
+{%- endfor -%}
+{%- set raw = 'CEF:0|sophos|sophos central|1.0|' ~ ty[0] ~ '|' ~ header_name.replace('\\', '\\\\').replace('|', '\\|') ~ '|' ~ sev_map[ty[2]] ~ '|' ~ (plain + moved) | join(' ') -%}
+{%- set cats = {'MALWARE': (['malware'], ['info']), 'PUA': (['malware'], ['info']), 'UPDATING': (['host'], ['info']), 'PROTECTION': (['iam'], ['user', 'creation'])} -%}
+{%- set record = {'@timestamp': when_s,
+  'ecs': {'version': '8.11.0'},
+  'event': {'kind': 'event', 'dataset': 'sophos_central.event', 'module': 'sophos_central',
+    'category': cats[ty[1]][0], 'type': cats[ty[1]][1],
+    'code': ty[0], 'action': name, 'id': eid, 'created': created_s,
+    'severity': sev_map[ty[2]], 'original': raw},
+  'observer': {'vendor': 'Sophos', 'product': 'Sophos Central'},
+  'organization': {'id': params.customer_id},
+  'host': {'name': ep.host, 'id': ep.eid},
+  'source': {'ip': ep.ip},
+  'related': {'ip': [ep.ip], 'hosts': [ep.host]},
+  'sophos_central': {'event': {'type': ty[0], 'group': ty[1], 'severity': ty[2],
+    'source': source, 'location': ep.host, 'when': when_s, 'created_at': created_s,
+    'endpoint': {'id': ep.eid, 'type': ep.etype}, 'datastream': 'event'}}} -%}
+{%- if ep.user -%}
+  {%- do record.update({'user': {'name': ep.user, 'domain': ep.host if c.v == 'UA' else params.domain, 'id': ep.uid}}) -%}
+  {%- do record.related.update({'user': [ep.user]}) -%}
+  {%- do record.sophos_central.event.update({'user_id': ep.uid}) -%}
+{%- endif -%}
+{%- if threat is not none -%}
+  {%- do record.update({'file': {'path': it.p, 'name': it.p.split('\\')[-1]}}) -%}
+  {%- do record.sophos_central.event.update({'threat': threat, 'detection_identity_name': threat}) -%}
+{%- endif -%}
+{{ module.json.dumps(record) }}
