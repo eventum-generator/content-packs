@@ -1,33 +1,308 @@
-{%- set step = vars.step -%}
-{%- set chain = step.startswith('chain_') -%}
-{%- if step == 'routine_a' -%}
-  {%- do shared.pop('to_chain', none) -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_chain', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{#- One LoadMaster ESP virtual service publishing a webmail portal.
+    Every one-second tick emits at most one record: the earliest due
+    record of any open client session, otherwise nothing. Users start
+    sessions as independent random processes; the anomaly episode is
+    one extra session built by the same code. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set ecp_paths = ['/ecp/', '/ecp/PersonalSettings/HomePage.aspx',
+    '/ecp/Organize/AutomaticReplies.slab', '/ecp/UsersGroups/Mailboxes.slab',
+    '/ecp/Security/AdminRoles.slab'] -%}
+{%- set owa_paths = ['/owa/', '/owa/service.svc', '/owa/ev.owa2',
+    '/owa/sessiondata.ashx', '/owa/attachment.ashx', '/owa/userspecificresourceinjector.ashx'] -%}
+{%- set owa_weights = [22, 38, 14, 10, 7, 9] -%}
+{%- set user_agents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1'] -%}
+{%- set probe_agents = ['curl/8.5.0', 'python-requests/2.31.0',
+    'Microsoft Office/16.0 (Windows NT 10.0; Microsoft Outlook 16.0.17928; Pro)'] -%}
+{%- set lmax = 1.6 -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{#- Office-hours intensity, mean over a day about 1.0. -#}
+{%- set load = 1.6 if 7 <= hour < 17 else (0.9 if 17 <= hour < 21 else 0.33) -%}
+
+{%- macro external_ip() -%}
+{{- module.rand.choice(['198.51.100.', '203.0.113.']) ~ module.rand.number.integer(2, 254) -}}
+{%- endmacro -%}
+{%- macro gap(median, sigma, cap) -%}
+{{- [[module.rand.number.lognormal(module.math.log(median), sigma) | round | int, 1] | max, cap] | min -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set users = [] -%}
+  {%- for i in range(samples.users | length) -%}
+    {%- set row = samples.users[i] -%}
+    {%- do users.append({'name': row.name, 'home': row.home_ip,
+        'ua': module.rand.choice(user_agents),
+        'next': now + module.rand.number.exponential(params.sessions_per_user_day * lmax / 86400) | int}) -%}
+  {%- endfor -%}
+  {%- set amin = users | map(attribute='next') | min -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'queue': [],
+      'q_min': none, 'a_min': amin, 'busy': {}, 'denials': {}, 'logon_at': {}, 'seq': 0,
+      'probe_next': now + module.rand.number.exponential(params.probes_per_day / 86400) | int,
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_chain_user': none}) -%}
 {%- endif -%}
-{%- set class_id = 9 if step.startswith('chain_denied') else (8 if step == 'chain_login' else (14 if step == 'chain_request' else module.rand.weighted_choice([14, 9, 8], [85, 10, 5]))) -%}
-{%- set name = 'Access Denied' if class_id == 9 else ('Logged on' if class_id == 8 else 'Request') -%}
-{%- set severity = 6 if class_id == 9 else 1 -%}
-{%- set src = params.chain_source_ip if chain else '10.42.1.' ~ module.rand.number.integer(10, 180) -%}
-{%- set user = params.chain_user if chain else module.rand.choice(['alice@example.test', 'bob@example.test', 'service@example.test']) -%}
-{%- set vs = params.virtual_ip ~ ':443' -%}
-{%- set srcport = module.rand.number.integer(40000, 60000) -%}
-{%- set extension = {'vs':vs,'event':name,'srcip':src} -%}
-{%- if class_id == 14 -%}
-  {%- do extension.update({'srcport':srcport,'method':'GET','url':'https://' ~ params.virtual_ip ~ ('/admin' if chain else module.rand.choice(['/','/app','/health'])),'user':user,'useragent':'Mozilla/5.0'}) -%}
-{%- else -%}
-  {%- do extension.update({'user':user,'msg':'denied access' if class_id == 9 else 'logged on'}) -%}
+{%- set queue = shared.get('queue') -%}
+{%- set busy = shared.get('busy') -%}
+
+{%- macro add(rec) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do rec.update({'n': shared.get('seq')}) -%}
+  {%- do queue.append(rec) -%}
+  {%- if shared.get('q_min') is none or rec.due < shared.get('q_min') -%}
+    {%- do shared.set('q_min', rec.due) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- A complete client session planned at its start. `fails` and
+    `ecp` are forced only for the episode. -#}
+{%- macro plan(u, t0, ep=false, fails=none) -%}
+  {%- set s = namespace(t=t0, port=module.rand.number.integer(49152, 65535),
+      rs=module.rand.choice(params.real_servers), last=none) -%}
+  {%- set ip = u.home if module.rand.chance(0.7) else external_ip() -%}
+  {%- set base = {'u': u.name, 'ip': ip, 'ua': u.ua, 'ep': ep} -%}
+  {%- do busy.update({u.name: true}) -%}
+  {%- set recs = [] -%}
+  {%- do recs.append(dict(base, c=2, due=s.t, port=s.port)) -%}
+  {%- set s.t = s.t + module.rand.number.integer(0, 1) -%}
+  {%- do recs.append(dict(base, c=15, due=s.t, port=s.port, method='GET', path='/owa/')) -%}
+  {%- set k = fails if fails is not none else module.rand.weighted_choice(
+      [0, 1, 2, 3, 4, 5], [79, 10, 5, 3, 2, 1]) -%}
+  {%- for i in range(k) -%}
+    {%- set s.t = s.t + gap(9, 0.75, 240) | int -%}
+    {%- do recs.append(dict(base, c=9, due=s.t)) -%}
+  {%- endfor -%}
+  {%- if not ep and k > 0 and module.rand.chance(0.15) -%}
+    {#- The user gives up without logging on. -#}
+  {%- else -%}
+    {%- set s.t = s.t + gap(8, 0.7, 180) | int -%}
+    {%- do recs.append(dict(base, c=100, due=s.t)) -%}
+    {%- set s.t = s.t + module.rand.number.integer(0, 1) -%}
+    {%- do recs.append(dict(base, c=8, due=s.t)) -%}
+    {%- set s.t = s.t + module.rand.number.integer(0, 1) -%}
+    {%- do recs.append(dict(base, c=4, due=s.t, port=s.port, rs=s.rs)) -%}
+    {%- set n = [[module.rand.number.lognormal(module.math.log(7), 0.9) | int, 1] | max, 80] | min -%}
+    {%- if ep -%}{%- set n = [n, 3] | max -%}{%- endif -%}
+    {%- set forced = [] -%}
+    {%- if ep -%}
+      {%- set m = module.rand.weighted_choice([1, 2, 3], [45, 35, 20]) -%}
+      {%- set forced = module.random.sample(range(1, [n, 6] | min), [m, ([n, 6] | min) - 1] | min) -%}
+    {%- endif -%}
+    {%- for j in range(n) -%}
+      {%- set s.t = s.t + gap(18, 1.3, 1500) | int -%}
+      {%- if module.rand.chance(0.12) -%}
+        {%- set s.port = module.rand.number.integer(49152, 65535) -%}
+        {%- do recs.append(dict(base, c=2, due=s.t, port=s.port)) -%}
+        {%- if module.rand.chance(0.03) -%}
+          {%- do recs.append(dict(base, c=5, due=s.t, port=s.port, rs=s.rs)) -%}
+          {%- set others = params.real_servers | reject('equalto', s.rs) | list -%}
+          {%- set s.rs = module.rand.choice(others or params.real_servers) -%}
+        {%- endif -%}
+        {%- do recs.append(dict(base, c=4, due=s.t, port=s.port, rs=s.rs)) -%}
+      {%- endif -%}
+      {%- if j in forced or module.rand.chance(0.05) -%}
+        {%- set path = module.rand.choice(ecp_paths) -%}
+      {%- else -%}
+        {%- set path = module.rand.weighted_choice(owa_paths, owa_weights) -%}
+      {%- endif -%}
+      {%- set method = 'POST' if path in ['/owa/service.svc', '/owa/ev.owa2'] else 'GET' -%}
+      {%- do recs.append(dict(base, c=14, due=s.t, port=s.port, path=path, method=method)) -%}
+    {%- endfor -%}
+    {%- if module.rand.chance(0.55) -%}
+      {%- set s.t = s.t + gap(40, 1.0, 1200) | int -%}
+      {%- do recs.append(dict(base, c=6, due=s.t)) -%}
+      {%- set s.t = s.t + module.rand.number.integer(0, 1) -%}
+      {%- do recs.append(dict(base, c=102, due=s.t)) -%}
+    {%- else -%}
+      {%- set s.t = s.t + params.session_idle_seconds + module.rand.number.integer(1, 90) -%}
+      {%- do recs.append(dict(base, c=101, due=s.t)) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- do recs[-1].update({'last': true}) -%}
+  {%- for r in recs -%}{{- add(r) -}}{%- endfor -%}
+{%- endmacro -%}
+
+{#- 1. User session arrivals (thinned Poisson process per user). -#}
+{%- if now >= shared.get('a_min') -%}
+  {%- set users = shared.get('users') -%}
+  {%- for u in users -%}
+    {%- if now >= u.next -%}
+      {%- if not busy.get(u.name, false) and module.rand.chance(load / lmax) -%}
+        {{- plan(u, now) -}}
+      {%- endif -%}
+      {%- do u.update({'next': now + [module.rand.number.exponential(params.sessions_per_user_day * lmax / 86400) | int, 1] | max}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('a_min', users | map(attribute='next') | min) -%}
+{%- endif -%}
+
+{#- 2. Anonymous clients: TLS handshakes that time out or send one
+    unauthenticated request. -#}
+{%- if now >= shared.get('probe_next') -%}
+  {%- set pip = external_ip() -%}
+  {%- set pport = module.rand.number.integer(1024, 65535) -%}
+  {%- set pbase = {'u': none, 'ip': pip, 'ua': module.rand.choice(probe_agents), 'ep': false, 'port': pport} -%}
+  {{- add(dict(pbase, c=2, due=now)) -}}
+  {%- if module.rand.chance(0.35) -%}
+    {{- add(dict(pbase, c=3, due=now + gap(25, 0.6, 300) | int)) -}}
+  {%- else -%}
+    {{- add(dict(pbase, c=15, due=now + module.rand.number.integer(0, 2), method='GET',
+        path=module.rand.weighted_choice(['/', '/owa/', '/autodiscover/autodiscover.xml', '/ecp/'], [30, 35, 25, 10]))) -}}
+  {%- endif -%}
+  {%- do shared.set('probe_next', now + [module.rand.number.exponential(params.probes_per_day / 86400) | int, 1] | max) -%}
+{%- endif -%}
+
+{#- 3. Episode: due by source time, random start delay, next due from
+    the actual start, no catch-up, a different user each time. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + module.rand.number.exponential(1 / 1200) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set free = [] -%}
+    {%- for u in shared.get('users') -%}
+      {%- if not busy.get(u.name, false) and u.name != shared.get('last_chain_user') -%}
+        {%- do free.append(u) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if free -%}
+      {%- set cu = module.rand.choice(free) -%}
+      {{- plan(cu, now, true, module.rand.weighted_choice([3, 4, 5], [50, 30, 20])) -}}
+      {%- do shared.update({'last_chain_user': cu.name, 'start_at': none,
+          'next_due': now + (interval * 3600) | int}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 4. Emit the earliest due record, or nothing. -#}
+{%- if shared.get('q_min') is none or now < shared.get('q_min') -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set best = namespace(i=0) -%}
+{%- for r in queue -%}
+  {%- if r.due < queue[best.i].due or (r.due == queue[best.i].due and r.n < queue[best.i].n) -%}
+    {%- set best.i = loop.index0 -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set r = queue.pop(best.i) -%}
+{%- do shared.set('q_min', (queue | map(attribute='due') | min) if queue else none) -%}
+{%- if r.get('last') -%}{%- do busy.update({r.u: false}) -%}{%- endif -%}
+{%- set denials = shared.get('denials') -%}
+{%- set path = r.get('path') -%}
+{%- if r.c == 8 -%}
+  {%- do shared.get('logon_at').update({r.u: now}) -%}
+{%- elif r.c == 9 -%}
+  {%- set h = denials.get(r.u, []) + [[now, r.ip]] -%}
+  {%- do denials.update({r.u: h[-8:]}) -%}
+{%- elif r.c == 14 and not r.ep and path in ecp_paths -%}
+  {#- Guard on the final chain step: an ordinary session whose user
+      failed three times from this address within the hour does not
+      open the control panel. -#}
+  {%- set recent = denials.get(r.u, []) | selectattr('1', 'equalto', r.ip)
+      | selectattr('0', 'ge', now - 3600) | list -%}
+  {%- if recent | length >= 3 -%}
+    {%- set path = module.rand.weighted_choice(owa_paths, owa_weights) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- set names = {0: 'Accept', 2: 'SSL accept', 3: 'Connection timed out',
+    4: 'Connected', 5: 'Connection failed', 6: 'Logged off', 8: 'Logged on',
+    9: 'Access Denied', 14: 'Request', 15: 'Attempt', 100: 'User AAA',
+    101: 'User session timeout', 102: 'User session kill'} -%}
+{%- set sevs = {2: 0, 3: 1, 4: 1, 5: 3, 6: 1, 8: 1, 9: 6, 14: 1, 15: 2,
+    100: 0, 101: 0, 102: 0} -%}
+{%- set name = names[r.c] -%}
+{%- set vs = params.virtual_ip ~ ':' ~ params.virtual_port -%}
+{%- set ext = [('vs', vs), ('event', name)] -%}
+{%- if r.c in [2, 3, 4, 5, 14, 15] -%}
+  {%- do ext.extend([('srcip', r.ip), ('srcport', r.port)]) -%}
+{%- endif -%}
+{%- if r.c == 2 -%}
+  {%- do ext.append(('msg', 'SSL accept')) -%}
+{%- elif r.c == 3 -%}
+  {%- do ext.extend([('msg', 'waiting for initial client request'), ('await_remaddr', 0)]) -%}
+{%- elif r.c in [4, 5] -%}
+  {%- do ext.extend([('dstip', r.rs), ('dstport', params.real_server_port)]) -%}
+{%- elif r.c == 14 -%}
+  {%- do ext.extend([('method', r.method), ('url', 'https://' ~ params.portal_host ~ path),
+      ('user', r.u), ('useragent', r.ua)]) -%}
+{%- elif r.c == 15 -%}
+  {%- do ext.extend([('method', r.method), ('url', 'https://' ~ params.portal_host ~ path),
+      ('useragent', r.ua)]) -%}
+{%- elif r.c == 6 -%}
+  {%- do ext.extend([('user', r.u), ('srcip', r.ip)]) -%}
+{%- elif r.c in [8, 9] -%}
+  {%- do ext.extend([('srcip', r.ip), ('user', r.u),
+      ('msg', 'logged on' if r.c == 8 else 'denied access')]) -%}
+{%- elif r.c == 100 -%}
+  {%- do ext.extend([('user', r.u), ('domain', params.user_domain),
+      ('server', params.aaa_server), ('protocol', params.aaa_protocol),
+      ('result', '0:Success')]) -%}
+{%- elif r.c in [101, 102] -%}
+  {%- do ext.extend([('user', r.u), ('domain', params.sso_domain),
+      ('msg', ('Deleted expired user session' if r.c == 101 else 'Deleted user session')
+      ~ ', start time:' ~ shared.get('logon_at')[r.u] ~ ' duration:'
+      ~ (now - shared.get('logon_at')[r.u]) ~ ' seconds')]) -%}
 {%- endif -%}
 {%- set pairs = [] -%}
-{%- for key,value in extension.items() -%}{%- do pairs.append(key ~ '=' ~ value|string) -%}{%- endfor -%}
-{%- set raw = 'CEF:0|Kemp|LM|1.0|' ~ class_id ~ '|' ~ name ~ '|' ~ severity ~ '|' ~ pairs|join(' ') -%}
-{%- set cef = {'version':0,'vendor':'Kemp','product':'LM','device_version':'1.0','class_id':class_id,'name':name,'severity':severity,'extension':extension} -%}
-{%- set specific = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'access-denied' if class_id == 9 else ('logged-on' if class_id == 8 else 'request'),'category':['authentication'] if class_id == 8 else ['web'],'code':class_id|string,'dataset':'kemp_loadmaster.esp','kind':'event','original':raw,'type':['denied'] if class_id == 9 else (['start'] if class_id == 8 else ['access'])},'host':{'name':params.device_name},'source':{'ip':src},'destination':{'ip':params.virtual_ip,'port':443},'related':{'ip':[src,params.virtual_ip],'user':[user]},'user':{'name':user},'kemp':{'loadmaster':cef}} -%}
-{%- if class_id == 14 -%}
-  {%- do specific.source.update({'port':srcport}) -%}
-  {%- do specific.update({'http':{'request':{'method':'GET'}},'url':{'full':extension.url}}) -%}
+{%- set extension = {} -%}
+{%- for kv in ext -%}
+  {%- do pairs.append(kv[0] ~ '=' ~ kv[1]) -%}
+  {%- do extension.update({kv[0]: kv[1] | string}) -%}
+{%- endfor -%}
+{%- set raw = 'CEF:0|Kemp|LM|1.0|' ~ r.c ~ '|' ~ name ~ '|' ~ sevs[r.c] ~ '|' ~ pairs | join(' ') -%}
+
+{%- set meta = {
+    2: ('ssl-accept', ['network'], ['connection', 'start'], none),
+    3: ('connection-timed-out', ['network'], ['connection', 'end'], 'failure'),
+    4: ('connected', ['network'], ['connection', 'start'], 'success'),
+    5: ('connection-failed', ['network'], ['connection', 'end'], 'failure'),
+    6: ('logged-off', ['authentication', 'session'], ['end'], 'success'),
+    8: ('logged-on', ['authentication', 'session'], ['start'], 'success'),
+    9: ('access-denied', ['authentication'], ['start'], 'failure'),
+    14: ('request', ['web'], ['access'], none),
+    15: ('attempt', ['web'], ['access'], none),
+    100: ('user-aaa', ['authentication'], ['info'], 'success'),
+    101: ('user-session-timeout', ['session'], ['end'], none),
+    102: ('user-session-kill', ['session'], ['end'], none)}[r.c] -%}
+{%- set event = {'action': meta[0], 'category': meta[1], 'type': meta[2],
+    'code': r.c | string, 'severity': sevs[r.c], 'dataset': 'kemp_loadmaster.esp',
+    'kind': 'event', 'module': 'kemp_loadmaster', 'original': raw} -%}
+{%- if meta[3] -%}{%- do event.update({'outcome': meta[3]}) -%}{%- endif -%}
+{%- set doc = {'@timestamp': timestamp.astimezone(utc).isoformat(),
+    'ecs': {'version': '8.17.0'}, 'event': event,
+    'observer': {'hostname': params.device_name, 'product': 'LoadMaster',
+        'vendor': 'Progress Kemp', 'type': 'load-balancer'},
+    'destination': {'ip': params.virtual_ip, 'port': params.virtual_port},
+    'kemp': {'loadmaster': {'cef': {'version': 0, 'device_vendor': 'Kemp',
+        'device_product': 'LM', 'device_version': '1.0',
+        'device_event_class_id': r.c | string, 'name': name,
+        'severity': sevs[r.c]}, 'extension': extension}}} -%}
+{%- set rel_ip = [params.virtual_ip] -%}
+{%- if 'srcip' in extension -%}
+  {%- set src = {'ip': r.ip} -%}
+  {%- if 'srcport' in extension -%}{%- do src.update({'port': r.port}) -%}{%- endif -%}
+  {%- do doc.update({'source': src}) -%}
+  {%- do rel_ip.insert(0, r.ip) -%}
 {%- endif -%}
-{{- specific | tojson -}}
+{%- if 'dstip' in extension -%}
+  {%- do doc.update({'server': {'ip': r.rs, 'port': params.real_server_port}}) -%}
+  {%- do rel_ip.append(r.rs) -%}
+{%- endif -%}
+{%- set related = {'ip': rel_ip} -%}
+{%- if 'user' in extension -%}
+  {%- do doc.update({'user': {'name': r.u}}) -%}
+  {%- do related.update({'user': [r.u]}) -%}
+{%- endif -%}
+{%- do doc.update({'related': related}) -%}
+{%- if r.c in [14, 15] -%}
+  {%- do doc.update({'http': {'request': {'method': r.method}},
+      'url': {'full': extension.url, 'domain': params.portal_host, 'path': path, 'scheme': 'https'},
+      'user_agent': {'original': r.ua}}) -%}
+{%- endif -%}
+{{- doc | tojson -}}

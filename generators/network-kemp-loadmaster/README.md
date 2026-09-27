@@ -1,118 +1,127 @@
 # Progress Kemp LoadMaster ESP CEF
 
-Eventum content pack for LoadMaster ESP CEF events. Each output is ECS JSON with the vendor CEF body in `event.original`. `anomaly_mode: true` is the default; `false` emits background only.
+Edge Security Pack (ESP) user logs of a Progress Kemp LoadMaster in Common Event Format, for one virtual service that pre-authenticates a webmail portal. Each output line is ECS JSON with the vendor CEF body in `event.original` and the parsed header and extension under `kemp.loadmaster`. The pack is for SIEM teams that test CEF parsing, ESP authentication monitoring and correlation of failed ESP logons with later access.
 
-## Run
+## Event Types
 
-From the content-packs repository root:
+Shares measured on the final default capture (78 h, `anomaly_mode: true`, 13,332 events). The `anomaly_mode: false` capture of the same window differs by less than 0.6 percentage points per class.
 
-```bash
-eventum generate --path generators/network-kemp-loadmaster/generator.yml --id network-kemp-loadmaster --live-mode true
-```
+| CEF class ID | Name | `event.action` | Share | ECS category |
+| --- | --- | --- | --- | --- |
+| `14` | Request | `request` | 49.8% | `web` |
+| `2` | SSL accept | `ssl-accept` | 13.0% | `network` |
+| `4` | Connected | `connected` | 10.7% | `network` |
+| `15` | Attempt | `attempt` | 6.4% | `web` |
+| `100` | User AAA | `user-aaa` | 4.8% | `authentication` |
+| `8` | Logged on | `logged-on` | 4.8% | `authentication`, `session` |
+| `6` | Logged off | `logged-off` | 2.7% | `authentication`, `session` |
+| `102` | User session kill | `user-session-kill` | 2.7% | `session` |
+| `9` | Access Denied | `access-denied` | 2.2% | `authentication` |
+| `101` | User session timeout | `user-session-timeout` | 2.0% | `session` |
+| `3` | Connection timed out | `connection-timed-out` | 0.7% | `network` |
+| `5` | Connection failed | `connection-failed` | 0.2% | `network` |
 
-For a bounded batch, run `timeout 3s eventum generate --path generators/network-kemp-loadmaster/generator.yml --id network-kemp-loadmaster-batch --live-mode false`. Exit code 124 is expected for this continuous source. Output is written to `generators/network-kemp-loadmaster/output/events.json`.
+Names, severities, extension keys and key order follow the vendor examples for each class ID. The rates are a synthetic workload, not measured LoadMaster traffic.
 
-## Events
+## Background Model
 
-| CEF class ID | Meaning | Background frequency | ECS category |
-| --- | --- | --- | --- |
-| `9` | ESP Access Denied | About 10% | `web` |
-| `8` | ESP Logged on | About 5% | `authentication` |
-| `14` | ESP Request | About 85% | `web` |
+Forty users (`samples/users.csv`) start portal sessions as independent random processes, about five per user per day, with more activity from 07:00 to 17:00 UTC. A session is a TLS accept and an unauthenticated `Attempt` for `/owa/`, zero to five `Access Denied` records (about 6% of sessions have three or more, and 15% of sessions with a failure end without a logon), then `User AAA`, `Logged on` and `Connected` to a real server. Requests follow with log-normal gaps; about 5% of them open an Exchange control panel path under `/ecp/`. New client connections add `SSL accept` and `Connected`, rarely after a `Connection failed`. A session ends with `Logged off` plus `User session kill`, or with `User session timeout` after the idle time. Users connect from their office address or, in 30% of sessions, from a random external address. Anonymous clients add TLS accepts that time out or send one `Attempt`.
 
-Those weights and the chain interval are synthetic workload settings, not measured LoadMaster rates. The source is the L7 ESP CEF profile published by Progress Kemp. Header version `1.0` follows the vendor's CEF examples; it is not a claim about appliance firmware. This pack omits WAF, SMTP, connection, and SSOMGR codes. The shipped file is ECS JSON, so forward `event.original` via syslog to test KUMA's generic CEF parser.
+Every record is emitted at the one-second tick it is due; records that fall on the same second leave one per tick, so a few are delayed by a second or two.
 
 ## Anomaly Chain
 
-Three `Access Denied` events for `operator@example.test` from `10.42.9.77` precede a `Logged on` event and an ESP `Request` for `/admin`. All five events share the same user, source IP, and virtual service `10.42.20.15:443`. Correlate `user.name`, `source.ip`, `kemp.loadmaster.extension.vs`, CEF class ID, and `@timestamp` to detect access denials followed by login and sensitive-path access. The logs show service behavior; they do not establish that the user was compromised. Sort by `@timestamp`; file-line order is not guaranteed under concurrent generation.
+A user fails the ESP logon repeatedly and then logs on and opens the Exchange control panel:
 
-`anomaly_mode: false` keeps routine denials, logons, and requests but never emits the chain user or source.
+1. `Access Denied` (class 9) three to five times for user U from address I, seconds apart.
+2. `User AAA` (100) with `result=0:Success` and `Logged on` (8) for U from I.
+3. `Request` (14) for one to three `/ecp/` paths by U from I, among the first requests of the session.
+4. The session ends like any other: `Logged off` (6) and `User session kill` (102), or `User session timeout` (101).
+
+Linking fields: `user.name`, `source.ip` (CEF `user`, `srcip`), the same virtual service `vs`, and `@timestamp`. The measured episodes lasted 1.6 to 21.2 minutes from the first denial to the session end.
+
+Recurrence: the first episode is due `anomaly_interval_hours` after the start of generation, and each next one is due that long after the actual start of the previous one; missed episodes are not caught up. When an episode is due, its start is delayed by a random exponential time with a 20-minute mean. The chain user is drawn at random among users without an open session, never the previous episode's user; the address comes from that user's normal choice (office or external). The default interval is 24 h; the minimum is 6 h.
+
+Variation: the number of denials, the user, the address, the `/ecp/` paths and the rest of the session change between episodes.
+
+Nothing in the chain is unique to it: every user, address type, class ID and `/ecp/` path also occurs in background, including logons that follow three or more denials from the same address (30 to 49 per 78-hour background capture) and `/ecp/` requests by nearly every user (39 or 40 of 40 per capture). Only the full sequence is kept out of background: an ordinary session whose user had three or more denials from the same address in the past hour does not request `/ecp/`.
+
+Detection idea: for one user and source address, three or more `Access Denied` records followed within 30 minutes by `Logged on` and a `Request` for `/ecp/`. The logs show portal behavior; they do not show whether the account was compromised.
+
+`anomaly_mode: true` is the default. With `anomaly_mode: false` the generator emits the same background without episodes.
 
 ## Parameters
 
 ### Event Parameters
 
-| Parameter | Default | Meaning |
+| Parameter | Default | Description |
 | --- | --- | --- |
-| `device_name` | `loadmaster-01.example.test` | ECS device host |
-| `virtual_ip` | `10.42.20.15` | ESP virtual service address |
-| `anomaly_mode` | `true` | Include the five-event chain; `false` emits background only |
-| `anomaly_interval_events` | `80` | Routine pairs between chain injections |
-| `chain_source_ip` | `10.42.9.77` | Stable chain client |
-| `chain_user` | `operator@example.test` | Stable chain user |
+| `device_name` | `lm-edge-01` | LoadMaster host name in `observer.hostname` |
+| `virtual_ip` | `10.42.20.15` | ESP virtual service address (`vs`, `destination.ip`) |
+| `virtual_port` | `443` | Virtual service port |
+| `portal_host` | `mail.example.test` | Host in request URLs |
+| `real_servers` | `[172.20.0.21, 172.20.0.22, 172.20.0.23]` | Real servers in `Connected` and `Connection failed` |
+| `real_server_port` | `443` | Real server port |
+| `user_domain` | `example.test` | `domain` of `User AAA` |
+| `sso_domain` | `EXAMPLE-ESP` | ESP SSO domain in session timeout and kill records |
+| `aaa_server` | `10.42.30.10` | Authentication server in `User AAA` |
+| `aaa_protocol` | `LDAP Unencrypted` | Authentication protocol in `User AAA` |
+| `sessions_per_user_day` | `6` | Mean session starts per user per day before office-hours thinning (about 5 are realized) |
+| `session_idle_seconds` | `900` | Idle time before `User session timeout` |
+| `probes_per_day` | `80` | Anonymous client connections per day |
+| `anomaly_mode` | `true` | Include anomaly episodes; `false` emits background only |
+| `anomaly_interval_hours` | `24` | Hours between episodes, from the actual start of the previous one (6 to 8760) |
+
+Users and their office addresses are in `samples/users.csv`.
 
 ### Output Parameters
 
-No top-level `${params.*}` or `${secrets.*}` placeholders are shipped. File output works without credentials. Replace the `output` block and configure the selected plugin to forward to a SIEM.
+The shipped config writes `output/events.json` with the `json` formatter and needs no `${params.*}` or `${secrets.*}`. To send events elsewhere, replace the `output` section, for example:
 
-## Sample output
+```yaml
+output:
+  - opensearch:
+      hosts: ["${params.opensearch_url}"]
+      username: ${params.opensearch_user}
+      password: ${secrets.opensearch_password}
+      index: kemp-loadmaster-esp
+```
 
-This complete anomaly event was captured with `anomaly_mode: true`:
+## Usage
+
+Live mode:
+
+```bash
+eventum generate --path generators/network-kemp-loadmaster/generator.yml --id kemp-loadmaster --live-mode true
+```
+
+Batch mode needs a bounded input: add `start` and `end` to the `cron` input, then run:
+
+```bash
+eventum generate --path generators/network-kemp-loadmaster/generator.yml --id kemp-loadmaster --live-mode false
+```
+
+## Limitations
+
+- The vendor documents the CEF body per class ID but no raw syslog line for the L7 ESP classes, so `event.original` holds the CEF body only. The documented syslog framing (`<time> <host> ssomgr: CEF:...`) exists only for classes 100-104.
+- The CEF header table states Device Version `0`, while every vendor example carries `1.0`; the pack follows the examples.
+- Failure result strings of `User AAA` are not documented, so `User AAA` is emitted only for successful logons, and a failed logon produces `Access Denied` alone. Access Blocked, Access Locked, Access Disabled, Password Expired, User interaction, WAF, SMTP, Kill all sessions and Flush SSO cache are not modelled. The User Logs page also says a session is deleted on invalid credentials; the pack emits no 101/102 session records after denials.
+- CEF logging requires firmware 7.2.50 or later; session records 101 and 102 follow the 7.2.53 behavior. No firmware version is claimed beyond that.
+- Timestamps have one-second resolution, and at most one record is emitted per second.
+- Office hours are fixed to UTC.
+
+## Sample Output
+
+The first `/ecp/` request of the first episode, copied byte for byte from the final default capture (line 4425):
 
 ```json
-{
-  "@timestamp": "2026-09-25T13:59:06+00:00",
-  "destination": {
-    "ip": "10.42.20.15",
-    "port": 443
-  },
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "access-denied",
-    "category": [
-      "web"
-    ],
-    "code": "9",
-    "dataset": "kemp_loadmaster.esp",
-    "kind": "event",
-    "original": "CEF:0|Kemp|LM|1.0|9|Access Denied|6|vs=10.42.20.15:443 event=Access Denied srcip=10.42.9.77 user=operator@example.test msg=denied access",
-    "type": [
-      "denied"
-    ]
-  },
-  "host": {
-    "name": "loadmaster-01.example.test"
-  },
-  "kemp": {
-    "loadmaster": {
-      "class_id": 9,
-      "device_version": "1.0",
-      "extension": {
-        "event": "Access Denied",
-        "msg": "denied access",
-        "srcip": "10.42.9.77",
-        "user": "operator@example.test",
-        "vs": "10.42.20.15:443"
-      },
-      "name": "Access Denied",
-      "product": "LM",
-      "severity": 6,
-      "vendor": "Kemp",
-      "version": 0
-    }
-  },
-  "related": {
-    "ip": [
-      "10.42.9.77",
-      "10.42.20.15"
-    ],
-    "user": [
-      "operator@example.test"
-    ]
-  },
-  "source": {
-    "ip": "10.42.9.77"
-  },
-  "user": {
-    "name": "operator@example.test"
-  }
-}
+{"@timestamp": "2026-09-27T00:37:18+00:00", "destination": {"ip": "10.42.20.15", "port": 443}, "ecs": {"version": "8.17.0"}, "event": {"action": "request", "category": ["web"], "code": "14", "dataset": "kemp_loadmaster.esp", "kind": "event", "module": "kemp_loadmaster", "original": "CEF:0|Kemp|LM|1.0|14|Request|1|vs=10.42.20.15:443 event=Request srcip=203.0.113.129 srcport=64175 method=GET url=https://mail.example.test/ecp/Security/AdminRoles.slab user=x.romero@example.test useragent=Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1", "severity": 1, "type": ["access"]}, "http": {"request": {"method": "GET"}}, "kemp": {"loadmaster": {"cef": {"device_event_class_id": "14", "device_product": "LM", "device_vendor": "Kemp", "device_version": "1.0", "name": "Request", "severity": 1, "version": 0}, "extension": {"event": "Request", "method": "GET", "srcip": "203.0.113.129", "srcport": "64175", "url": "https://mail.example.test/ecp/Security/AdminRoles.slab", "user": "x.romero@example.test", "useragent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1", "vs": "10.42.20.15:443"}}}, "observer": {"hostname": "lm-edge-01", "product": "LoadMaster", "type": "load-balancer", "vendor": "Progress Kemp"}, "related": {"ip": ["203.0.113.129", "10.42.20.15"], "user": ["x.romero@example.test"]}, "source": {"ip": "203.0.113.129", "port": 64175}, "url": {"domain": "mail.example.test", "full": "https://mail.example.test/ecp/Security/AdminRoles.slab", "path": "/ecp/Security/AdminRoles.slab", "scheme": "https"}, "user": {"name": "x.romero@example.test"}, "user_agent": {"original": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"}}
 ```
 
 ## References
 
-- [Progress Kemp LoadMaster CEF extension and event classes](https://docs.progress.com/bundle/loadmaster-technical-note-common-event-format-cef-logs-ga/page/CEF-Extension.html)
-- [Progress Kemp ESP user logs and CEF setup](https://docs.progress.com/bundle/loadmaster-technical-note-esp-logs-ltsf/page/User-Logs.html)
-- [KUMA 4.2 supported event sources](https://support.kaspersky.ru/kuma/4.2/255782)
+- [Progress Kemp: CEF Extension (examples per class ID)](https://docs.progress.com/bundle/loadmaster-technical-note-common-event-format-cef-logs-ga/page/CEF-Extension.html)
+- [Progress Kemp: CEF Header (class ID, name, severity)](https://docs.progress.com/bundle/loadmaster-technical-note-common-event-format-cef-logs-ga/page/CEF-Header.html)
+- [Progress Kemp: Common Event Format (CEF) Logs](https://docs.progress.com/bundle/loadmaster-technical-note-common-event-format-cef-logs-ga/page/Common-Event-Format-CEF-Logs.html)
+- [Progress Kemp: ESP User Logs](https://docs.progress.com/bundle/loadmaster-technical-note-esp-logs-ltsf/page/User-Logs.html)
+- No Elastic integration exists for Kemp LoadMaster ESP logs.
