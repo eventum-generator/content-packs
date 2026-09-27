@@ -103,8 +103,8 @@ The ARP spoofing step of an anomaly episode from a default-configuration run:
 - Only Asset Management address events and ARP spoofing signs are covered. Process Control, Intrusion Detection rules, Command Control, PLC project events, application messages and audit messages are outside this pack. Optional common fields (`cnt`, `end`, ports, `vlanId`, `triggeredRule`, industrial addresses, device network name and model) are not generated.
 - The default output is a file with ECS JSON; KICS sends CEF through a SIEM connector. KUMA 4.2 lists a syslog normalizer for KICS for Networks 4.2; compatibility with it is not established.
 - Rates, shares, device pools and the service-profile behaviour are scenario assumptions.
-
 - A background ARP spoofing burst that would complete the chain claims a different IP, picked per record. About once per 36 capture-days this leaves a conflict on one IP followed by ARP spoofing for another IP inside the hour, and a burst can carry several substituted IPs under one attack start. At an 8 h interval about 30% of episodes start at night against about 14% of background activity.
+
 ## References
 
 - [KICS for Networks 4.2: Format of messages forwarded to a SIEM system](https://support.kaspersky.com/KICSforNetworks/4.2/en-US/283821.htm)
