@@ -1,48 +1,237 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 5) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- if chain -%}
-  {%- set user_name = params.target_user -%}
-  {%- set user_id = params.target_user_id -%}
-  {%- set source_ip = params.target_source_ip -%}
-  {%- set chain_count = (shared.get('chain_count', 0) + 1) % 900000 -%}
-  {%- do shared.set('chain_count', chain_count) -%}
-  {%- set alert_id = 100000 + chain_count -%}
-{%- else -%}
-  {%- set actor = module.rand.choice([
-    ('analyst-one', '3451141c-bac6-467c-8d72-85e0fab569ce', '192.0.2.11'),
-    ('analyst-two', 'a51de0aa-3f3d-4daa-a3f5-1714bf5e91ab', '192.0.2.12'),
-    ('soc-lead', '9446b38d-318b-4647-a109-e15432fa9365', '192.0.2.13')]) -%}
-  {%- set user_name = actor[0] -%}
-  {%- set user_id = actor[1] -%}
-  {%- set source_ip = actor[2] -%}
-  {%- set alert_id = module.rand.number.integer(1000, 8999) -%}
+{#- FortiSOAR 7.x "Alert Deleted" audit records forwarded over syslog in
+    CEF, wrapped in ECS JSON. One input tick every 2 seconds.
+    Every analyst runs an independent session process (thinned Poisson
+    arrivals with a daytime peak and a per-day activity factor). A
+    session is a few bulk deletions from the grid (one record per alert,
+    milliseconds apart) separated by random gaps. Planned records sit in
+    a heap; each tick emits the earliest due one or drops.
+    Times are epoch seconds (UTC). -#}
+{%- set now = timestamp.timestamp() -%}
+{%- set window = 120 -%}
+{%- set burst = 9 -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, upper tail redrawn. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- [ns.v, hi] | min -}}
+{%- endmacro -%}
+{%- macro next_session(u, t) -%}
+  {#- Thinned Poisson session arrivals of one analyst, rate peaking at
+      12:30 UTC, scaled by the analyst's activity factor of that day. -#}
+  {%- set lam = shared.get('lam')[u] -%}
+  {%- set ns = namespace(t=t, go=true) -%}
+  {%- for _ in range(600) if ns.go -%}
+    {%- set ns.t = ns.t + module.rand.number.exponential(lam * 2.5) -%}
+    {%- set day = module.builtins.int(ns.t // 86400) -%}
+    {%- set fac = shared.get('fac') -%}
+    {%- if u not in fac or fac[u][0] != day -%}
+      {%- do fac.update({u: [day, [module.rand.number.lognormal(-0.125, 0.5), 2.5] | min]}) -%}
+    {%- endif -%}
+    {%- set h = (ns.t % 86400) / 3600.0 -%}
+    {%- set f = 0.35 + ([0, module.math.sin(module.math.pi * (h - 6) / 13)] | max) -%}
+    {%- if module.rand.number.floating(0, 1.35 * 2.5) < f * fac[u][1] -%}{%- set ns.go = false -%}{%- endif -%}
+  {%- endfor -%}
+  {{- ns.t -}}
+{%- endmacro -%}
+{%- macro arm(due, span) -%}
+  {#- Arming time of the next episode: a random delay of up to span
+      seconds after due, weighted by the daytime shape of the sessions
+      with a small night floor, so every hour stays possible. -#}
+  {%- set ns = namespace(x=0.0, go=true) -%}
+  {%- for _ in range(200) if ns.go -%}
+    {%- set ns.x = module.rand.number.floating(0, span) -%}
+    {%- set h = ((due + ns.x) % 86400) / 3600.0 -%}
+    {%- set ns.go = module.rand.number.floating(0, 1.05) >= 0.05 + ([0, module.math.sin(module.math.pi * (h - 6) / 13)] | max) -%}
+  {%- endfor -%}
+  {{- due + ns.x -}}
+{%- endmacro -%}
+{%- macro bulk_size() -%}
+  {#- Alerts selected in one delete: usually one to three. -#}
+  {{- 1 if module.rand.chance(0.55) else [1 + module.builtins.int(module.rand.number.lognormal(module.math.log(1.2), 0.5)), 25] | min -}}
+{%- endmacro -%}
+{%- if shared.get('q') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'sessions_per_day': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 2, 'le': 2000}},
+    'alerts_per_day': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 50, 'le': 1000000}},
+    'device_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._-]{1,63}$'}},
+    'device_id': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9-]{1,32}$'}},
+    'device_version': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[0-9]+(\\.[0-9]+){1,3}$'}},
+    'virtual_domain': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': ['enterprise', 'master', 'tenant']}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set users = [] -%}
+  {%- set weights = [] -%}
+  {%- set info = {} -%}
+  {%- set lam = {} -%}
+  {%- for row in samples.analysts -%}
+    {%- do users.append(row.user) -%}
+    {%- do weights.append(row.weight) -%}
+    {%- do info.update({row.user: [row.uuid, row.ip, row.alt_ip]}) -%}
+  {%- endfor -%}
+  {%- set wsum = weights | sum -%}
+  {%- for row in samples.analysts -%}
+    {#- Peak-rate of the thinned process; the daytime shape averages
+        0.695 and peaks at 1.35. -#}
+    {%- do lam.update({row.user: params.sessions_per_day * row.weight / wsum / 86400.0 / 0.695 * 1.35}) -%}
+  {%- endfor -%}
+  {%- set interval = params.anomaly_interval_hours * 3600 -%}
+  {%- do shared.update({'q': [], 'seq': 0, 'users': users, 'weights': weights, 'info': info, 'lam': lam, 'fac': {},
+    'sess': {}, 'recent': {}, 'pause': {}, 'deleted': [], 'dset': {}, 't0': now,
+    'id0': module.rand.number.integer(20000, 400000),
+    'ep_arm': arm(now + interval * module.rand.number.floating(0, 1.0), [interval / 4, 21600] | min) | float,
+    'ep_last': none}) -%}
+  {%- for u in users -%}
+    {%- do module.heapq.heappush(shared.get('q'), [next_session(u, now) | float, 0, 'sess', u, none, none]) -%}
+  {%- endfor -%}
+  {%- do shared.set('next_due', shared.get('q')[0][0]) -%}
 {%- endif -%}
-{%- set event_ms = (event_time.timestamp() * 1000) | int -%}
-{%- set event_time_str = event_time.strftime('%d %b %Y %H:%M:%S.%f')[:-3] -%}
-{%- set raw = event_time.isoformat(timespec='microseconds') ~ ' '
+{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set info = shared.get('info') -%}
+{%- set sess = shared.get('sess') -%}
+{%- set dset = shared.get('dset') -%}
+{%- set deleted = shared.get('deleted') -%}
+{%- macro push(t, kind, u, ip, aid) -%}
+  {%- do shared.set('seq', (shared.get('seq') + 1) % 1000000000) -%}
+  {%- do module.heapq.heappush(q, [t | float, shared.get('seq'), kind, u, ip, aid]) -%}
+{%- endmacro -%}
+{%- macro plan_bulk(t, u, ip, kind, size=0) -%}
+  {#- One bulk delete: alerts picked near each other in the grid (IDs
+      descending with small skips), records milliseconds apart. Returns
+      the time after the last record. -#}
+  {%- set n = size if size else bulk_size() | int -%}
+  {%- set top = shared.get('id0') + module.builtins.int((t - shared.get('t0')) * params.alerts_per_day / 86400.0) -%}
+  {%- set ns = namespace(t=t, a=top - module.builtins.int(module.rand.number.lognormal(module.math.log(params.alerts_per_day / 3.0), 1.1)), k=0) -%}
+  {%- for _ in range(n * 4) if ns.k < n and ns.a > 1 -%}
+    {%- if ns.a not in dset -%}
+      {%- do dset.update({ns.a: 1}) -%}
+      {%- do deleted.append(ns.a) -%}
+      {%- do push(ns.t, kind, u, ip, ns.a) -%}
+      {%- set ns.k = ns.k + 1 -%}
+      {%- set ns.t = ns.t + (d(0.02, 0.18, 0.7, 2.5) | float) -%}
+    {%- endif -%}
+    {%- set ns.a = ns.a - (1 if module.rand.chance(0.8) else module.rand.number.integer(2, 6)) -%}
+  {%- endfor -%}
+  {%- for _ in range(deleted | length - 30000) -%}{%- do dset.pop(deleted.pop(0), none) -%}{%- endfor -%}
+  {{- ns.t -}}
+{%- endmacro -%}
+{%- set out = namespace(u=none, ip=none, aid=none, t=none) -%}
+{%- for _ in range(40) if out.u is none and q and q[0][0] <= now -%}
+  {%- set item = module.heapq.heappop(q) -%}
+  {%- set t = item[0] -%}
+  {%- set u = item[3] -%}
+  {%- if item[2] == 'sess' -%}
+    {%- do module.heapq.heappush(q, [next_session(u, t) | float, 0, 'sess', u, none, none]) -%}
+    {#- An analyst still in a session keeps its address; a new session
+        comes from the office (85%) or the remote-access pool. -#}
+    {%- if u in sess and sess[u][1] > t -%}
+      {%- set ip = sess[u][0] -%}
+    {%- else -%}
+      {%- set ip = info[u][1] if module.rand.chance(0.85) else info[u][2] -%}
+    {%- endif -%}
+    {%- set ns = namespace(t=t, go=true) -%}
+    {%- for _ in range(30) if ns.go -%}
+      {%- set ns.t = plan_bulk(ns.t, u, ip, 'del') | float -%}
+      {%- set ns.go = module.rand.chance(0.65) -%}
+      {%- if ns.go -%}{%- set ns.t = ns.t + (d(4, 110, 1.1, 1500) | float) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set end = ns.t -%}
+    {%- if params.anomaly_mode and t >= shared.get('ep_arm') and u != shared.get('ep_last') -%}
+      {#- Anomaly episode on the next session after due + delay by an
+          analyst other than the previous episode's: on top of the
+          ordinary session, the same analyst from the same address
+          deletes 10-15 more alerts in quick successive deletes, all
+          within about 100 seconds. -#}
+      {%- set total = module.rand.number.integer(10, 15) -%}
+      {%- set t1 = t + (d(2, 25, 1.0, 120) | float) -%}
+      {#- Sizes and gaps are drawn until the deletes add up to the total
+          and fit in 95 seconds. -#}
+      {%- set pl = namespace(ok=false, sizes=[], gaps=[]) -%}
+      {%- for _ in range(40) if not pl.ok -%}
+        {%- set pl.sizes = [] -%}{%- set pl.gaps = [] -%}
+        {%- for _ in range(total) if (pl.sizes | sum) < total -%}
+          {%- do pl.sizes.append([bulk_size() | int, total - (pl.sizes | sum)] | min) -%}
+          {%- do pl.gaps.append(d(2, 9, 0.8, 40) | float) -%}
+        {%- endfor -%}
+        {%- set pl.ok = (pl.gaps[:-1] | sum) + 0.4 * total <= 95 -%}
+      {%- endfor -%}
+      {%- if not pl.ok -%}{%- set pl.gaps = [] -%}{%- for _ in pl.sizes -%}{%- do pl.gaps.append(4.0) -%}{%- endfor -%}{%- endif -%}
+      {%- set ns = namespace(t=t1) -%}
+      {%- for n in pl.sizes -%}
+        {%- set ns.t = (plan_bulk(ns.t, u, ip, 'ep', n) | float) + pl.gaps[loop.index0] -%}
+      {%- endfor -%}
+      {%- set end = [end, ns.t] | max -%}
+      {%- set interval = params.anomaly_interval_hours * 3600 -%}
+      {%- do shared.update({'ep_last': u, 'ep_arm': arm(t + interval, [interval / 4, 21600] | min) | float}) -%}
+    {%- endif -%}
+    {%- do sess.update({u: [ip, [end + 300, (sess[u][1] if u in sess else 0)] | max]}) -%}
+  {%- else -%}
+    {%- set out.u = u -%}{%- set out.ip = item[4] -%}{%- set out.aid = item[5] -%}{%- set out.t = t -%}
+    {%- if item[2] in ['del', 'dd'] -%}
+      {#- Pacing: an analyst who has made 8 ordinary deletions from one
+          address in the last 2 minutes pauses. The rest of that
+          delete and what follows it are postponed by an ordinary gap
+          between deletes; actor, address and alerts stay. Episode
+          records are not counted. -#}
+      {%- set recent = shared.get('recent') -%}
+      {%- set pause = shared.get('pause') -%}
+      {%- set key = u ~ '|' ~ out.ip -%}
+      {%- set p = pause.get(key) -%}
+      {%- set n = recent.get(key, []) | select('gt', t - window) | list | length -%}
+      {%- if p and 0 <= t - p[0] <= 3 -%}
+        {%- do pause.update({key: [t, p[1]]}) -%}
+        {%- do push(t + p[1], 'dd', u, out.ip, out.aid) -%}
+        {%- set out.u = none -%}
+      {%- elif n >= burst - 1 -%}
+        {%- set sh = d(4, 110, 1.1, 1500) | float -%}
+        {%- do pause.update({key: [t, sh]}) -%}
+        {%- do push(t + sh, 'dd', u, out.ip, out.aid) -%}
+        {%- set out.u = none -%}
+      {%- else -%}
+        {%- do recent.update({key: (recent.get(key, []) | select('gt', t - window) | list) + [t]}) -%}
+      {%- endif -%}
+      {%- if recent | length > 40 -%}
+        {%- for k in recent.keys() | list if not (recent[k] | select('gt', t - window) | list) -%}{%- do recent.pop(k) -%}{%- endfor -%}
+      {%- endif -%}
+      {%- if pause | length > 40 -%}
+        {%- for k in pause.keys() | list if t - pause[k][0] > 3 -%}{%- do pause.pop(k) -%}{%- endfor -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- do shared.set('next_due', q[0][0]) -%}
+{%- if out.u is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set end_ms = module.builtins.int(out.t * 1000) -%}
+{%- set moment = module.datetime.datetime.fromtimestamp(end_ms / 1000.0, module.datetime.timezone.utc) -%}
+{#- rsyslog stamps the line when it forwards it: a short skewed delay
+    after the audit record, with its own microseconds. -#}
+{%- set fwd = moment + module.datetime.timedelta(seconds=d(0.001, 0.08, 1.2, 20) | float) -%}
+{%- set user_id = info[out.u][0] -%}
+{%- set raw = fwd.isoformat(timespec='microseconds') ~ ' '
   ~ params.device_name ~ ' fortisoar-audit-log: '
   ~ 'CEF:0|Fortinet Inc|FortiSOAR|' ~ params.device_version
   ~ '|Alert Deleted|Alert Deleted|1|'
-  ~ 'devid="' ~ params.device_id ~ '" vd="enterprise" level="warning"'
-  ~ ' type="Audit Log" msg="Alert [' ~ alert_id ~ '] Deleted "'
-  ~ ' src="' ~ source_ip ~ '" suid="' ~ user_id ~ '"'
-  ~ ' suser="' ~ user_name ~ '" end=' ~ event_ms
+  ~ 'devid="' ~ params.device_id ~ '" vd="' ~ params.virtual_domain ~ '" level="warning"'
+  ~ ' type="Audit Log" msg="Alert [' ~ out.aid ~ '] Deleted "'
+  ~ ' src="' ~ out.ip ~ '" suid="' ~ user_id ~ '"'
+  ~ ' suser="' ~ out.u ~ '" end=' ~ end_ms
   ~ ' playbookName="" playbookId="" eventTimeStr="'
-  ~ event_time_str ~ '"' -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
+  ~ moment.strftime('%d %b %Y %H:%M:%S.%f')[:-3] ~ '"' -%}
+{%- set record = {'@timestamp': moment.isoformat(timespec='milliseconds'),
   'ecs': {'version': '8.17.0'},
   'event': {'kind': 'event', 'dataset': 'fortinet.fortisoar.audit',
-    'category': ['api'], 'type': ['deletion'], 'action': 'alert_deleted',
-    'code': 'Alert Deleted', 'original': raw},
-  'host': {'name': params.device_name},
-  'user': {'name': user_name, 'id': user_id},
-  'source': {'ip': source_ip},
-  'related': {'user': [user_name], 'ip': [source_ip]},
-  'fortinet': {'fortisoar': {'alert_id': alert_id, 'device_id': params.device_id,
-    'virtual_domain': 'enterprise', 'level': 'warning',
-    'log_type': 'Audit Log'}}} -%}
+    'category': ['configuration'], 'type': ['deletion'], 'action': 'alert_deleted',
+    'code': 'Alert Deleted', 'severity': 1, 'created': fwd.isoformat(timespec='microseconds'), 'original': raw},
+  'observer': {'hostname': params.device_name, 'serial_number': params.device_id,
+    'vendor': 'Fortinet', 'product': 'FortiSOAR', 'version': params.device_version},
+  'log': {'level': 'warning', 'logger': 'fortisoar-audit-log'},
+  'user': {'name': out.u, 'id': user_id},
+  'source': {'ip': out.ip},
+  'related': {'user': [out.u], 'ip': [out.ip]},
+  'fortinet': {'fortisoar': {'alert_id': out.aid, 'record_type': 'Alert', 'operation': 'Delete',
+    'device_id': params.device_id, 'virtual_domain': params.virtual_domain, 'log_type': 'Audit Log'}}} -%}
 {{ record | tojson }}
