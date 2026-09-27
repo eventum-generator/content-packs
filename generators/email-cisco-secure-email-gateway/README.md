@@ -79,7 +79,7 @@ Set under `event.template.params` in `generator.yml`.
 | `host_name` | `esa-01.contoso.example` | Gateway host name in the syslog header |
 | `interface_ip` | `10.20.30.25` | Address of the `Management` interface |
 | `internal_domain` | `contoso.example` | Domain of internal users |
-| `relay_hosts` | `exch-01`, `exch-02` (`10.20.10.11`, `.12`) | Internal Exchange hosts that relay outbound mail and receive inbound mail |
+| `relay_hosts` | `exch-01.contoso.example`, `exch-02.contoso.example` (`10.20.10.11`, `.12`) | Internal Exchange hosts that relay outbound mail and receive inbound mail |
 | `large_message_bytes` | `8000000` | Size threshold of the episode messages; background never has three such messages to the sender's own mailbox within 40 minutes |
 | `max_message_bytes` | `20000000` | Largest message the listener accepts |
 | `users` | 40 names | Local parts of internal users |
