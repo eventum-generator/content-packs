@@ -1,78 +1,372 @@
-{%- set step = vars.step -%}
-{%- if step == 'routine' -%}
-  {%- set n = (shared.get('routine_count', 0) % 1000000) + 1 -%}
-  {%- do shared.set('routine_count', n) -%}
-  {%- set slot = n % 100 -%}
-  {%- set now = timestamp.timestamp() -%}
-  {%- set target_found = (n - 1) % 1200 == 0
-      and now >= shared.get('target_ban_until', 0) -%}
-  {%- set next_due = shared.get('next_anomaly_epoch', none) -%}
-  {%- if params.anomaly_mode and next_due is none -%}
-    {%- do shared.set('next_anomaly_epoch', now
-        + params.anomaly_interval_hours * 3600) -%}
-  {%- endif -%}
-  {%- set trigger = params.anomaly_mode and target_found
-      and next_due is not none and now >= next_due -%}
-  {%- if trigger -%}
-    {%- do shared.set('next_anomaly_epoch', now
-        + params.anomaly_interval_hours * 3600) -%}
-    {%- do shared.set('start_anomaly', true) -%}
-  {%- endif -%}
-  {%- if target_found or slot in [17, 31, 45, 59, 73, 87] -%}
-    {%- set kind = 'found' -%}
-  {%- elif slot == 96 -%}
-    {%- set kind = 'ban' -%}
+{#- One Ideco NGFW Novum sending Syslog (not CEF) for three services:
+    traffic-journal (firewall flows), ideco-vpn-authd (VPN
+    authorizations) and fail2ban (Found / Ban / Unban). Each one-second
+    tick emits the earliest due entry of a queue fed by independent
+    random processes (VPN users logging in, internet brute-force
+    campaigns, administrator typos, VPN session flows) or, when nothing
+    is due, one ordinary traffic flow with an hour-of-day probability.
+    fail2ban is evaluated when a failed attempt is emitted: six Found
+    for one IP and jail within 900 s ban it for 2700 s, and a banned IP
+    produces no attempts in that jail until Unban. The anomaly episode
+    only adds one attempt set for a VPN user; it never touches the
+    background processes. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window_s = 900 -%}
+{%- set findtime = 900 -%}
+{%- set maxretry = 6 -%}
+{%- set bantime = 2700 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (1 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if not (10 <= params.vpn_user_count <= 200) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set checked = module.ipaddress.IPv4Address(params.ngfw_ip) -%}
+  {%- set surnames = ['ivanov', 'petrova', 'sidorov', 'kuznetsova', 'smirnov',
+      'popova', 'volkov', 'morozova', 'lebedev', 'kozlova', 'novikov',
+      'sokolova', 'pavlov', 'orlova', 'egorov', 'fedorova', 'zaitsev',
+      'belova', 'makarov', 'gusev', 'titova', 'romanov', 'vasilieva',
+      'nikitin', 'sorokina', 'frolov', 'medvedeva', 'zhukov', 'baranova',
+      'kiselev', 'tarasova', 'belyaev', 'komarova', 'antonov', 'filippova'] -%}
+  {%- set initials = 'abdegiklmnoprstv' -%}
+  {%- set users = [] -%}
+  {%- set user_w = [] -%}
+  {%- set uinfo = {} -%}
+  {%- set used = [] -%}
+  {%- for n in range(params.vpn_user_count) -%}
+    {%- set t = namespace(name='') -%}
+    {%- for k in range(50) -%}
+      {%- if not t.name -%}
+        {%- set cand = module.rand.choice(initials | list) ~ '.' ~ module.rand.choice(surnames) -%}
+        {%- if cand not in used -%}{%- set t.name = cand -%}{%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if not t.name -%}{%- set t.name = 'vpnuser' ~ n -%}{%- endif -%}
+    {%- do used.append(t.name) -%}
+    {%- set ips = [] -%}
+    {%- set ipw = [] -%}
+    {%- for k in range(1 if module.rand.chance(0.7) else 2) -%}
+      {%- do ips.append(module.rand.choice(['198.51.100.', '203.0.113.']) ~ module.rand.number.integer(2, 126)) -%}
+      {%- do ipw.append(module.rand.number.lognormal(0, 1.0)) -%}
+    {%- endfor -%}
+    {%- do users.append(t.name) -%}
+    {%- do user_w.append(module.rand.number.lognormal(0, 0.8)) -%}
+    {%- do uinfo.update({t.name: {'ips': ips, 'ipw': ipw}}) -%}
+  {%- endfor -%}
+  {%- set attackers = [] -%}
+  {%- set att_w = [] -%}
+  {%- set att_jw = [] -%}
+  {%- for n in range(40) -%}
+    {%- do attackers.append(module.rand.choice(['203.0.113.', '192.0.2.']) ~ module.rand.number.integer(128, 254)) -%}
+    {%- do att_w.append(module.rand.number.lognormal(0, 1.1)) -%}
+    {%- do att_jw.append([module.rand.number.lognormal(0, 1.2), module.rand.number.lognormal(-0.3, 1.2),
+        module.rand.number.lognormal(-1.0, 1.2)]) -%}
+  {%- endfor -%}
+  {%- set lan = [] -%}
+  {%- set lan_w = [] -%}
+  {%- for n in range(60) -%}
+    {%- do lan.append('10.50.1.' ~ (20 + n)) -%}
+    {%- do lan_w.append(module.rand.number.lognormal(0, 1.0)) -%}
+  {%- endfor -%}
+  {%- set sites = [] -%}
+  {%- set site_w = [] -%}
+  {%- for n in range(80) -%}
+    {%- do sites.append(module.rand.choice(['198.51.100.', '203.0.113.', '192.0.2.']) ~ module.rand.number.integer(1, 254)) -%}
+    {%- do site_w.append(module.rand.number.lognormal(0, 1.3)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'user_w': user_w, 'uinfo': uinfo,
+      'attackers': attackers, 'att_w': att_w, 'att_jw': att_jw, 'lan': lan, 'lan_w': lan_w,
+      'sites': sites, 'site_w': site_w, 'q': [], 'hist': {}, 'banned': {},
+      'next_due': now + (interval * 3600) | int, 'last_actor': none, 'ep_at': none}) -%}
+{%- endif -%}
+
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set banned = shared.get('banned') -%}
+{%- set users = shared.get('users') -%}
+{%- set user_w = shared.get('user_w') -%}
+{%- set uinfo = shared.get('uinfo') -%}
+{%- set jails = ['utm-vpn-authd', 'utm-ssh', 'utm-web-interface'] -%}
+{%- set jail_port = {'utm-vpn-authd': 1723, 'utm-ssh': 22, 'utm-web-interface': 8443} -%}
+{%- set user_curve = [0.15, 0.1, 0.08, 0.08, 0.1, 0.25, 0.6, 1.3, 2.0, 2.1, 1.9, 1.7,
+    1.5, 1.8, 1.9, 1.8, 1.6, 1.2, 0.8, 0.6, 0.5, 0.4, 0.3, 0.2] -%}
+{%- set user_load = user_curve[hour] / 0.9567 -%}
+{%- set traffic_load = [0.35, 0.3, 0.28, 0.28, 0.3, 0.4, 0.6, 1.0, 1.4, 1.5, 1.5, 1.45,
+    1.35, 1.45, 1.5, 1.45, 1.35, 1.15, 0.9, 0.75, 0.65, 0.55, 0.45, 0.4][hour] -%}
+
+{#- One VPN login: a PPTP control connection to the NGFW, zero or more
+    failed authorizations (each one a fail2ban Found in utm-vpn-authd)
+    and, unless the user gives up, an authorization. The episode draws
+    4 or 5 failures from the same gap law and always ends in success. -#}
+{%- macro login(user, ip, episode, retry) -%}
+  {%- if episode -%}
+    {%- set f = module.rand.weighted_choice([4, 5], [60, 40]) -%}
+  {%- elif retry -%}
+    {%- set f = module.rand.weighted_choice([0, 1, 2, 3, 4], [70, 18, 7, 3, 2]) -%}
   {%- else -%}
-    {%- set kind = 'traffic' -%}
+    {%- set f = module.rand.weighted_choice([0, 1, 2, 3, 4, 5, 6, 7, 8], [780, 120, 50, 25, 11, 6, 4, 2, 2]) -%}
   {%- endif -%}
-  {%- set src = params.target_source_ip if target_found
-      else '203.0.113.' ~ (42 + (((n - 1) // 100) % 200)) -%}
-{%- else -%}
-  {%- do shared.pop('start_anomaly', none) -%}
-  {%- set kind = 'ban' if step == 'ban' else 'found' -%}
-  {%- set src = params.target_source_ip -%}
-  {%- if step == 'ban' -%}
-    {%- do shared.set('target_ban_until', timestamp.timestamp() + 2700) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- do q.append({'due': t.v, 'kind': 'flow', 'src': ip, 'role': 'vpn_ctl'}) -%}
+  {%- set t.v = t.v + gap(3, 0.6) | int -%}
+  {%- for n in range(f) -%}
+    {%- do q.append({'due': t.v, 'kind': 'try', 'src': ip, 'jail': 'utm-vpn-authd'}) -%}
+    {%- set t.v = t.v + gap(18, 0.8) | int -%}
+  {%- endfor -%}
+  {%- if episode or f <= 3 -%}
+    {%- do q.append({'due': t.v, 'kind': 'auth', 'src': ip, 'user': user, 'episode': episode}) -%}
+  {%- elif module.rand.chance(0.6) -%}
+    {%- do q.append({'due': t.v + gap(2400, 1.1) | int, 'kind': 'relogin', 'src': ip, 'user': user}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Background arrivals. -#}
+{%- if module.rand.chance(params.vpn_user_count * 2.5 / 86400 * user_load) -%}
+  {%- set u = module.rand.weighted_choice(users, user_w) -%}
+  {%- set info = uinfo[u] -%}
+  {%- do login(u, module.rand.weighted_choice(info.ips, info.ipw), false, false) -%}
+{%- endif -%}
+{%- if module.rand.chance(40 / 86400) -%}
+  {%- set ai = module.rand.weighted_choice(range(40) | list, shared.get('att_w')) -%}
+  {%- set src = shared.get('attackers')[ai] -%}
+  {%- set jail = module.rand.weighted_choice(jails, shared.get('att_jw')[ai]) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- do q.append({'due': t.v, 'kind': 'flow', 'src': src, 'role': 'brute', 'port': jail_port[jail]}) -%}
+  {%- set t.v = t.v + gap(2, 0.7) | int -%}
+  {%- for n in range([(module.rand.number.lognormal(module.math.log(5), 1.0)) | round | int, 1] | max) -%}
+    {%- do q.append({'due': t.v, 'kind': 'try', 'src': src, 'jail': jail}) -%}
+    {%- set t.v = t.v + gap(6, 1.0) | int -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- if module.rand.chance(6 / 86400 * user_load) -%}
+  {%- set src = module.rand.weighted_choice(['10.50.1.5', '10.50.1.6', '10.50.1.7'], [5, 3, 1]) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4], [60, 25, 10, 5])) -%}
+    {%- do q.append({'due': t.v, 'kind': 'try', 'src': src, 'jail': 'utm-web-interface'}) -%}
+    {%- set t.v = t.v + gap(12, 0.8) | int -%}
+  {%- endfor -%}
+{%- endif -%}
+
+{#- Episode start. The first start is drawn over the first
+    min(interval, 24 h) of the run, in one-minute slots weighted by the
+    VPN login hour-of-day curve, so its hour follows the curve rather
+    than the run start. Each later episode is due anomaly_interval_hours
+    after the previous start and starts in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor; the window has no forward bias,
+    so the start hour stays in busy hours while gaps stay within
+    interval +/- w/2. The user is picked with the background user
+    weights among users other than the previous one whose addresses
+    have no VPN failure in the fail2ban window and no ban, so the chain
+    is not cut by a ban. -#}
+{%- if params.anomaly_mode and shared.get('ep_at') is none -%}
+  {%- set sw = [] -%}
+  {%- if shared.get('last_actor') is none -%}
+    {%- set slots = [([interval * 3600, 86400] | min / 60) | int, 1] | max -%}
+    {%- set lo = now -%}
+    {%- for k in range(slots) -%}
+      {%- do sw.append(user_curve[((lo + k * 60) % 86400) // 3600]) -%}
+    {%- endfor -%}
+  {%- else -%}
+    {%- set slots = [([interval * 900, 21600] | min / 60) | int, 1] | max -%}
+    {%- set lo = shared.get('next_due') - slots * 30 -%}
+    {%- for k in range(slots) -%}
+      {%- set c = user_curve[((lo + k * 60) % 86400) // 3600] -%}
+      {%- do sw.append(c * c + 0.01) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set k = module.rand.weighted_choice(range(slots) | list, sw) -%}
+  {%- do shared.set('ep_at', [lo + k * 60 + module.rand.number.integer(0, 59), now] | max) -%}
+{%- endif -%}
+{%- if params.anomaly_mode -%}
+  {%- if now >= shared.get('ep_at') -%}
+    {%- set last = shared.get('last_actor') -%}
+    {%- set cand = [] -%}
+    {%- set cw = [] -%}
+    {%- for u in users -%}
+      {%- set busy = namespace(v=u == last) -%}
+      {%- for ip in uinfo[u].ips -%}
+        {%- if banned.get(ip ~ '|utm-vpn-authd', 0) > now
+            or hist.get(ip ~ '|utm-vpn-authd', []) | select('ge', now - findtime) | list -%}
+          {%- set busy.v = true -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if not busy.v -%}{%- do cand.append(u) -%}{%- do cw.append(user_w[loop.index0]) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set u = module.rand.weighted_choice(cand, cw) -%}
+    {%- set info = uinfo[u] -%}
+    {%- do login(u, module.rand.weighted_choice(info.ips, info.ipw), true, false) -%}
+    {%- do shared.update({'next_due': now + (interval * 3600) | int, 'last_actor': u, 'ep_at': none}) -%}
   {%- endif -%}
 {%- endif -%}
-{%- set service = 'traffic-journal' if kind == 'traffic' else 'fail2ban' -%}
-{%- if kind == 'traffic' -%}
-  {%- if n % 11 == 0
-      and timestamp.timestamp() >= shared.get('target_ban_until', 0) -%}
-    {%- set src = params.target_source_ip -%}
-    {%- set src_zone = 'WAN' -%}
-  {%- elif n % 4 == 0 -%}
-    {%- set src = '203.0.113.' ~ (42 + ((n // 100) % 200)) -%}
-    {%- set src_zone = 'WAN' -%}
-  {%- else -%}
-    {%- set src = params.internal_source_ip if n % 3
-        else '10.50.1.21' -%}
-    {%- set src_zone = 'LAN' -%}
+
+{#- Pick the earliest due entry. -#}
+{%- set best = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < best.due -%}{%- set best.i = loop.index0 -%}{%- set best.due = e.due -%}{%- endif -%}
+{%- endfor -%}
+{%- set e = q.pop(best.i) if best.i >= 0 else {'kind': 'idle'} -%}
+
+{%- macro is_banned(src, jail) -%}
+{{- 'y' if banned.get(src ~ '|' ~ jail, 0) > now else '' -}}
+{%- endmacro -%}
+
+{#- Resolve the entry into one record kind. -#}
+{%- set r = namespace(kind='none', src='', jail='', user='') -%}
+{%- if e.kind == 'relogin' -%}
+  {%- do login(e.user, e.src, false, true) -%}
+{%- elif e.kind == 'try' -%}
+  {%- if not is_banned(e.src, e.jail) -%}
+    {%- set r.kind = 'found' -%}{%- set r.src = e.src -%}{%- set r.jail = e.jail -%}
   {%- endif -%}
-  {%- if src_zone == 'WAN' -%}
+{%- elif e.kind == 'auth' -%}
+  {%- if not is_banned(e.src, 'utm-vpn-authd') -%}
+    {%- set recent = hist.get(e.src ~ '|utm-vpn-authd', []) | select('ge', now - window_s) | list -%}
+    {%- if not e.episode and recent | length >= 4 -%}
+      {#- Guard: the chain window already holds four failures, so this
+          attempt fails too (same time, same actor). -#}
+      {%- set r.kind = 'found' -%}{%- set r.src = e.src -%}{%- set r.jail = 'utm-vpn-authd' -%}
+    {%- else -%}
+      {%- set r.kind = 'auth' -%}{%- set r.src = e.src -%}{%- set r.user = e.user -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- elif e.kind == 'ban' -%}
+  {%- set r.kind = 'ban' -%}{%- set r.src = e.src -%}{%- set r.jail = e.jail -%}
+{%- elif e.kind == 'unban' -%}
+  {%- set r.kind = 'unban' -%}{%- set r.src = e.src -%}{%- set r.jail = e.jail -%}
+{%- elif e.kind == 'flow' -%}
+  {%- if e.role == 'vpn_ctl' and is_banned(e.src, 'utm-vpn-authd') -%}
+  {%- else -%}
+    {%- set r.kind = 'flow' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if r.kind == 'none' -%}
+  {%- if module.rand.chance(0.25 * traffic_load) -%}
+    {%- set e = {'kind': 'flow', 'role': 'filler'} -%}
+    {%- set r.kind = 'flow' -%}
+  {%- else -%}
+    {{- dispatch.drop() -}}
+  {%- endif -%}
+{%- endif -%}
+
+{%- set ts_local = timestamp.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- if r.kind == 'found' -%}
+  {%- set key = r.src ~ '|' ~ r.jail -%}
+  {%- set h = hist.get(key, []) | select('ge', now - findtime) | list -%}
+  {%- do h.append(now) -%}
+  {%- do hist.update({key: h}) -%}
+  {%- if h | length >= maxretry -%}
+    {%- do banned.update({key: now + bantime + 60}) -%}
+    {%- do q.append({'due': now + gap(1, 0.6) | int, 'kind': 'ban', 'src': r.src, 'jail': r.jail}) -%}
+  {%- endif -%}
+  {%- if hist | length > 400 -%}
+    {%- for k in hist | list -%}
+      {%- if not (hist[k] | select('ge', now - findtime) | list) -%}{%- do hist.pop(k) -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set service = 'fail2ban' -%}
+  {%- set body = 'INFO [' ~ r.jail ~ '] Found ' ~ r.src ~ ' - ' ~ ts_local -%}
+  {%- set native = {'jail': r.jail, 'action': 'Found', 'src_ip': r.src, 'found_at': ts_local} -%}
+  {%- set event = {'kind': 'event', 'category': ['intrusion_detection'], 'type': ['info'],
+      'action': 'fail2ban_found'} -%}
+{%- elif r.kind == 'ban' or r.kind == 'unban' -%}
+  {%- set key = r.src ~ '|' ~ r.jail -%}
+  {%- if r.kind == 'ban' -%}
+    {%- set until = now + bantime + gap(3, 0.8) | int -%}
+    {%- do banned.update({key: until + 1}) -%}
+    {%- do hist.pop(key, none) -%}
+    {%- do q.append({'due': until, 'kind': 'unban', 'src': r.src, 'jail': r.jail}) -%}
+  {%- else -%}
+    {%- do banned.pop(key, none) -%}
+  {%- endif -%}
+  {%- set word = 'Ban' if r.kind == 'ban' else 'Unban' -%}
+  {%- set service = 'fail2ban' -%}
+  {%- set body = 'NOTICE [' ~ r.jail ~ '] ' ~ word ~ ' ' ~ r.src -%}
+  {%- set native = {'jail': r.jail, 'action': word, 'src_ip': r.src} -%}
+  {%- set event = {'kind': 'event', 'category': ['intrusion_detection'],
+      'type': ['denied'] if r.kind == 'ban' else ['allowed'],
+      'action': 'fail2ban_' ~ word | lower} -%}
+{%- elif r.kind == 'auth' -%}
+  {%- set tunnel = '10.128.0.' ~ module.rand.number.integer(2, 250) -%}
+  {%- set service = 'ideco-vpn-authd' -%}
+  {%- set body = 'Subnet ' ~ tunnel ~ "/32 is authorized as user '" ~ r.user
+      ~ "'. Connection made from '" ~ r.src ~ "', type '" ~ params.vpn_type ~ "'" -%}
+  {%- set native = {'subnet': tunnel ~ '/32', 'user': r.user, 'connected_from': r.src,
+      'type': params.vpn_type} -%}
+  {%- set event = {'kind': 'event', 'category': ['authentication', 'network'],
+      'type': ['start', 'allowed'], 'action': 'vpn_authorized', 'outcome': 'success'} -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for n in range([(module.rand.number.lognormal(module.math.log(6), 0.9)) | round | int, 1] | max) -%}
+    {%- set t.v = t.v + gap(90, 1.2) | int -%}
+    {%- do q.append({'due': t.v, 'kind': 'flow', 'src': tunnel, 'role': 'vpn_session'}) -%}
+  {%- endfor -%}
+{%- else -%}
+  {#- traffic-journal flow -#}
+  {%- set role = e.role -%}
+  {%- if role == 'filler' -%}
+    {%- set role = module.rand.weighted_choice(['lan_web', 'lan_dns', 'scan'], [55, 15, 30]) -%}
+  {%- endif -%}
+  {%- if role == 'lan_web' -%}
+    {%- set src = module.rand.weighted_choice(shared.get('lan'), shared.get('lan_w')) -%}
+    {%- set src_zone = 'LAN' -%}
+    {%- set dst = module.rand.weighted_choice(shared.get('sites'), shared.get('site_w')) -%}
+    {%- set dst_zone = 'WAN' -%}
+    {%- set dst_port = module.rand.weighted_choice([443, 80, 8080, 5222], [82, 13, 3, 2]) -%}
+    {%- set table = 'fwd' -%}
+    {%- set result = 'drop' if module.rand.chance(0.07) else 'accept' -%}
+  {%- elif role == 'lan_dns' -%}
+    {%- set src = module.rand.weighted_choice(shared.get('lan'), shared.get('lan_w')) -%}
+    {%- set src_zone = 'LAN' -%}
     {%- set dst = params.ngfw_ip -%}
     {%- set dst_zone = 'NGFW' -%}
-    {%- set dst_port = 443 if n % 3 else 22 -%}
+    {%- set dst_port = module.rand.weighted_choice([53, 123], [92, 8]) -%}
     {%- set table = 'inp' -%}
+    {%- set result = 'accept' -%}
+  {%- elif role == 'scan' -%}
+    {%- if module.rand.chance(0.5) -%}
+      {%- set src = module.rand.weighted_choice(shared.get('attackers'), shared.get('att_w')) -%}
+    {%- else -%}
+      {%- set src = module.rand.choice(['192.0.2.', '198.51.100.', '203.0.113.']) ~ module.rand.number.integer(1, 254) -%}
+    {%- endif -%}
+    {%- set src_zone = 'WAN' -%}
+    {%- set dst = params.ngfw_ip -%}
+    {%- set dst_zone = 'NGFW' -%}
+    {%- set dst_port = module.rand.weighted_choice([22, 23, 3389, 445, 8080, 1723, 443, 8443, 5060], [14, 12, 16, 10, 8, 6, 14, 6, 6]) -%}
+    {%- set table = 'inp' -%}
+    {%- set result = 'accept' if dst_port in [443, 1723, 22, 8443] and module.rand.chance(0.5) else 'drop' -%}
+  {%- elif role == 'brute' or role == 'vpn_ctl' -%}
+    {%- set src = e.src -%}
+    {%- set src_zone = 'WAN' -%}
+    {%- set dst = params.ngfw_ip -%}
+    {%- set dst_zone = 'NGFW' -%}
+    {%- set dst_port = e.port if role == 'brute' else 1723 -%}
+    {%- set table = 'inp' -%}
+    {%- set result = 'accept' -%}
   {%- else -%}
-    {%- set dst = params.external_destination_ip if n % 3
-        else '198.51.100.11' -%}
-    {%- set dst_zone = 'WAN' -%}
-    {%- set dst_port = [443, 80, 53][n % 3] -%}
+    {%- set src = e.src -%}
+    {%- set src_zone = 'VPN' -%}
+    {%- set dst = '10.50.2.' ~ module.rand.weighted_choice([10, 11, 12, 13, 14, 15], [30, 22, 16, 12, 10, 10]) -%}
+    {%- set dst_zone = 'SERVERS' -%}
+    {%- set dst_port = module.rand.weighted_choice([443, 445, 3389, 22, 53, 1433], [38, 24, 15, 7, 11, 5]) -%}
     {%- set table = 'fwd' -%}
+    {%- set result = 'drop' if module.rand.chance(0.05) else 'accept' -%}
   {%- endif -%}
-  {%- set protocol = 'UDP' if dst_port == 53 else 'TCP' -%}
-  {%- set result = 'drop' if n % 10 in [3, 9] else 'accept' -%}
-  {%- set action = 'l7_inspection' if result == 'accept'
-      and n % 13 == 0 and dst_port == 443 else result -%}
-  {%- set rule_id = {'fwd': {'accept': '2', 'drop': '4'},
-      'inp': {'accept': '7', 'drop': '9'}}[table][result] -%}
-  {%- set src_port = module.rand.number.integer(32768, 60999) -%}
-  {%- set flow_id = timestamp.strftime('%Y%m%d%H%M%S')
-      ~ '%02d' | format(n % 100) -%}
-  {%- set inspected = action == 'l7_inspection' -%}
-  {%- set native = {'result': result, 'rule_id': rule_id,
-      'table': table, 'action': action,
+  {%- set protocol = 'UDP' if dst_port in [53, 123, 5060] else 'TCP' -%}
+  {%- set inspected = result == 'accept' and table == 'fwd' and dst_port == 443 and module.rand.chance(0.3) -%}
+  {%- set action = 'l7_inspection' if inspected else result -%}
+  {%- set rule_id = {'LAN': {'accept': '2', 'drop': '4'}, 'WAN': {'accept': '7', 'drop': '9'},
+      'VPN': {'accept': '11', 'drop': '13'}}[src_zone][result] if not (table == 'inp' and src_zone == 'LAN')
+      else '5' -%}
+  {%- set src_port = module.rand.number.integer(1024, 65535) if src_zone == 'WAN'
+      else module.rand.number.integer(32768, 60999) -%}
+  {%- set flow_id = module.rand.number.integer(1000000000000000, 2251799813685247) | string -%}
+  {%- set service = 'traffic-journal' -%}
+  {%- set native = {'result': result, 'rule_id': rule_id, 'table': table, 'action': action,
       'ips_profile': 'default-ips' if inspected else '',
       'ips_action': 'accept' if inspected else 'absent',
       'ips_signature_id': '',
@@ -80,58 +374,37 @@
       'dpi_action': 'accept' if inspected else 'absent',
       'dpi_app': 'https' if inspected else '',
       'dpi_protocol': 'HTTPS' if inspected else '',
-      'protocol': protocol, 'src_ip': src,
-      'src_port': src_port | string, 'src_zone': src_zone,
-      'dst_ip': dst, 'dst_port': dst_port | string,
-      'dst_zone': dst_zone, 'flow_id': flow_id} -%}
+      'protocol': protocol, 'src_ip': src, 'src_port': src_port | string, 'src_zone': src_zone,
+      'dst_ip': dst, 'dst_port': dst_port | string, 'dst_zone': dst_zone, 'flow_id': flow_id} -%}
   {%- set pairs = [] -%}
-  {%- for key, value in native.items() -%}
-    {%- do pairs.append(key ~ ':' ~ value) -%}
-  {%- endfor -%}
+  {%- for key, value in native.items() -%}{%- do pairs.append(key ~ ':' ~ value) -%}{%- endfor -%}
   {%- set body = pairs | join(', ') -%}
-  {%- set event = {'dataset': 'ideco.ngfw_syslog', 'kind': 'event',
-      'category': ['network'],
-      'type': ['connection', 'allowed'] if result == 'accept'
-          else ['connection', 'denied'],
-      'action': 'traffic_' ~ result,
-      'id': flow_id} -%}
-  {%- set source = {'ip': src, 'port': src_port} -%}
-{%- elif kind == 'found' -%}
-  {%- set body = 'INFO [' ~ params.fail2ban_jail ~ '] Found '
-      ~ src ~ ' - ' ~ timestamp.strftime('%Y-%m-%d %H:%M:%S') -%}
-  {%- set native = {'jail': params.fail2ban_jail,
-      'action': 'Found', 'src_ip': src,
-      'found_at': timestamp.strftime('%Y-%m-%d %H:%M:%S')} -%}
-  {%- set event = {'dataset': 'ideco.ngfw_syslog', 'kind': 'event',
-      'category': ['intrusion_detection'], 'type': ['info'],
-      'action': 'fail2ban_found'} -%}
-  {%- set source = {'ip': src} -%}
-{%- else -%}
-  {%- set body = 'NOTICE [' ~ params.fail2ban_jail ~ '] Ban '
-      ~ src -%}
-  {%- set native = {'jail': params.fail2ban_jail,
-      'action': 'Ban', 'src_ip': src} -%}
-  {%- set event = {'dataset': 'ideco.ngfw_syslog', 'kind': 'event',
-      'category': ['intrusion_detection'], 'type': ['denied'],
-      'action': 'fail2ban_ban'} -%}
-  {%- set source = {'ip': src} -%}
+  {%- set event = {'kind': 'event', 'category': ['network'],
+      'type': ['connection', 'allowed'] if result == 'accept' else ['connection', 'denied'],
+      'action': 'traffic_' ~ result, 'id': flow_id} -%}
+  {%- set r.src = src -%}
 {%- endif -%}
-{%- set raw = timestamp.isoformat() ~ ' ' ~ params.ngfw_host
-    ~ ' ' ~ service ~ ' - - - ' ~ body -%}
-{%- do event.update({'original': raw}) -%}
-{%- set record = {'@timestamp': timestamp.isoformat(),
-    'ecs': {'version': '8.17.0'}, 'event': event,
-    'message': body,
-    'observer': {'hostname': params.ngfw_host,
-        'ip': params.ngfw_ip, 'vendor': 'Ideco',
+
+{%- set raw = timestamp.isoformat() ~ ' ' ~ params.ngfw_host ~ ' ' ~ service ~ ' - - - ' ~ body -%}
+{%- do event.update({'dataset': 'ideco.ngfw_syslog', 'original': raw}) -%}
+{%- set record = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'},
+    'event': event, 'message': body,
+    'observer': {'hostname': params.ngfw_host, 'ip': params.ngfw_ip, 'vendor': 'Ideco',
         'product': 'NGFW Novum'},
-    'source': source,
-    'related': {'ip': [src]},
-    'ideco': {'ngfw': {'service': service, 'fields': native}}
-} -%}
-{%- if kind == 'traffic' -%}
+    'process': {'name': service},
+    'source': {'ip': r.src}, 'related': {'ip': [r.src]},
+    'ideco': {'ngfw': {'service': service, 'fields': native}}} -%}
+{%- if service == 'traffic-journal' -%}
+  {%- do record.source.update({'port': src_port}) -%}
   {%- do record.update({'destination': {'ip': dst, 'port': dst_port},
-      'network': {'transport': protocol | lower, 'type': 'ipv4'}}) -%}
-  {%- do record['related']['ip'].append(dst) -%}
+      'network': {'transport': protocol | lower, 'type': 'ipv4'},
+      'rule': {'id': rule_id}}) -%}
+  {%- do record.related.ip.append(dst) -%}
+{%- elif service == 'ideco-vpn-authd' -%}
+  {%- do record.update({'user': {'name': r.user}}) -%}
+  {%- do record.related.update({'user': [r.user]}) -%}
+  {%- do record.related.ip.append(tunnel) -%}
+{%- else -%}
+  {%- do record.update({'rule': {'name': r.jail}}) -%}
 {%- endif -%}
 {{ record | tojson }}
