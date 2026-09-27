@@ -29,7 +29,7 @@ One analyst raises an incident and attaches evidence; another analyst removes th
 
 The records share `fortinet.fortianalyzer.incident_id`; steps 2 and 3 share `fortinet.fortianalyzer.attachment`; steps 3 and 4 share `user.name`. `source.ip` is D's current address; like every analyst, D keeps one address (office or remote access) for minutes to hours before possibly switching, so steps 3 and 4 usually, but not always, share it. The whole chain completes within 100 minutes of creation. Deletion is final: FortiAnalyzer logs no restore of a deleted incident, so nothing is restored.
 
-**Recurrence.** One chain per `anomaly_interval_hours` (default 24, minimum 6) of source time. The first becomes due between 0.3 and 1.0 intervals after the start; each next one is due one interval after the actual start of the previous chain. After it is due, a random delay of up to `min(1 h, interval / 8)` passes, and the chain starts on the next incident an analyst raises through the ordinary arrival process, so its hour of day and creator follow the analyst-raised background. Missed chains are not caught up.
+**Recurrence.** One chain per `anomaly_interval_hours` (default 24, minimum 6) of source time. The first becomes due between 0.3 and 1.0 intervals after the start; each next one is due one interval after the actual start of the previous chain. After it is due, a random delay of up to `min(1 h, interval / 8)` passes, and the chain starts on the next incident an analyst raises through the ordinary arrival process, so its hour of day and creator follow the analyst-raised background. Missed chains are not caught up. Measured gaps: 24.5-27.7 h at the default 24 h (9 chains over 10 days), 17 chains over 10 days at 12 h.
 
 **Variation.** C is the analyst who raises that incident; D is drawn by the analysts' ordinary activity weights, never C and never the previous chain's D. The incident, attachment, severity and all delays are drawn per chain.
 
@@ -48,8 +48,8 @@ Edit `event.template.params` in `generator.yml`.
 | Name | Default | Description |
 | --- | --- | --- |
 | `anomaly_mode` | `true` | Emit the anomaly chain on top of the background. |
-| `anomaly_interval_hours` | `24` | Source-time interval between chain starts; minimum `6`. |
-| `incidents_per_day` | `36` | Average number of incidents raised per day. |
+| `anomaly_interval_hours` | `24` | Source-time interval between chain starts; range `6`-`8760`. |
+| `incidents_per_day` | `36` | Average number of incidents raised per day (`4`-`2000`). |
 | `analyzer_serial` | `FAZ-VMTM26001234` | `devid` of the FortiAnalyzer unit. |
 | `analyzer_name` | `faz-soc-01` | `devname` of the FortiAnalyzer unit. |
 | `adom` | `root` | `vd` and `adom` values. |
