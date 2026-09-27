@@ -21,7 +21,7 @@ Clear-text password harvesting after an access request:
 2. After an approval delay, U views the clear text of S (`2303064603`).
 3. U views the clear text of five more distinct secrets from U's own folders; ordinary re-views of already opened secrets may come in between.
 
-All steps fall within 30 minutes of the request (measured spans 4-28 minutes (design cap 28)). Linking fields: `user`, `secretid` (with `secret`, `account`, `uuid`); the window is the detection rule's window.
+All steps fall within 30 minutes of the request (measured spans 4-28 minutes; design cap 28 minutes). Linking fields: `user`, `secretid` (with `secret`, `account`, `uuid`); the window is the detection rule's window.
 
 - **Recurrence.** `anomaly_interval_hours` (default 24, minimum 2, maximum 8760) sets the interval by source time. The first episode starts within the first min(interval, 24 h) of generation, at a time drawn from the background hour-of-day load. Each later episode is due one interval after the previous episode's actual start and starts in a window of width w = min(interval / 4, 6 h) centred on that due time, weighted by the squared hour-of-day load plus a small floor, so it leans towards busy hours. Missed time is never caught up. Gaps therefore stay within interval ± w/2: measured 22.5-26.1 h (mean 24.0) at the default, 10.6-13.4 h (mean 11.8) with 12 h.
 - **Variation.** The user is drawn with the same per-user weights as the background and never repeats the previous episode's user; S is one of that user's approval-gated secrets, never the previous episode's first secret; the other secrets, the approval delay and the gaps between views come from the background distributions (the draw is repeated when the episode would not fit in 28 minutes).
