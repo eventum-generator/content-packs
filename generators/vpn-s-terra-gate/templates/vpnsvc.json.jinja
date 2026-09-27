@@ -1,0 +1,291 @@
+{#- One S-Terra Gate 4.1 remote-access concentrator: vpnsvc syslog lines
+    for S-Terra Client users behind office NAT addresses and mobile
+    carrier NAT. Each one-second tick emits at most one line: the
+    earliest due one. Users connect as independent random processes;
+    the anomaly episode only queues its own lines and never touches the
+    background. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set guard_s = 3600 -%}
+{%- set office = ['10.20.0.0/16', 'IPsec:Protect:RA-MAP:10:OFFICE-NET',
+    'IPsecAction:RA-MAP:10'] -%}
+{%- set mgmt = ['10.0.10.0/24', 'IPsec:Protect:RA-MAP:20:MGMT-NET',
+    'IPsecAction:RA-MAP:20'] -%}
+{%- set sites = ['203.0.113.10', '203.0.113.37', '203.0.113.58',
+    '198.51.100.14', '198.51.100.71', '198.51.100.129', '203.0.113.201',
+    '198.51.100.202'] -%}
+{%- set site_sizes = [20, 10, 8, 7, 5, 4, 3, 3] -%}
+{%- set carrier = ['192.0.2.33', '192.0.2.78', '192.0.2.145', '192.0.2.211'] -%}
+{%- set admins = [0, 1, 20, 30, 38] -%}
+{%- set names = ['a.ivanova', 'd.smirnov', 'e.kuznetsova', 'm.popov',
+    'o.vasilieva', 'p.petrov', 's.sokolova', 'i.mikhailov', 'n.novikova',
+    'k.fedorov', 'l.morozova', 'r.volkov', 't.alekseeva', 'v.lebedev',
+    'y.semenova', 'g.egorov', 'a.pavlova', 'b.kozlov', 'z.stepanova',
+    'f.nikolaev', 'e.orlova', 'a.andreev', 'm.makarova', 'n.zakharov',
+    'o.zaitseva', 's.soloviev', 'k.borisova', 'i.yakovlev', 'v.grigorieva',
+    'p.romanov', 'd.vorobieva', 'r.sergeev', 'l.kuzmina', 't.frolov',
+    'a.belova', 'g.gusev', 'e.titova', 'm.kiselev', 'n.komarova',
+    'v.kovalev', 'o.ilina', 'k.gerasimov', 'i.maksimova', 's.polyakov',
+    'y.medvedeva', 'd.antonov', 'a.tarasova', 'b.belov', 'l.nikitina',
+    'r.zhukov', 'm.baranova', 'f.filippov', 'e.efimova', 'p.kulikov',
+    't.markova', 'a.shcherbakov', 'z.nazarova', 'k.bykov', 'o.denisova',
+    'i.gromov'] -%}
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set users = [] -%}
+  {%- set s = namespace(site=0, left=site_sizes[0]) -%}
+  {%- for n in range(names | length) -%}
+    {%- if s.left == 0 -%}
+      {%- set s.site = s.site + 1 -%}{%- set s.left = site_sizes[s.site] -%}
+    {%- endif -%}
+    {%- set s.left = s.left - 1 -%}
+    {#- [ike id, site index, weight, failure propensity] -#}
+    {%- do users.append([names[n] ~ '@' ~ params.user_domain, s.site,
+        module.rand.number.lognormal(0, 0.7),
+        [module.rand.number.lognormal(module.math.log(0.05), 0.8), 0.4] | min]) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'users': users,
+      'weights': users | map(attribute=2) | list, 'q': [], 'qmin': none,
+      'fh': {}, 'ctr': module.rand.number.integer(200, 9000),
+      'next_due': now + (interval * 3600) | int, 'armed': false,
+      'last_c': none, 'last_p': none}) -%}
+{%- endif -%}
+{%- set users = shared.get('users') -%}
+{%- set weights = shared.get('weights') -%}
+{%- set q = shared.get('q') -%}
+{%- set local_hour = (timestamp.astimezone(utc).hour + 3) % 24 -%}
+{%- set load = 1.6 if 8 <= local_hour < 19 else (0.7 if 19 <= local_hour < 23 else 0.25) -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{%- macro push(e) -%}
+  {%- do q.append(e) -%}
+  {%- if shared.get('qmin') is none or e.due < shared.get('qmin') -%}
+    {%- do shared.set('qmin', e.due) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro next_id() -%}
+  {%- do shared.set('ctr', shared.get('ctr') + 1) -%}
+  {{- shared.get('ctr') -}}
+{%- endmacro -%}
+
+{#- One established client session: IKE SA, IKECFG address, one or two
+    IPsec SAs, then the client's deletions and the closing lines. -#}
+{%- macro session(u, ip, port, t0, ep=false) -%}
+  {%- set n = next_id() | int -%}
+  {%- set cfg = '10.99.' ~ module.rand.number.integer(0, 3) ~ '.' ~ module.rand.number.integer(10, 250) -%}
+  {%- set base = {'user': u, 'ip': ip, 'port': port, 'isakmp': n, 'cfg': cfg, 'ep': ep} -%}
+  {%- set t = namespace(at=t0, m=1) -%}
+  {{- push(dict(base, due=t.at, kind='created')) -}}
+  {%- set t.at = t.at + module.rand.number.integer(0, 1) -%}
+  {{- push(dict(base, due=t.at, kind='cfg', m=t.m)) -}}
+  {%- set sels = [] -%}
+  {%- if u in admins and (ep or module.rand.chance(0.4)) -%}
+    {%- do sels.append(mgmt) -%}
+    {%- if module.rand.chance(0.5) -%}{%- do sels.append(office) -%}{%- endif -%}
+  {%- else -%}
+    {%- do sels.append(office) -%}
+  {%- endif -%}
+  {%- set sas = [] -%}
+  {%- for sel in sels -%}
+    {%- set t.m = t.m + 1 -%}
+    {%- set t.at = t.at + module.rand.number.integer(0, 2) -%}
+    {%- set k = next_id() | int -%}
+    {%- do sas.append(k) -%}
+    {{- push(dict(base, due=t.at, kind='est', m=t.m, ipsec=k, sel=sel)) -}}
+  {%- endfor -%}
+  {%- set dur = [[gap(5400, 0.9) | int, 36000] | min, 60] | max -%}
+  {%- set t.at = t.at + dur -%}
+  {%- for k in sas -%}
+    {%- set t.m = t.m + 1 -%}
+    {%- set rx = gap(dur * 900, 1.2) | int -%}
+    {{- push(dict(base, due=t.at, kind='del_ipsec', m=t.m, ipsec=k)) -}}
+    {%- set t.at = t.at + module.rand.number.integer(0, 1) -%}
+    {{- push(dict(base, due=t.at, kind='closed_ipsec', ipsec=k, rx=rx,
+        tx=(rx * module.rand.number.lognormal(module.math.log(4), 0.8)) | int)) -}}
+  {%- endfor -%}
+  {%- set t.at = t.at + module.rand.number.integer(0, 2) -%}
+  {{- push(dict(base, due=t.at, kind='del_isakmp', m=t.m + 1)) -}}
+  {%- set t.at = t.at + module.rand.number.integer(0, 1) -%}
+  {{- push(dict(base, due=t.at, kind='closed_isakmp')) -}}
+{%- endmacro -%}
+
+{#- A series of failed attempts; returns the time after the last one. -#}
+{%- macro fails(u, ip, port, t0, k, ep=false) -%}
+  {%- set t = namespace(at=t0) -%}
+  {%- for i in range(k) -%}
+    {%- if i > 0 -%}{%- set t.at = t.at + gap(35, 0.9) | int -%}{%- endif -%}
+    {{- push({'due': t.at, 'kind': 'fail', 'user': u, 'ip': ip, 'port': port, 'ep': ep}) -}}
+  {%- endfor -%}
+  {{- t.at -}}
+{%- endmacro -%}
+
+{%- macro user_ip(u) -%}
+{{- sites[users[u][1]] if module.rand.chance(0.8) else module.rand.choice(carrier) -}}
+{%- endmacro -%}
+
+{#- Weighted pick of a user index from a candidate list. -#}
+{%- macro wpick(cands) -%}
+  {%- set w = [] -%}
+  {%- for c in cands -%}{%- do w.append(weights[c]) -%}{%- endfor -%}
+  {{- module.rand.weighted_choice(cands, w) -}}
+{%- endmacro -%}
+
+{%- macro port() -%}{{- module.rand.number.integer(1024, 65000) -}}{%- endmacro -%}
+
+{#- 1. Background: independent connection attempts of weighted users,
+    modulated by office hours; some fail and are retried or given up. -#}
+{%- if module.rand.chance(0.003 * load) -%}
+  {%- set u = module.rand.weighted_choice(range(users | length) | list, weights) -%}
+  {%- set ip = user_ip(u) -%}
+  {%- set p = port() | int -%}
+  {%- if module.rand.chance(users[u][3]) -%}
+    {%- set t_end = fails(u, ip, p, now, module.rand.weighted_choice([1, 2, 3, 4], [45, 30, 15, 10])) | int -%}
+    {%- if module.rand.chance(0.75) -%}{{- session(u, ip, p, t_end + gap(60, 1.0) | int) -}}{%- endif -%}
+  {%- else -%}
+    {{- session(u, ip, p, now) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Background: a site-wide problem (expired CRL, NAT change) makes
+    several users behind one office address fail within minutes. -#}
+{%- if module.rand.chance(0.000028 * load) -%}
+  {%- set site = module.rand.weighted_choice(range(sites | length) | list, site_sizes) -%}
+  {%- set members = range(users | length) | select('in', range(site_sizes[:site] | sum, site_sizes[:site + 1] | sum)) | list -%}
+  {%- set first = module.rand.choice(members) -%}
+  {%- set hit = [first, module.rand.choice(members | reject('equalto', first) | list)] -%}
+  {%- for u in members if u not in hit and module.rand.chance(0.12) -%}{%- do hit.append(u) -%}{%- endfor -%}
+  {%- for u in hit -%}
+    {%- set p = port() | int -%}
+    {%- set t0 = now + gap(420, 1.2) | int -%}
+    {%- set t_end = fails(u, sites[site], p, t0, module.rand.weighted_choice([1, 2, 3], [50, 32, 18])) | int -%}
+    {%- if module.rand.chance(0.6) -%}{{- session(u, sites[site], p, t_end + gap(600, 0.9) | int) -}}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+
+{#- 3. Episode: due by source time, started after a random delay that
+    follows the office-hours curve, next due from the actual start. -#}
+{%- if params.anomaly_mode and now >= shared.get('next_due')
+    and module.rand.chance(load / 5400) -%}
+  {%- set cands = [] -%}
+  {%- for c in admins if c != shared.get('last_c') and sites[users[c][1]] != shared.get('last_p') -%}
+    {%- do cands.append(c) -%}
+  {%- endfor -%}
+  {%- set c = wpick(cands) | int -%}
+  {%- set ip = sites[users[c][1]] -%}
+  {%- set pool = range(users | length) | select('in', range(site_sizes[:users[c][1]] | sum,
+      site_sizes[:users[c][1] + 1] | sum)) | reject('equalto', c) | list -%}
+  {%- set a = wpick(pool) | int -%}
+  {%- set pool_b = pool | reject('equalto', a) | list -%}
+  {%- set b = wpick(pool_b) | int -%}
+  {%- set t1 = fails(a, ip, port() | int, now, module.rand.weighted_choice([1, 2, 3], [50, 35, 15]), true) | int -%}
+  {%- set t2 = fails(b, ip, port() | int, t1 + gap(60, 1.0) | int,
+      module.rand.weighted_choice([1, 2, 3], [50, 35, 15]), true) | int -%}
+  {{- session(c, ip, port() | int, [[t2 + gap(150, 0.8) | int, now + 2400] | min, t2 + 5] | max, true) -}}
+  {%- do shared.update({'next_due': now + (interval * 3600) | int,
+      'last_c': c, 'last_p': ip}) -%}
+{%- endif -%}
+
+{#- 4. Emit the earliest due line, otherwise nothing. -#}
+{%- if shared.get('qmin') is none or shared.get('qmin') > now -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due < pick.due -%}{%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}{%- endif -%}
+{%- endfor -%}
+{%- set e = q.pop(pick.i) -%}
+{%- do shared.set('qmin', (q | map(attribute='due') | min) if q else none) -%}
+{%- set uid = users[e.user][0] -%}
+{%- set peer = e.ip ~ ':' ~ e.port -%}
+
+{#- Failed attempts per peer address within the guard window. -#}
+{%- set fh = shared.get('fh') -%}
+{%- set h = fh.get(e.ip, []) | selectattr('0', 'ge', now - guard_s) | list -%}
+{%- if e.kind == 'fail' -%}{%- do h.append([now, uid]) -%}{%- endif -%}
+{%- if h -%}{%- do fh.update({e.ip: h[-12:]}) -%}{%- elif e.ip in fh -%}{%- do fh.pop(e.ip) -%}{%- endif -%}
+{%- set sel = e.sel if e.kind == 'est' else none -%}
+{#- Guard on the final chain step only: an ordinary management tunnel
+    from an address that just failed for two different identities is
+    opened to the office network instead. -#}
+{%- if sel == mgmt and not e.ep and (h | map(attribute='1') | unique | list | length) >= 2 -%}
+  {%- set sel = office -%}
+{%- endif -%}
+
+{%- if e.kind == 'fail' -%}
+  {%- set msg = ['0010011C', 'MSG_ID_LP_INCOMING_CONNECTION_FAILURE', 'LP', 'ERR', none,
+      'Incoming connection failed. Peer ' ~ peer ~ ', id "' ~ uid ~ '"'] -%}
+{%- elif e.kind == 'created' -%}
+  {%- set msg = ['10000005', 'MSG_ID_IKE_SA_CREATED', 'IKE', 'INFO', none,
+      'ISAKMP connection ' ~ e.isakmp ~ ' created, peer ' ~ peer ~ ', id "' ~ uid ~ '"'] -%}
+{%- elif e.kind == 'cfg' -%}
+  {%- set msg = ['10002001', 'MSG_ID_IKE_IKECFG_ASSIGNED', 'IKE', 'INFO', e.m,
+      'IKECFG address ' ~ e.cfg ~ ' assigned to peer ' ~ peer ~ ', id "' ~ uid ~ '", proxy ARP enabled'] -%}
+{%- elif e.kind == 'est' -%}
+  {%- set msg = ['00100119', 'MSG_ID_LP_HOST_CONNECTED', 'LP', 'NOTICE', e.m,
+      'IPSec connection ' ~ e.ipsec ~ ' established, traffic selector ' ~ e.cfg ~ '->' ~ sel[0]
+      ~ ', peer ' ~ peer ~ ', id "' ~ uid ~ '", Filter ' ~ sel[1] ~ ', IPsecAction ' ~ sel[2]
+      ~ ', IKERule IKERule:RA-MAP:10'] -%}
+{%- elif e.kind == 'del_ipsec' -%}
+  {%- set msg = ['1000001A', 'MSG_ID_IKE_DELETION_RECV', 'IKE', 'INFO', e.m,
+      'Received deletion for IPSec connection ' ~ e.ipsec ~ ' - ESP'] -%}
+{%- elif e.kind == 'closed_ipsec' -%}
+  {%- set msg = ['0010011D', 'MSG_ID_LP_CONNECTION_CLOSED', 'LP', 'NOTICE', none,
+      'IPSec connection ' ~ e.ipsec ~ ' closed: ' ~ e.tx ~ ' bytes sent, ' ~ e.rx ~ ' received: deleted by peer'] -%}
+{%- elif e.kind == 'del_isakmp' -%}
+  {%- set msg = ['1000001A', 'MSG_ID_IKE_DELETION_RECV', 'IKE', 'INFO', e.m,
+      'Received deletion for ISAKMP connection ' ~ e.isakmp] -%}
+{%- else -%}
+  {%- set msg = ['10000006', 'MSG_ID_IKE_SA_CLOSED', 'IKE', 'INFO', none,
+      'ISAKMP connection ' ~ e.isakmp ~ ' closed, peer ' ~ peer ~ ', id "' ~ uid ~ '"'] -%}
+{%- endif -%}
+{%- set session_id = '<' ~ e.isakmp ~ ':' ~ msg[4] ~ '>' if msg[4] is not none else none -%}
+
+{%- set dt = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set clock = dt.strftime('%b') ~ ' ' ~ '%2d' | format(dt.day) ~ ' ' ~ dt.strftime('%H:%M:%S') -%}
+{%- set raw = clock ~ ' ' ~ params.gateway_host ~ ' vpnsvc: ' ~ msg[0] ~ ' '
+    ~ (session_id ~ ' ' if session_id else '') ~ msg[5] -%}
+{%- set actions = {'fail': 'incoming-connection-failed', 'created': 'isakmp-connection-created',
+    'cfg': 'ikecfg-address-assigned', 'est': 'ipsec-connection-established',
+    'del_ipsec': 'deletion-received', 'closed_ipsec': 'ipsec-connection-closed',
+    'del_isakmp': 'deletion-received', 'closed_isakmp': 'isakmp-connection-closed'} -%}
+{%- set types = {'fail': ['start', 'connection'], 'created': ['start', 'connection'],
+    'cfg': ['allowed', 'connection'], 'est': ['start', 'connection'],
+    'del_ipsec': ['info'], 'closed_ipsec': ['end', 'connection'],
+    'del_isakmp': ['info'], 'closed_isakmp': ['end', 'connection']} -%}
+{%- set vg = {'msg_id': msg[0], 'msg_name': msg[1], 'section': msg[2], 'severity': msg[3]} -%}
+{%- if e.isakmp is defined -%}{%- do vg.update({'isakmp_connection_id': e.isakmp}) -%}{%- endif -%}
+{%- if session_id -%}{%- do vg.update({'session_id': session_id}) -%}{%- endif -%}
+{%- if e.kind in ['est', 'del_ipsec', 'closed_ipsec'] -%}{%- do vg.update({'ipsec_connection_id': e.ipsec}) -%}{%- endif -%}
+{%- if e.kind == 'cfg' -%}{%- do vg.update({'ikecfg_address': e.cfg}) -%}{%- endif -%}
+{%- if e.kind == 'est' -%}
+  {%- do vg.update({'traffic_selector': e.cfg ~ '->' ~ sel[0], 'filter': sel[1],
+      'ipsec_action': sel[2], 'ike_rule': 'IKERule:RA-MAP:10'}) -%}
+{%- endif -%}
+{%- if e.kind == 'closed_ipsec' -%}
+  {%- do vg.update({'bytes_sent': e.tx, 'bytes_received': e.rx, 'reason': 'deleted by peer'}) -%}
+{%- endif -%}
+{%- set peer_rows = e.kind in ['fail', 'created', 'cfg', 'est', 'closed_isakmp'] -%}
+{%- if peer_rows -%}{%- do vg.update({'ike_id': uid}) -%}{%- endif -%}
+{%- set event = {'kind': 'event', 'module': 's_terra', 'dataset': 's_terra.vpn_gate',
+    'category': ['network', 'authentication'] if e.kind == 'fail' else ['network'],
+    'type': types[e.kind], 'action': actions[e.kind], 'code': msg[0],
+    'original': raw} -%}
+{%- if e.kind == 'fail' -%}{%- do event.update({'outcome': 'failure'}) -%}
+{%- elif e.kind in ['created', 'cfg', 'est'] -%}{%- do event.update({'outcome': 'success'}) -%}{%- endif -%}
+{%- set record = {'@timestamp': dt.isoformat(), 'ecs': {'version': '8.17.0'},
+    'event': event, 'log': {'level': msg[3] | lower},
+    'observer': {'hostname': params.gateway_host, 'vendor': 'S-Terra',
+      'product': 'S-Terra Gate', 'version': '4.1', 'type': 'vpn'},
+    'process': {'name': 'vpnsvc'},
+    's_terra': {'vpn_gate': vg}} -%}
+{%- if peer_rows -%}
+  {%- do record.update({'source': {'ip': e.ip, 'port': e.port}, 'user': {'name': uid},
+      'related': {'ip': [e.ip] + ([e.cfg] if e.kind in ['cfg', 'est'] else []), 'user': [uid]}}) -%}
+{%- endif -%}
+{%- if e.kind == 'closed_ipsec' -%}
+  {%- do record.update({'source': {'bytes': e.rx}, 'destination': {'bytes': e.tx}}) -%}
+{%- endif -%}
+{{ record | tojson }}
