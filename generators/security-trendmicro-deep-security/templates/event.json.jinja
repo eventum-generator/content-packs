@@ -1,28 +1,266 @@
-{%- set step = vars.step -%}
-{%- if step == 'routine' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- set n = shared.get('routine_count', 0) + 1 -%}
-  {%- if n >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', n) -%}{%- endif -%}
+{#- One Deep Security Agent firewall or intrusion prevention event per
+    one-second tick at most, relayed by Deep Security Manager in CEF
+    (Deep Security 20 "Syslog message formats"). Background is a
+    superposition of independent random processes per source; the
+    anomaly episode only adds events for one source and one host and
+    never touches the background queue. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{#- Chain window: three distinct denied ports and the IPS event of one
+    source on one host within this many seconds. -#}
+{%- set window_s = 3600 -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if not (10 <= params.host_count <= 200) or not (20 <= params.source_count <= 1000) -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- if params.deny_rules | length < 5 or params.ips_rules | length < 1 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set net = module.ipaddress.IPv4Network(params.server_network) -%}
+  {%- set hosts = [] -%}
+  {%- set used = namespace(ip=[], id=[], n={}) -%}
+  {%- for n in range(params.host_count * 6) -%}
+    {%- if hosts | length < params.host_count -%}
+      {%- set ip = (net.network_address + module.rand.number.integer(10, net.num_addresses - 2)) | string -%}
+      {%- set hid = module.rand.number.integer(2, 1999) -%}
+      {%- if ip not in used.ip and hid not in used.id -%}
+        {%- set role = module.rand.weighted_choice(['web', 'app', 'db'], [45, 30, 25]) -%}
+        {%- set os = module.rand.weighted_choice(['linux', 'windows'], [65, 35]) -%}
+        {%- set num = used.n.get(role, 0) + 1 -%}
+        {%- do used.n.update({role: num}) -%}
+        {%- do used.ip.append(ip) -%}{%- do used.id.append(hid) -%}
+        {%- set ports = ([80, 443] if role == 'web' else []) + ([22] if os == 'linux' else [3389]) -%}
+        {%- do hosts.append({'name': '%s-%02d.%s' % (role, num, params.domain), 'ip': ip, 'id': hid,
+            'web': role == 'web', 'ports': ports,
+            'mac': '00:50:56:%02X:%02X:%02X' % (module.rand.number.integer(0, 63),
+              module.rand.number.integer(0, 255), module.rand.number.integer(0, 255))}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set sources = [] -%}
+  {%- for n in range(params.source_count * 6) -%}
+    {%- if sources | length < params.source_count -%}
+      {%- set nets = params.source_networks | list -%}
+      {%- set snet = module.ipaddress.IPv4Network(module.rand.weighted_choice(nets, ([70, 20] + [10] * nets | length)[:nets | length])) -%}
+      {%- set ip = (snet.network_address + module.rand.number.integer(2, snet.num_addresses - 2)) | string -%}
+      {%- if ip not in sources and ip not in used.ip -%}{%- do sources.append(ip) -%}{%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set host_w = [] -%}{%- for h in hosts -%}{%- do host_w.append(module.rand.number.lognormal(0, 0.8)) -%}{%- endfor -%}
+  {%- set src_w = [] -%}{%- for s in sources -%}{%- do src_w.append(module.rand.number.lognormal(0, 1.0)) -%}{%- endfor -%}
+  {%- set web_i = [] -%}{%- for h in hosts -%}{%- if h.web -%}{%- do web_i.append(loop.index0) -%}{%- endif -%}{%- endfor -%}
+  {%- if web_i | length < 2 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- do shared.update({'initialized': true, 'hosts': hosts, 'host_w': host_w, 'web_i': web_i,
+      'sources': sources, 'src_w': src_w, 'q': [], 'hist': {},
+      'next_due': now + (interval * 3600) | int, 'last_source': none, 'last_host': none}) -%}
 {%- endif -%}
-{%- set attack = step != 'routine' -%}
-{%- set variant = (module.rand.weighted_choice(['firewall_log','firewall_deny','ips'],[85,12,3]) if not attack else ('ips' if step.startswith('ips') else 'firewall_deny')) -%}
-{%- set host_id = params.attack_host_id if attack else module.rand.number.integer(1, 50) -%}
-{%- set host_name = params.attack_target_name if attack else 'app-%02d.corp.example' % host_id -%}
-{%- set target_ip = params.attack_target_ip if attack else '10.50.20.' ~ (host_id + 20) -%}
-{%- set source_ip = params.attack_source_ip if attack else '10.50.1.' ~ module.rand.number.integer(10, 150) -%}
-{%- set dest_port = (445 if step == 'probe_1' else 3389) if step.startswith('probe') else (80 if variant == 'ips' or variant == 'firewall_log' else module.rand.choice([445, 3389])) -%}
-{%- set source_port = module.rand.number.integer(40000, 60000) -%}
-{%- set signature = '1001111' if variant == 'ips' else ('21' if variant == 'firewall_deny' else '20') -%}
-{%- set name = 'Test Intrusion Prevention Rule' if variant == 'ips' else ('Deny Inbound Management' if variant == 'firewall_deny' else 'Log for TCP Port 80') -%}
-{%- set act = 'IDS:Reset' if variant == 'ips' else ('Deny' if variant == 'firewall_deny' else 'Log') -%}
-{%- set severity = 3 if variant == 'ips' else (5 if variant == 'firewall_deny' else 0) -%}
-{%- set fields = {'cn1':host_id,'cn1Label':'Host ID','dvchost':host_name,'act':act,'dmac':'00:50:56:F5:7F:%02X' % host_id,'smac':'00:0C:29:EB:35:DE','TrendMicroDsFrameType':'IP','src':source_ip,'dst':target_ip,'in':60 if variant == 'firewall_deny' else 1093,'cs3':'DF','cs3Label':'Fragmentation Bits','proto':'TCP','spt':source_port,'dpt':dest_port,'cs2':'0x02 SYN' if variant == 'firewall_deny' else '0x18 ACK PSH','cs2Label':'TCP Flags','cnt':1} -%}
-{%- if variant != 'firewall_deny' -%}{%- do fields.update({'TrendMicroDsPacketData':'R0VUIC8gSFRUUC8xLjE='}) -%}{%- endif -%}
-{%- if variant == 'ips' -%}{%- do fields.update({'cn3':10,'cn3Label':'Intrusion Prevention Packet Position','cs5':10,'cs5Label':'Intrusion Prevention Stream Position','cs6':8,'cs6Label':'Intrusion Prevention Flags'}) -%}{%- endif -%}
-{%- set parts = [] -%}{%- for key,value in fields.items() -%}{%- do parts.append(key ~ '=' ~ value|string) -%}{%- endfor -%}
-{%- set raw = timestamp.strftime('%b %d %H:%M:%S') ~ ' ' ~ params.manager_name ~ ' CEF:0|Trend Micro|Deep Security Agent|' ~ params.agent_version ~ '|' ~ signature ~ '|' ~ name ~ '|' ~ severity ~ '|' ~ parts|join(' ') -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'intrusion-reset' if variant == 'ips' else ('firewall-deny' if variant == 'firewall_deny' else 'firewall-log'),'category':['network','intrusion_detection'] if variant == 'ips' else ['network'],'code':signature,'dataset':'trendmicro.deep_security','kind':'alert' if variant == 'ips' else 'event','original':raw,'type':['denied'] if variant != 'firewall_log' else ['info']},'host':{'name':host_name,'ip':[target_ip]},'source':{'ip':source_ip,'port':source_port},'destination':{'ip':target_ip,'port':dest_port},'network':{'transport':'tcp'},'related':{'ip':[source_ip,target_ip],'hosts':[host_name]},'trendmicro':{'deep_security':{'host_id':host_id,'rule_id':signature,'rule_name':name,'action':act,'manager_name':params.manager_name}}} -%}
-{{- out | tojson -}}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set host_w = shared.get('host_w') -%}
+{%- set sources = shared.get('sources') -%}
+{%- set src_w = shared.get('src_w') -%}
+{%- set web_i = shared.get('web_i') -%}
+{%- set web_w = [] -%}{%- for i in web_i -%}{%- do web_w.append(host_w[i]) -%}{%- endfor -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set load = (1.35 if 7 <= hour < 19 else (0.9 if 19 <= hour < 23 else 0.45)) / 0.975 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- A burst of IPS detections of one source against a web service of
+    one host. Hits share one mutable burst record, so a changed source
+    applies to the rest of the burst. -#}
+{%- macro ips_burst(src, hi, at, episode=false) -%}
+  {%- set b = {'src': src} -%}
+  {%- set port = module.rand.weighted_choice([80, 443], [60, 40]) -%}
+  {%- set rule = module.rand.weighted_choice(params.ips_rules, params.ips_rules | map(attribute='weight') | list) -%}
+  {%- set t = namespace(v=at, rule=rule) -%}
+  {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4], [55, 25, 12, 8])) -%}
+    {%- if not loop.first -%}
+      {%- set t.v = t.v + gap(8, 1.2) | int -%}
+      {%- if module.rand.chance(0.25) -%}
+        {%- set t.rule = module.rand.weighted_choice(params.ips_rules, params.ips_rules | map(attribute='weight') | list) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- do q.append({'due': t.v, 'kind': 'ips', 'episode': episode,
+        's': {'b': b, 'hi': hi, 'port': port, 'rule': t.rule}}) -%}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{%- macro log_conns(src, hi, port, at) -%}
+  {%- set t = namespace(v=at) -%}
+  {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4], [58, 24, 11, 7])) -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(20, 1.4) | int -%}{%- endif -%}
+    {%- do q.append({'due': t.v, 'kind': 'log', 'episode': false,
+        's': {'src': src, 'hi': hi, 'port': port}}) -%}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{#- Denied attempts on several ports of one host, then optionally IPS
+    detections or an ordinary logged connection from the same source.
+    The same law serves background and the episode. The follow-up is
+    drawn independently of the port count; an IPS follow-up of a
+    background scan on three or more ports is not made (that is the
+    complete chain), every other outcome keeps its share. -#}
+{%- macro probe_burst(src, hi, k, follow, episode=false) -%}
+  {%- set ports = module.rand.shuffle(params.deny_rules | list)[:k] -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for rule in ports -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(20, 1.1) | int -%}{%- endif -%}
+    {%- for a in range(module.rand.weighted_choice([1, 2, 3], [55, 32, 13])) -%}
+      {%- if not loop.first -%}{%- set t.v = t.v + gap(3, 0.7) | int -%}{%- endif -%}
+      {%- do q.append({'due': t.v, 'kind': 'deny', 'episode': episode,
+          's': {'src': src, 'hi': hi, 'rule': rule}}) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set at = t.v + gap(90, 1.0) | int -%}
+  {%- if follow == 'ips' and (episode or k < 3) -%}
+    {{- ips_burst(src, hi, at, episode) -}}
+  {%- elif follow == 'log' -%}
+    {{- log_conns(src, hi, module.rand.choice(hosts[hi].ports), at) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Background arrivals, independent random streams. -#}
+{%- if module.rand.chance(0.05 * load) -%}
+  {#- Ordinary connections matched by log-only rules, diurnal. -#}
+  {%- set hi = module.rand.weighted_choice(range(hosts | length) | list, host_w) -%}
+  {%- set h = hosts[hi] -%}
+  {%- set port = module.rand.weighted_choice(h.ports, [35, 55, 10] if h.web else [1]) -%}
+  {{- log_conns(module.rand.weighted_choice(sources, src_w), hi, port, now) -}}
+{%- endif -%}
+{%- if module.rand.chance(0.004) -%}
+  {#- Denied ports: scanners, inventory tools, misconfigured clients,
+      users trying another protocol; flat over the day. -#}
+  {%- set hi = module.rand.weighted_choice(range(hosts | length) | list, host_w) -%}
+  {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5], [50, 24, 14, 8, 4]) -%}
+  {%- set r = module.rand.number.floating(0, 1) -%}
+  {%- set follow = ('ips' if r < 0.3 else ('log' if r < 0.6 else none)) if hosts[hi].web
+      else ('log' if r < 0.35 else none) -%}
+  {{- probe_burst(module.rand.weighted_choice(sources, src_w), hi, k, follow) -}}
+{%- endif -%}
+{%- if module.rand.chance(0.0012) -%}
+  {#- Exploit attempts and false positives against web services. -#}
+  {{- ips_burst(module.rand.weighted_choice(sources, src_w), module.rand.weighted_choice(web_i, web_w), now) -}}
+{%- endif -%}
+
+{#- 2. Episode: due by source time, exponential start delay (mean
+    20 min, flat over the day like background denies), next due from
+    the actual start, never catching up. -#}
+{%- if params.anomaly_mode and now >= shared.get('next_due') and module.rand.chance(1 / 1200) -%}
+  {%- set sp = namespace(s=[], w=[]) -%}
+  {%- for ip in sources -%}
+    {%- if ip != shared.get('last_source') -%}{%- do sp.s.append(ip) -%}{%- do sp.w.append(src_w[loop.index0]) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set hp = namespace(i=[], w=[]) -%}
+  {%- for i in web_i -%}
+    {%- if i != shared.get('last_host') -%}{%- do hp.i.append(i) -%}{%- do hp.w.append(web_w[loop.index0]) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set src = module.rand.weighted_choice(sp.s, sp.w) -%}
+  {%- set hi = module.rand.weighted_choice(hp.i, hp.w) -%}
+  {{- probe_burst(src, hi, module.rand.weighted_choice([3, 4, 5], [54, 31, 15]), 'ips', true) -}}
+  {%- do shared.update({'last_source': src, 'last_host': hi, 'next_due': now + (interval * 3600) | int}) -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due event, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}{%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}{%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+{%- set s = e.s -%}
+{%- set kind = e.kind -%}
+{%- set h = hosts[s.hi] -%}
+
+{%- for key in hist | list -%}
+  {%- set kept = hist[key] | selectattr('0', 'ge', now - window_s) | list -%}
+  {%- if kept -%}{%- do hist.update({key: kept}) -%}{%- else -%}{%- do hist.pop(key) -%}{%- endif -%}
+{%- endfor -%}
+
+{%- if kind == 'deny' -%}
+  {%- set src = s.src -%}
+  {%- set key = src ~ '>' ~ s.hi -%}
+  {%- do hist.update({key: (hist.get(key, []) + [[now, s.rule.port]])[-24:]}) -%}
+{%- elif kind == 'ips' -%}
+  {#- Guard on the final chain step only, window equal to the chain
+      window: an ordinary IPS detection (a coincidence of independent
+      streams) whose source was denied on three or more distinct ports
+      of this host within the window becomes an ordinary logged
+      connection of the same source to the same web port at the same
+      time; the actor and the host stay unchanged. -#}
+  {%- set src = s.b.src -%}
+  {%- if not e.episode and (hist.get(src ~ '>' ~ s.hi, []) | map(attribute='1') | unique | list | length) >= 3 -%}
+    {%- set kind = 'log' -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set src = s.src -%}
+{%- endif -%}
+
+{#- 4. The CEF message: extension order as in the Deep Security 20
+    firewall and intrusion prevention CEF samples, tenant fields as the
+    manager adds them when it relays agent events. -#}
+{%- set rt = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set header = rt.strftime('%b ') ~ ('%2d' % rt.day) ~ rt.strftime(' %H:%M:%S') ~ ' ' ~ params.manager_host -%}
+{%- set spt = module.rand.number.integer(49152, 65535) if module.rand.chance(0.7) else module.rand.number.integer(1024, 49151) -%}
+{%- set frag = 'DF' if module.rand.chance(0.93) else '' -%}
+{%- set base = 'cn1=' ~ h.id ~ ' cn1Label=Host ID dvchost=' ~ h.name ~ ' TrendMicroDsTenant=' ~ params.tenant
+    ~ ' TrendMicroDsTenantId=' ~ params.tenant_id -%}
+{%- if kind == 'ips' -%}
+  {%- set rule = s.rule -%}
+  {%- set sig = rule.id | string -%}{%- set name = rule.name -%}{%- set sev = rule.severity -%}
+  {%- set act = params.ips_action -%}{%- set dpt = s.port -%}
+  {%- set size = [[module.rand.number.lognormal(module.math.log(420), 0.6) | int, 120] | max, 1460] | min -%}
+  {%- set pos = module.rand.number.integer(0, [size - 60, 1] | max) -%}
+  {%- set stream = pos + (0 if module.rand.chance(0.6) else module.rand.number.integer(1, 2400)) -%}
+  {%- set has_data = dpt == 80 -%}
+  {%- set ext = base ~ ' dmac=' ~ h.mac ~ ' smac=' ~ params.gateway_mac ~ ' TrendMicroDsFrameType=IP src=' ~ src
+      ~ ' dst=' ~ h.ip ~ ' in=' ~ size ~ ' cs3=' ~ frag ~ ' cs3Label=Fragmentation Bits proto=TCP spt=' ~ spt
+      ~ ' dpt=' ~ dpt ~ ' cs2=0x18 ACK PSH cs2Label=TCP Flags cnt=1 act=' ~ act
+      ~ ' cn3=' ~ pos ~ ' cn3Label=Intrusion Prevention Packet Position cs5=' ~ stream
+      ~ ' cs5Label=Intrusion Prevention Stream Position cs6=' ~ (8 if has_data else 0)
+      ~ ' cs6Label=Intrusion Prevention Flags' -%}
+  {%- if has_data -%}
+    {%- set ext = ext ~ ' TrendMicroDsPacketData=' ~ module.base64.b64encode((rule.request ~ '\r\nHost: ' ~ h.name ~ '\r\n').encode()).decode() | replace('=', '\\=') -%}
+  {%- endif -%}
+  {%- set category = 'intrusion-prevention-event' -%}
+  {%- set ecs_category = ['intrusion_detection'] -%}
+{%- else -%}
+  {%- if kind == 'deny' -%}
+    {%- set sig = '21' -%}{%- set name = s.rule.name -%}{%- set sev = 5 -%}{%- set act = 'Deny' -%}{%- set dpt = s.rule.port -%}
+  {%- else -%}
+    {%- set lr = params.log_rules | selectattr('port', 'equalto', s.port) | first -%}
+    {%- set sig = '20' -%}{%- set name = lr.name -%}{%- set sev = 0 -%}{%- set act = 'Log' -%}{%- set dpt = s.port -%}
+  {%- endif -%}
+  {%- set size = module.rand.weighted_choice([60, 64, 66, 74], [30, 10, 25, 35]) -%}
+  {%- set ext = base ~ ' act=' ~ act ~ ' dmac=' ~ h.mac ~ ' smac=' ~ params.gateway_mac
+      ~ ' TrendMicroDsFrameType=IP src=' ~ src ~ ' dst=' ~ h.ip ~ ' in=' ~ size ~ ' cs3=' ~ frag
+      ~ ' cs3Label=Fragmentation Bits proto=TCP spt=' ~ spt ~ ' dpt=' ~ dpt
+      ~ ' cs2=0x02 SYN cs2Label=TCP Flags cnt=1' -%}
+  {%- set category = 'firewall-event' -%}
+  {%- set ecs_category = ['network'] -%}
+{%- endif -%}
+{%- set raw = header ~ ' CEF:0|Trend Micro|Deep Security Agent|' ~ params.product_version ~ '|' ~ sig ~ '|'
+    ~ name ~ '|' ~ sev ~ '|' ~ ext -%}
+
+{#- 5. ECS document, field names as the Elastic Trend Micro integration
+    maps them. -#}
+{%- set record = {'@timestamp': rt.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ecs_category, 'type': ['info'],
+    'action': act | lower | replace(' ', '-'), 'code': sig, 'severity': sev,
+    'dataset': 'trendmicro.deep_security', 'original': raw},
+  'observer': {'hostname': h.name, 'vendor': 'Trend Micro', 'product': 'Deep Security Agent',
+    'version': params.product_version},
+  'host': {'id': h.id | string, 'name': h.name, 'ip': [h.ip]},
+  'source': {'ip': src, 'port': spt, 'mac': params.gateway_mac | replace(':', '-')},
+  'destination': {'ip': h.ip, 'port': dpt, 'mac': h.mac | replace(':', '-')},
+  'network': {'transport': 'tcp', 'type': 'ipv4'},
+  'related': {'ip': [src, h.ip], 'hosts': [h.id | string, h.name]},
+  'trendmicro': {'deep_security': {'signature_id': sig | int, 'name': name, 'severity': sev | string,
+    'action': act, 'event_category': category, 'bytes_in': size,
+    'tenant_name': params.tenant, 'tenant_id': params.tenant_id | string}}} -%}
+{%- if kind == 'ips' -%}{%- do record.update({'rule': {'id': sig, 'name': name}}) -%}{%- else -%}{%- do record.update({'rule': {'name': name}}) -%}{%- endif -%}
+{{ record | tojson }}

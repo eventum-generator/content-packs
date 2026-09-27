@@ -1,115 +1,103 @@
 # Trend Micro Deep Security Agent CEF
 
-Eventum content pack for Deep Security Agent firewall and intrusion-prevention messages forwarded through syslog in CEF. Output is ECS JSON with the native CEF line in `event.original`. `anomaly_mode: true` is the default; `false` leaves only background traffic.
+Firewall and intrusion prevention events of Trend Micro Deep Security 20 Agents on protected servers, relayed by Deep Security Manager over syslog in CEF. Each record is ECS JSON with the native syslog line in `event.original`; field names follow the Elastic Trend Micro integration.
 
-## Run
+The protected estate is 40 servers (web, application and database roles, Linux or Windows) and 180 internal source addresses. Every source has its own activity weight; traffic is a superposition of independent random processes: ordinary connections matched by log-only firewall rules (busier during the working day), denied connection attempts on one to five blocked ports of one host (flat over the day), and intrusion prevention detections against web services.
 
-From the content-packs repository root:
+## Event types
 
-```bash
-eventum generate --path generators/security-trendmicro-deep-security/generator.yml --id security-trendmicro-deep-security --live-mode true
-```
+Shares measured on a 78-hour default capture (`anomaly_mode: true`, 27,201 events, 3 episodes).
 
-For a bounded batch sample, use `timeout 3s eventum generate --path generators/security-trendmicro-deep-security/generator.yml --id security-trendmicro-deep-security-batch --live-mode false`. Exit code 124 is expected for this continuous source. Events go to `generators/security-trendmicro-deep-security/output/events.json`.
+| CEF signature ID | Event | `act` | Share | ECS category |
+|---|---|---|---|---|
+| `20` | Log-only firewall rule (`Log Inbound HTTP`, `HTTPS`, `SSH`, `RDP`) | `Log` | 84.2% | `network` |
+| `21` | Deny firewall rule (`Deny Inbound SMB`, `Telnet`, `MSSQL` and 7 more) | `Deny` | 12.6% | `network` |
+| `1000000`-`1999999` | Intrusion prevention rule (11 Trend Micro rules, rule ID = signature ID) | `IDS:Reset` | 3.2% | `intrusion_detection` |
 
-## Events
-
-| CEF signature ID | Meaning | Routine distribution | ECS category |
-| --- | --- | --- | --- |
-| `20` | Log-only firewall rule | 85% | `network` |
-| `21` | Deny firewall rule | 12%; two per chain | `network` |
-| `1001111` | Intrusion-prevention rule with `IDS:Reset` | 3%; two per chain | `network`, `intrusion_detection` |
-
-The routine percentages are synthetic workload weights, not vendor-measured production rates. Fifty agent hosts share a manager syslog sender; `dvchost` and `cn1` identify the protected host.
+The shares are synthetic workload weights, not vendor-measured rates. Log-only and deny rule names are customer-defined in Deep Security; the shipped ones are examples. The intrusion prevention rule IDs and names are real Trend Micro rules, taken from a Deep Security Manager rule update record.
 
 ## Anomaly Chain
 
-One source attempts SMB/445 and RDP/3389 against the same protected host and hits firewall deny rule 21. The source then triggers IPS rule 1001111 with `IDS:Reset` on HTTP/80 twice. Correlate `source.ip`, `destination.ip`, `host.name` or `trendmicro.deep_security.host_id`, and a short time window. The records show a multi-port probe followed by IPS resets. They do not establish that the host was compromised. Concurrent output can reorder lines; sort by `@timestamp` when inspecting the chain.
+`anomaly_mode` defaults to `true`. With `false` the generator emits the background only and the complete chain never occurs.
 
-The generator models only firewall and IPS CEF records. It does not emit anti-malware, integrity-monitoring, application-control, web-reputation, LEEF, or manager sign-in events. KUMA 4.2 lists Trend Micro Deep Security via the Syslog-CEF normalizer. The shipped output is ECS JSON, so pass `event.original` to a native CEF parser if testing that normalizer.
+Sequence, all for one source S (`src` / `source.ip`) and one protected web server H (`cn1` / `dvchost` / `host.name`, `dst`):
+
+1. Deny firewall event (signature `21`, `act=Deny`, TCP SYN) from S to H on blocked port P1.
+2. Deny from S to H on a second blocked port P2.
+3. Deny from S to H on a third blocked port P3 (four or five ports in about four episodes in ten); each port gets one to three attempts.
+4. One to four intrusion prevention events (`act=IDS:Reset`) from S to H on HTTP or HTTPS: a port scan followed by exploit attempts against the service it found.
+
+Linking fields: `src` / `source.ip`, `cn1` / `host.id`, `dvchost` / `host.name` and `dst` / `destination.ip` in all steps; distinct `dpt` / `destination.port` in steps 1-3.
+
+Recurrence: an episode becomes due every `anomaly_interval_hours` of source time (default 24, minimum 2), first one interval after generation starts. It starts after a random delay (exponential, mean 20 minutes, flat over the day like the background denies). The next due time counts from the actual start, so a late episode never causes catch-up. Episodes in the final captures spanned 68 s to 14 minutes from the first deny to the first intrusion prevention event.
+
+Variation: the source and the web server differ from the previous episode's; both are drawn with the background weights. Ports, attempt counts, gaps, rules and the HTTP/HTTPS split come from the same law as the background.
+
+Detection idea: one source is denied on three or more distinct ports of one host and then triggers an intrusion prevention rule on that host within an hour. Every fragment occurs in background of both modes: five 78-hour background captures hold about 130 scans of a web server on three or more ports each, and after a scan of one or two ports the same source triggers an intrusion prevention rule within ten minutes in 28% of cases. What follows a scan does not depend on its port count otherwise: within ten minutes of a scan on 1-2 vs 3+ ports, the same source makes a logged connection in 32% vs 32% of cases and another source triggers an intrusion prevention rule on the host in 9% vs 10%. Only the complete sequence is kept out of the background: a background scan on three or more ports never gets the intrusion prevention follow-up (the other outcomes keep their shares), and an independent intrusion prevention event whose source was denied on three or more distinct ports of the same host within the last 3600 s (the chain window) becomes a logged connection of that source to the same web port at the same time.
 
 ## Parameters
 
 ### Event Parameters
 
+Edit `event.template.params` in `generator.yml`:
+
 | Parameter | Default | Meaning |
-| --- | --- | --- |
-| `manager_name` | `dsm-01.corp.example` | Syslog sender |
-| `agent_version` | `20.0.0` | CEF Device Version |
-| `anomaly_mode` | `true` | Add the four-event chain; `false` emits background only |
-| `anomaly_interval_events` | `250` | Routine records between chains |
-| `attack_source_ip` | `10.50.9.77` | Stable chain source |
-| `attack_target_name` | `app-01.corp.example` | Protected agent host |
-| `attack_target_ip` | `10.50.20.15` | Protected host IP |
-| `attack_host_id` | `101` | Agent host identifier in `cn1` |
+|---|---|---|
+| `anomaly_mode` | `true` | Add periodic episodes to the background |
+| `anomaly_interval_hours` | `24` | Episode interval in source hours, 2-8760 |
+| `manager_host` | `dsm-01.corp.example` | Syslog header host (the relaying manager) |
+| `product_version` | `20.0.877` | CEF Device Version (the manager version for relayed events) |
+| `tenant` | `Primary` | `TrendMicroDsTenant` |
+| `tenant_id` | `0` | `TrendMicroDsTenantId` |
+| `gateway_mac` | `00:1C:73:4A:0E:01` | `smac` of routed traffic |
+| `domain` | `corp.example` | Domain of the protected host names |
+| `host_count` | `40` | Protected servers, 10-200 (at least two must get the web role) |
+| `source_count` | `180` | Source addresses, 20-1000 |
+| `source_networks` | 3 networks | Networks the sources are drawn from |
+| `server_network` | `10.50.20.0/24` | Network of the protected servers |
+| `log_rules` | 4 rules | Log-only rules (`name`, `port`); ports 80, 443, 22 and 3389 are required |
+| `deny_rules` | 10 rules | Deny rules (`name`, `port`), at least five |
+| `ips_action` | `IDS:Reset` | `act` of intrusion prevention events (detect-only policy) |
+| `ips_rules` | 11 rules | Intrusion prevention rules (`id`, `name`, CEF `severity`, `weight`, `request` line used for the packet data) |
 
 ### Output Parameters
 
-No top-level `${params.*}` or `${secrets.*}` placeholders are shipped. File output needs no credentials. Replace the `output` block to forward to a SIEM, then configure its endpoint and credentials there.
+The shipped `generator.yml` writes to a local file and uses no `${params.*}` or `${secrets.*}` placeholders. To send events to a backend, replace the `output` block and parameterize its endpoint and credentials, for example `hosts: ["${params.opensearch_host}"]` and `password: ${secrets.opensearch_password}`, then pass `--params '{"opensearch_host": "..."}'` and store the secret in the Eventum keyring.
+
+## Usage
+
+Live mode:
+
+```bash
+eventum generate --path generators/security-trendmicro-deep-security/generator.yml --id deep-security --live-mode true
+```
+
+Batch mode (bound the run with `start` / `end` on the `cron` input for a finite capture):
+
+```bash
+eventum generate --path generators/security-trendmicro-deep-security/generator.yml --id deep-security --live-mode false
+```
+
+Events go to `generators/security-trendmicro-deep-security/output/events.json`.
+
+## Limitations
+
+- Only Agent firewall (signature `20`, `21`) and intrusion prevention events. Anti-malware, integrity monitoring, log inspection, web reputation, application control, device control, policy firewall (`100`-`199`) and manager system events are not modeled, nor LEEF or basic syslog.
+- Vendor documentation gives the CEF extension tables and truncated samples, not complete captured records. Extension order follows the Deep Security 20 samples; `TrendMicroDsTenant` / `TrendMicroDsTenantId` are placed after `dvchost` as in the documented manager-relayed samples. The documentation states that the order and presence of extensions may vary.
+- CEF severity: `0` for log-only and `5` for deny events as in the documented samples; intrusion prevention severities `3`, `6`, `8`, `10` are assigned per rule and are not taken from the vendor rule catalog.
+- Packet data (`TrendMicroDsPacketData`, `cs6=8`) is present only for HTTP detections and holds the request line and `Host` header; HTTPS detections carry no packet data (`cs6=0`). Log-only and deny events carry no packet data.
+- One event per second at most, with whole-second timestamps as in the RFC 3164 header; the header carries no year and no time zone (UTC is used).
+- All traffic is inbound TCP to protected servers, so only `in` (never `out`) is set.
 
 ## Sample output
 
-This complete event was captured from an `anomaly_mode: true` run:
+The first intrusion prevention event of an episode from the final default capture (HTTP, with packet data):
 
 ```json
-{
-  "@timestamp": "2026-09-25T13:34:51+00:00",
-  "destination": {
-    "ip": "10.50.20.15",
-    "port": 445
-  },
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "firewall-deny",
-    "category": [
-      "network"
-    ],
-    "code": "21",
-    "dataset": "trendmicro.deep_security",
-    "kind": "event",
-    "original": "Sep 25 13:34:51 dsm-01.corp.example CEF:0|Trend Micro|Deep Security Agent|20.0.0|21|Deny Inbound Management|5|cn1=101 cn1Label=Host ID dvchost=app-01.corp.example act=Deny dmac=00:50:56:F5:7F:65 smac=00:0C:29:EB:35:DE TrendMicroDsFrameType=IP src=10.50.9.77 dst=10.50.20.15 in=60 cs3=DF cs3Label=Fragmentation Bits proto=TCP spt=45856 dpt=445 cs2=0x02 SYN cs2Label=TCP Flags cnt=1",
-    "type": [
-      "denied"
-    ]
-  },
-  "host": {
-    "ip": [
-      "10.50.20.15"
-    ],
-    "name": "app-01.corp.example"
-  },
-  "network": {
-    "transport": "tcp"
-  },
-  "related": {
-    "hosts": [
-      "app-01.corp.example"
-    ],
-    "ip": [
-      "10.50.9.77",
-      "10.50.20.15"
-    ]
-  },
-  "source": {
-    "ip": "10.50.9.77",
-    "port": 45856
-  },
-  "trendmicro": {
-    "deep_security": {
-      "action": "Deny",
-      "host_id": 101,
-      "manager_name": "dsm-01.corp.example",
-      "rule_id": "21",
-      "rule_name": "Deny Inbound Management"
-    }
-  }
-}
+{"@timestamp": "2026-09-27T00:13:42+00:00", "destination": {"ip": "10.50.20.41", "mac": "00-50-56-1E-E4-CB", "port": 80}, "ecs": {"version": "8.17.0"}, "event": {"action": "ids:reset", "category": ["intrusion_detection"], "code": "1011143", "dataset": "trendmicro.deep_security", "kind": "event", "original": "Sep 27 00:13:42 dsm-01.corp.example CEF:0|Trend Micro|Deep Security Agent|20.0.877|1011143|WordPress \u0027ProfilePress\u0027 Plugin Privilege Escalation Vulnerability (CVE-2021-34621)|8|cn1=1035 cn1Label=Host ID dvchost=web-07.corp.example TrendMicroDsTenant=Primary TrendMicroDsTenantId=0 dmac=00:50:56:1E:E4:CB smac=00:1C:73:4A:0E:01 TrendMicroDsFrameType=IP src=10.40.8.228 dst=10.50.20.41 in=283 cs3=DF cs3Label=Fragmentation Bits proto=TCP spt=53439 dpt=80 cs2=0x18 ACK PSH cs2Label=TCP Flags cnt=1 act=IDS:Reset cn3=34 cn3Label=Intrusion Prevention Packet Position cs5=1046 cs5Label=Intrusion Prevention Stream Position cs6=8 cs6Label=Intrusion Prevention Flags TrendMicroDsPacketData=UE9TVCAvd3AtYWRtaW4vYWRtaW4tYWpheC5waHA/YWN0aW9uPXBwX2FqYXhfc2lnbnVwIEhUVFAvMS4xDQpIb3N0OiB3ZWItMDcuY29ycC5leGFtcGxlDQo\\=", "severity": 8, "type": ["info"]}, "host": {"id": "1035", "ip": ["10.50.20.41"], "name": "web-07.corp.example"}, "network": {"transport": "tcp", "type": "ipv4"}, "observer": {"hostname": "web-07.corp.example", "product": "Deep Security Agent", "vendor": "Trend Micro", "version": "20.0.877"}, "related": {"hosts": ["1035", "web-07.corp.example"], "ip": ["10.40.8.228", "10.50.20.41"]}, "rule": {"id": "1011143", "name": "WordPress \u0027ProfilePress\u0027 Plugin Privilege Escalation Vulnerability (CVE-2021-34621)"}, "source": {"ip": "10.40.8.228", "mac": "00-1C-73-4A-0E-01", "port": 53439}, "trendmicro": {"deep_security": {"action": "IDS:Reset", "bytes_in": 283, "event_category": "intrusion-prevention-event", "name": "WordPress \u0027ProfilePress\u0027 Plugin Privilege Escalation Vulnerability (CVE-2021-34621)", "severity": "8", "signature_id": 1011143, "tenant_id": "0", "tenant_name": "Primary"}}}
 ```
 
 ## References
 
-- [Trend Micro Workload Security syslog/CEF message formats](https://docs.trendmicro.com/en-us/documentation/article/trend-micro-cloud-one-workload-security-event-syslog-message-formats)
+- [Deep Security 20: Syslog message formats](https://help.deepsecurity.trendmicro.com/20_0/on-premise/event-syslog-message-formats.html)
 - [Elastic Trend Micro integration](https://github.com/elastic/integrations/tree/main/packages/trendmicro)
-- [KUMA 4.2 supported event sources](https://support.kaspersky.ru/kuma/4.2/255782)
