@@ -63,7 +63,7 @@ Edit `event.template.params` in `generator.yml`:
 | `trusted_interface` | `Trusted` | Trusted interface name in the message |
 | `client_prefix` | `10.0.1.` | Client addresses are this prefix plus a host number |
 | `client_first` | `20` | First client host number |
-| `client_count` | `120` | Number of LAN clients (at least 8) |
+| `client_count` | `120` | Number of LAN clients (at least 8; `client_first + client_count` at most 255) |
 | `remote_count` | `150` | Number of external addresses (at least 20) |
 
 ### Output Parameters
