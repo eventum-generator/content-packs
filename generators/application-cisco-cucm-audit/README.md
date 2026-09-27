@@ -1,23 +1,45 @@
-# Cisco Unified Communications Manager audit log
+# Cisco Unified Communications Manager Audit Log
 
-Synthetic Cisco Unified Communications Manager 14.0.1.10000-20 application audit-file records in the `Audit00000001.log` `|LogMessage` format shown by Cisco DevNet. This pack models the file's audit event rows, not CUCM syslog alarms, CDRs, or Linux auditd.
+Generates Cisco Unified Communications Manager (CUCM) 14 application audit log rows as ECS JSON: Cisco Unified CM Administration logins and logouts and `processnode` configuration changes. The native row is kept verbatim in `event.original`, in the `|LogMessage` form of the `Audit00000001.log` file that Cisco DevNet shows for build 14.0.1.10000-20. CUCM syslog alarms, CDRs, database audit and Linux auditd are separate streams.
 
-## Event types
+## Event Types
 
-| Native EventType / detail | Approximate share with anomaly mode | ECS category | Meaning |
-| --- | ---: | --- | --- |
-| `UserLogging` / login | 43.1% | `authentication` | Successful CUCM Administration login |
-| `UserLogging` / logout | 43.1% | `authentication` | Successful Administration logout |
-| `GeneralConfigurationUpdate` / `processnode` updated | 6.9% | `configuration` | Existing processnode record updated |
-| `GeneralConfigurationUpdate` / `processnode` added | 6.9% | `configuration` | New processnode record added in routine and anomaly sessions |
+Measured on a 14-day default capture (`anomaly_mode: true`, 1,574 events). All classes occur in both modes.
 
-The template uses FSM mode and emits one event per simulated minute from one CUCM publisher. A routine cycle has 24 administrator sessions; every fourth session changes a `processnode` record, and every eighth adds one. An anomaly cycle adds one four-event session. Frequencies and timing are synthetic, not Cisco production telemetry.
+| Native `EventType` / `AuditDetails` | `event.action` | Share | Category |
+|---|---|---:|---|
+| `GeneralConfigurationUpdate` / `record in table processnode ... updated` | `processnode_updated` | 34.8% | configuration |
+| `UserLogging` / `Successfully Logged into Cisco Unified CM Admin Webpages` | `user_login` | 26.7% | authentication, session |
+| `UserLogging` / `Successfully Logged out Cisco Unified Administration Web Pages` | `user_logout` | 19.4% | authentication, session |
+| `GeneralConfigurationUpdate` / `record in table processnode ... deleted` | `processnode_deleted` | 9.9% | configuration |
+| `GeneralConfigurationUpdate` / `record in table processnode ... added` | `processnode_added` | 9.3% | configuration |
+
+Twelve administrator accounts (`samples/admins.json`) each follow their own random schedule: sessions every few hours to a few days (lognormal, per-account median 3 to 30 hours between sessions), from the account's usual workstation address or, in about 15% of sessions, a second address. About 40% of sessions only look around (login, logout). The rest carry one to about fifteen configuration changes (most often one to three) seconds to minutes apart on the `processnode` table (`samples/processnodes.json`, 24 server names, each present or absent):
+
+- **Update** of a present record, often the same record several times in a row; a quarter of updates are saved again seconds later.
+- **Add** of an absent record. Half of the adds are followed within seconds by an update of the same record, as in the Cisco sample; of the rest, more than half are deleted again later in the same session (added by mistake or for a test).
+- **Delete** of a present record; some follow an update of that record in the same session.
+
+About a quarter of sessions end without a logout row (the browser is closed and the session expires). One input tick per second emits the earliest due row with its own millisecond timestamp, or nothing. Rates, durations and the operation mix are synthetic workload choices, not measured CUCM production frequencies.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), `breakglass-admin` connects from `198.51.100.45`, an address also seen in isolated routine sessions, and logs into CUCM Administration. The same user and client address then add and update `cimp-shadow-<n>.example.test` in the `processnode` table before logging out. The four steps occur within three simulated minutes; the two configuration records share the record key. A rule can group by `user.name` and `source.ip`, sort by `@timestamp`, and alert on an add and update of the same `processnode` key in one short session. Output row order is not a reliable clock.
+`anomaly_mode` defaults to `true`. With `false` the generator emits only the background above, which never holds the complete chain; every step still occurs there on its own and in partial sequences. Per 14-day background capture: about 110-125 adds followed by an update of the same record by the same account within two hours, 40-50 adds followed by a delete, and about 23 updates followed by a delete.
 
-This is a synthetic high-interest administrative sequence, not proof of compromise. Cisco's primary sample shows the same four native event forms and record-key linkage. `CorrelationID` is empty for these short rows; it is used by CUCM to join fragments of one oversized audit message, not to identify this admin session. With `anomaly_mode: false`, routine sessions include occasional break-glass logins and processnode additions, but no add-and-update sequence on one record key.
+Sequence, one episode (one Administration session of one account, from one of that account's usual addresses):
+
+1. `UserLogging` login.
+2. `GeneralConfigurationUpdate` - `record in table processnode with key field name = <K> added`: a server record that is not in the table.
+3. The same record `updated` seconds later, sometimes saved again.
+4. Zero to several ordinary updates, of this or other records.
+5. The same record `deleted`, which restores the table to its state before the episode.
+6. Logout (or no logout row, as in background).
+
+Linking fields: `user.name` (`UserID`) and the record key (`cucm.audit.record.key_value`, parsed from `AuditDetails`) across steps 2, 3 and 5; `source.ip` (`ClientAddress`) for the session. `CorrelationID` stays empty: CUCM uses it to join fragments of one oversized audit message, not to link a session. Measured episode spans (add to delete): 0.4 to 5.3 minutes across the 14-day captures (default and 48-hour). All gaps come from the same distributions as background operations.
+
+Recurrence: the first episode is due `anomaly_interval_hours` after the first tick (default 24, minimum 6). It starts at a random delay of up to 30 minutes (up to an eighth of the interval for short intervals) after it is due, on the first moment an account is out of session with no own session due within 3 hours and no add in the last 3 hours, and a record is absent and untouched for 3 hours; otherwise it waits. The next episode is due one interval after the actual start; missed episodes are not replayed. Each episode picks a different account (weighted by how often each account works) and a different record than the previous one. The episode is an extra session: the account's own schedule resumes unchanged, and no background activity is suspended or shifted, except that ordinary changes do not touch the record reserved for the running episode. Measured: 13 episodes in 14 days at 24 hours (start gaps 24.1 to 24.5 hours), 6 in 14 days at 48 hours (48.1 to 48.4 hours); rotated accounts and records in every case.
+
+Detection idea: one account adds, updates and deletes the same cluster server record within two hours - a server entry staged and then removed, for example to register a rogue node temporarily. Each step alone, and each pair of steps, is ordinary administration here. Background never completes the sequence: an ordinary delete that would complete it is skipped.
 
 ## Parameters
 
@@ -25,111 +47,64 @@ This is a synthetic high-interest administrative sequence, not proof of compromi
 
 Edit `event.template.params` in `generator.yml`:
 
-| Parameter | Default | Purpose |
-| --- | --- | --- |
-| `anomaly_mode` | `true` | Include the four-event admin sequence; `false` produces background only |
-| `cucm_node` | `cucm-pub-01` | Native Node ID and ECS host name |
-| `routine_sessions_before_chain` | `24` | Routine sessions between anomaly sessions |
-| `suspect_user` | `breakglass-admin` | User in the anomaly chain |
-| `suspect_client_ip` | `198.51.100.45` | Unusual documentation-range client address |
-| `suspect_node_prefix` | `cimp-shadow` | Prefix of the newly added processnode record key |
+| Parameter | Default | Description |
+|---|---|---|
+| `anomaly_mode` | `true` | Include periodic anomaly episodes; `false` gives background only |
+| `anomaly_interval_hours` | `24` | Hours between episode starts; 6 to 8760, other values fail validation |
+| `cucm_node` | `cucm-pub-01` | Native `Node ID` and `host.name` |
+
+Accounts come from `samples/admins.json` (`user`, `ip`, `alt_ip`, `median_hours` between sessions) and records from `samples/processnodes.json` (`name`, initial `present`). Episode rotation needs at least two accounts and two initially absent records.
 
 ### Output Parameters
 
-No top-level `${params.*}` or `${secrets.*}` are required. Output defaults to `output/events.json`; edit the file output section to deliver elsewhere.
+The shipped output writes `output/events.json` and needs no credentials. To send events elsewhere, replace the output and pass values through top-level placeholders, for example:
+
+```yaml
+output:
+  - opensearch:
+      hosts:
+        - ${params.opensearch_host}
+      username: ${params.opensearch_user}
+      password: ${secrets.opensearch_password}
+      index: cucm-audit
+```
+
+A collector that expects the native row should read `event.original`.
 
 ## Usage
 
-From the content-packs repository:
+Live mode:
+
+```bash
+eventum generate --path generators/application-cisco-cucm-audit/generator.yml --id cucm --live-mode true
+```
+
+Batch mode, as fast as possible (the cron input runs until stopped unless `start` and `end` are set on it):
 
 ```bash
 eventum generate --path generators/application-cisco-cucm-audit/generator.yml --id cucm --live-mode false
 ```
 
-For continuous generation, use `--live-mode true`. Set `event.template.params.anomaly_mode` to `false` for background only. The file output is overwritten when a run starts.
+## Sample Output
 
-## Sample output
-
-This JSON event was copied from an anomaly-mode run:
+An episode's delete row from the final default capture:
 
 ```json
-{
-  "@timestamp": "2026-09-25T15:28:00+00:00",
-  "cucm": {
-    "audit": {
-      "app_id": "Cisco Tomcat",
-      "audit_category": "AdministrativeEvent",
-      "audit_details": "record in table processnode with key field name = cimp-shadow-1.example.test added",
-      "client_address": "198.51.100.45",
-      "cluster_id": "",
-      "component_id": "Cisco CUCM Administration",
-      "compulsory_event": "No",
-      "correlation_id": "",
-      "event_status": "Success",
-      "event_type": "GeneralConfigurationUpdate",
-      "node_id": "cucm-pub-01",
-      "processnode_name": "cimp-shadow-1.example.test",
-      "resource_accessed": "CUCMAdmin",
-      "severity": 5,
-      "timestamp_local": "15:28:00.000",
-      "user_id": "breakglass-admin"
-    }
-  },
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "processnode_added",
-    "category": [
-      "configuration"
-    ],
-    "code": "GeneralConfigurationUpdate",
-    "dataset": "cucm.audit",
-    "kind": "event",
-    "module": "cucm",
-    "original": "15:28:00.000 |LogMessage   UserID : breakglass-admin  ClientAddress : 198.51.100.45  Severity : 5  EventType : GeneralConfigurationUpdate  ResourceAccessed: CUCMAdmin  EventStatus : Success  CompulsoryEvent : No  AuditCategory : AdministrativeEvent  ComponentID : Cisco CUCM Administration  CorrelationID :   AuditDetails : record in table processnode with key field name = cimp-shadow-1.example.test added App ID: Cisco Tomcat Cluster ID:  Node ID: cucm-pub-01",
-    "outcome": "success",
-    "type": [
-      "creation"
-    ]
-  },
-  "host": {
-    "name": "cucm-pub-01"
-  },
-  "message": "record in table processnode with key field name = cimp-shadow-1.example.test added",
-  "related": {
-    "hosts": [
-      "cucm-pub-01"
-    ],
-    "ip": [
-      "198.51.100.45"
-    ],
-    "user": [
-      "breakglass-admin"
-    ]
-  },
-  "service": {
-    "name": "Cisco Unified Communications Manager",
-    "version": "14.0.1.10000-20"
-  },
-  "source": {
-    "ip": "198.51.100.45"
-  },
-  "user": {
-    "name": "breakglass-admin"
-  }
-}
+{"@timestamp": "2026-09-03T00:44:13.506+00:00", "cucm": {"audit": {"app_id": "Cisco Tomcat", "audit_category": "AdministrativeEvent", "audit_details": "record in table processnode with key field name = cucm-sub-02.example.test deleted", "client_address": "10.99.10.40", "cluster_id": "", "component_id": "Cisco CUCM Administration", "compulsory_event": "No", "correlation_id": "", "event_status": "Success", "event_type": "GeneralConfigurationUpdate", "node_id": "cucm-pub-01", "record": {"key_field": "name", "key_value": "cucm-sub-02.example.test", "operation": "deleted", "table": "processnode"}, "resource_accessed": "CUCMAdmin", "severity": 5, "timestamp_local": "00:44:13.506", "user_id": "rkowalski"}}, "ecs": {"version": "8.17.0"}, "event": {"action": "processnode_deleted", "category": ["configuration"], "code": "GeneralConfigurationUpdate", "dataset": "cucm.audit", "kind": "event", "module": "cucm", "original": "00:44:13.506 |LogMessage   UserID : rkowalski  ClientAddress : 10.99.10.40  Severity : 5  EventType : GeneralConfigurationUpdate  ResourceAccessed: CUCMAdmin  EventStatus : Success  CompulsoryEvent : No  AuditCategory : AdministrativeEvent  ComponentID : Cisco CUCM Administration  CorrelationID :   AuditDetails :  record in table processnode with key field name = cucm-sub-02.example.test deleted  App ID: Cisco Tomcat Cluster ID:  Node ID: cucm-pub-01", "outcome": "success", "type": ["deletion"]}, "host": {"name": "cucm-pub-01"}, "message": "record in table processnode with key field name = cucm-sub-02.example.test deleted", "related": {"hosts": ["cucm-pub-01"], "ip": ["10.99.10.40"], "user": ["rkowalski"]}, "service": {"name": "Cisco Unified Communications Manager", "version": "14.0.1.10000-20"}, "source": {"ip": "10.99.10.40"}, "user": {"name": "rkowalski"}}
 ```
 
-## Format and coverage
+## Limitations
 
-`event.original` preserves the vendor sample's time prefix, `|LogMessage` marker, and all 14 named fields: `UserID`, `ClientAddress`, `Severity`, `EventType`, `ResourceAccessed`, `EventStatus`, `CompulsoryEvent`, `AuditCategory`, `ComponentID`, `CorrelationID`, `AuditDetails`, `App ID`, `Cluster ID`, and `Node ID`. The `cucm.audit` object mirrors these values, giving 14/14 field coverage against the Cisco DevNet event rows. The complete line is synthetically assembled from those vendor rows; it is not a captured line. The separate file `HDR` line is not emitted as an event. Native event rows carry only a time of day; ECS `@timestamp` supplies the synthetic date in UTC.
-
-Cisco's example identifies build 14.0.1.10000-20 and `/var/log/active/audit/AuditApp/Audit00000001.log`. Application audit logging must be enabled; configuration detail depends on its logging settings. KUMA 4.2 lists a CUCM normalizer for 11.5.1, whereas this pack follows the 14.0.1 file example. Compatibility with that older normalizer or CUCM remote-syslog transport is not claimed.
+- The only complete native example is the DevNet file with four rows: login, `processnode` added, `processnode` updated, logout. Field names, spacing and the constant values of each form (`Severity`, `ResourceAccessed`, `AuditCategory`, `ComponentID`) follow it exactly. The CUCM 14 administration guide lists server additions and deletions among audited events, but shows no row; the `deleted` row reuses the `added`/`updated` form with the verb `deleted` seen in Cisco Community posts for other tables. It is not a captured line.
+- Only successful Administration logins and `processnode` changes are modeled. Failed logins, other tables (device, numplan, users), Serviceability and CLI events are not generated because no primary row example was found for them; real clusters change devices and directory numbers far more often than server records.
+- The file `HDR` line is not emitted. Native rows carry only a time of day; `@timestamp` supplies the date, and the time of day is UTC. Remote syslog framing (`AuditEventGenerated` alarms) is not modeled.
+- `cucm.audit.record` (table, key field, key value, operation) is parsed from `AuditDetails`; `event.*`, `user.*`, `source.*` and `related.*` are ECS normalization, not source fields.
+- KUMA 4.2 lists a CUCM normalizer for 11.5(1); this pack follows the 14.0.1 file example and does not claim compatibility with that normalizer.
+- No live capture, exact-build trace or maintained Elastic integration for CUCM audit logs was available for comparison.
 
 ## References
 
-- [KUMA 4.2 supported sources](https://support.kaspersky.ru/kuma/4.2/255782)
-- [Cisco DevNet: Log Collection API with complete CUCM 14 audit-file sample](https://developer.cisco.com/docs/sxml/log-collection-api/)
-- [Cisco CUCM 14 administration guide: audit event classes and logging settings](https://www.cisco.com/c/en/us/td/docs/voice_ip_comm/cucm/admin/14SU2/adminGd/cucm_b_administration-guide-14su2/cucm_b_test-adminguide_chapter_010100.html)
+- [Cisco DevNet: Log Collection API, complete CUCM 14 audit-file sample](https://developer.cisco.com/docs/sxml/log-collection-api/)
+- [Cisco CUCM 14 administration guide: audit logs](https://www.cisco.com/c/en/us/td/docs/voice_ip_comm/cucm/admin/14SU2/adminGd/cucm_b_administration-guide-14su2/cucm_b_test-adminguide_chapter_010100.html)
 - [Cisco CUCM 11.5(1) release notes: short and split audit messages](https://www.cisco.com/c/en/us/td/docs/voice_ip_comm/cucm/rel_notes/11_5_1/cucm_b_release-notes-cucm-imp-1151.pdf)
+- [KUMA 4.2 supported sources](https://support.kaspersky.ru/kuma/4.2/255782)
