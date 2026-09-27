@@ -1,75 +1,330 @@
-{%- for flag in ['to_denied_1', 'to_denied_2', 'to_upload', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 40 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_denied_1', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- set blocked = count % 8 == 0 -%}
-  {%- set is_upload = false -%}
-  {%- set user_name = params.ordinary_user -%}
-  {%- set source_ip = params.ordinary_ip -%}
-  {%- set target_host = 'social.example.test' if blocked else 'portal.example.test' -%}
-  {%- set target_ip = params.blocked_destination_ip if blocked else params.ordinary_destination_ip -%}
-  {%- set path = '/news' if blocked else '/home' -%}
-  {%- set bytes_out = 0 if blocked else 412 -%}
-  {%- set bytes_in = 0 if blocked else 8241 -%}
-{%- else -%}
-  {%- set blocked = stage != 'upload' -%}
-  {%- set is_upload = stage == 'upload' -%}
-  {%- set user_name = params.suspect_user -%}
-  {%- set source_ip = params.suspect_ip -%}
-  {%- set target_host = 'fileshare.example.test' if blocked else 'uploads.example.test' -%}
-  {%- set target_ip = params.blocked_destination_ip if blocked else params.upload_destination_ip -%}
-  {%- set path = '/restricted' if blocked else '/ingest' -%}
-  {%- set bytes_out = 0 if blocked else 12582912 -%}
-  {%- set bytes_in = 0 if blocked else 2048 -%}
-  {%- if stage == 'denied_1' -%}{%- do shared.set('to_denied_2', true) -%}
-  {%- elif stage == 'denied_2' -%}{%- do shared.set('to_upload', true) -%}
-  {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{#- One Solar webProxy 4.3.1 filtering node writing siem-log syslog
+    messages for an office user subnet (forward mode, TLS inspection).
+
+    Each one-second tick emits at most one message, taken from a
+    due-queue fed by independent per-user random processes (merged
+    Poisson with a diurnal load curve). The anomaly episode only adds
+    its own requests to the queue; it never suspends, delays or
+    reshapes background traffic.
+
+    Native line (installation manual 4.3.1, table 9.2 and its raw
+    example; key meanings from appendix F.1):
+      <MMM d HH:MM:SS> <host> java: [acc-domain:..] ... [flt-reason:..]
+    flt-rules and flt-codes carry one entry per applied rule, as in the
+    vendor examples (decryption rule 11, layer transitions 0, blocking
+    rule 2). -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set guard = 3600 -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (1 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.users | length < 4 or params.client_first + params.users | length > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set agents = [
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 YaBrowser/24.7.0.0 Safari/537.36',
+      'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
+      'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0'] -%}
+  {%- set users = [] -%}
+  {%- set weights = [] -%}
+  {%- for name in params.users -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + loop.index0) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do users.append({'name': name, 'ip': ip,
+        'group': module.rand.weighted_choice(params.groups, range(params.groups | length, 0, -1) | list),
+        'ua': module.rand.weighted_choice(agents, [46, 30, 16, 8])}) -%}
+    {%- do weights.append(module.rand.number.lognormal(0, 0.6)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'weights': weights,
+      'q': [], 'hist': {},
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_user': none, 'last_share': none}) -%}
 {%- endif -%}
-{%- set method = 'POST' if is_upload else 'GET' -%}
-{%- set status = 403 if blocked else 200 -%}
-{%- set reason = 'URL(' ~ target_host ~ ')' if blocked else '' -%}
-{%- set policy = 'Web category block' if blocked else 'Standard web access' -%}
-{%- set filter_codes = '11,0,0,2' if blocked else '11,0,0,0' -%}
-{%- set mime = 'text/html' if blocked or not is_upload else 'application/json' -%}
-{%- set request_time = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] ~ 'Z' -%}
-{%- set agent = 'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125.0.0.0 Safari/537.36' -%}
-{%- set fields = [
-  'acc-domain:' ~ params.account_domain,
-  'acc-groups:Employees',
-  'acc-ip:' ~ source_ip,
-  'acc-name:' ~ user_name,
-  'acc-port:54721',
-  'bytes-in:' ~ bytes_in,
-  'bytes-out:' ~ bytes_out,
-  'flt-categories:0',
-  'flt-codes:' ~ filter_codes,
-  'flt-policy:' ~ policy,
-  'flt-rules:https,web-filter',
-  'flt-status:' ~ status,
-  'flt-time:8',
-  'req-hostname:' ~ target_host,
-  'req-method:' ~ method,
-  'req-pathname:' ~ path,
-  'req-protocol:https',
-  'req-query:',
-  'req-referer:',
-  'req-time:' ~ request_time,
-  'req-user-agent:' ~ agent,
-  'res-datatype:' ~ mime,
-  'res-ip:' ~ target_ip,
-  'traf-mode:forward',
-  'req-port:443',
-  'flt-reason:' ~ reason
-] -%}
-{%- set syslog_time = timestamp.strftime('%b ') ~ timestamp.day ~ timestamp.strftime(' %H:%M:%S') -%}
-{%- set original = syslog_time ~ ' ' ~ params.proxy_host ~ ' java: [' ~ fields | join('] [') ~ ']' -%}
-{%- set action = 'http-denied' if blocked else 'http-allowed' -%}
-{%- set event_type = 'denied' if blocked else 'access' -%}
-{%- set outcome = 'failure' if blocked else 'success' -%}
-{%- set full_url = 'https://' ~ target_host ~ path -%}
-{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['web'], 'type': [event_type], 'action': action, 'outcome': outcome, 'original': original}, 'host': {'name': params.proxy_host}, 'source': {'ip': source_ip, 'port': 54721, 'bytes': bytes_out}, 'destination': {'ip': target_ip, 'port': 443, 'bytes': bytes_in}, 'user': {'name': user_name, 'domain': params.account_domain}, 'related': {'user': [user_name], 'ip': [source_ip, target_ip]}, 'url': {'full': full_url, 'scheme': 'https', 'domain': target_host, 'path': path}, 'http': {'request': {'method': method}, 'response': {'status_code': status}}, 'user_agent': {'original': agent}, 'solar_webproxy': {'account_groups': 'Employees', 'filter_codes': filter_codes, 'filter_policy': policy, 'filter_rules': 'https,web-filter', 'filter_time_ms': 8, 'filter_reason': reason, 'traffic_mode': 'forward', 'request_time': request_time, 'response_mime_type': mime}} -%}
-{{- payload | tojson -}}
+
+{%- set users = shared.get('users') -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- if now % 600 == 0 -%}
+  {%- for k in hist | list -%}
+    {%- set keep = hist[k] | selectattr('t', 'gt', now - 2 * guard) | list -%}
+    {%- if keep -%}{%- do hist.update({k: keep}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set local_hour = (hour + params.syslog_utc_offset_hours) % 24 -%}
+{%- set load = (1.7 if 8 <= local_hour < 18 else (0.7 if 18 <= local_hour < 22 else 0.2)) / 0.9 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Queue one request. kind: page, asset, api, deny, upload, share,
+    download. -#}
+{%- macro enq(u, kind, site, path, at, referer='') -%}
+  {%- do q.append({'due': at, 'u': u, 'kind': kind, 'site': site,
+      'path': path, 'referer': referer}) -%}
+{%- endmacro -%}
+
+{#- Chain guard on the final step only: for one user, no window of
+    `guard` seconds holds both two or more denied uploads to a blocked
+    file-sharing site and an allowed upload to cloud storage. A single
+    denial followed by an upload, and repeated denials without an
+    upload, stay in background. -#}
+{%- macro guard_ok(u, kind, at) -%}
+  {%- set rows = hist.get(u.name, []) | selectattr('t', 'gt', at - guard) | selectattr('t', 'lt', at + guard) | list -%}
+  {%- set nd = rows | selectattr('k', 'equalto', 'd') | list | length -%}
+  {%- set ng = rows | selectattr('k', 'equalto', 'g') | list | length -%}
+  {{- 'yes' if (kind == 'd' and (ng == 0 or nd == 0)) or (kind == 'g' and nd < 2) else 'no' -}}
+{%- endmacro -%}
+{%- macro mark(u, kind, at) -%}
+  {%- set rows = hist.get(u.name, []) -%}
+  {%- do rows.append({'t': at, 'k': kind}) -%}
+  {%- if rows | length > 40 -%}{%- do rows.pop(0) -%}{%- endif -%}
+  {%- do hist.update({u.name: rows}) -%}
+{%- endmacro -%}
+
+{%- set assets = ['/static/app.js', '/static/vendor.js', '/static/site.css',
+    '/img/logo.png', '/img/banner.jpg', '/fonts/inter.woff2', '/favicon.ico'] -%}
+
+{#- A page view: the page and a few embedded objects. -#}
+{%- macro page_view(u, site, at) -%}
+  {%- set t = namespace(v=at) -%}
+  {%- set page = module.rand.choice(site.pages) -%}
+  {{- enq(u, 'page', site, page, t.v, module.rand.weighted_choice(['', 'https://search.example.net/search'], [70, 30])) -}}
+  {%- set n = [(module.rand.number.lognormal(module.math.log(2.5), 0.8)) | round | int, 0] | max -%}
+  {%- for i in range([n, 10] | min) -%}
+    {%- set t.v = t.v + module.rand.weighted_choice([0, 1, 2], [50, 38, 12]) -%}
+    {{- enq(u, 'asset', site, module.rand.choice(assets), t.v, 'https://' ~ site.host ~ page) -}}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{#- Denied upload attempts, retried by the user; t.v advances to the
+    time after the last attempt. -#}
+{%- macro share_attempt(u, s, t, n, forced) -%}
+  {%- for i in range(n) -%}
+    {%- if forced or guard_ok(u, 'd', t.v) == 'yes' -%}
+      {{- mark(u, 'd', t.v) -}}
+      {{- enq(u, 'share', s, s.path, t.v, 'https://' ~ s.host ~ '/') -}}
+    {%- endif -%}
+    {%- set t.v = t.v + gap(25, 0.9) | int -%}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{#- 1. Background: one merged Poisson stream of independent users. -#}
+{%- if module.rand.chance(0.06 * load) -%}
+  {%- set u = module.rand.weighted_choice(users, shared.get('weights')) -%}
+  {%- set profile = module.rand.weighted_choice(
+      ['browse', 'api', 'blocked', 'upload', 'share', 'download'],
+      [63, 9, 8, 8, 6, 6]) -%}
+  {%- if profile == 'browse' -%}
+    {%- set site = module.rand.choice(params.sites) -%}
+    {{- page_view(u, site, now) -}}
+    {%- if module.rand.chance(0.35) -%}
+      {{- page_view(u, site, now + gap(40, 1.0) | int) -}}
+    {%- endif -%}
+  {%- elif profile == 'api' -%}
+    {%- set site = module.rand.choice(params.sites) -%}
+    {{- enq(u, 'api', site, module.rand.choice(site.pages), now, 'https://' ~ site.host ~ '/') -}}
+  {%- elif profile == 'blocked' -%}
+    {#- Blocked entertainment browsing with user retries. -#}
+    {%- set site = module.rand.choice(params.blocked_sites) -%}
+    {%- set path = module.rand.choice(site.pages) -%}
+    {%- set n = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+    {%- set t = namespace(v=now) -%}
+    {%- for i in range([n, 10] | min) -%}
+      {{- enq(u, 'deny', site, path, t.v) -}}
+      {%- set t.v = t.v + gap(25, 0.9) | int -%}
+    {%- endfor -%}
+  {%- elif profile == 'upload' -%}
+    {#- Ordinary upload to sanctioned cloud storage, sometimes several. -#}
+    {%- set s = module.rand.choice(params.storage_sites) -%}
+    {%- set t = namespace(v=now) -%}
+    {%- for i in range(module.rand.weighted_choice([1, 2, 3], [78, 16, 6])) -%}
+      {%- if guard_ok(u, 'g', t.v) == 'yes' -%}
+        {{- mark(u, 'g', t.v) -}}
+        {{- enq(u, 'upload', s, s.path, t.v, 'https://' ~ s.host ~ '/') -}}
+      {%- endif -%}
+      {%- set t.v = t.v + gap(90, 1.2) | int -%}
+    {%- endfor -%}
+  {%- elif profile == 'share' -%}
+    {#- Upload attempts on a blocked file-sharing site with retries;
+        afterwards the user may give up or use sanctioned storage. -#}
+    {%- set s = module.rand.choice(params.sharing_sites) -%}
+    {%- set n = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+    {%- set t = namespace(v=now) -%}
+    {{- share_attempt(u, s, t, [n, 10] | min, false) -}}
+    {%- if module.rand.chance(0.45) -%}
+      {%- set at = t.v + gap(180, 0.8) | int -%}
+      {%- set g = module.rand.choice(params.storage_sites) -%}
+      {%- if guard_ok(u, 'g', at) == 'yes' -%}
+        {{- mark(u, 'g', at) -}}
+        {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/') -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set s = module.rand.choice(params.storage_sites) -%}
+    {{- enq(u, 'download', s, s.path | replace('upload', 'download'), now, 'https://' ~ s.host ~ '/') -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, no catch-up. A rotated user is denied two or more
+    uploads to a rotated blocked file-sharing site, then uploads to
+    sanctioned cloud storage. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set u = module.rand.choice(users | rejectattr('name', 'equalto', shared.get('last_user')) | list) -%}
+    {%- set s = module.rand.choice(params.sharing_sites | rejectattr('host', 'equalto', shared.get('last_share')) | list) -%}
+    {%- set g = module.rand.choice(params.storage_sites) -%}
+    {%- set n = namespace(v=1) -%}
+    {%- for i in range(20) -%}
+      {%- if n.v < 2 -%}
+        {%- set n.v = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set n = [[n.v, 2] | max, 10] | min -%}
+    {%- set t = namespace(v=now) -%}
+    {{- share_attempt(u, s, t, n, true) -}}
+    {%- set at = t.v + [gap(180, 0.8) | int, 1200] | min -%}
+    {{- mark(u, 'g', at) -}}
+    {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/') -}}
+    {%- do shared.update({'start_at': none, 'last_user': u.name, 'last_share': s.host,
+        'next_due': now + (interval * 3600) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due request, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+
+{#- Request outcome. -#}
+{%- set u = e.u -%}
+{%- set site = e.site -%}
+{%- set denied = e.kind in ['deny', 'share'] -%}
+{%- set proto = 'http' if e.kind == 'page' and module.rand.chance(0.04) else 'https' -%}
+{%- set method = 'POST' if e.kind in ['api', 'share', 'upload'] else 'GET' -%}
+{%- set query = '' -%}
+{%- if e.kind == 'page' and e.path in ['/search', '/suggest'] -%}
+  {%- set query = 'q=' ~ module.rand.choice(['vpn+setup', 'expense+report', 'printer+driver', 'weather', 'exchange+rate', 'office+map']) -%}
+{%- elif e.kind == 'upload' -%}
+  {%- set query = 'uploadType=resumable' if module.rand.chance(0.5) else '' -%}
+{%- endif -%}
+{%- set ext = e.path.rsplit('.', 1)[-1] if '.' in e.path.split('/')[-1] else '' -%}
+{%- set mimes = {'js': 'application/javascript', 'css': 'text/css', 'png': 'image/png',
+    'jpg': 'image/jpeg', 'woff2': 'font/woff2', 'ico': 'image/x-icon', 'html': 'text/html'} -%}
+{%- set reqh = (module.rand.number.lognormal(module.math.log(560), 0.25)) | int -%}
+{%- set resh = (module.rand.number.lognormal(module.math.log(390), 0.2)) | int -%}
+{%- if denied -%}
+  {%- set status = 403 -%}
+  {%- set bytes_in = 0 -%}{%- set bytes_out = 0 -%}
+  {%- set mime = 'application/skvt-unchecked' -%}
+  {%- set ftime = gap(6, 0.6) | int -%}
+{%- else -%}
+  {%- set body_out = 0 -%}
+  {%- if e.kind == 'page' -%}
+    {%- set status = module.rand.weighted_choice([200, 304, 302, 404], [88, 6, 4, 2]) -%}
+    {%- set body_in = (module.rand.number.lognormal(module.math.log(14000), 1.1)) | int -%}
+    {%- set mime = 'application/json' if e.path.startswith('/api') else 'text/html' -%}
+  {%- elif e.kind == 'asset' -%}
+    {%- set status = module.rand.weighted_choice([200, 304, 404], [80, 18, 2]) -%}
+    {%- set body_in = (module.rand.number.lognormal(module.math.log(9000), 1.2)) | int -%}
+    {%- set mime = mimes.get(ext, 'application/octet-stream') -%}
+  {%- elif e.kind == 'api' -%}
+    {%- set status = module.rand.weighted_choice([200, 201, 400], [90, 7, 3]) -%}
+    {%- set body_out = (module.rand.number.lognormal(module.math.log(1800), 0.9)) | int -%}
+    {%- set body_in = (module.rand.number.lognormal(module.math.log(900), 0.8)) | int -%}
+    {%- set mime = 'application/json' -%}
+  {%- elif e.kind == 'upload' -%}
+    {%- set status = 200 -%}
+    {%- set body_out = (module.rand.number.lognormal(module.math.log(2500000), 1.5)) | int + 1024 -%}
+    {%- set body_in = (module.rand.number.lognormal(module.math.log(320), 0.5)) | int -%}
+    {%- set mime = 'application/json' -%}
+  {%- else -%}
+    {%- set status = 200 -%}
+    {%- set body_in = (module.rand.number.lognormal(module.math.log(4000000), 1.3)) | int + 1024 -%}
+    {%- set mime = 'application/octet-stream' -%}
+  {%- endif -%}
+  {%- if status == 304 -%}{%- set body_in = 0 -%}{%- endif -%}
+  {%- if status in [302, 400, 404] -%}
+    {%- set body_in = module.rand.number.integer(120, 1600) -%}{%- set mime = 'text/html' -%}
+  {%- endif -%}
+  {%- set bytes_out = reqh + body_out -%}
+  {%- set bytes_in = resh + body_in -%}
+  {%- set ftime = gap(25, 0.9) | int + (body_out / 1000000 * module.rand.number.lognormal(module.math.log(12), 0.4)) | int -%}
+{%- endif -%}
+{%- if denied -%}
+  {%- set rules = ['Переход к слою Icap Request', 'Переход к слою ' ~ params.block_layer, site.rule] -%}
+  {%- set codes = [0, 0, 2] -%}
+  {%- set policy = params.block_layer -%}
+  {%- set reason = 'URL(' ~ site.host ~ ')' -%}
+{%- else -%}
+  {%- set rules = ['Переход к слою Icap Request', 'Переход к слою Filter req', 'Переход к слою Icap Response',
+      'Переход к слою Filter resps', 'Переход к слою Завершение обработки политики'] -%}
+  {%- set codes = [0, 0, 0, 0, 0] -%}
+  {%- set policy = 'Завершение обработки политики' -%}
+  {%- set reason = '' -%}
+{%- endif -%}
+{%- if proto == 'https' -%}
+  {%- set rules = [params.decrypt_rule] + rules -%}
+  {%- set codes = [11] + codes -%}
+{%- endif -%}
+{%- set port = 443 if proto == 'https' else 80 -%}
+{%- set acc_port = module.rand.number.integer(49152, 65535) -%}
+
+{%- set ms = module.rand.number.integer(0, 999) -%}
+{%- set req_dt = module.datetime.datetime.fromtimestamp(now, utc) + module.datetime.timedelta(milliseconds=ms) -%}
+{%- set req_time = req_dt.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d' | format(ms) ~ 'Z' -%}
+{%- set log_dt = req_dt + module.datetime.timedelta(milliseconds=ftime, hours=params.syslog_utc_offset_hours) -%}
+{%- set syslog_time = log_dt.strftime('%b ') ~ log_dt.day ~ log_dt.strftime(' %H:%M:%S') -%}
+{%- set pairs = [
+  ['acc-domain', params.account_domain], ['acc-groups', u.group], ['acc-ip', u.ip],
+  ['acc-name', u.name], ['acc-port', acc_port], ['bytes-in', bytes_in], ['bytes-out', bytes_out],
+  ['flt-categories', site.category], ['flt-codes', codes | join(',')], ['flt-policy', policy],
+  ['flt-rules', rules | join(',')], ['flt-status', status], ['flt-time', ftime],
+  ['req-hostname', site.host], ['req-method', method], ['req-pathname', e.path],
+  ['req-protocol', proto], ['req-query', query], ['req-referer', e.referer],
+  ['req-time', req_time], ['req-user-agent', u.ua], ['res-datatype', mime],
+  ['res-ip', site.ip], ['traf-mode', 'forward']] -%}
+{%- set body = namespace(v='') -%}
+{%- for k, v in pairs -%}{%- set body.v = body.v ~ '[' ~ k ~ ':' ~ v ~ '] ' -%}{%- endfor -%}
+{%- set original = syslog_time ~ ' ' ~ params.proxy_host ~ ' java: ' ~ body.v ~ '[x-virus-id] [req-port:' ~ port ~ '] [flt-reason:' ~ reason ~ ']' -%}
+
+{%- set url = proto ~ '://' ~ site.host ~ e.path ~ ('?' ~ query if query else '') -%}
+{%- set record = {'@timestamp': req_dt.isoformat(timespec='milliseconds'),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['web', 'network'],
+    'type': ['denied', 'connection'] if denied else ['allowed', 'connection'],
+    'action': 'http-denied' if denied else 'http-allowed',
+    'outcome': 'failure' if denied else 'success',
+    'duration': ftime * 1000000, 'original': original},
+  'observer': {'hostname': params.proxy_host, 'vendor': 'Solar', 'product': 'Solar webProxy', 'type': 'proxy'},
+  'host': {'name': params.proxy_host},
+  'source': {'ip': u.ip, 'port': acc_port, 'bytes': bytes_out},
+  'destination': {'ip': site.ip, 'port': port, 'domain': site.host, 'bytes': bytes_in},
+  'user': {'name': u.name, 'domain': params.account_domain, 'group': {'name': u.group}},
+  'url': {'full': url, 'scheme': proto, 'domain': site.host, 'port': port, 'path': e.path},
+  'http': {'request': {'method': method, 'bytes': bytes_out},
+    'response': {'status_code': status, 'bytes': bytes_in, 'mime_type': mime}},
+  'user_agent': {'original': u.ua},
+  'rule': {'name': policy},
+  'related': {'user': [u.name], 'ip': [u.ip, site.ip], 'hosts': [site.host]},
+  'solar_webproxy': {'account_groups': u.group, 'filter_categories': site.category | string,
+    'filter_codes': codes | join(','), 'filter_policy': policy, 'filter_rules': rules | join(','),
+    'filter_status': status, 'filter_time_ms': ftime, 'filter_reason': reason,
+    'traffic_mode': 'forward', 'request_time': req_time, 'response_datatype': mime}} -%}
+{%- if query -%}{%- do record.url.update({'query': query}) -%}{%- endif -%}
+{%- if e.referer -%}{%- do record.http.request.update({'referrer': e.referer}) -%}{%- endif -%}
+{%- if reason -%}{%- do record.event.update({'reason': reason}) -%}{%- endif -%}
+{{ record | tojson }}
