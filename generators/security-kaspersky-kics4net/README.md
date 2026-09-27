@@ -56,7 +56,7 @@ Edit `event.template.params` in `generator.yml`.
 | Name | Default | Description |
 | --- | --- | --- |
 | `anomaly_mode` | `true` | Add the recurring new device, IP conflict, ARP spoofing episode. `false` produces background only. |
-| `anomaly_interval_hours` | `24` | Hours from the start of one episode to the time the next is due. Minimum 3. |
+| `anomaly_interval_hours` | `24` | Hours from the start of one episode to the time the next is due. Range 3-8760. |
 | `server_host` | `10.20.40.5` | KICS for Networks Server address (`hostname`). |
 | `device_version` | `4.2.0.335` | KICS for Networks version in the CEF header. |
 
