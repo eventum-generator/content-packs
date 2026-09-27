@@ -1,55 +1,389 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 3) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
-{%- if chain -%}
-  {%- set code = ['4000005003', '4000005005', '4000004001'][step] -%}
-  {%- set ip = params.target_ip -%}
-  {%- set owner_mac = params.owner_mac -%}
-  {%- set challenger_mac = params.challenger_mac -%}
-{%- else -%}
-  {%- set code = module.rand.weighted_choice(['4000005003', '4000005007', '4000005005'], [60, 30, 10]) -%}
-  {%- set ip = module.rand.choice(['10.20.30.20', '10.20.30.21', '10.20.30.22']) -%}
-  {%- set owner_mac = module.rand.choice(['02:42:ac:11:00:20', '02:42:ac:11:00:21', '02:42:ac:11:00:22']) -%}
-  {%- set challenger_mac = '02:42:ac:11:00:77' -%}
+{#- Kaspersky Industrial CyberSecurity for Networks 4.2 EventMessage
+    records (CEF) for Asset Management and ARP spoofing detections,
+    wrapped in ECS JSON with the CEF line in event.original.
+    One input tick per second; each tick emits the earliest due row,
+    stamped with its own time, or drops. Independent processes:
+    transient devices (engineering and contractor laptops) visit the
+    network, known assets change addresses, redundant pairs fail over.
+    Times are held in microseconds and written with milliseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- if shared.get('queue') is not none and (not shared.get('queue') or shared.get('queue')[0][0] > now) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set hq = module.heapq -%}
+{%- set sec = 1000000 -%}
+{%- set hour = 3600 * sec -%}
+{#- Chain window: a background ARP spoofing row whose sender MAC was
+    detected as a new device with the claimed IP and then challenged
+    that IP within this window gets another claimed IP, so the new
+    device -> conflict -> ARP spoofing sequence stays episode-only. -#}
+{%- set window = hour -%}
+{%- set visits_per_day = 240 -%}
+{%- set asset_events_per_day = 40 -%}
+{%- set diurnal = [0.15, 0.15, 0.15, 0.15, 0.3, 0.7, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.7, 0.5, 0.3, 0.2, 0.15, 0.15, 0.15, 0.15, 0.15] -%}
+{%- set titles = {
+  '4000005003': 'New device detected on network',
+  '4000005007': 'New device IP address detected',
+  '4000005008': 'MAC address added to the device',
+  '4000005009': 'IP address added to the device',
+  '4000005010': 'New device MAC address detected',
+  '4000005005': 'IP address conflict detected',
+  '4000004001': 'Symptoms of ARP spoofing detected in ARP replies',
+  '4000004002': 'Symptoms of ARP spoofing detected in ARP requests'} -%}
+{%- set base_score = {'4000005003': 5.0, '4000005007': 3.4, '4000005008': 3.0, '4000005009': 3.0, '4000005010': 4.4, '4000005005': 5.8, '4000004001': 7.6, '4000004002': 7.2} -%}
+{%- set importance = {'plc': 1.3, 'scada': 1.0, 'gateway': 0.9, 'hmi': 0.6, 'ews': 0.3, 'switch': 0.2, 'transient': 0.0} -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro pick(kind) -%}
+  {{- module.rand.weighted_choice(shared.get(kind ~ '_idx'), shared.get(kind ~ '_w')) -}}
+{%- endmacro -%}
+{%- macro pick_other(kind, avoid) -%}
+  {%- set r = namespace(v=avoid) -%}
+  {%- for _ in range(30) if r.v == avoid -%}{%- set r.v = pick(kind) | int -%}{%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro hour_of(t) -%}
+  {{- module.datetime.datetime.fromtimestamp(t / 1000000, module.datetime.timezone.utc).hour -}}
+{%- endmacro -%}
+{%- macro thin(t0) -%}
+  {#- First time from t0 accepted by the hour-of-day weighting of
+      transient visits (episodes use the same weighting). -#}
+  {%- set t = namespace(v=t0, go=true) -%}
+  {%- for _ in range(200) if t.go -%}
+    {%- if module.rand.chance(diurnal[hour_of(t.v) | int]) -%}{%- set t.go = false -%}
+    {%- else -%}{%- set t.v = t.v + module.rand.number.integer(0, hour) -%}{%- endif -%}
+  {%- endfor -%}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro dhcp(home) -%}
+  {{- home ~ '.' ~ module.rand.number.integer(200, 239) -}}
+{%- endmacro -%}
+{%- macro new_mac(oui) -%}
+  {{- oui ~ ':' ~ module.rand.string.hex(2) | lower ~ ':' ~ module.rand.string.hex(2) | lower ~ ':' ~ module.rand.string.hex(2) | lower -}}
+{%- endmacro -%}
+{%- macro pick_target(x) -%}
+  {#- A target in the subnet of asset x, other than x. -#}
+  {%- set seg = shared.get('tgt')[shared.get('assets')[x].ip.rsplit('.', 1)[0]] -%}
+  {%- set r = namespace(v=x) -%}
+  {%- for _ in range(30) if r.v == x -%}{%- set r.v = module.rand.weighted_choice(seg[0], seg[1]) -%}{%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro misused(i) -%}
+  {#- Asset IP a transient device takes by mistake: usually one of its
+      service-profile IPs, otherwise any asset. -#}
+  {{- module.rand.choice(shared.get('trans')[i].prof) if module.rand.chance(0.85) else pick('asset') -}}
+{%- endmacro -%}
+{%- macro misused_other(i, avoid) -%}
+  {%- set r = namespace(v=avoid) -%}
+  {%- for _ in range(30) if r.v == avoid -%}{%- set r.v = misused(i) | int -%}{%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro conflicts(t0, x, mac, dev, ep) -%}
+  {#- IP conflict rows: the device with mac claims the IP of asset x.
+      Returns the time of the last one. -#}
+  {%- set a = shared.get('assets')[x] -%}
+  {%- set t = namespace(v=t0) -%}
+  {%- for j in range(module.rand.weighted_choice([1, 2, 3], [55, 30, 15])) -%}
+    {%- if j > 0 -%}{%- set t.v = t.v + (ln(120, 0.9) | int) -%}{%- endif -%}
+    {{- push(t.v, {'k': 'row', 'c': '4000005005', 'm': mac, 'src': a.ip, 'dev': dev, 'mp': a.mp, 'ep': ep,
+      'x': {'ownerMac': a.mac, 'ownerIp': a.ip, 'challengerMac': mac}}) -}}
+  {%- endfor -%}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro arp(t0, mac, ip, target, dev, mp, ep) -%}
+  {#- ARP spoofing signs: mac answers or asks for ip towards target.
+      The burst shares one attack start time. -#}
+  {%- set tg = shared.get('assets')[target] -%}
+  {%- set c = '4000004001' if module.rand.chance(0.7) else '4000004002' -%}
+  {%- set t = namespace(v=t0, go=true) -%}
+  {%- for j in range(6) if t.go -%}
+    {%- if j > 0 -%}{%- set t.v = t.v + (ln(45, 0.9) | int) -%}{%- endif -%}
+    {{- push(t.v, {'k': 'row', 'c': c, 'm': mac, 'src': ip, 'dst': tg.ip, 'dm': tg.mac, 'dev': dev, 'ddev': target, 'mp': mp, 'ep': ep, 'as': t0,
+      'x': {'substitutedIpAddress': ip, 'targetIpAddress': tg.ip}}) -}}
+    {%- set t.go = module.rand.chance(0.45) -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- macro visit(i, t0) -%}
+  {%- set d = shared.get('trans')[i] -%}
+  {%- set dev = ['t', i] -%}
+  {%- set r = module.rand.number.floating(0, 1) -%}
+  {%- if r < 0.40 -%}
+    {#- The device was removed from the devices table since its last
+        visit and is detected again; sometimes with the static IP of
+        an existing device, which then conflicts. -#}
+    {%- if module.rand.chance(0.16) -%}
+      {%- set x = misused(i) | int -%}
+      {%- set a = shared.get('assets')[x] -%}
+      {{- push(t0, {'k': 'row', 'c': '4000005003', 'm': d.mac, 'src': a.ip, 'dev': dev, 'mp': a.mp, 'ep': false,
+        'x': {'ownerMac': d.mac, 'ownerIp': a.ip}}) -}}
+      {%- set _ = conflicts(t0 + (ln(90, 0.8) | int), x, d.mac, dev, false) -%}
+    {%- else -%}
+      {%- set ip = dhcp(d.home) -%}
+      {%- do d.update({'ip': ip}) -%}
+      {{- push(t0, {'k': 'row', 'c': '4000005003', 'm': d.mac, 'src': ip, 'dev': dev, 'mp': d.mp, 'ep': false,
+        'x': {'ownerMac': d.mac, 'ownerIp': ip}}) -}}
+    {%- endif -%}
+  {%- elif r < 0.70 -%}
+    {%- set old = d.ip or dhcp(d.home) -%}
+    {%- set ip = namespace(v=old) -%}
+    {%- for _ in range(10) if ip.v == old -%}{%- set ip.v = dhcp(d.home) -%}{%- endfor -%}
+    {%- do d.update({'ip': ip.v}) -%}
+    {{- push(t0, {'k': 'row', 'c': '4000005007', 'm': d.mac, 'src': ip.v, 'dev': dev, 'mp': d.mp, 'ep': false,
+      'x': {'ownerMac': d.mac, 'newIpAddress': ip.v, 'oldIpAddress': old}}) -}}
+  {%- elif r < 0.82 -%}
+    {%- set ip = dhcp(d.home) -%}
+    {{- push(t0, {'k': 'row', 'c': '4000005009', 'm': d.mac, 'src': ip, 'dev': dev, 'mp': d.mp, 'ep': false,
+      'x': {'ownerMac': d.mac, 'ownerIp': ip}}) -}}
+  {%- elif r < 0.93 -%}
+    {#- Misconfigured known device: it takes over the IP of an asset,
+        which conflicts and/or shows ARP spoofing signs. -#}
+    {%- set x = misused(i) | int -%}
+    {%- set a = shared.get('assets')[x] -%}
+    {%- set target = pick_target(x) | int -%}
+    {%- if module.rand.chance(0.7) -%}
+      {%- set t = conflicts(t0, x, d.mac, dev, false) | int -%}
+      {%- if module.rand.chance(0.65) -%}
+        {{- arp(t + (ln(150, 0.8) | int), d.mac, a.ip, target, dev, a.mp, false) -}}
+      {%- endif -%}
+    {%- else -%}
+      {{- arp(t0, d.mac, a.ip, target, dev, a.mp, false) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro asset_event(j, t0) -%}
+  {%- set a = shared.get('assets')[j] -%}
+  {%- set dev = ['a', j] -%}
+  {%- set oui = a.mac[:8] -%}
+  {%- set prefix = a.ip.rsplit('.', 1)[0] -%}
+  {%- set kind = module.rand.weighted_choice(['5009', '5008', '5010', '5007'], [35, 25, 20, 20]) -%}
+  {%- if kind == '5009' -%}
+    {%- set ip = prefix ~ '.' ~ module.rand.number.integer(150, 199) -%}
+    {{- push(t0, {'k': 'row', 'c': '4000005009', 'm': a.mac, 'src': ip, 'dev': dev, 'mp': a.mp, 'ep': false, 'x': {'ownerMac': a.mac, 'ownerIp': ip}}) -}}
+  {%- elif kind == '5008' -%}
+    {%- set m = new_mac(oui) -%}
+    {{- push(t0, {'k': 'row', 'c': '4000005008', 'm': m, 'src': a.ip, 'dev': dev, 'mp': a.mp, 'ep': false, 'x': {'ownerMac': m, 'ownerIp': a.ip}}) -}}
+  {%- elif kind == '5010' -%}
+    {%- set m = new_mac(oui) -%}
+    {{- push(t0, {'k': 'row', 'c': '4000005010', 'm': m, 'src': a.ip, 'dev': dev, 'mp': a.mp, 'ep': false, 'x': {'ownerIp': a.ip, 'newMacAddress': m}}) -}}
+  {%- else -%}
+    {%- set ip = prefix ~ '.' ~ module.rand.number.integer(150, 199) -%}
+    {{- push(t0, {'k': 'row', 'c': '4000005007', 'm': a.mac, 'src': ip, 'dev': dev, 'mp': a.mp, 'ep': false, 'x': {'ownerMac': a.mac, 'newIpAddress': ip, 'oldIpAddress': a.ip}}) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro failover(j, t0) -%}
+  {#- Redundant pair: the backup takes over the shared IP (gratuitous
+      ARP, sometimes a conflict), the primary later takes it back. -#}
+  {%- set a = shared.get('assets')[j] -%}
+  {%- set dev = ['a', j] -%}
+  {%- set target = pick_target(j) | int -%}
+  {%- set t = namespace(v=t0) -%}
+  {%- if module.rand.chance(0.6) -%}
+    {{- push(t.v, {'k': 'row', 'c': '4000005005', 'm': a.bmac, 'src': a.ip, 'dev': dev, 'mp': a.mp, 'ep': false,
+      'x': {'ownerMac': a.mac, 'ownerIp': a.ip, 'challengerMac': a.bmac}}) -}}
+    {%- set t.v = t.v + (ln(20, 1.0) | int) -%}
+  {%- endif -%}
+  {{- arp(t.v, a.bmac, a.ip, target, dev, a.mp, false) -}}
+  {%- set tb = t.v + (ln(2400, 1.0) | int) -%}
+  {%- if module.rand.chance(0.8) -%}
+    {{- arp(tb, a.mac, a.ip, target, dev, a.mp, false) -}}
+  {%- endif -%}
+  {%- if module.rand.chance(0.3) -%}
+    {{- push(tb + (ln(20, 1.0) | int), {'k': 'row', 'c': '4000005005', 'm': a.mac, 'src': a.ip, 'dev': dev, 'mp': a.mp, 'ep': false,
+      'x': {'ownerMac': a.bmac, 'ownerIp': a.ip, 'challengerMac': a.mac}}) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro episode(t0) -%}
+  {#- A device detected as new claims the IP of an existing asset,
+      conflicts with it and sends spoofed ARP for that IP. Device, IP
+      and target rotate; gaps follow the background distributions. -#}
+  {%- set i = pick_other('trans', shared.get('ep_last_i')) | int -%}
+  {%- set x = misused_other(i, shared.get('ep_last_x')) | int -%}
+  {%- set target = pick_target(x) | int -%}
+  {%- set d = shared.get('trans')[i] -%}
+  {%- set a = shared.get('assets')[x] -%}
+  {%- set dev = ['t', i] -%}
+  {{- push(t0, {'k': 'row', 'c': '4000005003', 'm': d.mac, 'src': a.ip, 'dev': dev, 'mp': a.mp, 'ep': true,
+    'x': {'ownerMac': d.mac, 'ownerIp': a.ip}}) -}}
+  {%- set t = conflicts(t0 + (ln(90, 0.8) | int), x, d.mac, dev, true) | int -%}
+  {%- set ta = [t + (ln(150, 0.8) | int), t0 + 3000 * sec] | min -%}
+  {{- arp(ta, d.mac, a.ip, target, dev, a.mp, true) -}}
+  {%- do shared.update({'ep_last_i': i, 'ep_last_x': x}) -%}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 3, 'le': 8760}},
+    'server_host': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'device_version': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- do shared.update({'queue': [], 'seq': 0, 'hist': {}, 'ep_last_i': none, 'ep_last_x': none,
+    'eid': module.rand.number.integer(100000, 9000000)}) -%}
+  {%- set assets = [] -%}
+  {%- for r in samples.assets -%}
+    {%- do assets.append({'ip': r.ip, 'mac': r.mac, 'name': r.name, 'vendor': r.vendor, 'os': r.os, 'role': r.role,
+      'w': r.weight | float, 'bmac': r.backup_mac, 'mp': r.monitoring_point}) -%}
+  {%- endfor -%}
+  {%- set trans = [] -%}
+  {%- for r in samples.transients -%}
+    {%- set mp = {'10.20.30': 'MP-CellA-SPAN', '10.20.31': 'MP-CellB-SPAN', '10.20.40': 'MP-SCADA-SPAN'}[r.home] -%}
+    {%- do trans.append({'mac': r.mac, 'name': r.name, 'vendor': r.vendor, 'os': r.os, 'w': r.weight | float,
+      'home': r.home, 'mp': mp, 'ip': none}) -%}
+  {%- endfor -%}
+  {#- ARP spoofing targets per subnet (ARP stays in one broadcast
+      domain): the hosts there that poll or supervise others. -#}
+  {%- set tgt = {} -%}
+  {%- for j in range(assets | length) if assets[j].role in ['hmi', 'scada', 'gateway', 'ews'] -%}
+    {%- set seg = tgt.setdefault(assets[j].ip.rsplit('.', 1)[0], [[], []]) -%}
+    {%- do seg[0].append(j) -%}{%- do seg[1].append(assets[j].w) -%}
+  {%- endfor -%}
+  {%- do shared.update({'assets': assets, 'trans': trans,
+    'asset_idx': range(assets | length) | list, 'asset_w': assets | map(attribute='w') | list,
+    'tgt': tgt,
+    'trans_idx': range(trans | length) | list, 'trans_w': trans | map(attribute='w') | list}) -%}
+  {#- Service profile: the asset IPs a transient device is usually
+      misconfigured with (drawn per run). -#}
+  {%- for d in trans -%}
+    {%- set prof = [] -%}
+    {%- for _ in range(40) if prof | length < 3 -%}
+      {%- set x = pick('asset') | int -%}
+      {%- if x not in prof -%}{%- do prof.append(x) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- do d.update({'prof': prof}) -%}
+  {%- endfor -%}
+  {#- Each process starts at a uniform point of a length-biased gap
+      (median scaled by exp(sigma^2)), so the run starts stationary. -#}
+  {%- set tw_total = trans | sum(attribute='w') -%}
+  {%- for i in range(trans | length) -%}
+    {%- do trans[i].update({'med': 86400 * tw_total / (visits_per_day * trans[i].w) * module.math.exp(-0.5)}) -%}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(trans[i].med * module.math.exp(1.0), 1.0) | int)), {'k': 'tv', 'i': i}) -}}
+  {%- endfor -%}
+  {%- set aw_total = assets | sum(attribute='w') -%}
+  {%- for j in range(assets | length) -%}
+    {%- do assets[j].update({'med': 86400 * aw_total / (asset_events_per_day * assets[j].w) * module.math.exp(-0.5)}) -%}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(assets[j].med * module.math.exp(1.0), 1.0) | int)), {'k': 'as', 'j': j}) -}}
+    {%- if assets[j].bmac -%}
+      {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(36000 * module.math.exp(0.81), 0.9) | int)), {'k': 'rp', 'j': j}) -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- if params.anomaly_mode -%}
+    {{- push(thin(now + hour + module.rand.number.integer(0, [hour, interval // 8] | min)) | int, {'k': 'ep'}) -}}
+  {%- endif -%}
 {%- endif -%}
-{%- set title = {'4000005003': 'New device detected on network', '4000005007': 'New device IP address detected', '4000005005': 'IP address conflict detected', '4000004001': 'Symptoms of ARP spoofing detected in ARP replies'}[code] -%}
-{%- set score = 8.7 if code == '4000004001' else (5.5 if code == '4000005005' else 2.1) -%}
+{%- set q = shared.get('queue') -%}
+{%- set assets = shared.get('assets') -%}
+{%- set trans = shared.get('trans') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{%- set out = namespace(due=none, item=none) -%}
+{%- for _ in range(500) if out.item is none and q and q[0][0] <= now -%}
+  {%- set top = hq.heappop(q) -%}
+  {%- set it = top[2] -%}
+  {%- if it.k == 'tv' -%}
+    {%- if module.rand.chance(diurnal[hour_of(top[0]) | int]) -%}{{- visit(it.i, top[0]) -}}{%- endif -%}
+    {{- push(top[0] + (ln(trans[it.i].med, 1.0) | int), it) -}}
+  {%- elif it.k == 'as' -%}
+    {%- if module.rand.chance(diurnal[hour_of(top[0]) | int]) -%}{{- asset_event(it.j, top[0]) -}}{%- endif -%}
+    {{- push(top[0] + (ln(assets[it.j].med, 1.0) | int), it) -}}
+  {%- elif it.k == 'rp' -%}
+    {{- failover(it.j, top[0]) -}}
+    {{- push(top[0] + (ln(36000, 0.9) | int), it) -}}
+  {%- elif it.k == 'ep' -%}
+    {{- episode(top[0]) -}}
+    {{- push(thin(top[0] + interval + module.rand.number.integer(0, [hour, interval // 8] | min)) | int, it) -}}
+  {%- else -%}
+    {%- set out.due = top[0] -%}
+    {%- set out.item = it -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.item is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set it = out.item -%}
+{%- set t = out.due -%}
+{%- set hist = shared.get('hist') -%}
+{%- set h = (hist.get(it.m) or []) | selectattr(0, 'ge', t - window) | list -%}
+{%- set x = it.x -%}
+{%- if it.c in ['4000004001', '4000004002'] and not it.ep -%}
+  {%- set st = namespace(bad=false) -%}
+  {%- for n in h if n[1] == 'N' and n[2] == x.substitutedIpAddress -%}
+    {%- for c in h if c[1] == 'C' and c[2] == n[2] and c[0] >= n[0] -%}{%- set st.bad = true -%}{%- endfor -%}
+  {%- endfor -%}
+  {%- if st.bad -%}
+    {%- set claimed = namespace(v=x.substitutedIpAddress) -%}
+    {%- set net = x.substitutedIpAddress.rsplit('.', 1)[0] -%}
+    {%- for _ in range(200) if claimed.v in [x.substitutedIpAddress, x.targetIpAddress] or not claimed.v.startswith(net ~ '.') -%}
+      {%- set claimed.v = assets[pick('asset') | int].ip -%}
+    {%- endfor -%}
+    {%- set x = {'substitutedIpAddress': claimed.v, 'targetIpAddress': x.targetIpAddress} -%}
+    {%- do it.update({'src': claimed.v}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if it.c == '4000005003' -%}{%- do h.append([t, 'N', x.ownerIp]) -%}
+{%- elif it.c == '4000005005' -%}{%- do h.append([t, 'C', x.ownerIp]) -%}{%- endif -%}
+{%- if h -%}{%- do hist.update({it.m: h[-40:]}) -%}{%- elif it.m in hist -%}{%- do hist.pop(it.m) -%}{%- endif -%}
+{%- set eid = shared.get('eid') + 1 + (module.rand.number.lognormal(module.math.log(30), 1.1) | int) -%}
+{%- do shared.set('eid', eid) -%}
+{%- if it.dev[0] == 't' -%}
+  {%- set sd = trans[it.dev[1]] -%}
+  {%- set role = 'transient' -%}
+{%- else -%}
+  {%- set sd = assets[it.dev[1]] -%}
+  {%- set role = sd.role -%}
+{%- endif -%}
+{%- set score = [[base_score[it.c] + importance[role] + module.rand.number.gauss(0, 0.35), 0.0] | max, 10.0] | min | round(1) -%}
 {%- set severity = 9 if score >= 8 else (6 if score >= 4 else 3) -%}
-{%- set event_id = 30000 + (shared.get('event_id', -1) + 1) % 999999999 -%}
-{%- do shared.set('event_id', event_id - 30000) -%}
-{%- set common = ' dateTime=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%S.000Z')
-  ~ ' hostname=' ~ params.server_host ~ ' messageType=Event'
-  ~ ' score=' ~ score ~ ' eventIdentifier=' ~ event_id
-  ~ ' src=' ~ ip ~ ' dst=10.20.30.1' -%}
-{%- if code == '4000004001' -%}
-  {%- set fields = ' substitutedIpAddress=' ~ ip ~ ' targetIpAddress=10.20.30.1'
-    ~ ' attackStartTimestamp=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%S.000Z') -%}
-{%- elif code == '4000005005' -%}
-  {%- set fields = ' ownerIp=' ~ ip ~ ' ownerMac=' ~ owner_mac
-    ~ ' challengerMac=' ~ challenger_mac -%}
-{%- elif code == '4000005007' -%}
-  {%- set fields = ' ownerMac=' ~ owner_mac ~ ' newIpAddress=' ~ ip
-    ~ ' oldIpAddress=10.20.30.99' -%}
+{%- macro fmt(v) -%}
+  {{- module.datetime.datetime.fromtimestamp(v / 1000000, module.datetime.timezone.utc).strftime('%Y-%m-%dT%H:%M:%S.%f')[:-3] ~ 'Z' -}}
+{%- endmacro -%}
+{%- set ids = it.c in ['4000004001', '4000004002'] -%}
+{%- set ext = namespace(s='dateTime=' ~ fmt(t) ~ ' hostname=' ~ params.server_host ~ ' messageType=Event score=' ~ score) -%}
+{%- if it.dst -%}{%- set ext.s = ext.s ~ ' dmac=' ~ it.dm ~ ' dst=' ~ it.dst -%}{%- endif -%}
+{%- set ext.s = ext.s ~ ' smac=' ~ it.m ~ ' src=' ~ it.src ~ ' start=' ~ fmt(t + (ln(0.8, 0.7) | int))
+  ~ ' technology=' ~ ('Intrusion Detection' if ids else 'Asset Management') -%}
+{%- if ids -%}{%- set ext.s = ext.s ~ ' protocol=ARP' -%}{%- endif -%}
+{%- set ext.s = ext.s ~ ' monitoringPoint=' ~ it.mp ~ ' eventIdentifier=' ~ eid -%}
+{%- if ids -%}
+  {%- set ext.s = ext.s ~ ' substitutedIpAddress=' ~ x.substitutedIpAddress ~ ' targetIpAddress=' ~ x.targetIpAddress ~ ' attackStartTimestamp=' ~ fmt(it['as']) -%}
 {%- else -%}
-  {%- set fields = ' ownerIp=' ~ ip ~ ' ownerMac=' ~ owner_mac
-    ~ ' assetName=example-device-' ~ tick -%}
+  {%- for k in ['ownerMac', 'ownerIp', 'challengerMac', 'newIpAddress', 'newMacAddress', 'oldIpAddress'] if k in x -%}
+    {%- set ext.s = ext.s ~ ' ' ~ k ~ '=' ~ x[k] -%}
+  {%- endfor -%}
+  {%- if it.c == '4000005003' and sd.name -%}{%- set ext.s = ext.s ~ ' assetName=' ~ sd.name -%}{%- endif -%}
 {%- endif -%}
-{%- set raw = 'CEF:0|Kaspersky Lab|Kaspersky Industrial CyberSecurity for Networks|4.2.0.335|'
-  ~ code ~ '|' ~ title ~ '|' ~ severity ~ '|' ~ (common ~ fields).strip() -%}
-{%- set category = 'intrusion_detection' if code == '4000004001' else ('network' if code == '4000005005' else 'host') -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
+{%- if it.c != '4000005003' and sd.name -%}
+  {%- set ext.s = ext.s ~ ' srcAssetName=' ~ sd.name ~ ' srcVendor=' ~ sd.vendor ~ ' srcOS=' ~ sd.os -%}
+{%- endif -%}
+{%- if it.dst -%}
+  {%- set dd = assets[it.ddev] -%}
+  {%- set ext.s = ext.s ~ ' dstAssetName=' ~ dd.name ~ ' dstVendor=' ~ dd.vendor ~ ' dstOS=' ~ dd.os -%}
+{%- endif -%}
+{%- set raw = 'CEF:0|Kaspersky Lab|Kaspersky Industrial CyberSecurity for Networks|' ~ params.device_version ~ '|'
+  ~ it.c ~ '|' ~ titles[it.c] ~ '|' ~ severity ~ '|' ~ ext.s -%}
+{%- macro ecs_mac(m) -%}{{- m | upper | replace(':', '-') -}}{%- endmacro -%}
+{%- set kics = {'event_identifier': eid, 'score': score, 'message_type': 'Event',
+  'technology': 'Intrusion Detection' if ids else 'Asset Management', 'monitoring_point': it.mp} -%}
+{%- set names = {'ownerMac': 'owner_mac', 'ownerIp': 'owner_ip', 'challengerMac': 'challenger_mac', 'newIpAddress': 'new_ip',
+  'newMacAddress': 'new_mac', 'oldIpAddress': 'old_ip', 'substitutedIpAddress': 'substituted_ip', 'targetIpAddress': 'target_ip'} -%}
+{%- for k in x -%}{%- do kics.update({names[k]: x[k]}) -%}{%- endfor -%}
+{%- if it.c == '4000005003' and sd.name -%}{%- do kics.update({'asset_name': sd.name}) -%}{%- endif -%}
+{%- set rel = [it.src] -%}
+{%- for k in ['ownerIp', 'newIpAddress', 'oldIpAddress', 'targetIpAddress'] if k in x and x[k] not in rel -%}{%- do rel.append(x[k]) -%}{%- endfor -%}
+{%- set record = {'@timestamp': module.datetime.datetime.fromtimestamp(t / 1000000, module.datetime.timezone.utc).isoformat(timespec='milliseconds'),
   'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'alert' if code in ['4000005005', '4000004001'] else 'event',
-    'dataset': 'kaspersky.kics_networks', 'category': [category],
-    'type': ['info'], 'code': code, 'action': title, 'original': raw},
-  'host': {'name': params.server_host},
-  'source': {'ip': ip}, 'destination': {'ip': '10.20.30.1'},
-  'related': {'ip': [ip, '10.20.30.1']},
-  'kaspersky': {'kics_networks': {'event_identifier': event_id,
-    'score': score, 'owner_mac': owner_mac,
-    'challenger_mac': challenger_mac if code == '4000005005' else none}}} -%}
+  'event': {'kind': 'alert' if ids or it.c == '4000005005' else 'event',
+    'dataset': 'kaspersky.kics_networks',
+    'category': ['intrusion_detection', 'network'] if ids else (['network'] if it.c == '4000005005' else ['host']),
+    'type': ['indicator'] if ids else ['info'],
+    'code': it.c, 'action': titles[it.c], 'severity': severity, 'risk_score': score, 'original': raw},
+  'observer': {'vendor': 'Kaspersky Lab', 'product': 'Kaspersky Industrial CyberSecurity for Networks',
+    'version': params.device_version, 'hostname': params.server_host},
+  'source': {'ip': it.src, 'mac': ecs_mac(it.m)},
+  'related': {'ip': rel},
+  'kaspersky': {'kics_networks': kics}} -%}
+{%- if it.dst -%}{%- do record.update({'destination': {'ip': it.dst, 'mac': ecs_mac(it.dm)}}) -%}{%- endif -%}
 {{ record | tojson }}
