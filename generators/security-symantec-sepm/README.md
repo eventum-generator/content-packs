@@ -35,7 +35,7 @@ One input tick per second emits the earliest due record, or nothing. Rates and m
 
 Sequence, one episode (one extra console session of one administrator):
 
-1. Two or more `Administrator  log on failed` records, seconds apart. The extra failures come from the same retry distribution as the background, conditioned on at least two.
+1. Two or more `Administrator  log on failed` records, seconds apart. The extra failures come from the same retry distribution as the background, conditioned on at least two (at most seven failures in a row).
 2. `Administrator log on succeeded`.
 3. `Policy has been edited ... policy: <P>`: the first operation of the session edits policy P. The clients assigned to P download it.
 4. Zero to two other operations: edits of other policies, or a new group.
