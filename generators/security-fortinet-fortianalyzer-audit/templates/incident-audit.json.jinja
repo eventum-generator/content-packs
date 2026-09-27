@@ -1,123 +1,321 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set sequence = (shared.get('sequence', 0) + 1) % 1000000000 -%}
-{%- do shared.set('sequence', sequence) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- if chain -%}
-  {%- set step = tick - params.anomaly_interval_events -%}
-  {%- set kind = ['create', 'attachment_add', 'attachment_delete', 'delete'][step] -%}
-  {%- if step == 0 -%}
-    {%- do shared.set('incident_serial', (shared.get('incident_serial', 0) + 1) % 1000000) -%}
-    {%- do shared.set('chain_incident_id', params.incident_prefix ~ '-' ~ event_time.strftime('%Y') ~ '-' ~ (1000 + shared.get('incident_serial'))) -%}
-  {%- endif -%}
-  {%- set incident_id = shared.get('chain_incident_id') -%}
-  {%- set actor = 'soc_analyst' if step < 2 else params.suspicious_analyst -%}
-  {%- set severity = 'high' -%}
-{%- else -%}
-  {%- set incidents = shared.get('open_incidents', []) -%}
-  {%- set with_attachment = [] -%}
-  {%- set without_attachment = [] -%}
-  {%- set old_incidents = [] -%}
-  {%- for candidate in incidents -%}
-    {%- if candidate.has_attachment -%}
-      {%- do with_attachment.append(candidate) -%}
-    {%- else -%}
-      {%- do without_attachment.append(candidate) -%}
-    {%- endif -%}
-    {%- if event_time.timestamp() - candidate.created_epoch >= 1800 -%}
-      {%- do old_incidents.append(candidate) -%}
-    {%- endif -%}
+{#- FortiAnalyzer 7.2.4 local APPEVENT / INCIDENT audit records (message
+    IDs 100001, 100002, 100003, 100005, 100006) wrapped in ECS JSON.
+    One input tick every 5 seconds. Every incident is created by an arrival
+    process with a daytime peak and gets its own random lifecycle
+    (attachments, analyst work sessions, sometimes deletion), planned at
+    creation. Each tick emits the earliest due operation or drops.
+    Times are epoch seconds (UTC). -#}
+{%- set now = timestamp.timestamp() -%}
+{%- set window = 7200 -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, upper tail redrawn. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
   {%- endfor -%}
-  {%- set desired = module.rand.weighted_choice(
-    ['create', 'update', 'attachment_add', 'attachment_delete', 'delete'],
-    [8, 54, 24, 9, 5]) -%}
-  {%- if not incidents or (desired == 'create' and incidents | length < 80) -%}
-    {%- set kind = 'create' -%}
-    {%- do shared.set('incident_serial', (shared.get('incident_serial', 0) + 1) % 1000000) -%}
-    {%- set incident = {
-      'id': params.incident_prefix ~ '-' ~ event_time.strftime('%Y') ~ '-' ~ (1000 + shared.get('incident_serial')),
-      'severity': module.rand.choice(['low', 'medium', 'high']),
-      'created_epoch': event_time.timestamp(), 'has_attachment': false} -%}
-    {%- do incidents.append(incident) -%}
-  {%- elif desired == 'attachment_add' and without_attachment -%}
-    {%- set kind = 'attachment_add' -%}
-    {%- set incident = module.rand.choice(without_attachment) -%}
-    {%- do incident.update({'has_attachment': true}) -%}
-  {%- elif desired == 'attachment_delete' and with_attachment -%}
-    {%- set kind = 'attachment_delete' -%}
-    {%- set incident = module.rand.choice(with_attachment) -%}
-    {%- do incident.update({'has_attachment': false}) -%}
-  {%- elif desired == 'delete' and old_incidents -%}
-    {%- set kind = 'delete' -%}
-    {%- set incident = module.rand.choice(old_incidents) -%}
-    {%- do incidents.remove(incident) -%}
-  {%- else -%}
-    {%- set kind = 'update' -%}
-    {%- set incident = module.rand.choice(incidents) -%}
+  {{- [ns.v, hi] | min -}}
+{%- endmacro -%}
+{%- macro next_arrival(t) -%}
+  {#- Thinned Poisson arrivals, rate peaking at 13:00 UTC. -#}
+  {%- set ns = namespace(t=t, go=true) -%}
+  {%- for _ in range(400) if ns.go -%}
+    {%- set ns.t = ns.t + module.rand.number.exponential(shared.get('lam_max')) -%}
+    {%- set h = (ns.t % 86400) / 3600.0 -%}
+    {%- set f = 0.45 + ([0, module.math.sin(module.math.pi * (h - 7) / 12)] | max) -%}
+    {%- if module.rand.number.floating(0, 1.45) < f -%}{%- set ns.go = false -%}{%- endif -%}
+  {%- endfor -%}
+  {{- ns.t -}}
+{%- endmacro -%}
+{%- if shared.get('q') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'incidents_per_day': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 4, 'le': 2000}},
+    'analyzer_serial': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9-]{1,16}$'}},
+    'analyzer_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._-]{1,35}$'}},
+    'adom': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._-]{1,64}$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set users = [] -%}
+  {%- set weights = [] -%}
+  {%- set hosts = {} -%}
+  {%- for row in samples.analysts -%}
+    {%- do users.append(row.user) -%}
+    {%- do weights.append(row.weight) -%}
+    {%- do hosts.update({row.user: [row.ip, row.alt_ip]}) -%}
+  {%- endfor -%}
+  {%- set interval = params.anomaly_interval_hours * 3600 -%}
+  {#- Mean of the daytime shape is 0.768, its peak 1.45. -#}
+  {%- do shared.update({'q': [], 'seq': 0, 'incidents': {}, 'users': users, 'weights': weights, 'hosts': hosts,
+    'serial': module.rand.number.integer(120, 880), 'evt': module.rand.number.integer(1000, 90000),
+    'rid': module.rand.number.integer(0, 9000000),
+    'lam_max': params.incidents_per_day / 86400.0 / 0.768 * 1.45,
+    'ep_arm': now + interval * module.rand.number.floating(0.3, 1.0) + module.rand.number.floating(0, [3600, interval / 8] | min),
+    'ep_last': none}) -%}
+  {%- do module.heapq.heappush(shared.get('q'), [next_arrival(now) | float, 0, 'arrival', none, none]) -%}
+  {%- do shared.set('next_due', shared.get('q')[0][0]) -%}
+{%- endif -%}
+{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set incidents = shared.get('incidents') -%}
+{%- set users = shared.get('users') -%}
+{%- set weights = shared.get('weights') -%}
+{%- macro push(t, kind, iid, actor) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do module.heapq.heappush(q, [t | float, shared.get('seq'), kind, iid, actor]) -%}
+  {%- do incidents[iid].update({'pend': incidents[iid].pend + 1}) -%}
+{%- endmacro -%}
+{%- macro pick(excluded) -%}
+  {#- Analyst weighted by activity, excluding the given names. -#}
+  {%- set pu = [] -%}{%- set pw = [] -%}
+  {%- for u in users if u not in excluded -%}{%- do pu.append(u) -%}{%- do pw.append(weights[loop.index0]) -%}{%- endfor -%}
+  {{- module.rand.weighted_choice(pu, pw) -}}
+{%- endmacro -%}
+{%- macro gap() -%}{{- d(3, 35, 0.9, 900) -}}{%- endmacro -%}
+{%- macro first_attach(creator) -%}
+  {{- d(2, 15, 1.0, 900) if creator == 'system' else d(5, 90, 1.2, 3600) -}}
+{%- endmacro -%}
+{%- set out = namespace(kind=none, iid=none, actor=none, sev=none, att=none, moment=none) -%}
+{%- for _ in range(40) if out.kind is none and q and q[0][0] <= now -%}
+  {%- set item = module.heapq.heappop(q) -%}
+  {%- set kind = item[2] -%}
+  {%- set t = item[0] -%}
+  {%- set moment = module.datetime.datetime.fromtimestamp(module.builtins.int(t), module.datetime.timezone.utc) -%}
+  {%- if kind == 'arrival' -%}
+    {%- do module.heapq.heappush(q, [next_arrival(item[0]) | float, 0, 'arrival', none, none]) -%}
+    {%- do shared.set('serial', (shared.get('serial') + 1) % 100000000) -%}
+    {%- set iid = 'IN' ~ ('%08d' | format(shared.get('serial'))) -%}
+    {%- set creator = 'system' if module.rand.chance(0.62) else pick([]) -%}
+    {%- set assignee = pick([]) if creator == 'system' else creator -%}
+    {%- set sev = module.rand.weighted_choice(['low', 'medium', 'high', 'critical'], [30, 38, 24, 8]) -%}
+    {%- set ep = params.anomaly_mode and t >= shared.get('ep_arm') and creator != 'system' -%}
+    {%- do incidents.update({iid: {'sev': sev, 'creator': creator, 'created': t, 'atts': [], 'hist': [], 'pend': 0, 'ep': ep}}) -%}
+    {%- if ep -%}
+      {#- Anomaly episode on the next analyst-raised incident once due:
+          the creator attaches evidence as usual, then another analyst
+          removes the attachment and deletes the incident, all within
+          about 100 minutes of creation. -#}
+      {%- set deleter = pick([creator, shared.get('ep_last')]) -%}
+      {%- set ns = namespace(a=0, g=0, u=0, k=0, ok=false) -%}
+      {%- for _ in range(40) if not ns.ok -%}
+        {%- set ns.a = first_attach(creator) | float -%}
+        {%- set ns.g = d(60, 2400, 1.4, 259200) | float -%}
+        {%- set ns.u = (gap() | float) if module.rand.chance(0.5) else 0 -%}
+        {%- set ns.k = gap() | float -%}
+        {%- set ns.ok = ns.a + ns.g + ns.u + ns.k <= window - 1200 -%}
+      {%- endfor -%}
+      {%- if not ns.ok -%}{%- set ns.g = 300 -%}{%- set ns.a = [ns.a, 600] | min -%}{%- endif -%}
+      {%- do push(t + ns.a, 'attach_add', iid, creator) -%}
+      {%- if ns.u -%}{%- do push(t + ns.a + ns.g, 'update', iid, deleter) -%}{%- endif -%}
+      {%- do push(t + ns.a + ns.g + ns.u, 'attach_delete', iid, deleter) -%}
+      {%- do push(t + ns.a + ns.g + ns.u + ns.k, 'delete', iid, deleter) -%}
+      {%- set interval = params.anomaly_interval_hours * 3600 -%}
+      {%- do shared.update({'ep_last': deleter, 'ep_arm': t + interval + module.rand.number.floating(0, [3600, interval / 8] | min)}) -%}
+    {%- else -%}
+      {#- The whole lifecycle is planned first as [time, kind, actor]
+          and queued at the end. -#}
+      {%- set plan = [] -%}
+      {%- if creator == 'system' -%}
+        {%- if module.rand.chance(0.75) -%}
+          {%- set ns = namespace(t=t) -%}
+          {%- for _ in range(1 + (1 if module.rand.chance(0.35) else 0) + (1 if module.rand.chance(0.15) else 0)) -%}
+            {%- set ns.t = ns.t + (first_attach('system') | float) -%}
+            {%- do plan.append([ns.t, 'attach_add', 'system']) -%}
+          {%- endfor -%}
+        {%- endif -%}
+      {%- elif module.rand.chance(0.45) -%}
+        {%- do plan.append([t + (first_attach(creator) | float), 'attach_add', creator]) -%}
+      {%- endif -%}
+      {#- Work sessions: one analyst, a few operations seconds to
+          minutes apart. -#}
+      {%- set ns = namespace(t=t, go=true) -%}
+      {%- for _ in range(8) if ns.go -%}
+        {%- if module.rand.chance(0.62) -%}
+          {%- set ns.t = ns.t + (d(60, 2400, 1.4, 259200) | float) -%}
+          {%- set actor = assignee if module.rand.chance(0.8) else pick([assignee]) -%}
+          {%- set tt = namespace(t=ns.t, go=true) -%}
+          {%- for _ in range(6) if tt.go -%}
+            {%- do plan.append([tt.t, module.rand.weighted_choice(['update', 'attach_add', 'attach_delete'], [58, 26, 16]), actor]) -%}
+            {%- set tt.t = tt.t + (gap() | float) -%}
+            {%- set tt.go = module.rand.chance(0.45) -%}
+          {%- endfor -%}
+        {%- else -%}
+          {%- set ns.go = false -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- set dl = namespace(op=none) -%}
+      {%- if module.rand.chance(0.2) -%}
+        {#- Deletion, usually right after removing an attachment. A
+            third are duplicates or false positives removed within
+            minutes; the rest go hours to days later. The deleter is
+            the assignee (60%) or a colleague. The removal before it is
+            usually by the deleter (85%) or a colleague. On an
+            analyst-raised incident deleted by a colleague it is often a
+            handover: the creator (50%) or a third analyst (35%)
+            removed the evidence, the deleter only in 15%. -#}
+        {%- if module.rand.chance(0.35) -%}
+          {%- set dt = t + (d(20, 600, 1.0, 7200) | float) -%}
+        {%- else -%}
+          {%- set dt = t + (d(600, 14400, 1.5, 432000) | float) -%}
+        {%- endif -%}
+        {%- set deleter = assignee if module.rand.chance(0.6) else pick([assignee]) -%}
+        {%- if module.rand.chance(0.75) -%}
+          {%- if creator != 'system' and deleter != creator -%}
+            {%- set rr = module.rand.number.floating(0, 1) -%}
+            {%- set remover = deleter if rr < 0.15 else (creator if rr < 0.65 else pick([creator, deleter])) -%}
+          {%- else -%}
+            {%- set remover = deleter if module.rand.chance(0.85) else pick([deleter]) -%}
+          {%- endif -%}
+          {%- do plan.append([[t + 2, dt - (gap() | float)] | max, 'attach_delete', remover]) -%}
+        {%- endif -%}
+        {%- set dl.op = [dt, 'delete', deleter] -%}
+        {%- do plan.append(dl.op) -%}
+      {%- endif -%}
+      {#- Planning guard, final step only, analyst-raised incidents:
+          replay the plan as the records will come out (a removal
+          without attachments is written as an update). If the first
+          removal by someone other than the creator after an attachment
+          is by D and D would delete within the window (one minute of
+          slack for emission delay), the deletion is redrawn by the
+          ordinary deleter rule until it is not D. Its time and every
+          other operation stay. Playbook incidents are outside the
+          sequence. -#}
+      {%- if creator != 'system' and dl.op is not none and dl.op[0] - t <= window + 60 -%}
+        {%- set sim = namespace(n=0, bind=none, done=false) -%}
+        {%- for op in plan | sort(attribute='0') if not sim.done -%}
+          {%- if op[1] == 'delete' -%}{%- set sim.done = true -%}
+          {%- elif op[1] == 'attach_add' -%}{%- set sim.n = sim.n + 1 -%}
+          {%- elif op[1] == 'attach_delete' and sim.n > 0 -%}
+            {%- set sim.n = sim.n - 1 -%}
+            {%- if sim.bind is none and op[2] != creator -%}{%- set sim.bind = op[2] -%}{%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if sim.bind is not none and sim.bind == dl.op[2] -%}
+          {%- set rd = namespace(u=sim.bind) -%}
+          {%- for _ in range(40) if rd.u == sim.bind -%}
+            {%- set rd.u = assignee if module.rand.chance(0.6) else pick([assignee]) -%}
+          {%- endfor -%}
+          {%- if rd.u == sim.bind -%}{%- set rd.u = creator -%}{%- endif -%}
+          {%- do dl.op.pop(2) -%}{%- do dl.op.append(rd.u) -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- for op in plan -%}{%- do push(op[0], op[1], iid, op[2]) -%}{%- endfor -%}
+    {%- endif -%}
+    {%- set out.kind = 'create' -%}{%- set out.moment = moment -%}{%- set out.iid = iid -%}{%- set out.actor = creator -%}{%- set out.sev = sev -%}
+    {%- if incidents[iid].pend == 0 -%}{%- do incidents.pop(iid) -%}{%- endif -%}
+  {%- elif item[3] in incidents -%}
+    {%- set iid = item[3] -%}
+    {%- set inc = incidents[iid] -%}
+    {%- set actor = item[4] -%}
+    {%- do inc.update({'pend': inc.pend - 1}) -%}
+    {%- if kind == 'attach_add' -%}
+      {%- do shared.set('evt', (shared.get('evt') + module.rand.number.integer(1, 60)) % 1000000000) -%}
+      {%- set att = moment.strftime('%Y%m%d') ~ (1000000000 + shared.get('evt')) -%}
+      {%- do inc.atts.append(att) -%}
+      {%- do inc.hist.append([t, 'add', actor]) -%}
+      {%- set out.kind = 'attach_add' -%}{%- set out.att = att -%}
+    {%- elif kind == 'attach_delete' and inc.atts -%}
+      {%- set att = inc.atts.pop(0 if inc.ep else module.rand.number.integer(0, inc.atts | length - 1)) -%}
+      {%- do inc.hist.append([t, 'del', actor]) -%}
+      {%- set out.kind = 'attach_delete' -%}{%- set out.att = att -%}
+    {%- elif kind == 'delete' -%}
+      {#- Backstop for the planning guard (emission delay past its
+          slack): on an analyst-raised incident, a deletion that would
+          still complete the anomaly sequence keeps its time and is done
+          by the creator. -#}
+      {%- set g = namespace(add=false, bind=none) -%}
+      {%- if not inc.ep and inc.creator != 'system' and t - inc.created <= window and inc.creator != actor -%}
+        {%- for h in inc.hist -%}
+          {%- if h[1] == 'add' -%}{%- set g.add = true -%}
+          {%- elif h[1] == 'del' and g.add -%}
+            {%- if g.bind is none and h[2] != inc.creator -%}{%- set g.bind = h[2] -%}{%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- if g.bind is not none and g.bind == actor -%}
+        {%- set actor = inc.creator -%}
+      {%- endif -%}
+      {%- set out.kind = 'delete' -%}
+      {%- do incidents.pop(iid) -%}
+    {%- else -%}
+      {%- if module.rand.chance(0.12) -%}
+        {%- do inc.update({'sev': module.rand.choice(['low', 'medium', 'high', 'critical'] | reject('equalto', inc.sev) | list)}) -%}
+      {%- endif -%}
+      {%- set out.kind = 'update' -%}
+    {%- endif -%}
+    {%- set out.iid = iid -%}{%- set out.actor = actor -%}{%- set out.sev = inc.sev -%}{%- set out.moment = moment -%}
+    {%- if out.kind != 'delete' and iid in incidents and inc.pend == 0 -%}{%- do incidents.pop(iid) -%}{%- endif -%}
   {%- endif -%}
-  {%- do shared.set('open_incidents', incidents) -%}
-  {%- set incident_id = incident.id -%}
-  {%- set actor = module.rand.choice(['soc_analyst', 'ir_analyst', params.suspicious_analyst]) -%}
-  {%- set severity = incident.severity -%}
-{%- endif -%}
-{%- if kind == 'create' -%}
-  {%- set logid = '100001' -%}
-  {%- set desc = 'New_Incident_Create' -%}
-  {%- set message = 'Incident ' ~ incident_id ~ ' created' -%}
-  {%- set event_type = ['creation'] -%}
-{%- elif kind == 'update' -%}
-  {%- set logid = '100002' -%}
-  {%- set desc = 'Incident_Update' -%}
-  {%- set message = 'Incident ' ~ incident_id ~ ' updated' -%}
-  {%- set event_type = ['change'] -%}
-{%- elif kind == 'attachment_add' -%}
-  {%- set logid = '100005' -%}
-  {%- set desc = 'Incident_Attachment_Add' -%}
-  {%- set message = 'Attachment added to incident ' ~ incident_id -%}
-  {%- set event_type = ['creation'] -%}
-{%- elif kind == 'attachment_delete' -%}
-  {%- set logid = '100006' -%}
-  {%- set desc = 'Incident_Attachment_Delete' -%}
-  {%- set message = 'Attachment deleted from incident ' ~ incident_id -%}
-  {%- set event_type = ['deletion'] -%}
+{%- endfor -%}
+{%- do shared.set('next_due', q[0][0]) -%}
+{%- if out.kind is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set iid = out.iid -%}
+{%- set timestamp = out.moment -%}
+{%- if out.kind == 'create' -%}
+  {%- set logid = '100001' -%}{%- set desc = 'New_Incident_Create' -%}
+  {%- set message = 'Incident ' ~ iid ~ ' created' -%}{%- set etype = ['creation'] -%}
+{%- elif out.kind == 'update' -%}
+  {%- set logid = '100002' -%}{%- set desc = 'Incident_Update' -%}
+  {%- set message = 'Incident ' ~ iid ~ ' updated' -%}{%- set etype = ['change'] -%}
+{%- elif out.kind == 'attach_add' -%}
+  {%- set logid = '100005' -%}{%- set desc = 'Incident_Attachment_Add' -%}
+  {%- set message = 'Attachment added to incident ' ~ iid -%}{%- set etype = ['change'] -%}
+{%- elif out.kind == 'attach_delete' -%}
+  {%- set logid = '100006' -%}{%- set desc = 'Incident_Attachment_Delete' -%}
+  {%- set message = 'Attachment deleted from incident ' ~ iid -%}{%- set etype = ['change'] -%}
 {%- else -%}
-  {%- set logid = '100003' -%}
-  {%- set desc = 'Incident_Delete' -%}
-  {%- set message = 'Incident ' ~ incident_id ~ ' deleted' -%}
-  {%- set event_type = ['deletion'] -%}
+  {%- set logid = '100003' -%}{%- set desc = 'Incident_Delete' -%}
+  {%- set message = 'Incident ' ~ iid ~ ' deleted' -%}{%- set etype = ['deletion'] -%}
 {%- endif -%}
-{%- set ingest_time = event_time - module.datetime.timedelta(seconds=1) -%}
-{%- set raw = 'id=' ~ (6826113487000000000 + sequence)
-  ~ ' itime=' ~ ingest_time.strftime('%Y-%m-%d %H:%M:%S')
-  ~ ' vd=' ~ params.adom
-  ~ ' logid=' ~ logid
+{%- if out.actor == 'system' -%}
+  {%- set ip = none -%}{%- set user_from = 'system' -%}
+{%- else -%}
+  {#- An analyst keeps one address (office or remote access) for a
+      random stretch of minutes to hours, then may switch. -#}
+  {%- set cur = shared.get('cur_ip', {}) -%}
+  {%- set tnow = timestamp.timestamp() -%}
+  {%- if out.actor not in cur or tnow >= cur[out.actor][1] -%}
+    {%- set hp = shared.get('hosts')[out.actor] -%}
+    {%- do cur.update({out.actor: [hp[0] if module.rand.chance(0.85) else hp[1], tnow + (d(900, 10800, 1.0, 86400) | float)]}) -%}
+    {%- do shared.set('cur_ip', cur) -%}
+  {%- endif -%}
+  {%- set ip = cur[out.actor][0] -%}
+  {%- set user_from = 'GUI(' ~ ip ~ ')' -%}
+{%- endif -%}
+{#- itime (receipt) is the event second plus a small skewed delay; the
+    Fortinet example shows it one second before the device time, so a
+    small negative skew occurs too. The log id carries itime_t in its
+    upper 32 bits, as in that example. -#}
+{%- set skew = module.builtins.int(module.rand.number.lognormal(-0.4, 1.0)) - (1 if module.rand.chance(0.2) else 0) -%}
+{%- set itime = timestamp + module.datetime.timedelta(seconds=[skew, 30] | min) -%}
+{%- set itime_t = module.builtins.int(itime.timestamp()) -%}
+{%- do shared.set('rid', (shared.get('rid') + 1) % 16777216) -%}
+{%- set itime_s = itime.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set raw = 'id=' ~ (itime_t * 4294967296 + 16777216 + shared.get('rid'))
+  ~ ' itime=' ~ itime_s ~ ' euid=1 epid=1 dsteuid=1 dstepid=1'
+  ~ ' vd=' ~ params.adom ~ ' logid=' ~ logid
   ~ ' type=appevent subtype=incident level=information'
-  ~ ' date=' ~ event_time.strftime('%Y-%m-%d')
-  ~ ' time=' ~ event_time.strftime('%H:%M:%S')
-  ~ ' user=' ~ actor
-  ~ ' desc=' ~ desc
-  ~ ' msg=' ~ message
-  ~ ' incident_id=' ~ incident_id
-  ~ ' incident_severity=' ~ severity
-  ~ (' attachment=evidence-' ~ incident_id ~ '.json' if kind in ['attachment_add', 'attachment_delete'] else '')
+  ~ ' date=' ~ timestamp.strftime('%Y-%m-%d') ~ ' time=' ~ timestamp.strftime('%H:%M:%S')
+  ~ ' user=' ~ out.actor ~ ' user_from=' ~ user_from
+  ~ ' desc=' ~ desc ~ ' msg=' ~ message
+  ~ ' incident_id=' ~ iid ~ ' incident_severity=' ~ out.sev
+  ~ (' attachment=' ~ out.att if out.att else '')
   ~ ' adom=' ~ params.adom
-  ~ ' devid=' ~ params.analyzer_id
-  ~ ' dtime=' ~ ingest_time.strftime('%Y-%m-%d %H:%M:%S')
-  ~ ' itime_t=' ~ (ingest_time.timestamp() | int) -%}
-{%- set vendor = {'logid': logid, 'type': 'appevent', 'subtype': 'incident',
-  'incident_id': incident_id, 'incident_severity': severity,
-  'adom': params.adom, 'desc': desc} -%}
-{%- if kind in ['attachment_add', 'attachment_delete'] -%}
-  {%- do vendor.update({'attachment': 'evidence-' ~ incident_id ~ '.json'}) -%}
-{%- endif -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
+  ~ ' devid=' ~ params.analyzer_serial ~ ' devname=' ~ params.analyzer_name
+  ~ ' dtime=' ~ itime_s ~ ' itime_t=' ~ itime_t -%}
+{%- set vendor = {'logid': logid, 'type': 'appevent', 'subtype': 'incident', 'level': 'information',
+  'desc': desc, 'user_from': user_from, 'incident_id': iid, 'incident_severity': out.sev, 'adom': params.adom} -%}
+{%- if out.att -%}{%- do vendor.update({'attachment': out.att}) -%}{%- endif -%}
+{%- set record = {'@timestamp': timestamp.isoformat(),
   'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'dataset': 'fortinet.fortianalyzer.appevent',
-    'type': event_type, 'action': desc, 'code': logid, 'original': raw},
-  'observer': {'name': params.analyzer_id, 'vendor': 'Fortinet', 'product': 'FortiAnalyzer'},
-  'user': {'name': actor}, 'related': {'user': [actor]},
+  'event': {'kind': 'event', 'dataset': 'fortinet.fortianalyzer.appevent', 'category': ['configuration'],
+    'type': etype, 'action': desc, 'code': logid, 'outcome': 'success', 'original': raw},
+  'observer': {'name': params.analyzer_name, 'serial_number': params.analyzer_serial, 'vendor': 'Fortinet', 'product': 'FortiAnalyzer', 'type': 'siem'},
+  'user': {'name': out.actor},
+  'related': {'user': [out.actor]},
   'fortinet': {'fortianalyzer': vendor}} -%}
+{%- if ip -%}
+  {%- do record.update({'source': {'ip': ip}}) -%}
+  {%- do record.related.update({'ip': [ip]}) -%}
+{%- endif -%}
 {{ record | tojson }}
