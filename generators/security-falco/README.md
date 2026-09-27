@@ -117,7 +117,7 @@ Edit `event.template.params` in `generator.yml`:
 | Parameter | Default | Meaning |
 |---|---|---|
 | `anomaly_mode` | `true` | Enable recurring complete episodes; `false` keeps background alerts only |
-| `anomaly_interval_hours` | `24` | Hours between episode due times, 1 to 8760; other values fail validation |
+| `anomaly_interval_hours` | `24` | Hours from the actual start of one episode to the due time of the next, 1 to 8760; other values fail validation |
 | `api_server_ip` | `10.96.0.1` | IPv4 address of the selected API DNS service, used in both modes |
 | `agent_version` | `8.13.3` | Synthetic Elastic Agent version |
 | `ecs_version` | `8.17.0` | ECS version |
