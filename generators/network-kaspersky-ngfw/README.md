@@ -59,7 +59,7 @@ Edit `event.template.params` in `generator.yml`:
 | `device_version` | `1.0.0.0` | CEF header version (1.0.0.x) |
 | `client_prefix` | `10.20.1.` | Client addresses are this prefix plus a host number |
 | `client_first` | `21` | First client host number |
-| `client_count` | `24` | Number of clients (at least 4) |
+| `client_count` | `24` | Number of clients (at least 4; `client_first + client_count` at most 255) |
 | `file_servers` | `10.20.2.14`, `10.20.2.15` | SMB servers |
 | `dns_server` | `10.20.0.53` | DNS resolver |
 | `cloud_destinations` | `203.0.113.10`-`203.0.113.13` | Cloud-storage addresses (at least 2) |
