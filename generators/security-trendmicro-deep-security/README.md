@@ -84,7 +84,7 @@ Events go to `generators/security-trendmicro-deep-security/output/events.json`.
 
 - Only Agent firewall (signature `20`, `21`) and intrusion prevention events. Anti-malware, integrity monitoring, log inspection, web reputation, application control, device control, policy firewall (`100`-`199`) and manager system events are not modeled, nor LEEF or basic syslog.
 - Vendor documentation gives the CEF extension tables and truncated samples, not complete captured records. Extension order follows the Deep Security 20 samples; `TrendMicroDsTenant` / `TrendMicroDsTenantId` are placed after `dvchost` as in the documented manager-relayed samples. The documentation states that the order and presence of extensions may vary.
-- CEF severity: `0` for log-only and `5` for deny events as in the documented samples; intrusion prevention severities `3`, `6`, `8`, `10` are assigned per rule and are not taken from the vendor rule catalog.
+- CEF severity: `0` for log-only and `5` for deny events as in the documented samples; intrusion prevention severities (`6`, `8` and `10` in the default rules) are assigned per rule and are not taken from the vendor rule catalog.
 - Packet data (`TrendMicroDsPacketData`, `cs6=8`) is present only for HTTP detections and holds the request line and `Host` header; HTTPS detections carry no packet data (`cs6=0`). Log-only and deny events carry no packet data.
 - One event per second at most, with whole-second timestamps as in the RFC 3164 header; the header carries no year and no time zone (UTC is used).
 - All traffic is inbound TCP to protected servers, so only `in` (never `out`) is set.
