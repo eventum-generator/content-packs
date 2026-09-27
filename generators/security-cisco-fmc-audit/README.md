@@ -18,7 +18,7 @@ Measured on a 14-day default capture (`anomaly_mode: true`, 3,100 events). All c
 
 Ten administrator accounts (`samples/admins.json`) each follow their own random schedule: sessions every few hours to a few days (lognormal, per-account median 4 to 20 hours between sessions), from the account's usual workstation address or, in about 15% of sessions, a second address. A session opens on the dashboard or the NAT list and holds one to about twenty actions seconds to minutes apart (most often a few):
 
-- **Page views** of the NAT list, the NAT policy editor and the dashboard.
+- **Page views** of the NAT list, the NAT policy editor and the `/ui/ddd/` web page (the sources do not name that page).
 - **Network object creation** with a new name (`<prefix>-<number>`, prefixes in `generator.yml`). More than half of the creations are followed later in the session by a NAT policy save (the object put into a rule).
 - **NAT policy save** of one of seven policies (`generator.yml`), always from the editor, which is shown again within a second, as in the Cisco sample. About a fifth of saves are saved again later in the session.
 
