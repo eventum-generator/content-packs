@@ -1,52 +1,317 @@
-{%- for flag in ['to_denied_1', 'to_denied_2', 'to_denied_3', 'to_alternate_fetch', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 48 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_denied_1', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['miss', 'hit', 'denied'], [80, 15, 5]) -%}
-  {%- set ip = module.rand.choice(['10.20.40.11', '10.20.40.12', '10.20.40.13']) -%}
-  {%- set domain = module.rand.choice(['portal.example.test', 'updates.example.test', 'docs.example.test']) -%}
-  {%- set path = module.rand.choice(['/index.html', '/release-notes.html', '/status']) -%}
-{%- else -%}
-  {%- set ip = params.suspect_ip -%}
-  {%- set path = params.target_path -%}
-  {%- if stage.startswith('denied_') -%}
-    {%- set kind = 'denied' -%}
-    {%- set domain = params.blocked_domain -%}
-    {%- set step = stage[-1] | int -%}
-    {%- do shared.set('to_denied_' ~ (step + 1), true) if step < 3 else shared.set('to_alternate_fetch', true) -%}
+{#- One Cisco Secure Web Appliance (AsyncOS 15.2) writing standard
+    (Squid-style) access log entries for an office client subnet.
+
+    Each one-second tick emits at most one entry, taken from a due-queue
+    fed by independent per-client random processes (merged Poisson with a
+    diurnal load curve). The anomaly episode only adds its own requests to
+    the queue; it never suspends, delays or reshapes background traffic.
+
+    Native entry (standard access log, AsyncOS 15.2 user guide, "Web Proxy
+    Information in Access Log Files"):
+      %t %e %a %w/%h %s %1r %2r %A %H/%d %c %D-<policy groups> <%Xr> <ua>
+    The angle-bracket verdict follows positions 1-39 of "Interpreting
+    Access Log Scanning Verdict Entries"; URL categories are quoted as
+    AsyncOS 11.8+ writes them. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set within = 1800 -%}
+{%- set guard = 3600 -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (1 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.client_count < 4 or params.client_first + params.client_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set clients = [] -%}
+  {%- set weights = [] -%}
+  {%- set groups = {} -%}
+  {%- set shifts = {} -%}
+  {%- for n in range(params.client_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do clients.append(ip) -%}
+    {%- do weights.append(module.rand.number.lognormal(0, 0.9)) -%}
+    {#- Own working hours (UTC start, length) per client. -#}
+    {%- do shifts.update({ip: [module.rand.number.floating(5.0, 10.0), module.rand.number.floating(7.0, 10.5)]}) -%}
+    {%- do groups.update({ip: module.rand.weighted_choice(params.access_policies, [70, 30])}) -%}
+  {%- endfor -%}
+  {#- Web reputation score per domain, fixed for the run. -#}
+  {%- set wbrs = {} -%}
+  {%- for d in params.sites | map(attribute='domain') | list + params.mirrors | map(attribute='domain') | list -%}
+    {%- do wbrs.update({d: '%.1f' | format(module.rand.number.clamp(module.rand.number.gauss(5.5, 1.8), 0.1, 10.0))}) -%}
+  {%- endfor -%}
+  {%- for d in params.blocked_sites | map(attribute='domain') | list + params.sharing_sites | map(attribute='domain') | list -%}
+    {%- do wbrs.update({d: '%.1f' | format(module.rand.number.clamp(module.rand.number.gauss(1.5, 2.0), -5.9, 7.0))}) -%}
+  {%- endfor -%}
+  {%- for d in params.low_reputation_domains -%}
+    {%- do wbrs.update({d: '%.1f' | format(module.rand.number.floating(-9.9, -6.0))}) -%}
+  {%- endfor -%}
+  {#- One file per package: its hash and typical size stay fixed. -#}
+  {%- set files = [] -%}
+  {%- for p in params.packages -%}
+    {%- do files.append({'path': p, 'name': p.split('/')[-1],
+        'sha': module.rand.crypto.sha256(),
+        'size': (module.rand.number.lognormal(module.math.log(6000000), 0.9)) | int}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'clients': clients,
+      'weights': weights, 'groups': groups, 'shifts': shifts, 'wbrs': wbrs, 'files': files,
+      'q': [], 'hist': {},
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_client': none, 'last_path': none}) -%}
+{%- endif -%}
+
+{%- set clients = shared.get('clients') -%}
+{%- set files = shared.get('files') -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- if now % 600 == 0 -%}
+  {%- for k in hist | list -%}
+    {%- set keep = hist[k] | selectattr('t', 'gt', now - 2 * guard) | list -%}
+    {%- if keep -%}{%- do hist.update({k: keep}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- set hod = (now % 86400) / 3600 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Queue one request. kind: page, asset, post, deny, wbrs, get (file). -#}
+{%- macro enq(client, kind, domain, path, cat, at, file=none) -%}
+  {%- do q.append({'due': at, 'client': client, 'kind': kind, 'domain': domain,
+      'path': path, 'cat': cat, 'file': file}) -%}
+{%- endmacro -%}
+
+{#- Chain guard on the final step only: for one client and one file path,
+    no window of `guard` seconds holds both two or more denials and an
+    allowed download. Anything else (single denial then a mirror
+    download, repeated denials without a download) stays in background. -#}
+{%- macro guard_ok(client, path, kind, at) -%}
+  {%- set rows = hist.get(client ~ '|' ~ path, []) | selectattr('t', 'gt', at - guard) | selectattr('t', 'lt', at + guard) | list -%}
+  {%- set nd = rows | selectattr('k', 'equalto', 'd') | list | length -%}
+  {%- set ng = rows | selectattr('k', 'equalto', 'g') | list | length -%}
+  {{- 'yes' if (kind == 'd' and (ng == 0 or nd == 0)) or (kind == 'g' and nd < 2) else 'no' -}}
+{%- endmacro -%}
+{%- macro mark(client, path, kind, at) -%}
+  {%- set k = client ~ '|' ~ path -%}
+  {%- set rows = hist.get(k, []) -%}
+  {%- do rows.append({'t': at, 'k': kind}) -%}
+  {%- if rows | length > 40 -%}{%- do rows.pop(0) -%}{%- endif -%}
+  {%- do hist.update({k: rows}) -%}
+{%- endmacro -%}
+
+{#- A browsing page view: the page and a few embedded objects. -#}
+{%- macro page_view(c, site, at) -%}
+  {%- set t = namespace(v=at) -%}
+  {{- enq(c, 'page', site.domain, module.rand.choice(site.pages), site.cat, t.v) -}}
+  {%- set n = [(module.rand.number.lognormal(module.math.log(3), 0.8)) | round | int, 0] | max -%}
+  {%- for i in range([n, 12] | min) -%}
+    {%- set t.v = t.v + module.rand.weighted_choice([0, 1, 2], [45, 40, 15]) -%}
+    {{- enq(c, 'asset', site.domain, module.rand.choice(params.assets), site.cat, t.v) -}}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{#- 1. Background: one merged Poisson stream of independent clients,
+    each thinned by its own working hours. -#}
+{%- set c = module.rand.weighted_choice(clients, shared.get('weights')) -%}
+{%- set sh = shared.get('shifts')[c] -%}
+{%- set into = (hod - sh[0]) % 24 -%}
+{%- set active = 1.0 if into < sh[1] else (0.45 if into < sh[1] + 4 else 0.12) -%}
+{%- if module.rand.chance(0.15 * active) -%}
+  {%- set profile = module.rand.weighted_choice(
+      ['browse', 'post', 'blocked', 'wbrs', 'mirror', 'sharing'],
+      [66, 8, 9, 2, 8, 7]) -%}
+  {%- if profile == 'browse' -%}
+    {%- set site = module.rand.choice(params.sites) -%}
+    {{- page_view(c, site, now) -}}
+    {%- if module.rand.chance(0.35) -%}
+      {{- page_view(c, site, now + gap(40, 1.0) | int) -}}
+    {%- endif -%}
+  {%- elif profile == 'post' -%}
+    {%- set site = module.rand.choice(params.sites) -%}
+    {{- enq(c, 'post', site.domain, module.rand.choice(site.pages), site.cat, now) -}}
+  {%- elif profile == 'blocked' -%}
+    {#- Blocked-category browsing with user retries. -#}
+    {%- set site = module.rand.choice(params.blocked_sites) -%}
+    {%- set path = module.rand.choice(site.pages) -%}
+    {%- set n = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+    {%- set t = namespace(v=now) -%}
+    {%- for i in range([n, 10] | min) -%}
+      {{- enq(c, 'deny', site.domain, path, site.cat, t.v) -}}
+      {%- set t.v = t.v + gap(25, 0.9) | int -%}
+    {%- endfor -%}
+  {%- elif profile == 'wbrs' -%}
+    {%- set d = module.rand.choice(params.low_reputation_domains) -%}
+    {{- enq(c, 'wbrs', d, module.rand.choice(['/', '/index.php', '/promo/offer.html', '/dl/setup.exe']), 'nc', now) -}}
+  {%- elif profile == 'mirror' -%}
+    {#- Ordinary download from an allowed mirror, sometimes repeated. -#}
+    {%- set f = module.rand.choice(files) -%}
+    {%- set m = module.rand.choice(params.mirrors) -%}
+    {%- set t = namespace(v=now) -%}
+    {%- for i in range(module.rand.weighted_choice([1, 2, 3], [82, 14, 4])) -%}
+      {%- if guard_ok(c, f.path, 'g', t.v) == 'yes' -%}
+        {{- mark(c, f.path, 'g', t.v) -}}
+        {{- enq(c, 'get', m.domain, f.path, m.cat, t.v, f) -}}
+      {%- endif -%}
+      {%- set t.v = t.v + gap(90, 1.2) | int -%}
+    {%- endfor -%}
   {%- else -%}
-    {%- set kind = 'miss' -%}
-    {%- set domain = params.alternate_domain -%}
-    {%- do shared.set('to_routine', true) -%}
+    {#- A download attempt on a blocked file-sharing site, with retries;
+        afterwards the user may give up, fetch another file from a
+        mirror, or (after a single denial) fetch the same file there. -#}
+    {%- set f = module.rand.choice(files) -%}
+    {%- set s = module.rand.choice(params.sharing_sites) -%}
+    {%- set n = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+    {%- set t = namespace(v=now, d=0) -%}
+    {%- for i in range([n, 10] | min) -%}
+      {%- if guard_ok(c, f.path, 'd', t.v) == 'yes' -%}
+        {{- mark(c, f.path, 'd', t.v) -}}
+        {{- enq(c, 'deny', s.domain, f.path, s.cat, t.v) -}}
+        {%- set t.d = t.d + 1 -%}
+      {%- endif -%}
+      {%- set t.v = t.v + gap(25, 0.9) | int -%}
+    {%- endfor -%}
+    {%- set after = module.rand.weighted_choice(['none', 'other', 'same'], [55, 25, 20]) -%}
+    {%- set at = t.v + gap(180, 0.8) | int -%}
+    {%- set m = module.rand.choice(params.mirrors) -%}
+    {%- set g = f if after == 'same' else module.rand.choice(files | rejectattr('path', 'equalto', f.path) | list) -%}
+    {%- if after != 'none' and guard_ok(c, g.path, 'g', at) == 'yes' -%}
+      {{- mark(c, g.path, 'g', at) -}}
+      {{- enq(c, 'get', m.domain, g.path, m.cat, at, g) -}}
+    {%- endif -%}
   {%- endif -%}
 {%- endif -%}
-{%- if kind == 'denied' -%}
-  {%- set code = 'TCP_DENIED' -%}
-  {%- set status = 403 -%}
-  {%- set size = 3146 -%}
-  {%- set hierarchy = 'NONE/-' -%}
-  {%- set mime = '-' -%}
-  {%- set acl = 'BLOCK_WEBCAT-DefaultGroup-DefaultGroup-NONE-NONE-DefaultRouting' -%}
-  {%- set verdict = '<IW_sprt,-,-,-,-,-,-,-,-,-,-,-,-,-,-,IW_sprt,->' -%}
-  {%- set event_type = ['denied'] -%}
-{%- else -%}
-  {%- set code = 'TCP_HIT' if kind == 'hit' else 'TCP_MISS' -%}
-  {%- set status = 200 -%}
-  {%- set size = module.rand.number.integer(2500, 9500) -%}
-  {%- set hierarchy = 'NONE/-' if kind == 'hit' else 'DIRECT/' ~ domain -%}
-  {%- set mime = 'application/octet-stream' if stage == 'alternate_fetch' else 'text/html' -%}
-  {%- set acl = 'DEFAULT_CASE_11-DefaultGroup-DefaultGroup-NONE-NONE-DefaultRouting-NONE' -%}
-  {%- set verdict = '<IW_comp,6.9,-,"-",-,-,-,-,"-",-,-,-,"-",-,-,"-","-",-,-,IW_comp,-,"-","-","Unknown","Unknown","-","-",198.34,0,-,[Local],"-",37,"-",33,0,"-","-">' -%}
-  {%- set event_type = ['access'] -%}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, no catch-up. A rotated client is denied a rotated
+    file on a blocked file-sharing site two or more times, then fetches
+    the same path from an allowed mirror. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set c = module.rand.choice(clients | reject('equalto', shared.get('last_client')) | list) -%}
+    {%- set f = module.rand.choice(files | rejectattr('path', 'equalto', shared.get('last_path')) | list) -%}
+    {%- set s = module.rand.choice(params.sharing_sites) -%}
+    {%- set m = module.rand.choice(params.mirrors) -%}
+    {%- set n = namespace(v=1) -%}
+    {%- for i in range(20) -%}
+      {%- if n.v < 2 -%}
+        {%- set n.v = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set t = namespace(v=now) -%}
+    {%- for i in range([[n.v, 2] | max, 10] | min) -%}
+      {{- mark(c, f.path, 'd', t.v) -}}
+      {{- enq(c, 'deny', s.domain, f.path, s.cat, t.v) -}}
+      {%- set t.v = t.v + gap(25, 0.9) | int -%}
+    {%- endfor -%}
+    {%- set at = t.v + [gap(180, 0.8) | int, 1200] | min -%}
+    {{- mark(c, f.path, 'g', at) -}}
+    {{- enq(c, 'get', m.domain, f.path, m.cat, at, f) -}}
+    {%- do shared.update({'start_at': none, 'last_client': c, 'last_path': f.path,
+        'next_due': now + (interval * 3600) | int}) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set url = 'http://' ~ domain ~ path -%}
-{%- set elapsed = module.rand.number.integer(10, 300) -%}
-{%- set epoch = '%.3f' | format(timestamp.timestamp()) -%}
-{%- set request = 'GET ' ~ url ~ (' HTTP/1.1' if kind == 'denied' else '') -%}
-{%- set original = epoch ~ ' ' ~ elapsed ~ ' ' ~ ip ~ ' ' ~ code ~ '/' ~ status ~ ' ' ~ size ~ ' ' ~ request ~ ' - ' ~ hierarchy ~ ' ' ~ mime ~ ' ' ~ acl ~ ' ' ~ verdict ~ ' -' -%}
-{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['web'], 'type': event_type, 'action': 'proxy-' ~ kind, 'outcome': 'failure' if kind == 'denied' else 'success', 'original': original}, 'host': {'name': params.host_name}, 'source': {'ip': ip}, 'url': {'full': url, 'domain': domain, 'path': path, 'scheme': 'http'}, 'http': {'request': {'method': 'GET'}, 'response': {'status_code': status, 'body': {'bytes': size}}}, 'network': {'protocol': 'http'}, 'related': {'ip': [ip]}, 'cisco': {'swa': {'result_code': code, 'elapsed_ms': elapsed, 'hierarchy': hierarchy, 'mime_type': mime, 'acl_decision_tag': acl, 'scan_verdict': verdict}}} -%}
-{{- payload | tojson -}}
+
+{#- 3. Emit the earliest due request, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+
+{#- Transaction outcome. -#}
+{%- set url = 'http://' ~ e.domain ~ e.path -%}
+{%- set method = 'POST' if e.kind == 'post' else 'GET' -%}
+{%- set ext = e.path.rsplit('.', 1)[-1] if '.' in e.path.split('/')[-1] else '' -%}
+{%- set mimes = {'html': 'text/html', 'php': 'text/html', 'js': 'application/javascript',
+    'css': 'text/css', 'png': 'image/png', 'jpg': 'image/jpeg', 'svg': 'image/svg+xml',
+    'woff2': 'font/woff2', 'json': 'application/json', 'msi': 'application/x-msi',
+    'exe': 'application/x-dosexec', 'zip': 'application/zip', 'gz': 'application/gzip'} -%}
+{%- set wb = shared.get('wbrs').get(e.domain, 'ns') -%}
+{%- set amp = namespace(v='-', name='-', sha='-') -%}
+{%- if e.kind in ['deny', 'wbrs'] -%}
+  {%- set code = 'TCP_DENIED' -%}{%- set status = 403 -%}
+  {%- set size = 2980 + 2 * (url | length) + module.rand.number.integer(0, 24) -%}
+  {%- set hier = 'NONE/-' -%}{%- set mime = '-' -%}
+  {%- set tag = 'BLOCK_WEBCAT' if e.kind == 'deny' else 'BLOCK_WBRS' -%}
+  {%- set elapsed = gap(2, 0.8) | int -%}
+  {%- set bw = '-' -%}
+{%- else -%}
+  {%- if e.kind == 'get' -%}
+    {%- set code = module.rand.weighted_choice(['TCP_MISS', 'TCP_CLIENT_REFRESH_MISS'], [95, 5]) -%}
+    {%- set size = (e.file.size * module.rand.number.floating(0.97, 1.0)) | int if module.rand.chance(0.08) else e.file.size -%}
+    {%- set mime = mimes.get(ext, 'application/octet-stream') -%}
+    {%- set amp.v = '0' -%}{%- set amp.name = e.file.name -%}{%- set amp.sha = e.file.sha -%}
+  {%- elif e.kind == 'post' -%}
+    {%- set code = 'TCP_MISS' -%}
+    {%- set size = (module.rand.number.lognormal(module.math.log(1800), 0.9)) | int + 200 -%}
+    {%- set mime = 'application/json' -%}
+  {%- else -%}
+    {%- set code = module.rand.weighted_choice(
+        ['TCP_MISS', 'TCP_HIT', 'TCP_MEM_HIT', 'TCP_REFRESH_HIT', 'TCP_IMS_HIT', 'TCP_CLIENT_REFRESH_MISS', 'NONE'],
+        [58, 12, 8, 6, 12, 3, 1] if e.kind == 'asset' else [84, 3, 2, 4, 3, 3, 1]) -%}
+    {%- set size = (module.rand.number.lognormal(module.math.log(14000 if e.kind == 'page' else 9000), 1.1)) | int + 300 -%}
+    {%- set mime = mimes.get(ext, 'text/html') -%}
+  {%- endif -%}
+  {%- set status = 304 if code == 'TCP_IMS_HIT' else (module.rand.choice([503, 504]) if code == 'NONE' else 200) -%}
+  {%- if status == 304 -%}{%- set size = module.rand.number.integer(180, 420) -%}{%- endif -%}
+  {%- if code == 'NONE' -%}{%- set size = module.rand.number.integer(1100, 1900) -%}{%- set mime = 'text/html' -%}{%- endif -%}
+  {%- set hier = 'NONE/-' if code in ['TCP_HIT', 'TCP_MEM_HIT', 'TCP_IMS_HIT', 'NONE'] else 'DIRECT/' ~ e.domain -%}
+  {%- set tag = 'DEFAULT_CASE' -%}
+  {%- if code in ['TCP_HIT', 'TCP_MEM_HIT', 'TCP_IMS_HIT'] -%}
+    {%- set elapsed = gap(4, 0.9) | int -%}
+  {%- elif code == 'NONE' -%}
+    {%- set elapsed = gap(9000, 0.6) | int -%}
+  {%- else -%}
+    {%- set kbps = module.rand.number.lognormal(module.math.log(24000), 0.8) -%}
+    {%- set elapsed = gap(120, 0.7) | int + (size * 8 / kbps) | int -%}
+  {%- endif -%}
+  {%- set bw = '%.2f' | format(size * 8 / [elapsed, 1] | max) -%}
+  {%- if amp.v == '-' and mime not in ['text/html', 'text/css', 'application/javascript', 'application/json'] and code != 'NONE' -%}
+    {%- set amp.v = '1' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set cat = '"IW_' ~ e.cat ~ '"' if e.cat != 'nc' else '"nc"' -%}
+{%- set group = shared.get('groups')[e.client] -%}
+{%- set acl = tag ~ '_' ~ module.rand.weighted_choice(['11', '12'], [55, 45]) ~ '-' ~ group ~ '-'
+    ~ params.identity_policy ~ '-DefaultGroup-NONE-NONE-DefaultRouting' -%}
+{%- set verdict = '<' ~ cat ~ ',' ~ wb ~ ',-,"-",-,-,-,-,"-",-,-,-,"-",-,-,"-","-",-,-,' ~ cat
+    ~ ',-,"-","-","-","Unknown","Unknown","-","-",' ~ bw ~ ',0,-,"-","-",' ~ amp.v ~ ',"-",-,0,"'
+    ~ amp.name ~ '","' ~ amp.sha ~ '">' -%}
+
+{%- set ms = module.rand.number.integer(0, 999) -%}
+{%- set iso = module.datetime.datetime.fromtimestamp(now, utc) + module.datetime.timedelta(milliseconds=ms) -%}
+{%- set epoch = now ~ '.' ~ '%03d' | format(ms) -%}
+{%- set raw = epoch ~ ' ' ~ elapsed ~ ' ' ~ e.client ~ ' ' ~ code ~ '/' ~ status ~ ' ' ~ size ~ ' '
+    ~ method ~ ' ' ~ url ~ ' - ' ~ hier ~ ' ' ~ mime ~ ' ' ~ acl ~ ' ' ~ verdict ~ ' -' -%}
+{%- set denied = code == 'TCP_DENIED' -%}
+{%- set record = {'@timestamp': iso.isoformat(timespec='milliseconds'),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'cisco_swa.access', 'category': ['web', 'network'],
+    'type': ['denied', 'connection'] if denied else (['connection', 'error'] if code == 'NONE' else ['allowed', 'connection']),
+    'action': code | lower, 'outcome': 'failure' if denied or code == 'NONE' else 'success',
+    'duration': elapsed * 1000000, 'original': raw},
+  'observer': {'hostname': params.host_name, 'vendor': 'Cisco', 'product': 'Secure Web Appliance', 'type': 'proxy'},
+  'host': {'name': params.host_name},
+  'source': {'ip': e.client},
+  'destination': {'domain': e.domain},
+  'url': {'original': url, 'full': url, 'scheme': 'http', 'domain': e.domain, 'path': e.path},
+  'http': {'request': {'method': method}, 'response': {'status_code': status, 'bytes': size}},
+  'network': {'protocol': 'http'},
+  'related': {'ip': [e.client], 'hosts': [e.domain]},
+  'cisco': {'swa': {'result_code': code, 'elapsed_ms': elapsed, 'hierarchy': hier,
+    'mime_type': mime, 'acl_decision_tag': acl, 'policy_group': group,
+    'url_category': cat | replace('"', ''), 'wbrs_score': wb, 'scan_verdict': verdict}}} -%}
+{%- if mime != '-' -%}{%- do record.http.response.update({'mime_type': mime}) -%}{%- endif -%}
+{%- if amp.sha != '-' -%}
+  {%- do record.update({'file': {'name': amp.name, 'hash': {'sha256': amp.sha}}}) -%}
+  {%- do record.related.update({'hash': [amp.sha]}) -%}
+{%- endif -%}
+{{ record | tojson }}
