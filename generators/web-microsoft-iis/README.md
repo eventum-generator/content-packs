@@ -120,7 +120,7 @@ eventum generate --path generators/web-microsoft-iis/finite.yml --id web-microso
 - Timestamps have one-second resolution, as in the native row, so `@timestamp` never carries a fraction.
 - Windows authentication is shown only as the account on successful export downloads; the anonymous `401 2 5` challenge that precedes it on a real server is not modeled, and directory probes are anonymous.
 - The monitor polls about once a minute with a random gap (16-204 s) rather than on an exact interval, and interactive rates follow one UTC office-hours curve.
-- The skipped-download rule guarantees only 30 minutes: a detector with a longer window finds ordinary B-A-E-download sequences (about 4 per day between 30 and 60 minutes).
+- The skipped-download rule guarantees only 30 minutes: a detector with a longer window finds ordinary B-A-E-download sequences (about 3 per day between 30 and 60 minutes, about 4 per day between 1 and 2 hours).
 - Clients, pages, files and rates are synthetic scenario assumptions rather than Microsoft-published traffic.
 
 ## Sample Output
