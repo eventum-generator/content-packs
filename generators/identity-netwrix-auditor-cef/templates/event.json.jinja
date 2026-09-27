@@ -1,21 +1,374 @@
-{%- set step = vars.step -%}
-{%- set chain = step.startswith('chain_') -%}
-{%- if step == 'routine_a' -%}
-  {%- do shared.pop('to_chain', none) -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_chain', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{#- Netwrix Auditor CEF Export Add-on records for the Active Directory
+    and Logon Activity data sources, as Filebeat decode_cef style ECS
+    JSON with the raw CEF line in event.original. One input tick per
+    second; each tick emits the earliest due record or drops. Staff log
+    on to their workstations and to servers in randomly phased work
+    sessions; helpdesk and admin operators change accounts, groups and
+    computers while on duty. Times are in microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set hq = module.heapq -%}
+{%- set sec = 1000000 -%}
+{%- set minute = 60 * sec -%}
+{%- set hour = 3600 * sec -%}
+{#- Chain window: an account created and then used to log on is not
+    offboarded by background operations inside this window. -#}
+{%- set window = 4 * hour -%}
+{%- set domain = params.domain -%}
+{%- set netbios = params.netbios -%}
+{%- set base = '\\' ~ (domain.split('.') | reverse | join('\\')) -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro row(due, product, action, cat, dc, who, what, tgt, ep) -%}
+  {{- push(due, {'k': 'row', 'p': product, 'a': action, 'c': cat, 'dc': dc, 'who': who, 'what': what, 'tgt': tgt, 'ep': ep}) -}}
+{%- endmacro -%}
+{%- macro pick_dc(pref) -%}
+  {{- pref if module.rand.chance(0.75) else module.rand.choice(shared.get('dcs')) -}}
+{%- endmacro -%}
+{%- macro new_name() -%}
+  {#- A logon name not held by a current or recently removed account. -#}
+  {%- set users = shared.get('users') -%}
+  {%- set r = namespace(v=none) -%}
+  {%- for _ in range(50) if r.v is none -%}
+    {%- set cand = module.rand.choice('jmdrkstacblpegwhnfvo') ~ module.rand.choice(shared.get('surnames')) -%}
+    {%- for sfx in ['', '2', '3', '4'] if r.v is none -%}
+      {%- if (cand ~ sfx) not in users and (cand ~ sfx) not in shared.get('recent_names') -%}{%- set r.v = cand ~ sfx -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro add_user(sam, op) -%}
+  {#- Register an account (and its workstation) in the directory. -#}
+  {%- set c = module.rand.weighted_choice(shared.get('containers'), [40, 35, 10, 15]) -%}
+  {%- do shared.get('users').update({sam: {'sam': sam, 'path': base ~ '\\' ~ c ~ '\\' ~ sam, 'ws': 'ws-' ~ module.rand.number.integer(1000, 9899) ~ '.' ~ domain, 'dc': module.rand.choice(shared.get('dcs')), 'pace': module.rand.number.lognormal(0, 0.35), 'op': op, 'sid': 0, 'on': false, 'gone': false, 'added': none, 'logged': false}}) -%}
+{%- endmacro -%}
+{%- macro logon(due, u, host, typo) -%}
+  {#- A logon to host, sometimes after mistyped attempts (each one
+      repeated with falling probability). Returns the success time. -#}
+  {%- set t = namespace(v=due) -%}
+  {%- if module.rand.chance(typo) -%}
+    {%- set n = namespace(go=true) -%}
+    {%- for _ in range(5) if n.go -%}
+      {{- row(t.v, 'Logon Activity', 'Failed Logon', 'Logon', pick_dc(u.dc), u.sam, host, none, false) -}}
+      {%- set t.v = t.v + (ln(7, 0.8) | int) -%}
+      {%- set n.go = module.rand.chance(0.35) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {{- row(t.v, 'Logon Activity', 'Successful Logon', 'Logon', pick_dc(u.dc), u.sam, host, none, false) -}}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro stale_burst(due, u) -%}
+  {#- A mapped drive or saved credential still holding an old password:
+      several failed logons to one server within minutes. -#}
+  {%- set host = module.rand.weighted_choice(shared.get('servers'), shared.get('server_w')) -%}
+  {%- set t = namespace(v=due) -%}
+  {%- for _ in range(module.rand.number.integer(2, 6)) -%}
+    {{- row(t.v, 'Logon Activity', 'Failed Logon', 'Logon', pick_dc(u.dc), u.sam, host, none, false) -}}
+    {%- set t.v = t.v + (ln(80, 0.9) | int) -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- macro start_session(due, u) -%}
+  {#- Workstation logon, then server logons until the session ends. -#}
+  {%- set sid = u.sid + 1 -%}
+  {%- do u.update({'sid': sid, 'on': true}) -%}
+  {%- set t = logon(due, u, u.ws, 0.07) | int -%}
+  {%- do u.update({'logged': true, 'last_logon': t}) -%}
+  {%- set dur = ln(9 * 3600, 0.35) | int -%}
+  {%- do u.update({'end': t + dur}) -%}
+  {{- push(t + module.builtins.int((ln(50 * 60, 1.0) | int) * u.pace), {'k': 'srv', 'u': u.sam, 'sid': sid}) -}}
+  {%- if u.op -%}{{- push(t + (ln(12 * 60, 1.0) | int), {'k': 'op', 'u': u.sam, 'sid': sid}) -}}{%- endif -%}
+  {{- push(t + dur, {'k': 'end', 'u': u.sam, 'sid': sid}) -}}
+{%- endmacro -%}
+{%- macro onboard(t0, op, sam, ep) -%}
+  {#- New account: created, then attributes set in quick succession,
+      sometimes group memberships. Returns the time of the last row. -#}
+  {%- set users = shared.get('users') -%}
+  {%- set u = users[sam] -%}
+  {%- do u.update({'added': t0}) -%}
+  {%- set dc = pick_dc(op.dc) -%}
+  {{- row(t0, 'Active Directory', 'Added', 'user', dc, op.sam, u.path, sam, ep) -}}
+  {%- set t = namespace(v=t0) -%}
+  {%- for _ in range(module.rand.weighted_choice([1, 2, 3], [45, 35, 20])) -%}
+    {%- set t.v = t.v + (ln(18, 0.9) | int) -%}
+    {{- row(t.v, 'Active Directory', 'Modified', 'user', dc, op.sam, u.path, sam, ep) -}}
+  {%- endfor -%}
+  {%- if module.rand.chance(0.6) -%}
+    {%- for _ in range(module.rand.weighted_choice([1, 2], [70, 30])) -%}
+      {%- set t.v = t.v + (ln(25, 0.9) | int) -%}
+      {{- row(t.v, 'Active Directory', 'Modified', 'group', dc, op.sam, module.rand.weighted_choice(shared.get('groups'), shared.get('group_w')), none, ep) -}}
+    {%- endfor -%}
+  {%- endif -%}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro remove(t, op, u, ep) -%}
+  {#- Account deletion; the account stops logging on at once and leaves
+      the directory after its queued rows. -#}
+  {{- row(t, 'Active Directory', 'Removed', 'user', pick_dc(op.dc), op.sam, u.path, u.sam, ep) -}}
+  {%- do u.update({'gone': true, 'on': false}) -%}
+  {{- push(t + minute, {'k': 'gc', 'u': u.sam}) -}}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'domain': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[a-z0-9-]+(\\.[a-z0-9-]+)+$'}},
+    'netbios': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[A-Z0-9-]{1,15}$'}},
+    'staff_count': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 20, 'le': 2000}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set surnames = [] -%}
+  {%- for r in samples.surnames -%}{%- do surnames.append(r.surname) -%}{%- endfor -%}
+  {%- set servers = ['fs-01', 'fs-02', 'rds-01', 'rds-02', 'app-01', 'app-02', 'sql-01', 'print-01', 'sp-01', 'exch-01', 'erp-01', 'wsus-01'] -%}
+  {%- set groups = ['Groups\\Finance', 'Groups\\Sales', 'Groups\\HR', 'Groups\\IT Support', 'Groups\\Engineering', 'Groups\\VPN Users', 'Groups\\RDS Users', 'Groups\\File Share Readers', 'Groups\\Project Alpha', 'Groups\\Printers', 'Users\\Remote Desktop Users', 'Users\\Domain Admins', 'Users\\Server Operators'] -%}
+  {%- set group_paths = [] -%}
+  {%- for g in groups -%}{%- do group_paths.append(base ~ '\\' ~ g) -%}{%- endfor -%}
+  {%- do shared.update({
+    'queue': [], 'seq': 0, 'users': {}, 'recent_names': [], 'surnames': surnames,
+    'dcs': ['dc-01.' ~ domain, 'dc-02.' ~ domain, 'dc-03.' ~ domain],
+    'containers': ['Users', 'Corp\\Staff', 'Corp\\Contractors', 'Corp\\Branch\\Users'],
+    'groups': group_paths, 'group_w': [14, 12, 8, 6, 12, 14, 9, 10, 6, 5, 2, 1, 1]
+  }) -%}
+  {%- set sv = [] -%}
+  {%- for s in servers -%}{%- do sv.append(s ~ '.' ~ domain) -%}{%- endfor -%}
+  {%- do shared.update({'servers': sv, 'server_w': [22, 14, 12, 8, 10, 7, 4, 6, 7, 5, 4, 1]}) -%}
+  {%- for i in range(params.staff_count) -%}{%- do add_user(new_name(), false) -%}{%- endfor -%}
+  {%- set ops = [] -%}
+  {%- for i in range(8) -%}
+    {%- set sam = ('adm.' if i < 3 else 'hd.') ~ new_name() -%}
+    {%- do add_user(sam, true) -%}
+    {%- do ops.append(sam) -%}
+  {%- endfor -%}
+  {%- do shared.update({'ops': ops}) -%}
+  {#- On-call stream: when no operator is on shift, an operator handles
+      a task remotely now and then. -#}
+  {{- push(now + (ln(40 * 60, 1.0) | int), {'k': 'oncall'}) -}}
+  {%- for sam, u in shared.get('users').items() -%}
+    {#- First session starts somewhere inside one typical off-duty gap. -#}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(15 * 3600, 0.4) | int)), {'k': 'session', 'u': sam}) -}}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'last_us': now - 1, 'ep_last_op': none, 'ep_due': now + hour + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
 {%- endif -%}
-{%- set slash = '\\' -%}
-{%- set operator = params.chain_operator if chain else 'EXAMPLE' ~ slash ~ module.rand.choice(['helpdesk-a','helpdesk-b','helpdesk-c']) -%}
-{%- set target = ('contractor0' ~ step[-1]) if chain else ('staff' ~ module.rand.number.integer(1000, 9999)) -%}
-{%- set path = slash ~ 'local' ~ slash ~ 'example' ~ slash ~ 'users' ~ slash ~ target -%}
-{%- set extension = {'shost':params.domain_controller,'cat':'user','suser':operator,'filePath':path,'start':timestamp.strftime('%b %d %Y %H:%M:%S')} -%}
+{%- set queue = shared.get('queue') -%}
+{%- set users = shared.get('users') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode: at its start (due + random delay) the episode is armed.
+    The next background "account created by mistake" task of an operator
+    other than the previous episode's, on shift with at least 1 hour
+    left or on call, becomes the episode: the task is performed exactly as usual
+    (same time, same rows), except that the fresh account logs on at the
+    desk before it is deleted. Operators therefore take episodes in
+    proportion to their own task rate. The next due time is one interval
+    after that creation plus a new random delay; missed episodes are not
+    replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {#- Parked until the episode's creation sets the next due time. -#}
+  {%- do shared.update({'ep_armed': true, 'ep_due': now + 1000 * hour}) -%}
+{%- endif -%}
+{%- if now < queue[0][0] -%}
+  {%- do shared.set('next_due', queue[0][0]) -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set out = namespace(row=none, rec=0) -%}
+{%- for _ in range(32) if out.row is none and queue and queue[0][0] <= now -%}
+  {%- set top = hq.heappop(queue) -%}
+  {%- set due = top[0] -%}
+  {%- set item = top[2] -%}
+  {%- set u = users.get(item.get('u')) -%}
+  {%- set oncall = namespace(v=false) -%}
+  {%- if item.k == 'oncall' -%}
+    {{- push(due + (ln(40 * 60, 1.0) | int), item) -}}
+    {%- set duty = [] -%}
+    {%- for sam in shared.get('ops') if users[sam].on -%}{%- do duty.append(sam) -%}{%- endfor -%}
+    {%- if not duty -%}
+      {%- set ow = [] -%}
+      {%- for sam in shared.get('ops') -%}{%- do ow.append(1.0 / users[sam].pace) -%}{%- endfor -%}
+      {%- set u = users[module.rand.weighted_choice(shared.get('ops'), ow)] -%}
+      {%- set oncall.v = true -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if item.k == 'row' -%}
+    {%- set out.row = item -%}
+    {%- set out.rec = [due, shared.get('last_us') + 1] | max -%}
+    {%- do shared.set('last_us', out.rec) -%}
+  {%- elif item.k == 'session' and u and not u.gone -%}
+    {{- start_session(due, u) -}}
+  {%- elif item.k == 'first' and u and not u.gone -%}
+    {#- First logon of a new account starts its first session. An episode
+        account keeps its mistake-pair deletion time if that falls after
+        the logon; otherwise the deletion follows the logon after a new
+        draw from the same delay. -#}
+    {{- start_session(due, u) -}}
+    {%- if item.get('ep_rm') -%}
+      {%- set rm = item.ep_rm if item.ep_rm > u.last_logon else u.last_logon + (ln(10 * 60, 0.9) | int) -%}
+      {{- push(rm, {'k': 'remove', 'u': u.sam, 'op': item.op, 'ep': true}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'end' and u and not u.gone and u.sid == item.sid -%}
+    {#- Off-duty gap; now and then a longer absence. -#}
+    {%- do u.update({'on': false}) -%}
+    {%- set off = ln(14.5 * 3600, 0.45) | int -%}
+    {%- if module.rand.chance(0.08) -%}{%- set off = off + (ln(40 * 3600, 0.5) | int) -%}{%- endif -%}
+    {{- push(due + off, {'k': 'session', 'u': u.sam}) -}}
+  {%- elif item.k == 'srv' and u and u.on and not u.gone and u.sid == item.sid -%}
+    {#- Server logon (operators also log on to domain controllers). -#}
+    {%- set host = module.rand.choice(shared.get('dcs')) if u.op and module.rand.chance(0.2) else module.rand.weighted_choice(shared.get('servers'), shared.get('server_w')) -%}
+    {%- set t = logon(due, u, host, 0.05) | int -%}
+    {%- if module.rand.chance(0.004) -%}{{- stale_burst(t + (ln(600, 1.0) | int), u) -}}{%- endif -%}
+    {{- push(t + module.builtins.int((ln(50 * 60, 1.0) | int) * u.pace), item) -}}
+  {%- elif item.k == 'remove' and u and not u.gone -%}
+    {{- remove(due, users[item.op], u, item.get('ep', false)) -}}
+  {%- elif item.k == 'gc' and u and u.gone -%}
+    {%- do users.pop(item.u) -%}
+    {%- set rn = shared.get('recent_names') -%}
+    {%- do rn.append(item.u) -%}
+    {%- if rn | length > 300 -%}{%- do rn.pop(0) -%}{%- endif -%}
+  {%- elif oncall.v or (item.k == 'op' and u and u.on and not u.gone and u.sid == item.sid) -%}
+    {#- One operator task; the next follows after a lognormal gap scaled
+        by the operator's own pace. -#}
+    {%- set dc = pick_dc(u.dc) -%}
+    {%- set staff = [] -%}
+    {#- Accounts created by mistake belong to nobody and get no tickets. -#}
+    {%- for s, x in users.items() if not x.op and not x.gone and not x.get('mistake') -%}{%- do staff.append(s) -%}{%- endfor -%}
+    {%- set r = module.rand.number.floating(0, 1) -%}
+    {%- if r < 0.02 and staff | length < params.staff_count * 1.2 -%}
+      {#- Onboarding. The new hire logs on either at the desk while the
+          helpdesk waits, or on a later day. -#}
+      {%- set sam = new_name() -%}
+      {%- do add_user(sam, false) -%}
+      {%- set t = onboard(due, u, sam, false) | int -%}
+      {%- set wait = ln(25 * 60, 0.8) | int if module.rand.chance(0.3) else ln(16 * 3600, 0.5) | int -%}
+      {{- push(t + wait, {'k': 'first', 'u': sam}) -}}
+    {%- elif r < 0.04 and staff | length > params.staff_count * 0.85 -%}
+      {#- Offboarding: either a direct deletion, or disable (sometimes
+          groups) and delete soon or hours later. An account created and
+          used to log on within the chain window is not picked. -#}
+      {%- set elig = [] -%}
+      {%- for s in staff if not (users[s].added is not none and users[s].logged and due - users[s].added <= window + hour) -%}{%- do elig.append(s) -%}{%- endfor -%}
+      {%- set v = users[module.rand.choice(elig)] -%}
+      {%- if module.rand.chance(0.5) -%}
+        {{- remove(due, u, v, false) -}}
+      {%- else -%}
+      {{- row(due, 'Active Directory', 'Modified', 'user', dc, u.sam, v.path, v.sam, false) -}}
+      {%- do v.update({'on': false, 'sid': v.sid + 1}) -%}
+      {%- set t = namespace(v=due) -%}
+      {%- if module.rand.chance(0.4) -%}
+        {%- set t.v = t.v + (ln(30, 0.9) | int) -%}
+        {{- row(t.v, 'Active Directory', 'Modified', 'group', dc, u.sam, module.rand.weighted_choice(shared.get('groups'), shared.get('group_w')), none, false) -}}
+      {%- endif -%}
+      {{- push(t.v + (ln(20 * 60, 1.0) | int if module.rand.chance(0.7) else ln(6 * 3600, 0.6) | int), {'k': 'remove', 'u': v.sam, 'op': u.sam}) -}}
+      {%- endif -%}
+    {%- elif r < 0.12 -%}
+      {#- Mistaken account: created, sometimes edited, deleted soon. When
+          an episode is armed, this pair becomes the episode: the account
+          also logs on at the desk (delay redrawn while above 2 h). -#}
+      {%- set sam = new_name() -%}
+      {%- do add_user(sam, false) -%}
+      {%- do users[sam].update({'mistake': true}) -%}
+      {%- set is_ep = shared.get('ep_armed') and u.sam != shared.get('ep_last_op') and (oncall.v or u.end > due + hour) -%}
+      {%- set t = onboard(due, u, sam, is_ep) | int -%}
+      {%- set rm = t + (ln(10 * 60, 0.9) | int) -%}
+      {%- if is_ep -%}
+        {%- set w = namespace(v=ln(25 * 60, 0.8) | int) -%}
+        {%- for _ in range(40) if w.v > 2 * hour -%}{%- set w.v = ln(25 * 60, 0.8) | int -%}{%- endfor -%}
+        {{- push(t + w.v, {'k': 'first', 'u': sam, 'ep_rm': rm, 'op': u.sam}) -}}
+        {%- do shared.update({'ep_armed': false, 'ep_last_op': u.sam, 'ep_due': due + interval + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
+      {%- else -%}
+        {{- push(rm, {'k': 'remove', 'u': sam, 'op': u.sam}) -}}
+      {%- endif -%}
+    {%- elif r < 0.40 -%}
+      {#- Password reset ticket: the user's failed attempts, the reset,
+          then a successful logon; sometimes an old saved password keeps
+          failing afterwards. -#}
+      {%- set v = users[module.rand.choice(staff)] -%}
+      {%- set t = namespace(v=due) -%}
+      {%- if module.rand.chance(0.6) -%}
+        {%- for _ in range(module.rand.number.integer(1, 5)) -%}
+          {{- row(t.v, 'Logon Activity', 'Failed Logon', 'Logon', pick_dc(v.dc), v.sam, v.ws, none, false) -}}
+          {%- set t.v = t.v + (ln(40, 1.0) | int) -%}
+        {%- endfor -%}
+        {%- set t.v = t.v + (ln(6 * 60, 0.8) | int) -%}
+      {%- endif -%}
+      {{- row(t.v, 'Active Directory', 'Modified', 'user', dc, u.sam, v.path, v.sam, false) -}}
+      {%- if module.rand.chance(0.7) -%}
+        {%- set t.v = logon(t.v + (ln(120, 0.9) | int), v, v.ws, 0.1) | int -%}
+      {%- endif -%}
+      {%- if module.rand.chance(0.15) -%}{{- stale_burst(t.v + (ln(900, 1.0) | int), v) -}}{%- endif -%}
+    {%- elif r < 0.67 -%}
+      {#- Attribute change (title, phone, manager, expiry). -#}
+      {%- set v = users[module.rand.choice(staff)] -%}
+      {%- set t = namespace(v=due) -%}
+      {%- for _ in range(module.rand.weighted_choice([1, 2], [75, 25])) -%}
+        {{- row(t.v, 'Active Directory', 'Modified', 'user', dc, u.sam, v.path, v.sam, false) -}}
+        {%- set t.v = t.v + (ln(20, 0.9) | int) -%}
+      {%- endfor -%}
+    {%- elif r < 0.87 -%}
+      {#- Group membership changes. -#}
+      {%- set t = namespace(v=due) -%}
+      {%- for _ in range(module.rand.weighted_choice([1, 2, 3], [60, 28, 12])) -%}
+        {{- row(t.v, 'Active Directory', 'Modified', 'group', dc, u.sam, module.rand.weighted_choice(shared.get('groups'), shared.get('group_w')), none, false) -}}
+        {%- set t.v = t.v + (ln(25, 0.9) | int) -%}
+      {%- endfor -%}
+    {%- elif r < 0.98 -%}
+      {#- Computer account lifecycle. -#}
+      {%- set a = module.rand.weighted_choice(['Added', 'Modified', 'Removed'], [35, 50, 15]) -%}
+      {%- set cc = module.rand.weighted_choice(['Computers', 'Corp\\Workstations', 'Corp\\Servers'], [30, 60, 10]) -%}
+      {{- row(due, 'Active Directory', a, 'computer', dc, u.sam, base ~ '\\' ~ cc ~ '\\WS-' ~ module.rand.number.integer(1000, 9899), none, false) -}}
+    {%- else -%}
+      {#- Group created or deleted. -#}
+      {{- row(due, 'Active Directory', module.rand.weighted_choice(['Added', 'Removed'], [60, 40]), 'group', dc, u.sam, base ~ '\\Groups\\' ~ module.rand.choice(['Project', 'Team', 'Share', 'App']) ~ ' ' ~ module.rand.choice(shared.get('surnames')) | capitalize, none, false) -}}
+    {%- endif -%}
+    {%- if not oncall.v -%}{{- push(due + module.builtins.int((ln(10 * 60, 1.1) | int) * u.pace), item) -}}{%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- do shared.set('next_due', queue[0][0] if queue else now + sec) -%}
+{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set row = out.row -%}
+{%- set moment = (ts + module.datetime.timedelta(microseconds=out.rec - now)).replace(microsecond=0) -%}
+{%- set iso = moment.strftime('%Y-%m-%dT%H:%M:%SZ') -%}
+{%- set who = netbios ~ '\\' ~ row.who -%}
+{%- set name = row.a ~ ' ' ~ row.c -%}
+{%- macro esc(v) -%}{{- v.replace('\\', '\\\\').replace('=', '\\=') -}}{%- endmacro -%}
+{%- set ext = [['shost', row.dc], ['cat', row.c], ['suser', who], ['filePath', row.what], ['start', moment.strftime('%b %d %Y %H:%M:%S')]] -%}
 {%- set pieces = [] -%}
-{%- for key,value in extension.items() -%}{%- do pieces.append(key ~ '=' ~ value|string) -%}{%- endfor -%}
-{%- set raw = 'CEF:0|Netwrix|Active Directory|1.0|Added|Added user|0|' ~ pieces|join(' ') -%}
-{%- set cef = {'version':0,'vendor':'Netwrix','product':'Active Directory','device_version':'1.0','class_id':'Added','name':'Added user','severity':0,'extension':extension} -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'added-user','category':['iam'],'code':'Added','dataset':'netwrix_auditor.cef','kind':'event','original':raw,'type':['creation']},'host':{'name':params.domain_controller},'user':{'name':operator,'target':{'name':target}},'related':{'user':[operator,target]},'netwrix':{'auditor':cef}} -%}
-{{- out | tojson -}}
+{%- for k, v in ext -%}{%- do pieces.append(k ~ '=' ~ esc(v)) -%}{%- endfor -%}
+{%- set raw = 'CEF:0|Netwrix|' ~ row.p ~ '|1.0|' ~ row.a ~ '|' ~ name ~ '|0|' ~ pieces | join(' ') -%}
+{%- set logon_row = row.p == 'Logon Activity' -%}
+{%- if logon_row -%}
+  {%- set ecs_ev = {'action': row.a | lower | replace(' ', '-'), 'category': ['authentication'], 'type': ['start'], 'outcome': 'success' if row.a == 'Successful Logon' else 'failure'} -%}
+  {%- set user = {'name': row.who, 'domain': netbios} -%}
+  {%- set related = {'user': [row.who], 'hosts': [row.dc, row.what]} -%}
+{%- else -%}
+  {%- set ecs_ev = {'action': (row.a ~ '-' ~ row.c) | lower, 'category': ['iam'], 'type': [row.c if row.c in ['user', 'group'] else 'info', {'Added': 'creation', 'Removed': 'deletion', 'Modified': 'change'}[row.a]]} -%}
+  {%- set user = {'name': row.who, 'domain': netbios} -%}
+  {%- set tgt = row.what.split('\\')[-1] -%}
+  {%- if row.c == 'user' -%}{%- do user.update({'target': {'name': tgt}}) -%}{%- elif row.c == 'group' -%}{%- do user.update({'target': {'group': {'name': tgt}}}) -%}{%- endif -%}
+  {%- set related = {'user': [row.who, tgt] if row.c == 'user' else [row.who], 'hosts': [row.dc]} -%}
+{%- endif -%}
+{%- do ecs_ev.update({'code': row.a, 'dataset': 'cef.log', 'kind': 'event', 'module': 'cef', 'original': raw, 'severity': 0, 'start': iso}) -%}
+{%- set event = {
+  '@timestamp': iso,
+  'cef': {
+    'version': '0',
+    'device': {'vendor': 'Netwrix', 'product': row.p, 'version': '1.0', 'event_class_id': row.a},
+    'name': name,
+    'severity': '0',
+    'extensions': {'sourceHostName': row.dc, 'deviceEventCategory': row.c, 'sourceUserName': who, 'filePath': row.what, 'startTime': iso}
+  },
+  'ecs': {'version': '8.17.0'},
+  'event': ecs_ev,
+  'file': {'path': row.what},
+  'message': name,
+  'observer': {'product': row.p, 'vendor': 'Netwrix', 'version': '1.0'},
+  'related': related,
+  'source': {'domain': row.dc, 'user': {'name': who}},
+  'user': user
+} -%}
+{{- event | tojson -}}
