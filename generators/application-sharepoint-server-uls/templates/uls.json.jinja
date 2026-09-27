@@ -1,82 +1,436 @@
-{%- for flag in ['next_routine_sql', 'next_routine_params', 'next_routine_begin', 'next_anomaly_begin', 'next_anomaly_sql', 'next_anomaly_params'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
-{%- set phase = vars.phase -%}
-{%- set track = vars.track -%}
-{%- if phase == 'begin' -%}
-  {%- do shared.set('pass_time', timestamp) -%}
-  {%- set linked_workflow = track == 'anomaly' or (track == 'routine' and shared.get('routine_count', 0) == 16) -%}
-  {%- set workflow_id = params.suspect_workflow_id if linked_workflow else module.rand.crypto.uuid4() | string -%}
-  {%- set correlation_id = module.rand.crypto.uuid4() | string -%}
-  {%- if linked_workflow -%}
-    {%- set site_id = shared.get('suspect_site_id') or module.rand.crypto.uuid4() | string -%}
-    {%- set web_id = shared.get('suspect_web_id') or module.rand.crypto.uuid4() | string -%}
-    {%- set item_id = shared.get('suspect_item_id') or module.rand.crypto.uuid4() | string -%}
-    {%- set list_id = shared.get('suspect_list_id') or module.rand.crypto.uuid4() | string -%}
-    {%- do shared.update({'suspect_site_id': site_id, 'suspect_web_id': web_id, 'suspect_item_id': item_id, 'suspect_list_id': list_id}) -%}
-  {%- else -%}
-    {%- set site_id = module.rand.crypto.uuid4() | string -%}
-    {%- set web_id = module.rand.crypto.uuid4() | string -%}
-    {%- set item_id = module.rand.crypto.uuid4() | string -%}
-    {%- set list_id = module.rand.crypto.uuid4() | string -%}
+{#- SharePoint Server 2019 ULS trace rows as ECS JSON with the raw
+    tab-separated line. One render emits the earliest due row, stamped
+    with its own time, or drops. Background: per-user browser sessions on
+    two web front ends (request traces, NTLM challenges, access-denied
+    redirects, site-owner permission pages) and the job-workflow timer
+    job on the application server. Times are integer microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set hq = module.heapq -%}
+{%- set sec = 1000000 -%}
+{%- set hour = 3600 * sec -%}
+{#- Guard window of the chain (grant, three or more downloads, revoke by
+    one account on one site); a little above the one-hour detection
+    window so row offsets inside a request cannot straddle it. -#}
+{%- set guard = 3720 * sec -%}
+{%- set build = '16.0.10390.20000' -%}
+{%- macro ln(med, sig) -%}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro activity(t) -%}
+  {#- Share of session arrivals kept at time t: business hours on
+      weekdays, a thin tail in the evening, night and weekend. -#}
+  {%- set d = module.datetime.datetime.fromtimestamp(t / 1000000, module.datetime.timezone.utc) -%}
+  {%- set h = d.hour + d.minute / 60 -%}
+  {%- if d.weekday() >= 5 -%}{{- 0.07 -}}
+  {%- elif 8 <= h < 18 -%}{{- 1.0 -}}
+  {%- elif 7 <= h < 8 or 18 <= h < 20 -%}{{- 0.35 -}}
+  {%- else -%}{{- 0.05 -}}
   {%- endif -%}
-  {%- do shared.update({'workflow_id': workflow_id, 'correlation_id': correlation_id, 'site_id': site_id, 'web_id': web_id, 'item_id': item_id, 'list_id': list_id}) -%}
-  {%- if track == 'anomaly' -%}
-    {%- do shared.set('anomaly_attempt', shared.get('anomaly_attempt', 0) + 1) -%}
-    {%- do shared.set('next_anomaly_sql', true) -%}
-  {%- else -%}
-    {%- do shared.set('next_routine_sql', true) -%}
+{%- endmacro -%}
+{%- macro next_arrival(t, med) -%}
+  {#- Thinned lognormal arrivals: the clock keeps advancing through
+      rejected draws, so quiet hours stretch gaps without a floor. -#}
+  {%- set c = namespace(t=t, done=false) -%}
+  {%- for _ in range(200) if not c.done -%}
+    {%- set c.t = c.t + (ln(med, 1.0) | int) -%}
+    {%- if module.rand.number.floating(0, 1) < (activity(c.t) | float) -%}{%- set c.done = true -%}{%- endif -%}
+  {%- endfor -%}
+  {{- c.t -}}
+{%- endmacro -%}
+{%- macro corr(pi, t) -%}
+  {#- Correlation ID in the shape of Microsoft's samples: first group a
+      little-endian counter that advances every few seconds, third and
+      fourth groups fixed per worker process, the rest random. -#}
+  {%- set p = shared.get('procs')[pi] -%}
+  {%- set c = (p.cbase + t // 4300000) % 4294967296 -%}
+  {{- c.to_bytes(4, 'little').hex() ~ '-' ~ module.rand.string.hex(4) ~ '-' ~ p.g3 ~ '-' ~ p.g4 ~ '-' ~ module.rand.string.hex(12) -}}
+{%- endmacro -%}
+{%- macro row(t, pi, tid, tag, msg, cid, ctx) -%}
+  {{- push(t, {'k': 'row', 'p': pi, 'tid': tid, 'tag': tag, 'msg': msg, 'corr': cid, 'ctx': ctx}) -}}
+{%- endmacro -%}
+{%- macro request(t, user, method, path, site, status) -%}
+  {#- One request trace on a web front end, rows in the order of the
+      Microsoft Q&A trace of SharePoint Server 2019. status 302 adds the
+      redirect row. Returns the end time. -#}
+  {%- set pi = module.rand.choice([0, 1]) -%}
+  {%- set p = shared.get('procs')[pi] -%}
+  {%- set tid = module.rand.choice(p.threads) -%}
+  {%- set url = params.web_app_url ~ ':443' ~ path -%}
+  {%- set name = 'Request (' ~ method ~ ':' ~ url ~ ')' -%}
+  {%- set cid = corr(pi, t) -%}
+  {%- set ctx = {'user': user, 'method': method, 'url': url, 'path': path, 'site': site} -%}
+  {%- set c = namespace(t=t) -%}
+  {{- row(c.t, pi, tid, 'nasq', 'Entering monitored scope (' ~ name ~ ')', '', {}) -}}
+  {%- set c.t = c.t + (ln(0.0003, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'xmnv', 'Name=' ~ name, cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.0004, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'avwhz', "SPRequestModule.BeginRequestHandler End, SP Build Version: '" ~ build ~ "'", cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.0025, 0.8) | int) -%}
+  {{- row(c.t, pi, tid, 'agb9s', 'Non-OAuth request. IsAuthenticated=True, UserIdentityName=0#.w|contoso\\' ~ user ~ ', ClaimsCount=' ~ shared.get('claims')[user], cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.006, 0.8) | int) -%}
+  {{- row(c.t, pi, tid, 'xmnv', 'Site=' ~ site, cid, ctx) -}}
+  {%- set exec_us = (ln(0.12, 0.9) | int) -%}
+  {%- if status == 302 -%}
+    {%- set exec_us = (ln(0.015, 0.7) | int) -%}
+    {{- row(c.t + exec_us * 8 // 10, pi, tid, 'aoxsq', 'Sending HTTP response 302 for HTTP ' ~ method ~ ' request', cid, ctx) -}}
   {%- endif -%}
-{%- else -%}
-  {%- set workflow_id = shared.get('workflow_id') -%}
-  {%- set correlation_id = shared.get('correlation_id') -%}
-  {%- set site_id = shared.get('site_id') -%}
-  {%- set web_id = shared.get('web_id') -%}
-  {%- set item_id = shared.get('item_id') -%}
-  {%- set list_id = shared.get('list_id') -%}
-  {%- if phase == 'sql' -%}
-    {%- do shared.set('next_anomaly_params' if track == 'anomaly' else 'next_routine_params', true) -%}
-  {%- elif track == 'anomaly' -%}
-    {%- if shared.get('anomaly_attempt', 0) < 3 -%}
-      {%- do shared.set('next_anomaly_begin', true) -%}
+  {%- set end = c.t + exec_us -%}
+  {%- set total_ms = (end - t) / 1000 -%}
+  {%- set cpu = [1, module.builtins.int(total_ms * module.rand.number.floating(0.15, 0.7))] | max -%}
+  {%- set sqlq = module.rand.number.integer(0, 3) if status == 302 else [0, module.builtins.int(module.rand.number.lognormal(module.math.log(9), 0.7))] | max -%}
+  {{- row(end, pi, tid, 'b4ly', 'Leaving Monitored Scope: (' ~ name ~ ') Execution Time=' ~ ('%.4f' | format(total_ms)) ~ '; CPU Milliseconds=' ~ cpu ~ '; SQL Query Count=' ~ sqlq ~ '; Parent=None', cid, ctx) -}}
+  {{- end -}}
+{%- endmacro -%}
+{%- macro challenge(t, method, path) -%}
+  {#- Anonymous first request of an NTLM handshake: challenged with 401,
+      no identity. Rows as in the Microsoft Q&A trace. -#}
+  {%- set pi = module.rand.choice([0, 1]) -%}
+  {%- set p = shared.get('procs')[pi] -%}
+  {%- set tid = module.rand.choice(p.threads) -%}
+  {%- set url = params.web_app_url ~ ':443' ~ path -%}
+  {%- set name = 'Request (' ~ method ~ ':' ~ url ~ ')' -%}
+  {%- set cid = corr(pi, t) -%}
+  {%- set ctx = {'method': method, 'url': url, 'path': path} -%}
+  {%- set c = namespace(t=t) -%}
+  {{- row(c.t, pi, tid, 'nasq', 'Entering monitored scope (' ~ name ~ ')', '', {}) -}}
+  {%- set c.t = c.t + (ln(0.0003, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'xmnv', 'Name=' ~ name, cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.0004, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'avwhz', "SPRequestModule.BeginRequestHandler End, SP Build Version: '" ~ build ~ "'", cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.0009, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'agb9s', 'Non-OAuth request. IsAuthenticated=False, UserIdentityName=, ClaimsCount=0', cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.0007, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'af32k', "Claims Windows Sign-In: Sending 401 for request '" ~ url ~ "' because the user is not authenticated and resource requires authentication.", cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.0003, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'b6p2', 'Sending HTTP response 401 - text/plain:401 UNAUTHORIZED.', cid, ctx) -}}
+  {%- set c.t = c.t + (ln(0.0009, 0.6) | int) -%}
+  {{- row(c.t, pi, tid, 'b4ly', 'Leaving Monitored Scope: (' ~ name ~ ') Execution Time=' ~ ('%.4f' | format((c.t - t) / 1000)) ~ '; CPU Milliseconds=' ~ module.rand.number.integer(1, 4) ~ '; SQL Query Count=0; Parent=None', cid, ctx) -}}
+  {{- c.t -}}
+{%- endmacro -%}
+{%- macro base(site) -%}{{- '' if site == '/' else site -}}{%- endmacro -%}
+{%- macro doc_path(site, f) -%}{{- base(site) ~ '/Shared%20Documents/' ~ (f | replace(' ', '%20')) -}}{%- endmacro -%}
+{%- macro note(u, site, kind, t) -%}
+  {#- History of grants and downloads per (account, site), for the chain
+      guard; entries older than the guard window are dropped. -#}
+  {%- set key = u ~ '|' ~ site -%}
+  {%- set hist = shared.get('hist') -%}
+  {%- set lst = hist.get(key, []) | selectattr(0, 'ge', t - guard) | list -%}
+  {%- do lst.append([t, kind]) -%}
+  {%- do hist.update({key: lst}) -%}
+{%- endmacro -%}
+{%- macro chain_ready(u, site, t) -%}
+  {#- True when a revoke by u on site at t would complete the chain: a
+      grant within the guard window followed by three or more downloads
+      of that site by u. -#}
+  {%- set lst = shared.get('hist').get(u ~ '|' ~ site, []) | selectattr(0, 'ge', t - guard) | list -%}
+  {%- set r = namespace(ok=false, g=none) -%}
+  {%- for e in lst -%}
+    {%- if e[1] == 'g' and r.g is none -%}{%- set r.g = e[0] -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if r.g is not none and (lst | selectattr(1, 'equalto', 'd') | selectattr(0, 'gt', r.g) | list | length) >= 3 -%}{%- set r.ok = true -%}{%- endif -%}
+  {{- 'yes' if r.ok else '' -}}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'web_app_url': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^https?://[A-Za-z0-9.-]+$'}},
+    'wfe_hosts': {'type': 'typed-dict-field', 'schema': {'type': 'list', 'items_schema': {'type': 'str'}, 'min_length': 2, 'max_length': 2}},
+    'app_host': {'type': 'typed-dict-field', 'schema': {'type': 'str'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- do shared.update({'queue': [], 'seq': 0, 'hist': {}, 'wf': [], 'last_us': now - 1}) -%}
+  {%- set procs = [] -%}
+  {%- for h in params.wfe_hosts + [params.app_host] -%}
+    {%- set threads = [] -%}
+    {%- for _ in range(module.rand.number.integer(10, 20)) -%}{%- do threads.append(4 * module.rand.number.integer(64, 6000)) -%}{%- endfor -%}
+    {%- do procs.append({'host': h, 'name': 'OWSTIMER.EXE' if loop.last else 'w3wp.exe', 'pid': 4 * module.rand.number.integer(300, 12000), 'threads': threads, 'cbase': module.rand.number.integer(0, 4294967295), 'g3': module.rand.string.hex(4), 'g4': module.rand.string.hex(4)}) -%}
+  {%- endfor -%}
+  {%- do shared.set('procs', procs) -%}
+  {%- set sites = samples.sites | list -%}
+  {%- set users = {} -%}
+  {%- set claims = {} -%}
+  {%- for urow in samples.users -%}
+    {%- set u = urow.account -%}
+    {%- set own = [] -%}
+    {%- for s in sites if u in s.owners -%}{%- do own.append(s.path) -%}{%- endfor -%}
+    {%- set member = own + ['/'] -%}
+    {%- set others = sites | map(attribute='path') | reject('in', member) | list -%}
+    {%- if u == 'svc_crawl' -%}
+      {%- set member = sites | map(attribute='path') | list -%}
     {%- else -%}
-      {%- do shared.set('anomaly_attempt', 0) -%}
-      {%- do shared.set('next_routine_begin', true) -%}
+      {%- for s in module.rand.choices(others, module.rand.number.integer(2, 5)) if s not in member -%}{%- do member.append(s) -%}{%- endfor -%}
     {%- endif -%}
+    {%- do users.update({u: {'own': own, 'member': member, 'busy': false}}) -%}
+    {%- do claims.update({u: module.rand.number.integer(14, 38)}) -%}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * 4 * hour), {'k': 'sess', 'u': u}) -}}
+  {%- endfor -%}
+  {%- do shared.update({'users': users, 'claims': claims, 'wf_sites': sites | selectattr('workflow') | map(attribute='path') | list}) -%}
+  {%- set site_ids = {} -%}
+  {%- for s in sites -%}{%- do site_ids.update({s.path: [module.rand.crypto.uuid4() | string, module.rand.crypto.uuid4() | string, module.rand.crypto.uuid4() | string]}) -%}{%- endfor -%}
+  {%- do shared.set('site_ids', site_ids) -%}
+  {%- do shared.set('docs', samples.documents | map(attribute='name') | list) -%}
+  {{- push(now + module.rand.number.integer(0, 300 * sec), {'k': 'tj', 'sch': now}) -}}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'ep_owner': none, 'ep_site': none, 'ep_due': now + hour + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- set users = shared.get('users') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode: once the due time plus its random delay has passed, the
+    start is thinned by the same activity curve as background sessions.
+    A site owner other than the previous episode's owner, on one of their
+    sites other than the previous episode's site, grants permissions,
+    downloads four to nine documents of that site and removes the
+    permission again within the hour. Every request uses the background
+    request builder and background delays. The next due time is one
+    interval after this start; missed episodes are not replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {%- if module.rand.number.floating(0, 1) >= (activity(now) | float) -%}
+    {%- do shared.set('ep_due', now + (ln(900, 1.0) | int)) -%}
   {%- else -%}
-    {%- set routine_count = shared.get('routine_count', 0) + 1 -%}
-    {%- if routine_count >= params.routine_workflows_before_chain -%}
-      {%- do shared.set('routine_count', 0) -%}
-      {%- do shared.set('next_anomaly_begin' if params.anomaly_mode else 'next_routine_begin', true) -%}
-    {%- else -%}
-      {%- do shared.set('routine_count', routine_count) -%}
-      {%- do shared.set('next_routine_begin', true) -%}
-    {%- endif -%}
+    {%- set owners = [] -%}
+    {%- for u, st in users.items() if st.own and u != shared.get('ep_owner') and (st.own | reject('equalto', shared.get('ep_site')) | list) -%}{%- do owners.append(u) -%}{%- endfor -%}
+    {%- set u = module.rand.choice(owners) -%}
+    {%- set site = module.rand.choice(users[u].own | reject('equalto', shared.get('ep_site')) | list) -%}
+    {%- set start = now + module.rand.number.integer(0, sec - 1) -%}
+    {{- push(start, {'k': 'ep', 'u': u, 'site': site}) -}}
+    {%- do shared.update({'ep_owner': u, 'ep_site': site, 'ep_due': start + interval + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
   {%- endif -%}
 {%- endif -%}
-{%- if phase == 'begin' -%}
-  {%- set area = 'SharePoint Foundation' -%}
-  {%- set category = 'Legacy Workflow Infrastructure' -%}
-  {%- set native_id = 'ahk8y' -%}
-  {%- set level = 'Verbose' -%}
-  {%- set action = 'workflow_begin' -%}
-  {%- set message = 'In RunWorkflowElev(), begin processing events for instance: ' ~ workflow_id -%}
-{%- elif phase == 'sql' -%}
-  {%- set area = 'SharePoint Foundation' -%}
-  {%- set category = 'Database' -%}
-  {%- set native_id = 'b6p4' -%}
-  {%- set level = 'VerboseEx' -%}
-  {%- set action = 'workflow_association_lookup' -%}
-  {%- set message = "SqlCommand: ; EXEC proc_getworkflowassociations '" ~ site_id ~ "', '" ~ web_id ~ "', '" ~ item_id ~ "', '" ~ list_id ~ "', @contenttypeid, @RequestGuid OUTPUT" -%}
-{%- else -%}
-  {%- set area = 'SharePoint Foundation' -%}
-  {%- set category = 'Database' -%}
-  {%- set native_id = 'tzkv' -%}
-  {%- set level = 'Verbose' -%}
-  {%- set action = 'workflow_association_lookup' -%}
-  {%- set message = "SqlCommand: 'proc_GetWorkflowAssociations' CommandType: StoredProcedure CommandTimeout: 0 Parameter: '@RETURN_VALUE' Type: Int Size: 0 Direction: ReturnValue Value: Parameter: '@SiteId' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ site_id ~ "' Parameter: '@WebId' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ web_id ~ "' Parameter: '@Id' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ item_id ~ "' Parameter: '@ListId' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ list_id ~ "' Parameter: '@ContentTypeId' Type: VarBinary Size: 512 Direction: Input Value: Parameter: '@RequestGuid' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ correlation_id ~ "'" -%}
+{%- if now < queue[0][0] -%}
+  {%- do shared.set('next_due', queue[0][0]) -%}
+  {{- dispatch.drop() -}}
 {%- endif -%}
-{%- set pass_time = shared.get('pass_time') -%}
-{%- set event_time = pass_time if phase == 'begin' else pass_time + module.datetime.timedelta(milliseconds=10 if phase == 'sql' else 20) -%}
-{%- set native_time = event_time.strftime('%m/%d/%Y %H:%M:%S.%f')[:-4] -%}
-{%- set native_line = [native_time, 'OWSTIMER.EXE (0x9318)', '0x6DF0', area, category, native_id, level, message, correlation_id] | join('\t') -%}
-{%- set payload = {'@timestamp': event_time.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['process'], 'type': ['info'], 'dataset': 'sharepoint.uls', 'module': 'sharepoint', 'action': action, 'code': native_id, 'original': native_line}, 'host': {'name': params.farm_host}, 'service': {'name': 'SharePoint Server', 'version': '2016'}, 'process': {'name': 'OWSTIMER.EXE', 'pid': 37656, 'thread': {'id': 28144}}, 'message': message, 'log': {'level': level | lower}, 'related': {'hosts': [params.farm_host]}, 'sharepoint': {'uls': {'timestamp_local': native_time, 'process': 'OWSTIMER.EXE (0x9318)', 'thread_id': '0x6DF0', 'area': area, 'category': category, 'event_id': native_id, 'level': level, 'message': message, 'correlation_id': correlation_id}, 'workflow': {'instance_id': workflow_id, 'site_id': site_id, 'web_id': web_id, 'item_id': item_id, 'list_id': list_id}}} -%}
-{{- payload | tojson -}}
+{%- set out = namespace(row=none, t=0) -%}
+{%- for _ in range(64) if out.row is none and queue and queue[0][0] <= now -%}
+  {%- set top = hq.heappop(queue) -%}
+  {%- set due = top[0] -%}
+  {%- set item = top[2] -%}
+  {%- if item.k == 'row' -%}
+    {%- set out.row = item -%}
+    {%- set out.t = [due, shared.get('last_us') + 1] | max -%}
+    {%- do shared.set('last_us', out.t) -%}
+  {%- elif item.k == 'sess' -%}
+    {#- Session arrival; a session still running absorbs the arrival. -#}
+    {%- set crawl = item.u == 'svc_crawl' -%}
+    {{- push(next_arrival(due, 5400 if crawl else (7200 if users[item.u].own else 10800)) | int, item) -}}
+    {%- set st = users[item.u] -%}
+    {%- if not st.busy -%}
+      {%- do st.update({'busy': true}) -%}
+      {%- set n = namespace(v=1, go=true) -%}
+      {%- for _ in range(40 if crawl else 24) if n.go -%}
+        {%- if module.rand.chance(0.93 if crawl else 0.8) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
+      {%- endfor -%}
+      {{- push(due, {'k': 'op', 'u': item.u, 'site': module.rand.choice(st.own if st.own and module.rand.chance(0.6) else st.member), 'left': n.v, 'first': true}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'op' -%}
+    {#- One user action inside a session. Owners also open the site
+        permissions page, grant permissions and plan the removal of a
+        grant. -#}
+    {%- set u = item.u -%}
+    {%- set st = users[u] -%}
+    {%- set crawl = u == 'svc_crawl' -%}
+    {%- set site = item.site -%}
+    {%- set t = namespace(v=due) -%}
+    {%- if item.first and not crawl and module.rand.chance(0.7) -%}
+      {%- set t.v = (challenge(t.v, 'GET', base(site) ~ '/SitePages/Home.aspx') | int) + (ln(0.05, 0.6) | int) -%}
+    {%- endif -%}
+    {%- set r = module.rand.number.floating(0, 1) -%}
+    {%- set owner = site in st.own -%}
+    {%- if crawl -%}
+      {%- set op = 'library' if r < 0.15 else 'download' -%}
+    {%- elif site not in st.member -%}
+      {%- set op = 'denied' -%}
+    {%- elif owner and r < 0.12 -%}
+      {%- set op = 'grant' -%}
+    {%- elif owner and r < 0.22 -%}
+      {%- set op = 'perms' -%}
+    {%- else -%}
+      {%- set r2 = module.rand.number.floating(0, 1) -%}
+      {%- set op = 'home' if r2 < 0.3 else ('root' if r2 < 0.38 else ('library' if r2 < 0.58 else ('download' if r2 < 0.9 else 'upload'))) -%}
+    {%- endif -%}
+    {%- if op == 'home' -%}
+      {%- set _ = request(t.v, u, 'GET', base(site) ~ '/SitePages/Home.aspx', site, 200) -%}
+    {%- elif op == 'root' -%}
+      {%- set e = request(t.v, u, 'GET', site, site, 302) | int -%}
+      {%- set _ = request(e + (ln(0.08, 0.6) | int), u, 'GET', base(site) ~ '/SitePages/Home.aspx', site, 200) -%}
+    {%- elif op == 'library' -%}
+      {%- set _ = request(t.v, u, 'GET', base(site) ~ '/Shared%20Documents/Forms/AllItems.aspx', site, 200) -%}
+    {%- elif op == 'download' -%}
+      {%- set _ = request(t.v, u, 'GET', doc_path(site, samples.documents.pick().name), site, 200) -%}
+      {{- note(u, site, 'd', t.v) -}}
+    {%- elif op == 'upload' -%}
+      {%- set _ = request(t.v, u, 'POST', base(site) ~ '/_layouts/15/Upload.aspx?List=%7B' ~ (shared.get('site_ids')[site][2] | upper) ~ '%7D', site, 200) -%}
+      {%- if site in shared.get('wf_sites') and module.rand.chance(0.6) and shared.get('wf') | length < 200 -%}
+        {%- set ids = shared.get('site_ids')[site] -%}
+        {%- do shared.get('wf').append({'id': module.rand.crypto.uuid4() | string, 'site': ids[0], 'web': ids[1], 'list': ids[2], 'item': module.rand.crypto.uuid4() | string, 'next': t.v + (ln(240, 1.0) | int), 'left': module.rand.number.integer(1, 3)}) -%}
+      {%- endif -%}
+    {%- elif op == 'perms' -%}
+      {%- set _ = request(t.v, u, 'GET', base(site) ~ '/_layouts/15/user.aspx', site, 200) -%}
+    {%- elif op == 'grant' -%}
+      {#- Grant permissions from the share dialog; the removal of this
+          grant is planned for 75% of grants: 40% are quick reverts
+          (median 15 minutes), the rest follow hours later. -#}
+      {%- set _ = request(t.v, u, 'POST', base(site) ~ '/_layouts/15/aclinv.aspx', site, 200) -%}
+      {{- note(u, site, 'g', t.v) -}}
+      {%- if module.rand.chance(0.75) -%}
+        {{- push(t.v + ((ln(900, 0.8) if module.rand.chance(0.4) else ln(10800, 1.0)) | int), {'k': 'rev', 'u': u, 'site': site}) -}}
+      {%- endif -%}
+    {%- elif op == 'denied' -%}
+      {#- Browsing a site without access: 302 to the access-denied page,
+          sometimes retried within minutes. -#}
+      {%- set path = base(site) ~ ('/SitePages/Home.aspx' if module.rand.chance(0.6) else '/Shared%20Documents/Forms/AllItems.aspx') -%}
+      {%- set tries = namespace(v=1, go=true) -%}
+      {%- for _ in range(3) if tries.go -%}
+        {%- if module.rand.chance(0.35) -%}{%- set tries.v = tries.v + 1 -%}{%- else -%}{%- set tries.go = false -%}{%- endif -%}
+      {%- endfor -%}
+      {%- for _ in range(tries.v) -%}
+        {%- set e = request(t.v, u, 'GET', path, site, 302) | int -%}
+        {%- set t.v = request(e + (ln(0.1, 0.6) | int), u, 'GET', base(site) ~ '/_layouts/15/AccessDenied.aspx?Source=' ~ (params.web_app_url ~ path) | urlencode, site, 200) | int -%}
+        {%- set t.v = t.v + (ln(25, 1.0) | int) -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- if item.left > 1 -%}
+      {%- set nsite = site if module.rand.chance(0.7) else module.rand.choice(st.member if module.rand.chance(0.95) else shared.get('site_ids').keys() | list) -%}
+      {{- push(t.v + (ln(40, 1.1) | int), {'k': 'op', 'u': u, 'site': nsite, 'left': item.left - 1, 'first': false}) -}}
+    {%- else -%}
+      {%- do st.update({'busy': false}) -%}
+    {%- endif -%}
+  {%- elif item.k == 'rev' -%}
+    {#- Planned removal of a grant, in 45% of cases after the owner
+        first downloads one to six documents of the site. When the
+        removal would complete the chain it becomes a view of the
+        permissions page instead. -#}
+    {%- set t = namespace(v=due) -%}
+    {%- if module.rand.chance(0.45) -%}
+      {%- for _ in range(module.rand.number.integer(1, 6)) -%}
+        {{- note(item.u, item.site, 'd', t.v) -}}
+        {%- set t.v = (request(t.v, item.u, 'GET', doc_path(item.site, samples.documents.pick().name), item.site, 200) | int) + (ln(40, 1.1) | int) -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- if chain_ready(item.u, item.site, t.v) -%}
+      {%- set _ = request(t.v, item.u, 'GET', base(item.site) ~ '/_layouts/15/user.aspx', item.site, 200) -%}
+    {%- else -%}
+      {%- set _ = request(t.v, item.u, 'POST', base(item.site) ~ '/_layouts/15/user.aspx', item.site, 200) -%}
+    {%- endif -%}
+  {%- elif item.k == 'ep' -%}
+    {%- set u = item.u -%}
+    {%- set site = item.site -%}
+    {%- set t = namespace(v=due) -%}
+    {%- if module.rand.chance(0.7) -%}
+      {%- set t.v = (challenge(t.v, 'GET', base(site) ~ '/SitePages/Home.aspx') | int) + (ln(0.05, 0.6) | int) -%}
+    {%- endif -%}
+    {%- if module.rand.chance(0.5) -%}
+      {%- set t.v = (request(t.v, u, 'GET', base(site) ~ '/_layouts/15/user.aspx', site, 200) | int) + (ln(40, 1.1) | int) -%}
+    {%- endif -%}
+    {%- set g = t.v -%}
+    {%- set t.v = (request(t.v, u, 'POST', base(site) ~ '/_layouts/15/aclinv.aspx', site, 200) | int) + (ln(40, 1.1) | int) -%}
+    {{- note(u, site, 'g', g) -}}
+    {%- if module.rand.chance(0.6) -%}
+      {%- set t.v = (request(t.v, u, 'GET', base(site) ~ '/Shared%20Documents/Forms/AllItems.aspx', site, 200) | int) + (ln(40, 1.1) | int) -%}
+    {%- endif -%}
+    {%- for f in module.random.sample(shared.get('docs'), module.rand.number.integer(4, 9)) -%}
+      {{- note(u, site, 'd', t.v) -}}
+      {%- set t.v = (request(t.v, u, 'GET', doc_path(site, f), site, 200) | int) + (ln(40, 1.1) | int) -%}
+    {%- endfor -%}
+    {%- set d = namespace(v=t.v + (ln(300, 1.1) | int)) -%}
+    {%- for _ in range(40) if d.v - g > 3300 * sec -%}{%- set d.v = t.v + (ln(300, 1.1) | int) -%}{%- endfor -%}
+    {%- if d.v - g > 3300 * sec -%}{%- set d.v = t.v + module.rand.number.integer(sec, 30 * sec) -%}{%- endif -%}
+    {%- set _ = request(d.v, u, 'POST', base(site) ~ '/_layouts/15/user.aspx', site, 200) -%}
+  {%- elif item.k == 'tj' -%}
+    {#- job-workflow timer job on the application server: a five-minute
+        schedule with a random start latency; each run processes the
+        workflow instances whose next event is due (ahk8y, b6p4, tzkv
+        per instance, one correlation ID per run). -#}
+    {%- set sch = item.sch + 300 * sec -%}
+    {{- push(sch + (ln(2.5, 0.9) | int), {'k': 'tj', 'sch': sch}) -}}
+    {%- set pi = 2 -%}
+    {%- set p = shared.get('procs')[pi] -%}
+    {%- set tid = module.rand.choice(p.threads) -%}
+    {%- set cid = corr(pi, due) -%}
+    {%- set name = 'Timer Job job-workflow' -%}
+    {%- set c = namespace(t=due, sql=0) -%}
+    {{- row(c.t, pi, tid, 'nasq', 'Entering monitored scope (' ~ name ~ ')', '', {}) -}}
+    {%- set c.t = c.t + (ln(0.0005, 0.6) | int) -%}
+    {{- row(c.t, pi, tid, 'xmnv', 'Name=' ~ name, cid, {}) -}}
+    {%- set keep = [] -%}
+    {%- set done = namespace(n=0) -%}
+    {%- for w in shared.get('wf') -%}
+      {%- if w.next <= due and done.n < 8 -%}
+        {%- set done.n = done.n + 1 -%}
+        {%- set wctx = {'wf': w} -%}
+        {%- set c.t = c.t + (ln(0.015, 0.8) | int) -%}
+        {{- row(c.t, pi, tid, 'ahk8y', 'In RunWorkflowElev(), begin processing events for instance: ' ~ w.id, cid, wctx) -}}
+        {%- set c.t = c.t + (ln(0.004, 0.8) | int) -%}
+        {{- row(c.t, pi, tid, 'b6p4', "SqlCommand: ; EXEC proc_getworkflowassociations '" ~ w.site ~ "', '" ~ w.web ~ "', '" ~ w.item ~ "', '" ~ w.list ~ "', @contenttypeid, @RequestGuid OUTPUT", cid, wctx) -}}
+        {{- row(c.t, pi, tid, 'tzkv', "SqlCommand: 'proc_GetWorkflowAssociations' CommandType: StoredProcedure CommandTimeout: 0 Parameter: '@RETURN_VALUE' Type: Int Size: 0 Direction: ReturnValue Value: Parameter: '@SiteId' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ w.site ~ "' Parameter: '@WebId' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ w.web ~ "' Parameter: '@Id' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ w.item ~ "' Parameter: '@ListId' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ w.list ~ "' Parameter: '@ContentTypeId' Type: VarBinary Size: 512 Direction: Input Value: Parameter: '@RequestGuid' Type: UniqueIdentifier Size: 0 Direction: Input Value: '" ~ cid ~ "'", cid, wctx) -}}
+        {%- set c.sql = c.sql + module.rand.number.integer(6, 20) -%}
+        {%- if w.left > 1 -%}
+          {%- do w.update({'left': w.left - 1, 'next': due + (ln(3600, 1.2) | int)}) -%}
+          {%- do keep.append(w) -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- do keep.append(w) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do shared.set('wf', keep) -%}
+    {%- set c.t = c.t + (ln(0.03, 0.8) | int) -%}
+    {%- set total_ms = (c.t - due) / 1000 -%}
+    {{- row(c.t, pi, tid, 'b4ly', 'Leaving Monitored Scope: (' ~ name ~ ') Execution Time=' ~ ('%.4f' | format(total_ms)) ~ '; CPU Milliseconds=' ~ [1, module.builtins.int(total_ms * module.rand.number.floating(0.2, 0.6))] | max ~ '; SQL Query Count=' ~ (c.sql + module.rand.number.integer(1, 4)) ~ '; Parent=None', cid, {}) -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- do shared.set('next_due', queue[0][0] if queue else now + sec) -%}
+{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set r = out.row -%}
+{%- set p = shared.get('procs')[r.p] -%}
+{%- set meta = {
+  'nasq': ['Monitoring', 'Medium', 'monitored-scope-enter', 'web'],
+  'b4ly': ['Monitoring', 'Medium', 'monitored-scope-leave', 'web'],
+  'xmnv': ['Logging Correlation Data', 'Medium', 'correlation-data', 'web'],
+  'avwhz': ['Asp Runtime', 'Medium', 'begin-request-end', 'web'],
+  'agb9s': ['Authentication Authorization', 'Medium', 'request-identity', 'authentication'],
+  'af32k': ['Claims Authentication', 'Medium', 'windows-sign-in-challenge', 'authentication'],
+  'b6p2': ['General', 'Medium', 'http-response', 'web'],
+  'aoxsq': ['Runtime', 'Medium', 'http-response', 'web'],
+  'ahk8y': ['Legacy Workflow Infrastructure', 'Verbose', 'workflow-begin', 'process'],
+  'b6p4': ['Database', 'VerboseEx', 'workflow-association-lookup', 'database'],
+  'tzkv': ['Database', 'Verbose', 'workflow-association-lookup', 'database']
+}[r.tag] -%}
+{%- if p.name == 'OWSTIMER.EXE' and r.tag in ['nasq', 'b4ly', 'xmnv'] -%}{%- set meta = meta[:3] + ['process'] -%}{%- endif -%}
+{%- set d = module.datetime.datetime.fromtimestamp(out.t // 10000 / 100, module.datetime.timezone.utc) -%}
+{%- set native_time = d.strftime('%m/%d/%Y %H:%M:%S.') ~ ('%02d' | format(out.t // 10000 % 100)) -%}
+{%- set proc_col = p.name ~ ' (0x' ~ ('%04X' | format(p.pid)) ~ ')' -%}
+{%- set tid_col = '0x' ~ ('%04X' | format(r.tid)) -%}
+{%- set line = [native_time, proc_col, tid_col, 'SharePoint Foundation', meta[0], r.tag, meta[1], r.msg, r.corr] | join('\t') -%}
+{%- set uls = {'timestamp_local': native_time, 'process': proc_col, 'thread_id': tid_col, 'area': 'SharePoint Foundation', 'category': meta[0], 'event_id': r.tag, 'level': meta[1], 'message': r.msg} -%}
+{%- if r.corr -%}{%- do uls.update({'correlation_id': r.corr}) -%}{%- endif -%}
+{%- set sp = {'uls': uls} -%}
+{%- set ev = {'@timestamp': d.strftime('%Y-%m-%dT%H:%M:%S.') ~ ('%02d' | format(out.t // 10000 % 100)) ~ '0Z', 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': [meta[3]], 'type': ['info'], 'dataset': 'sharepoint.uls', 'module': 'sharepoint', 'action': meta[2], 'code': r.tag, 'original': line},
+  'host': {'name': p.host}, 'service': {'name': 'SharePoint Server', 'version': build},
+  'process': {'name': p.name, 'pid': p.pid, 'thread': {'id': r.tid}},
+  'log': {'level': meta[1] | lower}, 'message': r.msg} -%}
+{%- set related = {'hosts': [p.host]} -%}
+{%- set ctx = r.ctx -%}
+{%- if ctx.url -%}
+  {%- set pq = ctx.path.split('?', 1) -%}
+  {%- set u = {'original': ctx.url, 'scheme': ctx.url.split(':', 1)[0], 'domain': ctx.url.split('/')[2].split(':')[0], 'port': 443, 'path': pq[0]} -%}
+  {%- if pq | length > 1 -%}{%- do u.update({'query': pq[1]}) -%}{%- endif -%}
+  {%- do ev.update({'url': u, 'http': {'request': {'method': ctx.method}}}) -%}
+{%- endif -%}
+{%- if ctx.user -%}
+  {%- do ev.update({'user': {'name': ctx.user, 'domain': 'contoso'}}) -%}
+  {%- do related.update({'user': [ctx.user]}) -%}
+{%- endif -%}
+{%- if ctx.site -%}{%- do sp.update({'site': {'url': ctx.site}}) -%}{%- endif -%}
+{%- if ctx.wf -%}{%- do sp.update({'workflow': {'instance_id': ctx.wf.id, 'site_id': ctx.wf.site, 'web_id': ctx.wf.web, 'list_id': ctx.wf.list, 'item_id': ctx.wf.item}}) -%}{%- endif -%}
+{%- do ev.update({'related': related, 'sharepoint': sp}) -%}
+{{- ev | tojson -}}
