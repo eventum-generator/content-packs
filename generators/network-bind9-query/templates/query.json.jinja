@@ -1,38 +1,244 @@
-{%- for flag in ['to_start', 'to_chunk_1', 'to_chunk_2', 'to_chunk_3', 'to_chunk_4', 'to_done', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 48 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}
-      {%- do shared.set('chain_id', module.rand.string.hex(8)) -%}
-      {%- do shared.set('to_start', true) -%}
+{#- One BIND 9.18 recursive resolver writing its `queries` category.
+    Each one-second tick emits at most one query record, taken from a
+    due-queue fed by independent per-client random processes. The
+    anomaly episode only adds a run of high-entropy TXT queries by one
+    client to one attacker zone; it never touches the background queue.
+
+    Native line (queries category, iso8601-utc file channel with
+    print-category and print-severity):
+      <iso8601z> queries: info: client @0x<ptr> <ip>#<port> \
+        (<qname>): query: <qname> <class> <type> <flags> (<destaddr>)
+    Format from BIND 9.18.28 lib/ns/client.c ns_client_logv,
+    lib/ns/query.c log_query, lib/isc/log.c and lib/isc/time.c. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set chain_steps = 8 -%}
+{%- set window = 3600 -%}
+{%- set tunnels = params.tunnel_zones -%}
+{%- set analytics = params.analytics_zones -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.client_count < 4 or params.client_first + params.client_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- if tunnels | length < 2 or analytics | length < 2 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set clients = [] -%}
+  {%- set weights = [] -%}
+  {%- set day = {} -%}
+  {%- for n in range(params.client_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do clients.append(ip) -%}
+    {%- do weights.append(module.rand.number.lognormal(0, 0.9)) -%}
+    {#- Own active window and off-hours rate per client: no shared
+        population-wide daily wave. -#}
+    {%- do day.update({ip: [module.rand.number.floating(0, 24),
+        module.rand.number.floating(6, 13),
+        module.rand.number.floating(0.1, 0.6)]}) -%}
+  {%- endfor -%}
+  {%- set checked = module.ipaddress.IPv4Address(params.server_ip) -%}
+  {%- set web = [] -%}
+  {%- for host in ['www', 'mail', 'api', 'app', 'cdn', 'vpn', 'portal', 'updates'] -%}
+    {%- for dom in ['example.com', 'example.net', 'example.org'] -%}
+      {%- do web.append(host ~ '.' ~ dom) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'clients': clients,
+      'weights': weights, 'day': day, 'web': web, 'q': [], 'hist': {},
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_client': none, 'last_zone': none}) -%}
+{%- endif -%}
+
+{%- set clients = shared.get('clients') -%}
+{%- set q = shared.get('q') -%}
+{%- set web = shared.get('web') -%}
+{%- set hist = shared.get('hist') -%}
+{%- if now % 600 == 0 -%}
+  {%- for k in hist | list -%}
+    {%- set keep = hist[k] | select('gt', now - window) | list -%}
+    {%- if keep -%}{%- do hist.update({k: keep}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- set dt = timestamp.astimezone(utc) -%}
+{%- set hour = dt.hour + dt.minute / 60 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 0] | max -}}
+{%- endmacro -%}
+
+{%- macro hexlabel() -%}
+{{- module.rand.string.hex(module.rand.number.integer(24, 62)) -}}
+{%- endmacro -%}
+
+{#- Queue one query: name, registered zone, type, transport, at time. -#}
+{%- macro enq(client, name, zone, qtype, tcp, at) -%}
+  {%- do q.append({'due': at, 'client': client, 'name': name, 'zone': zone,
+      'qtype': qtype, 'tcp': tcp}) -%}
+{%- endmacro -%}
+
+{#- 1. Background: one merged Poisson stream of independent clients,
+    thinned by each client's own active window. -#}
+{%- set cand = module.rand.weighted_choice(clients, shared.get('weights')) -%}
+{%- set dw = shared.get('day')[cand] -%}
+{%- set active = ((hour - dw[0]) % 24) < dw[1] -%}
+{%- if module.rand.chance(0.1 * (1.0 if active else dw[2])) -%}
+  {%- set c = cand -%}
+  {%- set tcp = module.rand.chance(0.03) -%}
+  {%- set profile = module.rand.weighted_choice(
+      ['web', 'mail', 'txt_auth', 'ptr', 'analytics', 'tunnel_bg'],
+      [174, 27, 18, 54, 12, 10]) -%}
+  {%- if profile == 'web' -%}
+    {%- set host = module.rand.choice(web) -%}
+    {%- set zone = host.split('.', 1)[1] -%}
+    {{- enq(c, host, zone, 'A', tcp, now) -}}
+    {%- if module.rand.chance(0.55) -%}
+      {{- enq(c, host, zone, 'AAAA', tcp, now + module.rand.weighted_choice([0, 1], [70, 30])) -}}
     {%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- set qtype = module.rand.weighted_choice(['A', 'AAAA', 'MX'], [70, 20, 10]) -%}
-  {%- set qname = module.rand.choice(['www.example.test', 'mail.example.test', 'updates.example.test', 'vpn.example.test']) -%}
-  {%- set client_ip = module.rand.choice(['10.20.40.11', '10.20.40.12', '10.20.40.13']) -%}
-{%- else -%}
-  {%- set client_ip = params.suspect_ip -%}
-  {%- if stage == 'start' -%}
-    {%- set qtype = 'A' -%}
-    {%- set qname = 'start.' ~ shared.get('chain_id') ~ '.' ~ params.tunnel_domain -%}
-    {%- do shared.set('to_chunk_1', true) -%}
-  {%- elif stage.startswith('chunk_') -%}
-    {%- set qtype = 'TXT' -%}
-    {%- set qname = module.rand.string.hex(48) ~ '.' ~ shared.get('chain_id') ~ '.' ~ params.tunnel_domain -%}
-    {%- set chunk = stage[-1] | int -%}
-    {%- do shared.set('to_chunk_' ~ (chunk + 1), true) if chunk < 4 else shared.set('to_done', true) -%}
+  {%- elif profile == 'mail' -%}
+    {%- set dom = module.rand.choice(['example.com', 'example.net', 'example.org']) -%}
+    {{- enq(c, dom, dom, 'MX', tcp, now) -}}
+    {%- if module.rand.chance(0.7) -%}
+      {{- enq(c, 'mx.' ~ dom, dom, 'A', tcp, now + module.rand.weighted_choice([0, 1], [60, 40])) -}}
+    {%- endif -%}
+  {%- elif profile == 'txt_auth' -%}
+    {%- set dom = module.rand.choice(['example.com', 'example.net', 'example.org']) -%}
+    {%- if module.rand.chance(0.5) -%}
+      {%- set sel = module.rand.string.hex(module.rand.number.integer(6, 16)) -%}
+      {{- enq(c, sel ~ '._domainkey.' ~ dom, dom, 'TXT', tcp, now) -}}
+    {%- else -%}
+      {{- enq(c, '_dmarc.' ~ dom, dom, 'TXT', tcp, now) -}}
+    {%- endif -%}
+  {%- elif profile == 'ptr' -%}
+    {%- set o = [module.rand.number.integer(1, 254), module.rand.number.integer(0, 255),
+        module.rand.number.integer(0, 255)] -%}
+    {%- set zone = o[1] ~ '.' ~ o[0] ~ '.10.in-addr.arpa' -%}
+    {{- enq(c, o[2] ~ '.' ~ zone, zone, 'PTR', tcp, now) -}}
+  {%- elif profile == 'analytics' -%}
+    {#- Long high-entropy TXT runs to a legitimate analytics zone: the
+        same shape as an exfil chain, but not an attacker zone. Length
+        is unbounded (lognormal), so background does reach and exceed
+        the chain length on a zone that is not a tunnel. -#}
+    {%- set zone = module.rand.choice(analytics) -%}
+    {%- set runlen = [(module.rand.number.lognormal(module.math.log(3), 0.9)) | round | int, 1] | max -%}
+    {%- set at = namespace(t=now) -%}
+    {%- for i in range(runlen) -%}
+      {{- enq(c, hexlabel() ~ '.' ~ zone, zone, 'TXT', tcp, at.t) -}}
+      {%- set at.t = at.t + gap(20, 1.0) | int -%}
+    {%- endfor -%}
   {%- else -%}
-    {%- set qtype = 'A' -%}
-    {%- set qname = 'done.' ~ shared.get('chain_id') ~ '.' ~ params.tunnel_domain -%}
-    {%- do shared.set('to_routine', true) -%}
-    {%- do shared.pop('chain_id', none) -%}
+    {#- Occasional short high-entropy TXT touches on an attacker zone
+        (ordinary background probing / stray lookups). Guard on the
+        final chain step: a client keeps fewer than `chain_steps - 1`
+        background TXT on one tunnel zone within `window` seconds either
+        side, the overflow goes to an analytics zone, so background never
+        completes an ordered run of `chain_steps` TXT to one tunnel. -#}
+    {#- Uniform client (thinned by its own window), so a heavy client
+        does not concentrate these touches and the guard rarely fires. -#}
+    {%- set u = module.rand.choice(clients) -%}
+    {%- set uw = shared.get('day')[u] -%}
+    {%- if ((hour - uw[0]) % 24) < uw[1] or module.rand.chance(uw[2]) -%}
+      {%- set c = u -%}
+    {%- endif -%}
+    {%- set zone = module.rand.choice(tunnels) -%}
+    {%- set hk = c ~ '|' ~ zone -%}
+    {#- Geometric run length (continue with p 0.35): decays smoothly and
+        passes 6 in about 0.2% of runs, so the guard rarely fires. -#}
+    {%- set rl = namespace(n=1, go=true) -%}
+    {%- for i in range(12) -%}
+      {%- if rl.go and module.rand.chance(0.35) -%}{%- set rl.n = rl.n + 1 -%}
+      {%- else -%}{%- set rl.go = false -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set runlen = rl.n -%}
+    {%- set at = namespace(t=now) -%}
+    {%- for i in range(runlen) -%}
+      {%- set near = hist.get(hk, []) | select('gt', at.t - window)
+          | select('lt', at.t + window) | list | length -%}
+      {%- if near < chain_steps - 2 -%}
+        {{- enq(c, hexlabel() ~ '.' ~ zone, zone, 'TXT', tcp, at.t) -}}
+        {%- do hist.update({hk: hist.get(hk, []) + [at.t]}) -%}
+      {%- else -%}
+        {%- set alt = module.rand.choice(analytics) -%}
+        {{- enq(c, hexlabel() ~ '.' ~ alt, alt, 'TXT', tcp, at.t) -}}
+      {%- endif -%}
+      {%- set at.t = at.t + gap(15, 0.9) | int -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {#- Every client also does plain apex lookups of the attacker zones,
+      so the zone itself is present in ordinary traffic of both modes. -#}
+  {%- if module.rand.chance(0.02) -%}
+    {%- set z = module.rand.choice(tunnels) -%}
+    {{- enq(c, z, z, module.rand.weighted_choice(['A', 'AAAA', 'NS'], [70, 20, 10]), tcp, now) -}}
   {%- endif -%}
 {%- endif -%}
-{%- set client_port = module.rand.number.integer(10000, 59999) -%}
-{%- set client_object = module.rand.string.hex(8) -%}
-{%- set stamp = timestamp.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] -%}
-{%- set original = stamp ~ ' client @0x' ~ client_object ~ ' ' ~ client_ip ~ '#' ~ client_port ~ ' (' ~ qname ~ '): query: ' ~ qname ~ ' IN ' ~ qtype ~ ' - (' ~ params.server_ip ~ ')' -%}
-{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['network'], 'type': ['protocol'], 'action': 'dns-query', 'original': original}, 'host': {'name': params.host_name}, 'source': {'ip': client_ip, 'port': client_port}, 'destination': {'ip': params.server_ip, 'port': 53}, 'network': {'protocol': 'dns', 'transport': 'udp'}, 'dns': {'type': 'query', 'question': {'name': qname, 'class': 'IN', 'type': qtype}}, 'related': {'ip': [client_ip, params.server_ip]}, 'bind9': {'query': {'client_object': '@0x' ~ client_object, 'flags': '-'}}} -%}
-{{- payload | tojson -}}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, no catch-up. One rotated client sends a run of
+    high-entropy TXT queries to one rotated attacker zone. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 900)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set c = module.rand.choice(clients | reject('equalto', shared.get('last_client')) | list) -%}
+    {%- set zone = module.rand.choice(tunnels | reject('equalto', shared.get('last_zone')) | list) -%}
+    {%- set n = module.rand.number.integer(chain_steps + 2, chain_steps + 8) -%}
+    {%- set at = namespace(t=now) -%}
+    {%- for i in range(n) -%}
+      {%- set tcp = module.rand.chance(0.03) -%}
+      {{- enq(c, hexlabel() ~ '.' ~ zone, zone, 'TXT', tcp, at.t) -}}
+      {%- set at.t = at.t + gap(12, 0.8) | int -%}
+    {%- endfor -%}
+    {%- do shared.update({'start_at': none, 'last_client': c, 'last_zone': zone,
+        'next_due': now + (interval * 3600) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due query, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+
+{#- Flags: recursion, EDNS, TCP, DO, CD, cookie. Order per query.c. -#}
+{%- set rd = '+' if module.rand.chance(0.98) else '-' -%}
+{%- set has_opt = module.rand.chance(0.9) -%}
+{%- set edns = 'E(0)' if has_opt else '' -%}
+{%- set t = 'T' if e.tcp else '' -%}
+{#- DO and the COOKIE option live in the EDNS OPT record
+    (client.c process_opt), so they need E(0). -#}
+{%- set d = 'D' if has_opt and module.rand.chance(0.15) else '' -%}
+{%- set ck = module.rand.weighted_choice(['K', 'V', ''], [55, 20, 25]) if has_opt else '' -%}
+{%- set flags = rd ~ edns ~ t ~ d ~ ck -%}
+{%- set port = module.rand.number.integer(1024, 65535) -%}
+{%- set obj = '0x7f' ~ module.rand.string.hex(10) -%}
+{%- set ms = module.rand.number.integer(0, 999) -%}
+{%- set iso = module.datetime.datetime.fromtimestamp(now, utc)
+    + module.datetime.timedelta(milliseconds=ms) -%}
+{%- set stamp = iso.strftime('%Y-%m-%dT%H:%M:%S') ~ '.' ~ '%03d' | format(ms) ~ 'Z' -%}
+{%- set transport = 'tcp' if e.tcp else 'udp' -%}
+{%- set raw = stamp ~ ' queries: info: client @' ~ obj ~ ' ' ~ e.client
+    ~ '#' ~ port ~ ' (' ~ e.name ~ '): query: ' ~ e.name ~ ' IN '
+    ~ e.qtype ~ ' ' ~ flags ~ ' (' ~ params.server_ip ~ ')' -%}
+{%- set record = {'@timestamp': iso.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'bind9.query', 'category': ['network'],
+    'type': ['protocol', 'info'], 'action': 'dns-query', 'original': raw},
+  'host': {'name': params.server_name},
+  'observer': {'hostname': params.server_name, 'vendor': 'ISC', 'product': 'BIND', 'type': 'dns'},
+  'source': {'ip': e.client, 'port': port},
+  'destination': {'ip': params.server_ip, 'port': 53},
+  'network': {'protocol': 'dns', 'transport': transport},
+  'dns': {'type': 'query',
+    'question': {'name': e.name, 'class': 'IN', 'type': e.qtype,
+      'registered_domain': e.zone}},
+  'related': {'ip': [e.client, params.server_ip]},
+  'bind9': {'query': {'client_object': '@' ~ obj, 'flags': flags}}} -%}
+{{ record | tojson }}
