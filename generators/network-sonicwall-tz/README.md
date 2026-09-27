@@ -57,11 +57,11 @@ Edit `event.template.params` in `generator.yml`:
 | `anomaly_mode` | `true` | Add periodic episodes to the background |
 | `anomaly_interval_hours` | `24` | Episode interval in source hours, 2-8760 |
 | `firewall_wan_ip` | `192.0.2.10` | Firewall WAN address: `fw=` and the Syslog header host |
-| `firewall_serial` | `02DEADBEEF01` | Synthetic serial (`sn=`, 12 hex digits); also the firewall MAC in m=14 `dstMac` |
+| `firewall_serial` | `02DEADBEEF01` | Synthetic serial (`sn=`, 12 characters; use hex digits); also the firewall MAC in m=14 `dstMac` |
 | `upstream_mac` | `02:00:5e:00:53:01` | MAC of the upstream router, `dstMac` of forwarded traffic |
 | `client_prefix` | `10.20.30.` | Client addresses are this prefix plus a host number |
 | `client_first` | `20` | First client host number |
-| `client_count` | `40` | Number of LAN clients (at least 8) |
+| `client_count` | `40` | Number of LAN clients (at least 8; `client_first + client_count` at most 255) |
 
 ### Output Parameters
 
