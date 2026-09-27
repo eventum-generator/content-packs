@@ -1,66 +1,446 @@
-{%- for flag in ['to_create_role', 'to_grant', 'to_select_sensitive', 'to_drop_role', 'to_routine'] -%}{%- do shared.pop(flag, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= 48 -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_create_role', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- set kind = module.rand.weighted_choice(['SELECT', 'UPDATE', 'USE_KEYSPACE'], [76, 18, 6]) -%}
-  {%- set actor = module.rand.choice(['app_reader', 'app_writer', 'etl_job']) -%}
-  {%- set ip = module.rand.choice(['10.20.40.21', '10.20.40.22', '10.20.40.23']) -%}
-{%- else -%}
-  {%- set kind = {'create_role': 'CREATE_ROLE', 'grant': 'GRANT', 'select_sensitive': 'SELECT', 'drop_role': 'DROP_ROLE'}[stage] -%}
-  {%- set actor = params.temporary_role if stage == 'select_sensitive' else 'cassandra' -%}
-  {%- set ip = params.suspect_ip -%}
-  {%- if stage == 'create_role' -%}{%- do shared.set('to_grant', true) -%}
-  {%- elif stage == 'grant' -%}{%- do shared.set('to_select_sensitive', true) -%}
-  {%- elif stage == 'select_sensitive' -%}{%- do shared.set('to_drop_role', true) -%}
-  {%- else -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{#- Apache Cassandra 4.1 FileAuditLogger (audit/audit.log, shipped logback
+    pattern) on one node. One 1 s input tick renders at most one record.
+    Background: independent per-actor session processes. Episode: a
+    temporary role created, granted SELECT on finance.payroll, used from
+    the admin host to read payroll, then dropped. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{%- macro lgn(median_s, sigma, cap_s) -%}
+  {{- ([module.rand.number.lognormal(module.math.log(median_s), sigma), cap_s] | min * 1000) | int + module.rand.number.integer(0, 999) -}}
+{%- endmacro -%}
+{%- macro expo(mean_s) -%}
+  {{- (module.rand.number.exponential(1 / mean_s) * 1000) | int + module.rand.number.integer(0, 999) -}}
+{%- endmacro -%}
+{%- set tz = module.datetime.timezone.utc -%}
+{%- set now = (timestamp.astimezone(tz).timestamp() * 1000) | round | int -%}
+{%- set tick_end = now + 1000 -%}
+{%- set rand = module.rand -%}
+{%- set num = module.rand.number -%}
+{%- set tables = ['orders', 'invoices', 'ledger', 'payroll'] -%}
+{%- set keys = {'orders': 'order_id', 'invoices': 'invoice_id', 'ledger': 'entry_id', 'payroll': 'employee_id'} -%}
+{%- set services = ['orders_svc', 'billing_svc', 'hr_portal', 'reporting_etl'] -%}
+{%- set pool = ['audit_reader', 'support_ro', 'bi_extract', 'recon_job', 'dq_check', 'migration_ro', 'finance_audit', 'ext_auditor', 'report_tmp', 'svc_backfill'] -%}
+{%- set guard_ms = 10800000 -%}
+{%- if shared.get('actors') is none -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean or not 6 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- invalid('anomaly_interval_hours must be a number in 6..8760') -}}
+  {%- endif -%}
+  {%- if params.host_ip is not string or not module.re.fullmatch('(\\d{1,3}\\.){3}\\d{1,3}', params.host_ip) -%}
+    {{- invalid('host_ip must be a dotted-quad IPv4 string') -}}
+  {%- endif -%}
+  {#- menu rows: [type, table, statement, weight]; {n} is a literal value,
+      apps use prepared statements with bind markers. -#}
+  {%- set actors = [
+    {'name': 'orders_svc', 'kind': 'app', 'ips': ['10.20.40.21', '10.20.40.22'], 'spd': 30, 'ops_med': 22, 'gap_med': 6, 'fail': 0.01, 'menu': [
+      ['SELECT', 'orders', 'SELECT * FROM orders WHERE order_id = ?', 60],
+      ['UPDATE', 'orders', 'UPDATE orders SET status = ? WHERE order_id = ?', 25],
+      ['UPDATE', 'orders', 'INSERT INTO orders (order_id, customer_id, amount, status, created_at) VALUES (?, ?, ?, ?, ?)', 15]]},
+    {'name': 'billing_svc', 'kind': 'app', 'ips': ['10.20.40.31'], 'spd': 24, 'ops_med': 18, 'gap_med': 8, 'fail': 0.01, 'menu': [
+      ['SELECT', 'invoices', 'SELECT * FROM invoices WHERE invoice_id = ?', 55],
+      ['UPDATE', 'invoices', 'UPDATE invoices SET paid_at = ?, status = ? WHERE invoice_id = ?', 30],
+      ['DELETE', 'invoices', 'DELETE FROM invoices WHERE invoice_id = ?', 5],
+      ['SELECT', 'orders', 'SELECT * FROM orders WHERE order_id = ?', 10]]},
+    {'name': 'hr_portal', 'kind': 'app', 'ips': ['10.20.40.41'], 'spd': 20, 'ops_med': 12, 'gap_med': 12, 'fail': 0.01, 'menu': [
+      ['SELECT', 'payroll', 'SELECT * FROM payroll WHERE employee_id = ?', 75],
+      ['UPDATE', 'payroll', 'UPDATE payroll SET salary = ?, updated_at = ? WHERE employee_id = ?', 25]]},
+    {'name': 'reporting_etl', 'kind': 'app', 'ips': ['10.20.40.51'], 'spd': 10, 'ops_med': 30, 'gap_med': 4, 'fail': 0.01, 'menu': [
+      ['SELECT', 'ledger', 'SELECT * FROM ledger WHERE entry_id = ?', 50],
+      ['SELECT', 'payroll', 'SELECT * FROM payroll WHERE employee_id = ?', 25],
+      ['SELECT', 'orders', 'SELECT * FROM orders WHERE order_id = ?', 25]]},
+    {'name': 'analyst_kim', 'kind': 'human', 'ips': ['10.20.50.14'], 'spd': 5, 'ops_med': 4, 'gap_med': 45, 'fail': 0.08, 'menu': [
+      ['SELECT', 'orders', 'SELECT * FROM finance.orders WHERE order_id = {n};', 45],
+      ['SELECT', 'invoices', 'SELECT count(*) FROM finance.invoices;', 20],
+      ['SELECT', 'invoices', 'SELECT * FROM finance.invoices LIMIT {k};', 25],
+      ['UNAUTHORIZED_ATTEMPT', 'payroll', 'SELECT * FROM finance.payroll LIMIT {k};', 4],
+      ['REQUEST_FAILURE', 'orders', 'SELECT * FROM finance.order WHERE order_id = {n};', 3]]},
+    {'name': 'analyst_osei', 'kind': 'human', 'ips': ['10.20.50.22'], 'spd': 4, 'ops_med': 5, 'gap_med': 50, 'fail': 0.07, 'menu': [
+      ['SELECT', 'ledger', 'SELECT * FROM finance.ledger LIMIT {k};', 40],
+      ['SELECT', 'ledger', 'SELECT * FROM finance.ledger WHERE entry_id = {n};', 30],
+      ['SELECT', 'invoices', 'SELECT * FROM finance.invoices WHERE invoice_id = {n};', 25],
+      ['REQUEST_FAILURE', 'ledger', 'SELECT * FROM finance.ledgers LIMIT {k};', 4],
+      ['UNAUTHORIZED_ATTEMPT', 'payroll', 'SELECT count(*) FROM finance.payroll;', 2]]},
+    {'name': 'hr_lead_mora', 'kind': 'human', 'ips': ['10.20.50.31'], 'spd': 5, 'ops_med': 4, 'gap_med': 40, 'fail': 0.08, 'menu': [
+      ['SELECT', 'payroll', 'SELECT employee_id, full_name, salary FROM finance.payroll WHERE employee_id = {n};', 55],
+      ['SELECT', 'payroll', 'SELECT * FROM finance.payroll LIMIT {k};', 25],
+      ['UPDATE', 'payroll', 'UPDATE finance.payroll SET salary = {m} WHERE employee_id = {n};', 15]]},
+    {'name': 'finance_ops_li', 'kind': 'human', 'ips': ['10.20.50.37'], 'spd': 4, 'ops_med': 4, 'gap_med': 50, 'fail': 0.06, 'menu': [
+      ['SELECT', 'invoices', 'SELECT * FROM finance.invoices WHERE invoice_id = {n};', 45],
+      ['UPDATE', 'invoices', "UPDATE finance.invoices SET status = 'void' WHERE invoice_id = {n};", 15],
+      ['SELECT', 'ledger', 'SELECT * FROM finance.ledger LIMIT {k};', 30]]},
+    {'name': 'dba_ivanova', 'kind': 'admin', 'ips': ['10.20.10.11', '10.20.10.5'], 'spd': 6, 'ops_med': 3, 'gap_med': 50, 'fail': 0.06, 'menu': []},
+    {'name': 'dba_okafor', 'kind': 'admin', 'ips': ['10.20.10.12', '10.20.10.5'], 'spd': 6, 'ops_med': 3, 'gap_med': 50, 'fail': 0.06, 'menu': []},
+    {'name': 'ops_admin', 'kind': 'admin', 'ips': ['10.20.10.5'], 'spd': 5, 'ops_med': 3, 'gap_med': 50, 'fail': 0.06, 'menu': []}
+  ] -%}
+  {%- for a in actors -%}
+    {%- do a.update({'phase': 'idle', 'next': now + (expo(86400 / a.spd) | int), 'port': 0, 'ip': a.ips[0], 'fails': 0, 'ops_left': 0, 'queue': [], 'ks': none, 'test_ip': none, 'pending': none, 'followup': none, 'followup_due': none}) -%}
+  {%- endfor -%}
+  {%- set roles = {} -%}
+  {%- for r in pool -%}
+    {%- do roles.update({r: none}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'actors': actors, 'roles': roles, 'ep': none, 'last_admin': none, 'last_role': none,
+      'next_due': now + (params.anomaly_interval_hours * 3600000) | int, 'delay': expo(1200) | int}) -%}
 {%- endif -%}
-{%- if kind == 'SELECT' -%}
-  {%- set category = 'QUERY' -%}
-  {%- set table = params.sensitive_table if stage == 'select_sensitive' else 'orders' -%}
-  {%- set operation = 'SELECT * FROM ' ~ params.keyspace ~ '.' ~ table ~ ';' -%}
-  {%- set ecs_category = ['database'] -%}
-  {%- set ecs_type = ['access'] -%}
-{%- elif kind == 'UPDATE' -%}
-  {%- set category = 'DML' -%}
-  {%- set table = 'orders' -%}
-  {%- set operation = "UPDATE " ~ params.keyspace ~ ".orders SET status = 'paid' WHERE order_id = 42;" -%}
-  {%- set ecs_category = ['database'] -%}
-  {%- set ecs_type = ['change'] -%}
-{%- elif kind == 'USE_KEYSPACE' -%}
-  {%- set category = 'OTHER' -%}
-  {%- set table = none -%}
-  {%- set operation = 'USE ' ~ params.keyspace ~ ';' -%}
-  {%- set ecs_category = ['database'] -%}
-  {%- set ecs_type = ['access'] -%}
-{%- elif kind == 'CREATE_ROLE' -%}
-  {%- set category = 'DCL' -%}
-  {%- set table = none -%}
-  {%- set operation = "CREATE ROLE " ~ params.temporary_role ~ " WITH LOGIN = true AND PASSWORD = '*******';" -%}
-  {%- set ecs_category = ['iam'] -%}
-  {%- set ecs_type = ['creation'] -%}
-{%- elif kind == 'GRANT' -%}
-  {%- set category = 'DCL' -%}
-  {%- set table = params.sensitive_table -%}
-  {%- set operation = 'GRANT SELECT ON TABLE ' ~ params.keyspace ~ '.' ~ table ~ ' TO ' ~ params.temporary_role ~ ';' -%}
-  {%- set ecs_category = ['iam'] -%}
-  {%- set ecs_type = ['change'] -%}
-{%- else -%}
-  {%- set category = 'DCL' -%}
-  {%- set table = none -%}
-  {%- set operation = 'DROP ROLE ' ~ params.temporary_role ~ ';' -%}
-  {%- set ecs_category = ['iam'] -%}
-  {%- set ecs_type = ['deletion'] -%}
+{%- set actors = shared.get('actors') -%}
+{%- set roles = shared.get('roles') -%}
+{%- set admins = actors | selectattr('kind', 'equalto', 'admin') | list -%}
+{%- set o = namespace(a=none, t=none, user=none, ip=none, port=0, type=none, ks=none, scope=none, op=none, target=none, attempted=none, auth=false) -%}
+{#- Episode start: due from the previous actual start, plus a random delay. -#}
+{%- if params.anomaly_mode and shared.get('ep') is none and now >= shared.get('next_due') + shared.get('delay') -%}
+  {%- set free = roles | dictsort | selectattr(1, 'none') | map(attribute=0) | reject('equalto', shared.get('last_role')) | list -%}
+  {%- set cand = admins | rejectattr('name', 'equalto', shared.get('last_admin')) | list -%}
+  {%- if free -%}
+    {%- set admin = rand.choice(cand) -%}
+    {%- set role = rand.choice(free) -%}
+    {%- do roles.update({role: {'episode': true}}) -%}
+    {%- do shared.update({'ep': {'step': 'a_login', 'due': now + num.integer(0, 999), 'admin': admin.name, 'role': role, 'ip': rand.choice(admin.ips),
+        'table': 'payroll', 'selects': rand.weighted_choice([1, 2, 3, 4], [35, 30, 20, 15]), 'use': rand.chance(0.25), 'relogin': rand.chance(0.5), 'revoke': rand.chance(0.4), 'aport': 0, 'xport': 0},
+        'last_admin': admin.name, 'last_role': role, 'next_due': now + (params.anomaly_interval_hours * 3600000) | int, 'delay': expo(1200) | int}) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set port = 46264 if stage == 'routine' else 46265 -%}
-{%- set stamp = (timestamp.timestamp() * 1000) | int -%}
-{%- set message = 'user:' ~ actor ~ '|host:' ~ params.host_ip ~ ':7000|source:/' ~ ip ~ '|port:' ~ port ~ '|timestamp:' ~ stamp ~ '|type:' ~ kind ~ '|category:' ~ category ~ ('|ks:' ~ params.keyspace if category != 'DCL' else '') ~ ('|scope:' ~ table if table and category != 'DCL' else '') ~ '|operation:' ~ operation -%}
-{%- set original = 'Type: AuditLog\nLogMessage:\n' ~ message -%}
-{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ecs_category, 'type': ecs_type, 'action': kind.lower().replace('_', '-'), 'original': original}, 'host': {'name': params.host_name, 'ip': [params.host_ip]}, 'source': {'ip': ip, 'port': port}, 'user': {'name': actor}, 'related': {'ip': [ip, params.host_ip], 'user': [actor]}, 'cassandra': {'audit': {'viewer_record_type': 'AuditLog', 'category': category, 'type': kind, 'operation': operation, 'timestamp_ms': stamp}}} -%}
-{%- if category != 'DCL' -%}{%- do payload.cassandra.audit.update({'keyspace': params.keyspace}) -%}{%- endif -%}
-{%- if table and category != 'DCL' -%}{%- do payload.cassandra.audit.update({'scope': table}) -%}{%- endif -%}
-{%- if stage in ['create_role', 'grant', 'select_sensitive', 'drop_role'] -%}{%- do payload.cassandra.audit.update({'temporary_role': params.temporary_role}) -%}{%- endif -%}
-{{- payload | tojson -}}
+{#- Pick the earliest due item in this tick. -#}
+{%- set pick = namespace(a=none, due=none) -%}
+{%- for a in actors + (roles.values() | reject('none') | rejectattr('episode') | list) -%}
+  {%- if a.next is not none and a.next < tick_end and (pick.due is none or a.next < pick.due) -%}
+    {%- set pick.a = a -%}
+    {%- set pick.due = a.next -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set ep = shared.get('ep') -%}
+{%- if ep is not none and ep.due < tick_end and (pick.due is none or ep.due < pick.due) -%}
+  {%- set pick.a = 'episode' -%}
+  {%- set pick.due = ep.due -%}
+{%- endif -%}
+{%- if pick.a is none -%}
+  {%- do dispatch.drop() -%}
+{%- endif -%}
+{%- set o.t = pick.due if pick.due >= now else now + num.integer(0, 999) -%}
+{%- macro q(text) -%}
+  {{- text.replace('{n}', num.integer(1000, 99999) | string).replace('{m}', (num.integer(300, 1800) * 100) | string).replace('{k}', rand.weighted_choice(['10', '100', '1000', '5000'], [40, 30, 20, 10])) -}}
+{%- endmacro -%}
+{%- macro role_query(t) -%}
+  {{- rand.weighted_choice(['SELECT * FROM finance.' ~ t ~ ' LIMIT {k};', 'SELECT count(*) FROM finance.' ~ t ~ ';', 'SELECT * FROM finance.' ~ t ~ ' WHERE ' ~ keys[t] ~ ' = {n};'], [50, 20, 30]) -}}
+{%- endmacro -%}
+{%- set ctables = ['payroll', 'orders', 'invoices', 'ledger'] -%}
+{%- set cweights = [35, 25, 20, 20] -%}
+{%- if pick.a == 'episode' -%}
+  {%- set admin = admins | selectattr('name', 'equalto', ep.admin) | first -%}
+  {%- set r = ep.role -%}
+  {%- set o.ip = ep.ip -%}
+  {%- set o.user = ep.admin -%}
+  {%- set o.ks = 'finance' if ep.use and ep.step not in ['a_login', 'a_relogin', 'x_login', 'x_select'] else none -%}
+  {%- if ep.step == 'a_login' -%}
+    {%- do ep.update({'aport': num.integer(32768, 60999)}) -%}
+    {%- set o.port = ep.aport -%}
+    {%- set o.type = 'LOGIN_SUCCESS' -%}
+    {%- set o.op = 'LOGIN SUCCESSFUL' -%}
+    {%- set o.ks = none -%}
+    {%- set o.auth = true -%}
+    {%- do ep.update({'step': 'a_use' if ep.use else 'create', 'due': o.t + (lgn(8 if ep.use else 35, 0.8, 300) | int)}) -%}
+  {%- elif ep.step == 'a_use' -%}
+    {%- set o.port = ep.aport -%}
+    {%- set o.type = 'USE_KEYSPACE' -%}
+    {%- set o.op = 'USE finance;' -%}
+    {%- do ep.update({'step': 'create', 'due': o.t + (lgn(35, 0.6, 300) | int)}) -%}
+  {%- elif ep.step == 'create' -%}
+    {%- set o.port = ep.aport -%}
+    {%- set o.type = 'CREATE_ROLE' -%}
+    {%- set o.op = 'CREATE ROLE ' ~ r ~ " WITH PASSWORD = '*******' AND LOGIN = true;" -%}
+    {%- set o.target = r -%}
+    {%- do ep.update({'step': 'grant', 'due': o.t + (lgn(45, 0.6, 300) | int), 'created': o.t}) -%}
+  {%- elif ep.step == 'grant' -%}
+    {%- set o.port = ep.aport -%}
+    {%- set o.type = 'GRANT' -%}
+    {%- set o.op = 'GRANT SELECT ON TABLE finance.payroll TO ' ~ r ~ ';' -%}
+    {%- set o.target = r -%}
+    {%- do ep.update({'step': 'x_login', 'due': o.t + (lgn(90, 0.7, 900) | int)}) -%}
+  {%- elif ep.step == 'x_login' -%}
+    {%- do ep.update({'xport': num.integer(32768, 60999)}) -%}
+    {%- set o.port = ep.xport -%}
+    {%- set o.user = r -%}
+    {%- set o.type = 'LOGIN_SUCCESS' -%}
+    {%- set o.op = 'LOGIN SUCCESSFUL' -%}
+    {%- set o.auth = true -%}
+    {%- do ep.update({'step': 'x_select', 'due': o.t + (lgn(20, 0.8, 300) | int)}) -%}
+  {%- elif ep.step == 'x_select' -%}
+    {%- set o.port = ep.xport -%}
+    {%- set o.user = r -%}
+    {%- set o.type = 'SELECT' -%}
+    {%- set o.ks = 'finance' -%}
+    {%- set o.scope = 'payroll' -%}
+    {%- set o.op = q(role_query('payroll')) -%}
+    {%- do ep.update({'selects': ep.selects - 1}) -%}
+    {%- if ep.selects > 0 -%}
+      {%- do ep.update({'due': o.t + (lgn(35, 0.8, 600) | int)}) -%}
+    {%- else -%}
+      {%- do ep.update({'step': 'a_relogin' if ep.relogin else ('revoke' if ep.revoke else 'drop'), 'due': o.t + (lgn(600, 0.6, 2400) | int)}) -%}
+    {%- endif -%}
+  {%- elif ep.step == 'a_relogin' -%}
+    {%- do ep.update({'aport': num.integer(32768, 60999), 'use': false}) -%}
+    {%- set o.port = ep.aport -%}
+    {%- set o.type = 'LOGIN_SUCCESS' -%}
+    {%- set o.op = 'LOGIN SUCCESSFUL' -%}
+    {%- set o.ks = none -%}
+    {%- set o.auth = true -%}
+    {%- do ep.update({'step': 'revoke' if ep.revoke else 'drop', 'due': o.t + (lgn(40, 0.6, 300) | int)}) -%}
+  {%- elif ep.step == 'revoke' -%}
+    {%- set o.port = ep.aport -%}
+    {%- set o.type = 'REVOKE' -%}
+    {%- set o.op = 'REVOKE SELECT ON TABLE finance.payroll FROM ' ~ r ~ ';' -%}
+    {%- set o.target = r -%}
+    {%- do ep.update({'step': 'drop', 'due': o.t + (lgn(30, 0.6, 300) | int)}) -%}
+  {%- else -%}
+    {%- set o.port = ep.aport -%}
+    {%- set o.type = 'DROP_ROLE' -%}
+    {%- set o.op = 'DROP ROLE ' ~ r ~ ';' -%}
+    {%- set o.target = r -%}
+    {%- do roles.update({r: none}) -%}
+    {%- do shared.set('ep', none) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set a = pick.a -%}
+  {%- set o.a = a -%}
+  {%- set o.user = a.name -%}
+  {%- if a.phase == 'idle' -%}
+    {#- Connection attempt: new TCP source port per attempt. -#}
+    {%- if a.test_ip is not none -%}
+      {%- do a.update({'ip': a.test_ip, 'test_ip': none, 'test': true}) -%}
+    {%- else -%}
+      {%- do a.update({'ip': rand.choice(a.ips), 'test': false}) -%}
+    {%- endif -%}
+    {%- do a.update({'port': num.integer(32768, 60999)}) -%}
+    {%- set o.ip = a.ip -%}
+    {%- set o.port = a.port -%}
+    {%- set o.auth = true -%}
+    {%- if not a.test and rand.chance(a.fail) -%}
+      {%- set o.type = 'LOGIN_ERROR' -%}
+      {%- set o.user = 'null' -%}
+      {%- set o.attempted = a.name -%}
+      {%- set o.op = 'LOGIN FAILURE; Provided username ' ~ a.name ~ ' and/or password *******' -%}
+      {%- if rand.chance(0.3) -%}
+        {%- do a.update({'next': o.t + (expo(86400 / a.spd) | int)}) -%}
+      {%- else -%}
+        {%- do a.update({'next': o.t + (lgn(15, 0.9, 600) | int)}) -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- set o.type = 'LOGIN_SUCCESS' -%}
+      {%- set o.op = 'LOGIN SUCCESSFUL' -%}
+      {%- set queue = [] -%}
+      {%- if a.kind == 'app' -%}
+        {%- do queue.append(['USE_KEYSPACE', none, 'USE "finance"']) -%}
+        {%- for row in rand.shuffle(a.menu) -%}
+          {%- if rand.chance(0.4) -%}
+            {%- do queue.append(['PREPARE_STATEMENT', row[1], row[2]]) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- elif a.kind != 'role' and rand.chance(0.25) -%}
+        {%- do queue.append(['USE_KEYSPACE', none, 'USE finance;']) -%}
+      {%- endif -%}
+      {%- set n = [1, (num.lognormal(module.math.log(a.ops_med), 0.7) | round | int)] | max -%}
+      {%- if a.test -%}
+        {%- set n = rand.weighted_choice([1, 2, 3], [50, 35, 15]) -%}
+      {%- endif -%}
+      {%- do a.update({'phase': 'session', 'ks': none, 'queue': queue, 'ops_left': n, 'next': o.t + (lgn(1.5 if a.kind == 'app' else 8, 0.8, 120) | int)}) -%}
+      {%- if a.get('followup') is not none and a.pending is none -%}
+        {%- do a.update({'pending': a.followup, 'followup': none, 'followup_due': none}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set o.ip = a.ip -%}
+    {%- set o.port = a.port -%}
+    {%- set item = none -%}
+    {%- if a.queue -%}
+      {%- set item = a.queue.pop(0) -%}
+    {%- elif a.pending is not none -%}
+      {%- set item = a.pending -%}
+      {%- do a.update({'pending': none, 'ops_left': a.ops_left - 1}) -%}
+    {%- else -%}
+      {%- do a.update({'ops_left': a.ops_left - 1}) -%}
+      {%- if a.kind in ['app', 'human'] -%}
+        {%- set row = rand.weighted_choice(a.menu, a.menu | map(attribute=3) | list) -%}
+        {%- set item = [row[0], row[1], q(row[2])] -%}
+      {%- elif a.kind == 'role' -%}
+        {%- if a.grants -%}
+          {%- set t = rand.choice(a.grants) -%}
+          {%- set item = ['SELECT', t, q(role_query(t))] -%}
+        {%- else -%}
+          {%- set item = ['UNAUTHORIZED_ATTEMPT', a.last_table, q(role_query(a.last_table))] -%}
+          {%- do a.update({'ops_left': 0}) -%}
+        {%- endif -%}
+      {%- else -%}
+        {#- Administrator: role management and routine checks. -#}
+        {%- set absent = roles | dictsort | selectattr(1, 'none') | map(attribute=0) | list -%}
+        {%- set active = roles.values() | reject('none') | rejectattr('episode') | list -%}
+        {%- set idle_roles = active | selectattr('phase', 'equalto', 'idle') | list -%}
+        {%- set granted = active | selectattr('grants') | list -%}
+        {%- set choice = rand.weighted_choice(['list_roles', 'list_perms', 'select', 'alter_role', 'create', 'grant', 'revoke', 'drop', 'alter_table'],
+            [22, 18, 16, 6, 7 if absent else 0, 6 if active else 0, 4 if granted else 0, 7 if idle_roles else 0, 3]) -%}
+        {%- if choice == 'drop' -%}
+          {%- set victim = rand.choice(idle_roles) -%}
+          {%- if victim.read_payroll and o.t - victim.created < guard_ms -%}
+            {%- set choice = 'list_perms_victim' -%}
+          {%- endif -%}
+        {%- endif -%}
+        {%- if choice == 'list_roles' -%}
+          {%- set item = ['LIST_ROLES', none, 'LIST ROLES;'] -%}
+        {%- elif choice == 'list_perms' -%}
+          {%- set who = rand.choice(services + (active | map(attribute='name') | list)) -%}
+          {%- set item = ['LIST_PERMISSIONS', none, 'LIST ALL PERMISSIONS OF ' ~ who ~ ';'] -%}
+        {%- elif choice == 'list_perms_victim' -%}
+          {%- set item = ['LIST_PERMISSIONS', none, 'LIST ALL PERMISSIONS OF ' ~ victim.name ~ ';'] -%}
+        {%- elif choice == 'select' -%}
+          {%- set t = rand.weighted_choice(ctables, cweights) -%}
+          {%- set item = ['SELECT', t, q(role_query(t))] -%}
+        {%- elif choice == 'alter_role' -%}
+          {%- set item = ['ALTER_ROLE', none, 'ALTER ROLE ' ~ rand.choice(services) ~ " WITH PASSWORD = '*******';"] -%}
+        {%- elif choice == 'alter_table' -%}
+          {%- set t = rand.choice(tables) -%}
+          {%- set item = ['ALTER_TABLE', t, 'ALTER TABLE finance.' ~ t ~ ' WITH gc_grace_seconds = ' ~ rand.choice(['86400', '172800', '432000', '864000']) ~ ';'] -%}
+        {%- elif choice == 'create' -%}
+          {%- set r = rand.choice(absent) -%}
+          {%- do roles.update({r: {'kind': 'role', 'name': r, 'episode': false, 'created': o.t, 'grants': [], 'last_table': 'payroll', 'read_payroll': false,
+              'phase': 'idle', 'next': none, 'ips': [rand.choice(['10.20.50.61', '10.20.50.62', '10.20.50.63', '10.20.50.64', '10.20.40.51'])], 'ip': none, 'port': 0,
+              'spd': 3, 'ops_med': 3, 'gap_med': 35, 'fail': 0.04, 'fails': 0, 'ops_left': 0, 'queue': [], 'ks': none, 'test_ip': none, 'test': false, 'pending': none, 'menu': []}}) -%}
+          {%- set item = ['CREATE_ROLE', none, 'CREATE ROLE ' ~ r ~ " WITH PASSWORD = '*******' AND LOGIN = true;", r] -%}
+          {%- if rand.chance(0.75) -%}
+            {%- do a.update({'pending': ['GRANT_NEW', r, none], 'ops_left': [a.ops_left, 1] | max}) -%}
+          {%- endif -%}
+        {%- elif choice == 'grant' -%}
+          {%- set who = rand.choice(active) -%}
+          {%- set t = rand.weighted_choice(ctables, cweights) -%}
+          {%- set item = ['GRANT', none, 'GRANT SELECT ON TABLE finance.' ~ t ~ ' TO ' ~ who.name ~ ';', who.name] -%}
+          {%- if t not in who.grants -%}
+            {%- do who.grants.append(t) -%}
+          {%- endif -%}
+          {%- if who.next is none -%}
+            {%- do who.update({'next': o.t + (expo(86400 / who.spd) | int)}) -%}
+          {%- endif -%}
+        {%- elif choice == 'revoke' -%}
+          {%- set who = rand.choice(granted) -%}
+          {%- set t = rand.choice(who.grants) -%}
+          {%- set item = ['REVOKE', none, 'REVOKE SELECT ON TABLE finance.' ~ t ~ ' FROM ' ~ who.name ~ ';', who.name] -%}
+          {%- do who.grants.remove(t) -%}
+          {%- do who.update({'last_table': t}) -%}
+        {%- else -%}
+          {%- set item = ['DROP_NEW', victim.name, victim.created] -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+    {#- A grant queued right after a CREATE ROLE in the same session. -#}
+    {%- if item[0] == 'GRANT_NEW' -%}
+      {%- set who = roles.get(item[1]) -%}
+      {%- if who is none -%}
+        {%- set item = ['LIST_ROLES', none, 'LIST ROLES;'] -%}
+      {%- else -%}
+        {%- set t = rand.weighted_choice(ctables, cweights) -%}
+        {%- set item = ['GRANT', none, 'GRANT SELECT ON TABLE finance.' ~ t ~ ' TO ' ~ who.name ~ ';', who.name] -%}
+        {%- do who.grants.append(t) -%}
+        {%- if rand.chance(0.45) -%}
+          {%- do who.update({'test_ip': a.ip, 'next': o.t + (lgn(90, 0.7, 900) | int)}) -%}
+          {#- Sometimes the tested role is dropped again in a later session. -#}
+          {%- if rand.chance(0.4) -%}
+            {%- do a.update({'followup': ['DROP_NEW', who.name, who.created], 'followup_due': o.t + (lgn(1200, 0.7, 5400) | int)}) -%}
+          {%- endif -%}
+        {%- else -%}
+          {%- do who.update({'next': o.t + (expo(86400 / who.spd) | int)}) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if item[0] == 'DROP_NEW' -%}
+      {%- set who = roles.get(item[1]) -%}
+      {%- if who is none or who.episode or who.created != item[2] -%}
+        {%- set item = ['LIST_ROLES', none, 'LIST ROLES;'] -%}
+      {%- elif who.phase != 'idle' or (who.read_payroll and o.t - who.created < guard_ms) -%}
+        {%- set item = ['LIST_PERMISSIONS', none, 'LIST ALL PERMISSIONS OF ' ~ who.name ~ ';'] -%}
+      {%- elif who.grants and not who.get('revoked') and rand.chance(0.4) -%}
+        {#- Revoke first, then drop in the next statement. -#}
+        {%- set t = rand.choice(who.grants) -%}
+        {%- set item = ['REVOKE', none, 'REVOKE SELECT ON TABLE finance.' ~ t ~ ' FROM ' ~ who.name ~ ';', who.name] -%}
+        {%- do who.grants.remove(t) -%}
+        {%- do who.update({'last_table': t, 'revoked': true}) -%}
+        {%- do a.update({'pending': ['DROP_NEW', who.name, who.created], 'ops_left': [a.ops_left, 1] | max}) -%}
+      {%- else -%}
+        {%- set item = ['DROP_ROLE', none, 'DROP ROLE ' ~ who.name ~ ';', who.name] -%}
+        {%- do roles.update({who.name: none}) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- set o.type = item[0] -%}
+    {%- set o.op = item[2] -%}
+    {%- set o.target = item[3] if item | length > 3 else none -%}
+    {%- if o.type == 'USE_KEYSPACE' -%}
+      {%- do a.update({'ks': 'finance'}) -%}
+    {%- endif -%}
+    {%- if o.type in ['SELECT', 'UPDATE', 'DELETE', 'PREPARE_STATEMENT', 'ALTER_TABLE', 'USE_KEYSPACE'] -%}
+      {%- set o.ks = 'finance' -%}
+      {%- set o.scope = item[1] -%}
+    {%- elif o.type == 'UNAUTHORIZED_ATTEMPT' -%}
+      {%- set o.ks = a.ks -%}
+      {%- set o.op = o.op ~ '; User ' ~ a.name ~ ' has no SELECT permission on <table finance.' ~ item[1] ~ '> or any of its parents' -%}
+    {%- elif o.type == 'REQUEST_FAILURE' -%}
+      {%- set o.ks = a.ks -%}
+      {%- set o.op = o.op ~ '; table ' ~ o.op.split('FROM finance.')[1].split(' ')[0] ~ ' does not exist' -%}
+    {%- else -%}
+      {%- set o.ks = a.ks -%}
+    {%- endif -%}
+    {%- if a.kind == 'role' and o.type == 'SELECT' and o.scope == 'payroll' -%}
+      {%- do a.update({'read_payroll': true}) -%}
+    {%- endif -%}
+    {%- if a.queue or a.ops_left > 0 or a.pending is not none -%}
+      {%- do a.update({'next': o.t + (lgn(a.gap_med, 0.9, 20 * a.gap_med) | int)}) -%}
+    {%- else -%}
+      {%- set nxt = o.t + (expo(86400 / a.spd) | int) -%}
+      {%- if a.get('followup') is not none and a.followup_due < nxt -%}
+        {%- set nxt = [a.followup_due, o.t + 1000] | max -%}
+      {%- endif -%}
+      {%- do a.update({'phase': 'idle', 'next': nxt}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set categories = {'SELECT': 'QUERY', 'UPDATE': 'DML', 'DELETE': 'DML', 'PREPARE_STATEMENT': 'PREPARE', 'USE_KEYSPACE': 'OTHER', 'ALTER_TABLE': 'DDL',
+    'LIST_ROLES': 'DCL', 'LIST_PERMISSIONS': 'DCL', 'CREATE_ROLE': 'DCL', 'ALTER_ROLE': 'DCL', 'DROP_ROLE': 'DCL', 'GRANT': 'DCL', 'REVOKE': 'DCL',
+    'LOGIN_SUCCESS': 'AUTH', 'LOGIN_ERROR': 'AUTH', 'UNAUTHORIZED_ATTEMPT': 'AUTH', 'REQUEST_FAILURE': 'ERROR'} -%}
+{%- set ecs = {'SELECT': [['database'], ['access']], 'UPDATE': [['database'], ['change']], 'DELETE': [['database'], ['deletion']],
+    'PREPARE_STATEMENT': [['database'], ['info']], 'USE_KEYSPACE': [['database'], ['info']], 'ALTER_TABLE': [['database', 'configuration'], ['change']],
+    'LIST_ROLES': [['iam'], ['info']], 'LIST_PERMISSIONS': [['iam'], ['info']], 'CREATE_ROLE': [['iam'], ['user', 'creation']],
+    'ALTER_ROLE': [['iam'], ['user', 'change']], 'DROP_ROLE': [['iam'], ['user', 'deletion']], 'GRANT': [['iam'], ['user', 'change']],
+    'REVOKE': [['iam'], ['user', 'change']], 'LOGIN_SUCCESS': [['authentication'], ['start']], 'LOGIN_ERROR': [['authentication'], ['start']],
+    'UNAUTHORIZED_ATTEMPT': [['database'], ['access', 'denied']], 'REQUEST_FAILURE': [['database'], ['info']]} -%}
+{%- set category = categories[o.type] -%}
+{%- set failed = o.type in ['LOGIN_ERROR', 'UNAUTHORIZED_ATTEMPT', 'REQUEST_FAILURE'] -%}
+{%- set host = '/' ~ params.host_ip ~ ':7000' -%}
+{%- set message = 'user:' ~ o.user ~ '|host:' ~ host ~ '|source:/' ~ o.ip ~ '|port:' ~ o.port ~ '|timestamp:' ~ o.t ~ '|type:' ~ o.type ~ '|category:' ~ category
+    ~ ('|ks:' ~ o.ks if o.ks else '') ~ ('|scope:' ~ o.scope if o.scope else '') ~ '|operation:' ~ o.op -%}
+{%- set logged = o.t + (num.lognormal(module.math.log(0.6 if o.auth else 2.5), 1.0) | int) -%}
+{%- set when = module.datetime.datetime.fromtimestamp(o.t // 1000, tz) + module.datetime.timedelta(milliseconds=o.t % 1000) -%}
+{%- set lw = module.datetime.datetime.fromtimestamp(logged // 1000, tz) + module.datetime.timedelta(milliseconds=logged % 1000) -%}
+{%- set thread = 'Native-Transport-Requests-' ~ ([1, num.lognormal(module.math.log(6), 0.8) | round | int] | max) -%}
+{%- set original = 'INFO  [' ~ thread ~ '] ' ~ lw.strftime('%Y-%m-%d %H:%M:%S,') ~ ('%03d' | format(logged % 1000)) ~ ' FileAuditLogger.java:51 - ' ~ message -%}
+{%- set actor = o.attempted if o.attempted else o.user -%}
+{%- set audit = {'user': o.user, 'host': host, 'source': '/' ~ o.ip, 'port': o.port, 'timestamp': o.t, 'type': o.type, 'category': category, 'operation': o.op} -%}
+{%- if o.ks -%}{%- do audit.update({'keyspace': o.ks}) -%}{%- endif -%}
+{%- if o.scope -%}{%- do audit.update({'scope': o.scope}) -%}{%- endif -%}
+{%- set user = {'name': actor} -%}
+{%- set related_users = [actor] -%}
+{%- if o.target -%}
+  {%- do user.update({'target': {'name': o.target}}) -%}
+  {%- do related_users.append(o.target) -%}
+{%- endif -%}
+{%- set iso = '%Y-%m-%dT%H:%M:%S.' -%}
+{{- {
+  '@timestamp': when.strftime(iso) ~ ('%03d' | format(o.t % 1000)) ~ 'Z',
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ecs[o.type][0], 'type': ecs[o.type][1], 'action': o.type | lower | replace('_', '-'), 'outcome': 'failure' if failed else 'success',
+            'created': lw.strftime(iso) ~ ('%03d' | format(logged % 1000)) ~ 'Z', 'original': original},
+  'host': {'name': params.host_name, 'ip': [params.host_ip]},
+  'log': {'level': 'INFO', 'logger': 'org.apache.cassandra.audit.FileAuditLogger', 'origin': {'file': {'name': 'FileAuditLogger.java', 'line': 51}}},
+  'process': {'thread': {'name': thread}},
+  'message': message,
+  'source': {'ip': o.ip, 'port': o.port},
+  'user': user,
+  'related': {'ip': [o.ip, params.host_ip], 'user': related_users},
+  'cassandra': {'audit': audit}
+} | tojson -}}
