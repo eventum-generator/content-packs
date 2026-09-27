@@ -1,58 +1,63 @@
 # Eltex ESR Router Syslog
 
-Generates selected Eltex ESR-series software 1.40 remote syslog records as ECS JSON. `event.original` holds the RFC 5424 frame and `message` the documented `%GROUP-SEVERITY-MNEMONIC: text` body. The source is one router with local SSH administrators and a small fixed IPv4 traffic inventory. ESR router codes are distinct from the MES switch source.
+Generates Eltex ESR-series (software 1.40) remote syslog records as ECS JSON for training SIEM content on router administration and firewall logs. `event.original` holds the RFC 5424 frame and `message` the documented `%GROUP-SEVERITY-MNEMONIC: text` body. The source is one router with two local SSH administrators, five temporary local accounts and a small fixed IPv4 traffic inventory.
 
 ## Event Types
 
-| Native message / generated action | Ordinary behavior | Category |
-|---|---|---|
-| `%FIREWALL-I-LOG` / `firewall_permitted` | Logged fixed permitted rule | Network |
-| `%FIREWALL-I-LOG` / `firewall_denied` | Logged fixed denied rule | Network |
-| `%NAT-I-LOG` / `snat_translation` | SNAT of permitted IPv4 traffic | Network |
-| `%IPS-I-INFO` / `ips_drop` | Selected native ICMP drop signature | Intrusion detection |
-| `%AAA-I-SSH` / `ssh_password_failed` | Isolated failed attempt followed by success | Authentication |
-| `%AAA-I-SSH` / `ssh_password_accepted` | Existing administrator or applied temporary account | Authentication |
-| `%AAA-LOCAL-I-SESSION` / `session_opened` | Open after accepted SSH authentication | Authentication |
-| `%AAA-LOCAL-I-SESSION` / `session_closed` | Close the existing selected session | Authentication |
-| `%USER-I-ADD` / `user_created` | Create the currently absent temporary alias | IAM |
-| `%USER-I-ADD` / `user_removed` | Remove the currently existing temporary alias | IAM |
-| `%USER-I-INFO` / `user_privilege_changed` | Existing default privilege 1 changes to 14 | IAM |
-| `%USER-I-INFO` / `enable_password_changed` | Privilege15 enable-password maintenance | IAM/configuration |
-| `%SYS-W-EVENT` / `configuration_applied` | Apply the pending configuration | Configuration |
-| `%TIME-I-INFO` / `system_time_changed` | Administrator clock maintenance | Configuration |
+Shares measured on the final default capture (76 h 20 min, `anomaly_mode: true`, 26,984 records).
 
-One stateful renderer shares the native envelope across fourteen actions. All actions, both administrators/IPs and all three temporary aliases occur outside the dense sequence in both modes. No emitted field labels an episode.
+| Native message | `event.action` | Share | Category |
+|---|---|---:|---|
+| `%FIREWALL-I-LOG` | `firewall_permitted` | 60.62% (16359) | Network |
+| `%FIREWALL-I-LOG` | `firewall_denied` | 20.50% (5532) | Network |
+| `%NAT-I-LOG` | `snat_translation` | 14.72% (3971) | Network |
+| `%IPS-I-INFO` | `ips_drop` | 1.49% (403) | Intrusion detection |
+| `%AAA-I-SSH` | `ssh_password_accepted` | 0.43% (115) | Authentication |
+| `%AAA-LOCAL-I-SESSION` | `session_opened` | 0.43% (115) | Authentication |
+| `%AAA-LOCAL-I-SESSION` | `session_closed` | 0.43% (115) | Authentication |
+| `%AAA-I-SSH` | `ssh_password_failed` | 0.36% (96) | Authentication |
+| `%SYS-W-EVENT` | `configuration_applied` | 0.34% (93) | Configuration |
+| `%USER-I-INFO` | `user_privilege_changed` | 0.14% (39) | IAM |
+| `%TIME-I-INFO` | `system_time_changed` | 0.14% (38) | Configuration |
+| `%USER-I-INFO` | `enable_password_changed` | 0.13% (35) | IAM, configuration |
+| `%USER-I-ADD` | `user_created` | 0.10% (26) | IAM |
+| `%USER-I-ADD` | `user_removed` | 0.09% (24) | IAM |
+| `%USER-I-INFO` | `user_password_changed` | 0.09% (23) | IAM |
 
-The input emits one record every ten seconds, 8640 records/day. Network-only slots choose permit/deny/SNAT/IPS with weights 620:200:150:15. Administrative workflows replace some slots. These rates and the maintenance-intensive account rotation are selected training assumptions, not vendor production measurements. Four fictional flow records retain addresses, ports, interfaces and NAT mappings. Rules 10/20/30 permit and 40 denies throughout capture. NAT/IPS selections use permitted candidates; no unchanged matching rule randomly switches its action. Firewall, NAT and IPS logging must be enabled on a real router.
+Every action, both administrators, both administrator addresses and all five temporary accounts occur in ordinary background in both modes. No field labels an episode.
+
+## Background Model
+
+Each one-second tick emits at most one record: the earliest due step of an open SSH connection or session, otherwise a traffic record with probability 0.1 scaled by an office-hours factor (06:00-16:00 UTC 1.64, 16:00-20:00 0.91, night 0.40), otherwise nothing. The result averages about one record per ten seconds with random gaps.
+
+- **Administrator sessions.** Each administrator starts sessions independently at about 16 per day (same office-hours factor). A connection has 0-3 failed passwords on the same TCP source port before success (weights 76/10/6/8); 12% of connections give up after 1-3 failures and 70% of those retry from a new port. The failure counter is assumed to reset after 300 seconds without failures; within that window failures never reach the five-attempt lockout threshold. A session holds 0-6 maintenance operations: create an absent temporary account (default privilege 1), change an account privilege (often the one created in the same session), remove an applied idle account, change a password, change the privilege 15 enable password, set the system clock. Half of the creations are followed directly by a privilege change of the new account. Configuration changes are followed by `Configuration is applied` either immediately or after further changes, and always before logout.
+- **Temporary accounts.** An account can log in only after its creation is applied. Applied accounts log in on their own at about five per day from either administrator address, and 45% of applied account changes are followed by a test login from the administrator's address.
+- **Traffic.** Permit, deny, SNAT and IPS drop records (weights 620/200/150/15) over `samples/flows.json`, with fresh ephemeral source and NAT ports. Rules 10/20/30 permit and rule 40 denies throughout.
+- **Sequence numbers** grow by one, or by 2-7 in 15% of records to account for device messages outside this subset.
+
+All gaps (between password attempts, operations, session length) are drawn from log-normal distributions; there are no fixed periods, rotations or per-actor cooldowns. State holds five account records, open connections and a bounded history of the last 150 administrative records.
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`. An episode becomes eligible every 24 source hours, first after one interval:
+`anomaly_mode` defaults to `true`. With `false` the generator emits the background only and the complete chain never occurs.
 
-1. The second existing administrator makes three failed password attempts, then authenticates and opens an SSH session from the same address/port.
-2. That administrator changes the privilege 15 enable password. A currently absent temporary alias is created at the documented default privilege 1, then changed to 14.
-3. `%SYS-W-EVENT` reports successful application of the pending configuration. `%TIME-I-INFO` identifies the administrator who changes system time.
-4. The applied temporary account authenticates from the same IP with a different TCP source port, opens and closes its session, then the administrator session closes.
+Sequence, all on one router:
 
-Fourteen core records span **130 seconds**. The next due time starts at the actual first failure, without catch-up bursts. An existing temporary account is visibly removed and that deletion applied before another episode starts. Ordinary removal of an injected account becomes eligible one hour after creation. Queued workflows finish before another begins, so eligibility may wait.
+1. `ssh_password_failed` three times for administrator A from address I on one TCP source port P.
+2. `ssh_password_accepted` for A from I on port P, then `session_opened`.
+3. `enable_password_changed` by A.
+4. `user_created` for an absent temporary account T, then `user_privilege_changed` of T from 1 to 14.
+5. `configuration_applied`.
+6. `system_time_changed` by A.
+7. `ssh_password_accepted` for T from address I on a new port, then T's session opens and closes; A's session closes independently.
 
-The three-name pool rotates independently for ordinary creation and episodes. A name can be reused after visible removal/application. Fresh SSH source ports and router/time/native sequence distinguish its observed incarnations. The source publishes no native user UUID or SSH session identifier here, so none is invented. Accepted/open/close context is modeled consistently, but the session-only lines do not themselves contain a remote address.
+Linking fields: `user.name` (A, then T), `source.ip` (I), `source.port` (P for steps 1-2), `user.target.name` (T). USER messages carry only the target account, so linking steps 3-6 to A relies on the surrounding session.
 
-Detection ideas: three failed passwords followed by success for the same account/source; enable-password maintenance and a new privilege 14 account in one short router window; first SSH use after visible account creation/application. USER create/privilege/remove bodies name only the target, so the surrounding administrator session supports contextual correlation, not proof of the command actor. The time-change body contains no old/new clock values. It does not establish clock rollback or evasion, and the selected source clock remains UTC and ordered.
+Recurrence: an episode becomes due every `anomaly_interval_hours` of source time (default 24, minimum 6), first one interval after generation starts (the first ordinary record may come later than that start). It starts after a random delay (exponential, mean 20 min) once an administrator has no pending failures and at least one account is absent. The next due time counts from the actual start, so a late episode never causes catch-up. Episodes in the final captures spanned 4-5.5 minutes.
 
-`anomaly_mode: false` retains the same accounts, IPs, actions and alias family. Ordinary maintenance creates/applies an account and tests SSH at default privilege 1, raises its privilege in a later hourly session, uses it separately, and eventually removes/applies the deletion. Enable-password/time maintenance occurs in another short session. The complete three-failure/privileged-new-account sequence is absent. Every ordinary alias is actually created and authenticated, rather than appearing only as a cleanup target.
+Variation: the administrator is chosen at random, the account is an absent one different from the previous episode's, and every gap is drawn from the same distributions as background sessions. The account is later removed and the removal applied by an ordinary maintenance session, like any other temporary account, so the changed state is visibly restored (a finite run may end before that).
 
-## Source Profile and Limits
-
-Both existing administrators have privilege 15 and configured local-password SSH rights. The selected lockout policy is the documented default five-attempt threshold and 300-second lock duration; isolated ordinary failure resets on success and an episode stops at three failures. Every candidate user/privilege change becomes usable only after its visible application. Service SSH closes before administrator logout/removal. State retains one temporary account, at most two live session contexts, one queue capped at fourteen actions, two modulo 3 cursors and scalar clocks/counters. A finite run may leave one existing account awaiting future cleanup; no final invisible reset is fabricated.
-
-The source's CLI `commit` must be confirmed within 600 seconds or the configuration rolls back. This profile **assumes timely confirmation outside the selected message subset**. The syslog catalog's CLI commit/confirm patterns literally contain `console`; an exact SSH command-input form was not established. The generator omits those CLI records rather than changing that literal and presenting it as a captured SSH format. `Configuration is applied` therefore does not itself prove permanent confirmation. The sampled ordering of USER changes before application is a selected lifecycle model, not a captured complete device trace.
-
-The vendor reference has a complete remote AAA-LOCAL example and field-complete selected body patterns. All ten selected remote-frame slots and the session access/user slots are represented; other message bodies preserve their documented parameters. This is format-slot coverage, not a 58/58 realism score or a full live-wire comparison. No matching maintained Elastic ESR sample was established.
-
-Sequence numbers are enabled in the selected profile and bounded at 2147483647. AAA program `login`/authpriv comes from the vendor example. Group-derived programs/local0 for other families are explicitly inferred selected bindings, without a complete native multi-family capture proving them. UTC second precision, immediate normalization and global sequence allocation are configuration/collector assumptions. Native `%SYS-W-EVENT` severity is warning even for successful application. ICMP IPS suffixes 2048/0 are preserved privately, with no TCP/UDP ECS-port or unproved ICMP-type interpretation.
-
-IPv6, console/Telnet, public-key authentication, AAA backends, password-expiry events, configuration rollback/timer records and complete traffic/session lifecycles are outside this subset. Exact full native capture, subsystem facility bindings and live SIEM-parser parity remain unverified.
+Detection idea: three failed passwords followed by success on the same connection, then enable-password change, a new account raised to privilege 14, a clock change by the same administrator and the new account's first login from the administrator's address, all within 30 minutes. Each fragment occurs in background: repeated failures on one connection, enable and clock changes in one session, create-and-raise in one session, test logins after creation. Only the complete sequence is kept out of the background: an ordinary account login that would complete it is emitted as a failed password attempt instead.
 
 ## Parameters
 
@@ -62,126 +67,63 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `router_name` | `esr-edge-01` | One router hostname |
-| `router_ip` | `10.50.0.1` | Selected management destination |
-| `normal_user` | `netops` | Existing privilege 15 administrator |
-| `normal_source_ip` | `10.50.1.25` | First administrator client |
-| `unusual_user` | `admin` | Second existing administrator, also ordinary |
-| `unusual_source_ip` | `10.99.4.33` | Second client, also ordinary |
-| `service_user_prefix` | `svc_remote_` | Three fixed aliases with 001/002/003 suffixes |
-| `anomaly_mode` | `true` | Periodic episodes mixed with background |
-| `anomaly_interval_hours` | `24` | Finite value from 6 to 8760 hours |
+| `router_name` | `esr-edge-01` | Router hostname in the syslog frame and `observer.*` |
+| `router_ip` | `10.50.0.1` | Management address (`destination.ip` of SSH records) |
+| `normal_user` | `netops` | First privilege 15 administrator |
+| `normal_source_ip` | `10.50.1.25` | First administrator's client address |
+| `unusual_user` | `admin` | Second privilege 15 administrator |
+| `unusual_source_ip` | `10.99.4.33` | Second administrator's client address |
+| `service_user_prefix` | `svc_remote_` | Temporary accounts are this prefix plus `001`-`005` |
+| `anomaly_mode` | `true` | Add periodic episodes to the background |
+| `anomaly_interval_hours` | `24` | Episode interval in source hours, 6-8760 |
 
-Names use ASCII letters, digits, underscore/hyphen, start with a letter and have at most 31 characters including suffixes. Administrators and generated aliases must be distinct. Router hostname is an ASCII label up to 64 characters; management/client addresses are IPv4. Traffic/rule mappings in `samples/flows.json` are a separate fixed inventory. Keep its permitted and denied candidates consistent. Keep count 1/ten-second cadence for documented episode timing.
+Account names use ASCII letters, digits, `_` and `-`, start with a letter and have at most 31 characters including the suffix; the administrators and the accounts must be distinct, and the two client addresses must differ. The hostname is an ASCII label of up to 64 characters; addresses are IPv4. The traffic inventory is `samples/flows.json`.
 
 ### Output Parameters
 
-The shipped generator writes `output/events.json` and requires no top-level `${params.*}` or `${secrets.*}` values. Change the file path or replace the output plugin to send this selected normalized JSON to a SIEM. Exact native parsing still requires a real source capture.
+The shipped config writes `output/events.json` with the `json` formatter and needs no `${params.*}` or `${secrets.*}`. To send events elsewhere, replace the `output` section, for example:
+
+```yaml
+output:
+  - opensearch:
+      hosts: ["${params.opensearch_url}"]
+      username: ${params.opensearch_user}
+      password: ${secrets.opensearch_password}
+      index: eltex-esr
+```
 
 ## Usage
 
-From the content-packs repository root:
+Live mode:
 
 ```bash
-uv run --project ../eventum eventum generate --path generators/network-eltex-esr/generator.yml --id esr --live-mode true
+eventum generate --path generators/network-eltex-esr/generator.yml --id esr --live-mode true
 ```
 
-For a finite batch, copy the config beside the original, set ISO 8601 cron `start`/`end`, then run that path with `--live-mode false --keep-order true -vv`. Batch mode alone does not bound an open-ended input. For example, 2026-09-26T00:00:00Z to 2026-09-29T04:20:00Z covers 76h20 and three daily sequences. Custom input with Moscow offsets still produces source UTC. Check nonempty output and error logs as well as exit status. Serialize Eventum/Node validation with `flock -x /tmp/eventum-generator-heavy.lock`.
+Batch mode needs a bounded input: add `start` and `end` to the `cron` input, then run:
 
-## Validation
+```bash
+eventum generate --path generators/network-eltex-esr/generator.yml --id esr --live-mode false
+```
 
-An independent native/state checker verified five fresh finite outputs, all generation exit 0 and no error log:
+## Limitations
 
-| Capture | Hours | Records | Complete sequences | Create/remove |
-|---|---:|---:|---:|---|
-| Default on |76h20|27481|3|16/15|
-| Default off |76h20|27481|0|13/12|
-| Custom on, 12h interval |76h20|27481|6|19/18|
-| Custom off |76h20|27481|0|13/12|
-| Minimum 6h interval |100h20|36121|16|33/32|
-
-All 14 actions and all three actual ordinary creation/authentication identities occur outside episodes, with zero policy contradictions, at most two sessions and one valid existing tail account. Checks cover native bodies/frame, UTC/source cadence, candidate application, before-state privilege/deletion, matching SSH lifecycles, simultaneous source-port distinction and recurrence. Native-consistent negative captures reject wrong old privilege, SSH before application, removal of an absent alias and identical live TCP tuples.
-
-The unmodified original 388238b model was separately generated for 80 minutes: 2401 records had 2360 one-second gaps and 40 sixty-one-second gaps, not steady two-second cadence. Two old chains created accounts without removals/application, opened administrator sessions without closing them, and accepted service authentication without open/close. Intermediate fixes that still produced static alias discrimination were rejected; only the fresh final snapshot above is reviewed.
+- The vendor reference gives field-complete message bodies and one complete remote frame (`<86>1 ... vesr login - - - 1: %AAA-LOCAL-I-SESSION: console: session opened for user admin`). The `ssh:` session prefix substitutes that documented `console:` slot for SSH logins; an SSH capture was not available.
+- App name `login` and facility authpriv (10) for AAA records come from the vendor example. The group-derived app names are an assumption; other families use facility local0 (16), which assumes `syslog facility local0` is configured (the CLI default is local7, 23).
+- CLI `commit`/`confirm` records are documented only with `console` input and are omitted. The profile assumes every commit is confirmed within the 600-second rollback timer, so `Configuration is applied` stands for a confirmed change.
+- The time-change body has no old or new clock value; nothing about clock rollback is implied, and the generated clock stays monotonic UTC with second precision.
+- IPv6, Telnet/console logins, public-key authentication, remote AAA, lockout records, configuration rollback and full traffic session lifecycles are outside this subset. Rates are training assumptions, not measured production volume. No Elastic integration exists for ESR, so ECS mapping is inferred.
 
 ## Sample Output
 
-The complete privilege-change record below was copied from the first final default-enabled episode. Its USER body has no command actor:
+The privilege change of the first episode, copied byte for byte from the final default capture (line 8966):
 
 ```json
-{
-  "@timestamp": "2026-09-27T00:01:10+00:00",
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "user_privilege_changed",
-    "category": [
-      "iam"
-    ],
-    "dataset": "eltex.esr.syslog",
-    "kind": "event",
-    "module": "eltex",
-    "original": "<134>1 2026-09-27T00:01:10+00:00 esr-edge-01 user - - - 8648: %USER-I-INFO: Privilege level of user svc_remote_001 was changed from 1 to 14",
-    "outcome": "success",
-    "type": [
-      "change"
-    ]
-  },
-  "message": "%USER-I-INFO: Privilege level of user svc_remote_001 was changed from 1 to 14",
-  "log": {
-    "level": "info",
-    "syslog": {
-      "priority": 134,
-      "facility": {
-        "code": 16
-      },
-      "severity": {
-        "code": 6
-      },
-      "appname": "user",
-      "version": "1"
-    }
-  },
-  "observer": {
-    "hostname": "esr-edge-01",
-    "ip": [
-      "10.50.0.1"
-    ],
-    "name": "esr-edge-01",
-    "product": "ESR",
-    "type": "router",
-    "vendor": "Eltex"
-  },
-  "eltex": {
-    "esr": {
-      "group": "USER",
-      "mnemonic": "INFO",
-      "severity_code": "I",
-      "sequence_number": 8648,
-      "details": {
-        "privilege": {
-          "new": 14,
-          "old": 1
-        }
-      }
-    }
-  },
-  "user": {
-    "target": {
-      "name": "svc_remote_001"
-    }
-  },
-  "related": {
-    "user": [
-      "svc_remote_001"
-    ]
-  }
-}
+{"@timestamp": "2026-09-27T00:47:43+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "user_privilege_changed", "category": ["iam"], "dataset": "eltex.esr.syslog", "kind": "event", "module": "eltex", "original": "\u003c134\u003e1 2026-09-27T00:47:43+00:00 esr-edge-01 user - - - 16185: %USER-I-INFO: Privilege level of user svc_remote_001 was changed from 1 to 14", "outcome": "success", "type": ["change"]}, "message": "%USER-I-INFO: Privilege level of user svc_remote_001 was changed from 1 to 14", "log": {"level": "info", "syslog": {"priority": 134, "facility": {"code": 16}, "severity": {"code": 6}, "appname": "user", "version": "1"}}, "observer": {"hostname": "esr-edge-01", "ip": ["10.50.0.1"], "name": "esr-edge-01", "product": "ESR", "type": "router", "vendor": "Eltex"}, "eltex": {"esr": {"group": "USER", "mnemonic": "INFO", "severity_code": "I", "sequence_number": 16185, "details": {"privilege": {"new": 14, "old": 1}}}}, "user": {"target": {"name": "svc_remote_001"}}, "related": {"user": ["svc_remote_001"]}}
 ```
 
 ## References
 
-- [Eltex ESR 1.40 Syslog Reference](https://docs.eltex-co.ru/download/attachments/52497571/ESR-Series_Syslog_reference_1.40.pdf?api=v2): remote envelope, native selected message bodies and optional sequence/timestamp controls.
-- [Eltex ESR 1.40 CLI Reference](https://docs.eltex-co.ru/download/attachments/52497571/ESR-Series_CLI_1.40.pdf?api=v2): local user default privilege, configuration/confirmation, administrative privilege requirements and lockout defaults.
-- [Elastic ECS field reference](https://www.elastic.co/docs/reference/ecs/ecs-field-reference): normalized field names; no dedicated ESR integration parity is claimed.
+- [Eltex ESR 1.40 Syslog reference](https://docs.eltex-co.ru/download/attachments/52497571/ESR-Series_Syslog_reference_1.40.pdf?api=v2): remote frame, message catalogue, sequence-number option.
+- [Eltex ESR 1.40 CLI reference](https://docs.eltex-co.ru/download/attachments/52497571/ESR-Series_CLI_1.40.pdf?api=v2): local users and default privilege, commit confirmation timer, login lockout defaults.
+- [Elastic ECS field reference](https://www.elastic.co/docs/reference/ecs/ecs-field-reference)

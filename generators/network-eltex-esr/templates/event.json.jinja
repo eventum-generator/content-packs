@@ -1,24 +1,27 @@
-{# One source, bounded maintenance queue and one temporary local account.
-   SSH CLI commit/confirm messages are outside this documented subset.
-   Deployment assumption: every commit is confirmed within 600 seconds. #}
+{#- One ESR router. Every one-second tick emits at most one record:
+    the earliest due SSH/maintenance step, otherwise random traffic.
+    Administrators, temporary accounts and traffic are independent
+    random processes; the anomaly episode is one extra session. -#}
 {%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
-{%- if not (6 <= interval <= 8760) -%}
-  {{ module.math.sqrt(-1) }}
-{%- endif -%}
+{%- set aliases_all = [] -%}
+{%- for n in range(1, 6) -%}
+  {%- do aliases_all.append(params.service_user_prefix ~ ('%03d' % n)) -%}
+{%- endfor -%}
+{%- set admins = [{'user': params.normal_user, 'ip': params.normal_source_ip},
+    {'user': params.unusual_user, 'ip': params.unusual_source_ip}] -%}
 {%- if not shared.get('initialized', false) -%}
-  {%- for name in [params.normal_user, params.unusual_user,
-      params.service_user_prefix ~ '001', params.service_user_prefix ~ '002',
-      params.service_user_prefix ~ '003'] -%}
+  {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- for name in [params.normal_user, params.unusual_user] + aliases_all -%}
     {%- if not module.re.fullmatch('[A-Za-z][A-Za-z0-9_-]{0,30}', name) -%}
       {{ module.math.sqrt(-1) }}
     {%- endif -%}
   {%- endfor -%}
-  {%- if params.normal_user == params.unusual_user or
-      params.normal_user in [params.service_user_prefix ~ '001',
-      params.service_user_prefix ~ '002', params.service_user_prefix ~ '003'] or
-      params.unusual_user in [params.service_user_prefix ~ '001',
-      params.service_user_prefix ~ '002', params.service_user_prefix ~ '003'] -%}
+  {%- if params.normal_user == params.unusual_user
+      or params.normal_user in aliases_all
+      or params.unusual_user in aliases_all
+      or params.normal_source_ip == params.unusual_source_ip -%}
     {{ module.math.sqrt(-1) }}
   {%- endif -%}
   {%- for ip in [params.router_ip, params.normal_source_ip,
@@ -29,65 +32,138 @@
       params.router_name) -%}
     {{ module.math.sqrt(-1) }}
   {%- endif -%}
-  {%- do shared.update({'initialized': true, 'next_episode': now +
-      (interval * 3600) | int, 'next_maintenance': now + 3600,
-      'maintenance_phase': 0, 'maintenance_cursor': 0,
-      'episode_cursor': 0, 'queue': [],
-      'queue_index': 0, 'temporary': none, 'context': {}}) -%}
+  {%- set pool = {} -%}
+  {%- for name in aliases_all -%}
+    {%- do pool.update({name: {'present': false, 'applied': false,
+        'priv': 1, 'removing': false, 'reserved': false}}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'aliases': pool, 'procs': [],
+      'hist': [], 'consec': {}, 'sequence': module.rand.number.integer(1, 5000),
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_actor': none, 'last_alias': none}) -%}
 {%- endif -%}
-{%- set queue = shared.get('queue') -%}
-{%- if not queue -%}
-  {%- set temporary = shared.get('temporary') -%}
-  {%- set due = params.anomaly_mode and now >= shared.get('next_episode') -%}
-  {%- set cleanup = temporary and (due or now >= temporary.cleanup_at) -%}
-  {%- set phase = shared.get('maintenance_phase') -%}
-  {%- set actor = params.unusual_user if (due or phase % 2)
-      else params.normal_user -%}
-  {%- set src = params.unusual_source_ip if actor == params.unusual_user
-      else params.normal_source_ip -%}
-  {%- set session = {'actor': actor, 'ip': src,
-      'port': module.rand.number.integer(32768, 60999),
-      'target': temporary.name if temporary else ''} -%}
-  {%- do session.update({'service_port': 32768 +
-      ((session.port - 32768 + module.rand.number.integer(1, 28231)) % 28232)}) -%}
-  {%- if cleanup -%}
-    {%- set queue = ['accepted', 'opened', 'remove', 'apply', 'closed'] -%}
-  {%- elif due -%}
-    {%- set cursor = shared.get('episode_cursor') -%}
-    {%- do shared.set('episode_cursor', (cursor + 1) % 3) -%}
-    {%- do session.update({'target': params.service_user_prefix ~
-        ('%03d' % (cursor + 1))}) -%}
-    {%- set queue = ['failed', 'failed', 'failed', 'accepted', 'opened',
-        'enable', 'create', 'privilege', 'apply', 'time',
-        'service_accepted', 'service_opened', 'service_closed', 'closed'] -%}
-    {%- do shared.set('next_episode', now + (interval * 3600) | int) -%}
-  {%- elif now >= shared.get('next_maintenance') -%}
-    {%- do shared.set('next_maintenance', now + 3600) -%}
-    {%- do shared.set('maintenance_phase', phase if phase == 0 and temporary else (phase + 1) % 6) -%}
-    {%- if phase == 0 and not temporary -%}
-      {%- set cursor = shared.get('maintenance_cursor') -%}
-      {%- do shared.set('maintenance_cursor', (cursor + 1) % 3) -%}
-      {%- do session.update({'target': params.service_user_prefix ~
-          ('%03d' % (cursor + 1))}) -%}
-      {%- set queue = ['failed', 'accepted', 'opened', 'create', 'apply',
-          'service_accepted', 'service_opened', 'service_closed', 'closed'] -%}
-    {%- elif phase == 1 and temporary and temporary.privilege == 1 -%}
-      {%- set queue = ['accepted', 'opened', 'privilege', 'apply', 'closed'] -%}
-    {%- elif phase == 2 and temporary and temporary.applied -%}
-      {%- set queue = ['service_accepted', 'service_opened', 'service_closed'] -%}
-    {%- elif phase == 3 -%}
-      {%- set queue = ['accepted', 'opened', 'enable', 'apply', 'time', 'closed'] -%}
-    {%- elif phase == 4 and temporary -%}
-      {%- set queue = ['accepted', 'opened', 'remove', 'apply', 'closed'] -%}
+{%- set pool = shared.get('aliases') -%}
+{%- set procs = shared.get('procs') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set consec = shared.get('consec') -%}
+{%- if shared.get('consec_t') is none -%}{%- do shared.set('consec_t', {}) -%}{%- endif -%}
+{%- set consec_t = shared.get('consec_t') -%}
+{#- Failed attempts older than the 300 s lockout window no longer count. -#}
+{%- for u in consec_t -%}
+  {%- if now - consec_t[u] > 300 -%}{%- do consec.update({u: 0}) -%}{%- endif -%}
+{%- endfor -%}
+{#- Office-hours intensity; mean over a day is about 0.883. -#}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set load = (1.45 if 6 <= hour < 16 else (0.8 if hour < 20 and hour >= 16
+    else 0.35)) / 0.883 -%}
+
+{%- macro spawn(kind, user, ip, delay, fails=none, ops=none, episode=false,
+    target=none, guard=true) -%}
+  {%- set busy = namespace(ports=[]) -%}
+  {%- for p in procs -%}{%- do busy.ports.append(p.port) -%}{%- endfor -%}
+  {%- set port = namespace(v=module.rand.number.integer(32768, 60999)) -%}
+  {%- for attempt in range(6) -%}
+    {%- if port.v in busy.ports -%}
+      {%- set port.v = module.rand.number.integer(32768, 60999) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set ok = true -%}
+  {%- if fails is none -%}
+    {%- if kind == 'admin' and module.rand.chance(0.12) -%}
+      {%- set ok = false -%}
+      {%- set k = module.rand.weighted_choice([1, 2, 3], [5, 3, 2]) -%}
+    {%- elif kind == 'admin' -%}
+      {%- set k = module.rand.weighted_choice([0, 1, 2, 3], [76, 10, 6, 8]) -%}
     {%- else -%}
-      {%- set queue = ['failed', 'accepted', 'opened', 'closed'] -%}
+      {%- set k = module.rand.weighted_choice([0, 1, 2, 3], [85, 9, 4, 2]) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set k = fails -%}
+  {%- endif -%}
+  {#- Keep queued plus recorded failures below the five-attempt lockout. -#}
+  {%- set queued = namespace(n=consec.get(user, 0)) -%}
+  {%- for p in procs -%}
+    {%- if p.user == user -%}{%- set queued.n = queued.n + p.fails -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set k = [k, [4 - queued.n, 0] | max] | min -%}
+  {%- if ok or k > 0 -%}
+    {%- if ops is none and kind == 'admin' and ok -%}
+      {%- set plan = ['any'] * module.rand.weighted_choice(
+          [0, 1, 2, 3, 4, 5, 6], [26, 26, 18, 12, 8, 6, 4]) -%}
+    {%- else -%}
+      {%- set plan = ops or [] -%}
+    {%- endif -%}
+    {%- do procs.append({'due': now + ([delay, 0] | max) | int, 'kind': kind,
+        'user': user, 'ip': ip, 'port': port.v, 'fails': k, 'ok': ok,
+        'stage': 'fail' if k else 'accept', 'ops': plan, 'pending': false,
+        'apply_next': false, 'changes': [], 'episode': episode,
+        'target': target, 'guard': guard}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- 1. Independent arrivals: administrator sessions, account logins. -#}
+{%- for a in admins -%}
+  {%- if module.rand.chance(16 / 86400 * load) -%}
+    {{- spawn('admin', a.user, a.ip, 0) -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- for name in aliases_all -%}
+  {%- set acc = pool[name] -%}
+  {%- if acc.present and acc.applied and not acc.removing
+      and module.rand.chance(5 / 86400 * load) -%}
+    {%- set via = module.rand.choice(admins) -%}
+    {{- spawn('svc', name, via.ip, 0) -}}
+  {%- endif -%}
+{%- endfor -%}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, never catching up. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set free = namespace(v=[]) -%}
+    {%- for name in aliases_all -%}
+      {%- if not pool[name].present and not pool[name].reserved -%}
+        {%- do free.v.append(name) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set ready = namespace(v=[]) -%}
+    {%- for a in admins -%}
+      {%- set waiting = procs | selectattr('user', 'equalto', a.user)
+          | selectattr('stage', 'equalto', 'fail') | list -%}
+      {%- if consec.get(a.user, 0) <= 1 and not waiting -%}
+        {%- do ready.v.append(a) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if free.v and ready.v -%}
+      {%- set fresh = free.v | reject('equalto', shared.get('last_alias')) | list -%}
+      {%- set alias = module.rand.choice(fresh or free.v) -%}
+      {%- set actor = module.rand.choice(ready.v) -%}
+      {%- do pool[alias].update({'reserved': true}) -%}
+      {{- spawn('admin', actor.user, actor.ip, 0, fails=3,
+          ops=['enable', 'create', 'privilege', 'apply', 'time'],
+          episode=true, target=alias) -}}
+      {%- do shared.update({'start_at': none, 'last_alias': alias,
+          'last_actor': actor.user,
+          'next_due': now + (interval * 3600) | int}) -%}
     {%- endif -%}
   {%- endif -%}
-  {%- if queue -%}
-    {%- do shared.update({'queue': queue, 'queue_index': 0,
-        'context': session}) -%}
-  {%- endif -%}
 {%- endif -%}
+
+{#- 3. Earliest due step, otherwise traffic, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for p in procs -%}
+  {%- if p.due <= now and p.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = p.due -%}
+  {%- endif -%}
+{%- endfor -%}
+
 {%- set extra = {} -%}
 {%- set category = ['network'] -%}
 {%- set event_type = ['info'] -%}
@@ -95,20 +171,187 @@
 {%- set group = 'FIREWALL' -%}
 {%- set severity_code = 'I' -%}
 {%- set mnemonic = 'LOG' -%}
-{%- set action = 'firewall_permitted' -%}
-{%- if queue -%}
-  {%- set index = shared.get('queue_index') -%}
-  {%- set step = queue[index] -%}
-  {%- set context = shared.get('context') -%}
-  {%- set actor = context.target if step.startswith('service_')
-      else context.actor -%}
-  {%- set src = context.ip -%}
-  {%- set port = context.service_port if step.startswith('service_')
-      else context.port -%}
-  {%- if step in ['failed', 'accepted', 'service_accepted'] -%}
+{%- set action = none -%}
+{%- set step = none -%}
+{%- set done = false -%}
+
+{%- if pick.i >= 0 -%}
+  {%- set p = procs[pick.i] -%}
+  {%- if p.stage == 'fail' -%}
+    {%- set step = 'failed' -%}
+    {%- do p.update({'fails': p.fails - 1}) -%}
+    {%- do consec.update({p.user: consec.get(p.user, 0) + 1}) -%}
+    {%- do consec_t.update({p.user: now}) -%}
+    {%- if p.fails > 0 -%}
+      {%- do p.update({'due': now + gap(6, 0.6) | int}) -%}
+    {%- elif p.ok -%}
+      {%- do p.update({'stage': 'accept', 'due': now + gap(7, 0.6) | int}) -%}
+    {%- else -%}
+      {%- set done = true -%}
+      {%- if module.rand.chance(0.7) -%}
+        {{- spawn(p.kind, p.user, p.ip, gap(50, 0.8) | int) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif p.stage == 'accept' -%}
+    {%- set step = 'accepted' -%}
+    {#- Guard on the final chain step only: an ordinary account login
+        that would complete the full ordered chain fails instead. -#}
+    {%- if p.kind == 'svc' and p.guard -%}
+      {%- set g = namespace(block=false) -%}
+      {%- set want = ['F', 'F', 'S', 'E', 'C', 'V', 'Y', 'T'] -%}
+      {%- for h0 in hist -%}
+        {%- if not g.block and h0.a == 'F' and h0.i == p.ip
+            and h0.u != p.user and now - h0.t <= 2400 -%}
+          {%- set m = namespace(k=0) -%}
+          {%- for h in hist[loop.index:] -%}
+            {%- if m.k < 8 and h.a == want[m.k] -%}
+              {%- if (h.a in ['F', 'S'] and h.u == h0.u and h.p == h0.p)
+                  or (h.a in ['E', 'T'] and h.u == h0.u)
+                  or (h.a in ['C', 'V'] and h.u == p.user)
+                  or h.a == 'Y' -%}
+                {%- set m.k = m.k + 1 -%}
+              {%- endif -%}
+            {%- endif -%}
+          {%- endfor -%}
+          {%- if m.k == 8 -%}{%- set g.block = true -%}{%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if g.block -%}
+        {%- set step = 'failed' -%}
+        {%- do consec.update({p.user: consec.get(p.user, 0) + 1}) -%}
+        {%- do consec_t.update({p.user: now}) -%}
+        {%- set done = true -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if step == 'accepted' -%}
+      {%- do consec.update({p.user: 0}) -%}
+      {%- do p.update({'stage': 'open', 'due': now + 1 +
+          (module.rand.number.exponential(1 / 1.2)) | int}) -%}
+    {%- endif -%}
+  {%- elif p.stage == 'open' -%}
+    {%- set step = 'opened' -%}
+    {%- if p.kind == 'admin' -%}
+      {%- do p.update({'stage': 'ops', 'due': now + gap(25, 0.8) | int}) -%}
+    {%- else -%}
+      {%- do p.update({'stage': 'close', 'due': now + gap(100, 1.0) | int}) -%}
+    {%- endif -%}
+  {%- elif p.stage == 'close' -%}
+    {%- set step = 'closed' -%}
+    {%- set done = true -%}
+  {%- else -%}
+    {#- Maintenance inside an administrator session. -#}
+    {%- set op = none -%}
+    {%- if p.apply_next or (not p.ops and p.pending) -%}
+      {%- set op = 'apply' -%}
+    {%- elif p.ops -%}
+      {%- set op = p.ops.pop(0) -%}
+      {%- if op == 'apply' and not p.pending -%}{%- set op = 'time' -%}{%- endif -%}
+    {%- endif -%}
+    {%- if op is none -%}
+      {%- set step = 'closed' -%}
+      {%- set done = true -%}
+    {%- else -%}
+      {%- set absent = namespace(v=[], present=[], removable=[]) -%}
+      {%- for name in aliases_all -%}
+        {%- set acc = pool[name] -%}
+        {%- if not acc.present and not acc.reserved -%}
+          {%- do absent.v.append(name) -%}
+        {%- elif acc.present and not acc.removing -%}
+          {%- do absent.present.append(name) -%}
+          {%- set active = namespace(n=0) -%}
+          {%- for q in procs -%}
+            {%- if q.user == name -%}{%- set active.n = active.n + 1 -%}{%- endif -%}
+          {%- endfor -%}
+          {%- if acc.applied and active.n == 0 and name not in p.changes -%}
+            {%- do absent.removable.append(name) -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- set mine = absent.present | select('in', p.changes) | list -%}
+      {%- if op == 'any' -%}
+        {%- set op = module.rand.weighted_choice(
+            ['create', 'privilege', 'remove', 'password', 'enable', 'time'],
+            [20 if absent.v else 0,
+             (18 if absent.present else 0) + (30 if mine else 0),
+             12 * (absent.removable | length), 14, 24, 22]) -%}
+      {%- endif -%}
+      {%- set step = op -%}
+      {%- set tgt = none -%}
+      {%- if op == 'create' -%}
+        {%- set tgt = p.target if p.target else module.rand.choice(absent.v) -%}
+        {%- do pool[tgt].update({'present': true, 'applied': false, 'priv': 1,
+            'reserved': false, 'removing': false}) -%}
+      {%- elif op == 'privilege' -%}
+        {%- if p.target -%}
+          {%- set tgt = p.target -%}
+        {%- elif mine and module.rand.chance(0.8) -%}
+          {%- set tgt = module.rand.choice(mine) -%}
+        {%- else -%}
+          {%- set tgt = module.rand.choice(absent.present) -%}
+        {%- endif -%}
+        {%- set old = pool[tgt].priv -%}
+        {%- if p.episode -%}
+          {%- set new = 14 -%}
+        {%- elif old == 1 -%}
+          {%- set new = module.rand.weighted_choice([14, 5, 15], [60, 25, 15]) -%}
+        {%- else -%}
+          {%- set new = module.rand.choice([1, 5, 14, 15] | reject('equalto', old) | list) -%}
+        {%- endif -%}
+        {%- do pool[tgt].update({'priv': new}) -%}
+      {%- elif op == 'remove' -%}
+        {%- set tgt = module.rand.choice(absent.removable) -%}
+        {%- do pool[tgt].update({'removing': true}) -%}
+      {%- elif op == 'password' -%}
+        {%- set tgt = module.rand.choice(absent.present + [p.user] * 2) -%}
+      {%- endif -%}
+      {%- if op in ['create', 'privilege', 'remove', 'password', 'enable'] -%}
+        {%- if tgt and tgt not in p.changes -%}{%- do p.changes.append(tgt) -%}{%- endif -%}
+        {%- if op == 'create' and not p.episode and module.rand.chance(0.5) -%}
+          {#- Account and its privilege configured in one go. -#}
+          {%- do p.ops.insert(0, 'privilege') -%}
+          {%- do p.update({'pending': true, 'apply_next': false}) -%}
+        {%- else -%}
+          {%- do p.update({'pending': true,
+              'apply_next': (not p.episode) and module.rand.chance(0.5)}) -%}
+        {%- endif -%}
+      {%- elif op == 'apply' -%}
+        {%- set tested = namespace(v=none) -%}
+        {%- for name in p.changes -%}
+          {%- if name in pool -%}
+            {%- if pool[name].removing -%}
+              {%- do pool[name].update({'present': false, 'applied': false,
+                  'removing': false, 'priv': 1}) -%}
+            {%- elif pool[name].present -%}
+              {%- do pool[name].update({'applied': true}) -%}
+              {%- set tested.v = name -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if tested.v and not p.episode and module.rand.chance(0.45) -%}
+          {{- spawn('svc', tested.v, p.ip, gap(40, 0.8) | int) -}}
+        {%- endif -%}
+        {%- do p.update({'pending': false, 'apply_next': false, 'changes': []}) -%}
+      {%- elif op == 'time' and p.episode -%}
+        {{- spawn('svc', p.target, p.ip, gap(40, 0.8) | int, guard=false) -}}
+      {%- endif -%}
+      {%- if not p.ops and not p.pending -%}
+        {%- do p.update({'due': now + gap(45, 0.8) | int}) -%}
+      {%- elif p.apply_next or (not p.ops and p.pending) -%}
+        {%- do p.update({'due': now + gap(12, 0.6) | int}) -%}
+      {%- else -%}
+        {%- do p.update({'due': now + gap(30, 0.8) | int}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if done -%}{%- do procs.pop(pick.i) -%}{%- endif -%}
+
+  {%- set actor = p.user -%}
+  {%- set src = p.ip -%}
+  {%- set port = p.port -%}
+  {%- if step in ['failed', 'accepted'] -%}
     {%- set group = 'AAA' -%}
     {%- set mnemonic = 'SSH' -%}
-    {%- set accepted = step != 'failed' -%}
+    {%- set accepted = step == 'accepted' -%}
     {%- set body = ('Accepted' if accepted else 'Failed') ~
         ' password for ' ~ actor ~ ' from ' ~ src ~ ' port ' ~ port ~ ' ssh2' -%}
     {%- set action = 'ssh_password_accepted' if accepted else 'ssh_password_failed' -%}
@@ -119,18 +362,18 @@
         'destination': {'ip': params.router_ip, 'port': 22},
         'network': {'transport': 'tcp'},
         'eltex': {'esr': {'ssh': {'protocol': 'ssh2'}}}}) -%}
-  {%- elif step in ['opened', 'closed', 'service_opened', 'service_closed'] -%}
+    {%- do hist.append({'t': now, 'a': 'S' if accepted else 'F', 'u': actor,
+        'i': src, 'p': port}) -%}
+  {%- elif step in ['opened', 'closed'] -%}
     {%- set group = 'AAA-LOCAL' -%}
     {%- set mnemonic = 'SESSION' -%}
-    {%- set opened = step.endswith('opened') -%}
-    {%- set body = 'ssh: session ' ~ ('opened' if opened else 'closed') ~ ' for user ' ~ actor -%}
-    {%- set action = 'session_opened' if opened else 'session_closed' -%}
+    {%- set body = 'ssh: session ' ~ step ~ ' for user ' ~ actor -%}
+    {%- set action = 'session_' ~ step -%}
     {%- set category = ['authentication'] -%}
-    {%- set event_type = ['start'] if opened else ['end'] -%}
+    {%- set event_type = ['start'] if step == 'opened' else ['end'] -%}
     {%- do extra.update({'user': {'name': actor},
         'eltex': {'esr': {'session': {'access': 'ssh'}}}}) -%}
   {%- elif step == 'enable' -%}
-    {%- do shared.set('pending_change', 'enable') -%}
     {%- set group = 'USER' -%}
     {%- set mnemonic = 'INFO' -%}
     {%- set body = "password for '$enab15$' changed by '" ~ actor ~ "'" -%}
@@ -139,39 +382,36 @@
     {%- set event_type = ['change'] -%}
     {%- do extra.update({'user': {'name': actor},
         'eltex': {'esr': {'privilege_level': 15}}}) -%}
-  {%- elif step == 'create' -%}
-    {%- do shared.set('pending_change', 'create') -%}
+    {%- do hist.append({'t': now, 'a': 'E', 'u': actor}) -%}
+  {%- elif step in ['create', 'remove'] -%}
     {%- set group = 'USER' -%}
     {%- set mnemonic = 'ADD' -%}
-    {%- set body = 'User ' ~ context.target ~ ' was created' -%}
-    {%- set action = 'user_created' -%}
+    {%- set created = step == 'create' -%}
+    {%- set body = 'User ' ~ tgt ~ ' was ' ~ ('created' if created else 'removed') -%}
+    {%- set action = 'user_created' if created else 'user_removed' -%}
     {%- set category = ['iam'] -%}
-    {%- set event_type = ['creation'] -%}
-    {%- do extra.update({'user': {'target': {'name': context.target}}}) -%}
-    {%- do shared.set('temporary', {'name': context.target, 'privilege': 1,
-        'applied': false, 'removed': false,
-        'cleanup_at': now + (3600 if 'enable' in queue else 18000)}) -%}
+    {%- set event_type = ['creation'] if created else ['deletion'] -%}
+    {%- do extra.update({'user': {'target': {'name': tgt}}}) -%}
+    {%- if created -%}{%- do hist.append({'t': now, 'a': 'C', 'u': tgt}) -%}{%- endif -%}
   {%- elif step == 'privilege' -%}
-    {%- do shared.set('pending_change', 'privilege') -%}
     {%- set group = 'USER' -%}
     {%- set mnemonic = 'INFO' -%}
-    {%- set body = 'Privilege level of user ' ~ context.target ~ ' was changed from 1 to 14' -%}
+    {%- set body = 'Privilege level of user ' ~ tgt ~ ' was changed from '
+        ~ old ~ ' to ' ~ new -%}
     {%- set action = 'user_privilege_changed' -%}
     {%- set category = ['iam'] -%}
     {%- set event_type = ['change'] -%}
-    {%- do extra.update({'user': {'target': {'name': context.target}},
-        'eltex': {'esr': {'privilege': {'old': 1, 'new': 14}}}}) -%}
-    {%- do shared.get('temporary').update({'privilege': 14, 'applied': false}) -%}
-  {%- elif step == 'remove' -%}
-    {%- do shared.set('pending_change', 'remove') -%}
+    {%- do extra.update({'user': {'target': {'name': tgt}},
+        'eltex': {'esr': {'privilege': {'old': old, 'new': new}}}}) -%}
+    {%- do hist.append({'t': now, 'a': 'V', 'u': tgt}) -%}
+  {%- elif step == 'password' -%}
     {%- set group = 'USER' -%}
-    {%- set mnemonic = 'ADD' -%}
-    {%- set body = 'User ' ~ context.target ~ ' was removed' -%}
-    {%- set action = 'user_removed' -%}
+    {%- set mnemonic = 'INFO' -%}
+    {%- set body = 'Password of user ' ~ tgt ~ ' was changed' -%}
+    {%- set action = 'user_password_changed' -%}
     {%- set category = ['iam'] -%}
-    {%- set event_type = ['deletion'] -%}
-    {%- do extra.update({'user': {'target': {'name': context.target}}}) -%}
-    {%- do shared.get('temporary').update({'removed': true}) -%}
+    {%- set event_type = ['change'] -%}
+    {%- do extra.update({'user': {'target': {'name': tgt}}}) -%}
   {%- elif step == 'apply' -%}
     {%- set group = 'SYS' -%}
     {%- set mnemonic = 'EVENT' -%}
@@ -180,14 +420,7 @@
     {%- set action = 'configuration_applied' -%}
     {%- set category = ['configuration'] -%}
     {%- set event_type = ['change'] -%}
-    {%- if shared.get('pending_change') != 'enable' -%}
-    {%- if shared.get('temporary').removed -%}
-      {%- do shared.set('temporary', none) -%}
-    {%- else -%}
-      {%- do shared.get('temporary').update({'applied': true}) -%}
-    {%- endif -%}
-    {%- endif -%}
-    {%- do shared.pop('pending_change', none) -%}
+    {%- do hist.append({'t': now, 'a': 'Y'}) -%}
   {%- elif step == 'time' -%}
     {%- set group = 'TIME' -%}
     {%- set mnemonic = 'INFO' -%}
@@ -196,15 +429,13 @@
     {%- set category = ['configuration'] -%}
     {%- set event_type = ['change'] -%}
     {%- do extra.update({'user': {'name': actor}}) -%}
+    {%- do hist.append({'t': now, 'a': 'T', 'u': actor}) -%}
   {%- endif -%}
-  {%- if index + 1 == queue | length -%}
-    {%- do shared.update({'queue': [], 'queue_index': 0, 'context': {}}) -%}
-  {%- else -%}
-    {%- do shared.set('queue_index', index + 1) -%}
-  {%- endif -%}
-{%- else -%}
+  {%- if hist | length > 150 -%}{%- do hist.pop(0) -%}{%- endif -%}
+{%- elif module.rand.chance(0.1 * load) -%}
   {%- set kind = module.rand.weighted_choice(['permit', 'deny', 'nat', 'ips'], [620, 200, 150, 15]) -%}
   {%- set flow = samples.flows.where(decision='denied' if kind == 'deny' else 'permitted').pick() -%}
+  {%- set sport = module.rand.number.integer(32768, 60999) -%}
   {%- if kind == 'permit' or kind == 'deny' -%}
     {%- set decision = 'permitted' if kind == 'permit' else 'denied' -%}
     {%- set action = 'firewall_' ~ decision -%}
@@ -213,12 +444,12 @@
     {%- set outcome = 'success' if kind == 'permit' else 'failure' -%}
     {%- set body = "zone-pair 'trust untrust' rule " ~ flow.rule
         ~ ' (VRF_prod) ' ~ decision ~ ' tcp '
-        ~ flow.source_ip ~ ':' ~ flow.source_port ~ ' ('
+        ~ flow.source_ip ~ ':' ~ sport ~ ' ('
         ~ flow.interface ~ ' ' ~ flow.interface_mac ~ ') -> '
         ~ flow.destination_ip ~ ':' ~ flow.destination_port
         ~ ', dscp 0' -%}
     {%- do extra.update({'source': {'ip': flow.source_ip,
-        'port': flow.source_port, 'zone': 'trust'},
+        'port': sport, 'zone': 'trust'},
         'destination': {'ip': flow.destination_ip,
             'port': flow.destination_port, 'zone': 'untrust'},
         'network': {'transport': 'tcp'},
@@ -230,18 +461,18 @@
     {%- set group = 'NAT' -%}
     {%- set action = 'snat_translation' -%}
     {%- set event_type = ['connection', 'allowed'] -%}
+    {%- set nport = module.rand.number.integer(1024, 65535) -%}
     {%- set body = "SNAT ruleset 'office-egress' rule 1 (VRF_prod) "
         ~ 'permitted translation for tcp ' ~ flow.source_ip ~ ':'
-        ~ flow.source_port ~ ' to ' ~ flow.nat_ip ~ ':'
-        ~ flow.nat_port -%}
+        ~ sport ~ ' to ' ~ flow.nat_ip ~ ':' ~ nport -%}
     {%- do extra.update({'source': {'ip': flow.source_ip,
-        'port': flow.source_port,
-        'nat': {'ip': flow.nat_ip, 'port': flow.nat_port}},
+        'port': sport,
+        'nat': {'ip': flow.nat_ip, 'port': nport}},
         'network': {'transport': 'tcp'},
         'eltex': {'esr': {'nat': {'type': 'SNAT',
             'ruleset': 'office-egress', 'rule': 1,
             'vrf': 'VRF_prod', 'decision': 'permitted'}}}}) -%}
-  {%- elif kind == 'ips' -%}
+  {%- else -%}
     {%- set group = 'IPS' -%}
     {%- set mnemonic = 'INFO' -%}
     {%- set action = 'ips_drop' -%}
@@ -252,8 +483,8 @@
         ~ '[Classification: Generic ICMP event] [Priority: 3] '
         ~ '{ICMP} ' ~ flow.source_ip ~ ':2048 -> '
         ~ flow.destination_ip ~ ':0' -%}
-    {%- do extra.update({'source': {'ip': flow.source_ip,
-        }, 'destination': {'ip': flow.destination_ip}, 'network': {'transport': 'icmp'},
+    {%- do extra.update({'source': {'ip': flow.source_ip},
+        'destination': {'ip': flow.destination_ip}, 'network': {'transport': 'icmp'},
         'eltex': {'esr': {'ips': {'action': 'Drop',
             'signature_id': '1:30010:0',
             'group_id': 1, 'rule_id': 30010, 'revision': 0,
@@ -261,23 +492,25 @@
             'classification': 'Generic ICMP event',
             'priority': 3, 'native_source_suffix': 2048,
             'native_destination_suffix': 0}}}}) -%}
-
   {%- endif -%}
 {%- endif -%}
+{%- if action is none -%}{{ dispatch.drop() }}{%- endif -%}
 {%- set raw = '%' ~ group ~ '-' ~ severity_code
     ~ '-' ~ mnemonic ~ ': ' ~ body -%}
-{%- set sequence = shared.get('sequence', 0) + 1 -%}
-{%- do shared.set('sequence', sequence % 2147483647) -%}
+{#- The device also numbers messages outside this subset. -#}
+{%- set sequence = (shared.get('sequence') + 1 + (0 if module.rand.chance(0.85)
+    else module.rand.number.integer(1, 6))) % 2147483647 -%}
+{%- do shared.set('sequence', sequence) -%}
 {%- set app_name = 'login' if group in ['AAA', 'AAA-LOCAL']
     else group.lower() -%}
 {%- set facility = 10 if group in ['AAA', 'AAA-LOCAL'] else 16 -%}
-{%- set severity = {'I': 6, 'W': 4, 'F': 2}[severity_code] -%}
+{%- set severity = {'I': 6, 'W': 4}[severity_code] -%}
 {%- set priority = facility * 8 + severity -%}
-{%- set frame = '<' ~ priority ~ '>1 ' ~ timestamp.astimezone(module.datetime.timezone.utc).isoformat(timespec='seconds')
-    ~ ' ' ~ params.router_name ~ ' ' ~ app_name ~ ' - - - '
-    ~ sequence ~ ': ' ~ raw -%}
+{%- set ts = timestamp.astimezone(utc).isoformat(timespec='seconds') -%}
+{%- set frame = '<' ~ priority ~ '>1 ' ~ ts ~ ' ' ~ params.router_name
+    ~ ' ' ~ app_name ~ ' - - - ' ~ sequence ~ ': ' ~ raw -%}
 {
-  "@timestamp": {{ timestamp.astimezone(module.datetime.timezone.utc).isoformat(timespec='seconds') | tojson }},
+  "@timestamp": {{ ts | tojson }},
   "ecs": {"version": "8.17.0"},
   "event": {
     "action": {{ action | tojson }},
@@ -291,8 +524,7 @@
   },
   "message": {{ raw | tojson }},
   "log": {
-    "level": {{ {'I': 'info', 'W': 'warning',
-      'F': 'critical'}[severity_code] | tojson }},
+    "level": {{ {'I': 'info', 'W': 'warning'}[severity_code] | tojson }},
     "syslog": {"priority": {{ priority }},
       "facility": {"code": {{ facility }}},
       "severity": {"code": {{ severity }}},
@@ -318,6 +550,6 @@
   "destination": {{ extra.destination | tojson }}{% endif %}{% if extra.get('network') %},
   "network": {{ extra.network | tojson }}{% endif %}{% if extra.get('user') %},
   "user": {{ extra.user | tojson }}{% endif %}{% if extra.get('user') %},
-  "related": {"user": {{ [extra.user.get('name', extra.user.get('target', {}).get('name'))] | tojson }}}{% elif extra.get('source') %},
+  "related": {"user": {{ [extra.user.get('name', extra.user.get('target', {}).get('name'))] | tojson }}{% if extra.get('source') %}, "ip": {{ [extra.source.ip] | tojson }}{% endif %}}{% elif extra.get('source') %},
   "related": {"ip": {{ [extra.source.ip] | tojson }}}{% endif %}
 }
