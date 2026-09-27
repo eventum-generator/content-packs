@@ -1,0 +1,363 @@
+{#- One Cisco FTD security event syslog message per one-second tick at
+    most: 430002 connection start, 430001 intrusion event, 430003
+    connection end, for inbound traffic from internet clients to DMZ
+    web servers. Background is a superposition of independent
+    per-client random processes. The anomaly episode only adds records
+    for one client and never touches the background queue. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set guard_s = 3600 -%}
+{#- Signatures: GID 1 from the Elastic cisco_ftd fixture, GID 119 from
+    the Snort 3 http_inspect event table. `drop` is the rule state in
+    the IPS policy (Drop and Generate); `bg` weights benign HTTP hits,
+    `burst` weights probing clients. -#}
+{%- set sigs = [
+  {'gid': 1, 'sid': 17279, 'rev': 12, 'msg': 'SERVER-WEBAPP Ipswitch WhatsUp Small Business directory traversal attempt', 'cls': 'Attempted User Privilege Gain', 'prio': 1, 'drop': true, 'bg': 1, 'burst': 14},
+  {'gid': 119, 'sid': 11, 'rev': 1, 'msg': '(http_inspect) URI path contains /../ pattern moving up a directory', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': true, 'bg': 4, 'burst': 16},
+  {'gid': 119, 'sid': 18, 'rev': 1, 'msg': '(http_inspect) URI path includes /../ that goes above the root directory', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': true, 'bg': 2, 'burst': 12},
+  {'gid': 119, 'sid': 2, 'rev': 1, 'msg': '(http_inspect) URI contains double-encoded hexadecimal characters', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': true, 'bg': 3, 'burst': 10},
+  {'gid': 119, 'sid': 4, 'rev': 1, 'msg': '(http_inspect) URI has Unicode encodings containing bytes that were not percent-encoded', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': true, 'bg': 2, 'burst': 8},
+  {'gid': 119, 'sid': 6, 'rev': 3, 'msg': '(http_inspect) URI has two-byte or three-byte UTF-8 encoding', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': false, 'bg': 30, 'burst': 10},
+  {'gid': 119, 'sid': 8, 'rev': 1, 'msg': '(http_inspect) URI path contains consecutive slash characters', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': false, 'bg': 25, 'burst': 10},
+  {'gid': 119, 'sid': 31, 'rev': 1, 'msg': '(http_inspect) HTTP request method is not known to Snort', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': false, 'bg': 8, 'burst': 8},
+  {'gid': 119, 'sid': 33, 'rev': 1, 'msg': '(http_inspect) HTTP request URI has space character that is not percent-encoded', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': false, 'bg': 15, 'burst': 6},
+  {'gid': 119, 'sid': 13, 'rev': 1, 'msg': '(http_inspect) HTTP start line or header line terminated by LF without a CR', 'cls': 'Not Suspicious Traffic', 'prio': 3, 'drop': false, 'bg': 10, 'burst': 6}
+] -%}
+{%- set drop_sigs = sigs | selectattr('drop') | list -%}
+{%- set alert_sigs = sigs | rejectattr('drop') | list -%}
+{%- set paths = ['/', '/index.html', '/login', '/favicon.ico', '/robots.txt', '/about', '/news', '/static/app.js'] -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.client_count < 20 or params.client_count > 1000 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.web_servers | length < 2 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- for srv in params.web_servers -%}{%- set checked = module.ipaddress.IPv4Address(srv.ip) -%}{%- endfor -%}
+  {%- set clients = [] -%}
+  {%- for n in range(params.client_count * 4) -%}
+    {%- if clients | length < params.client_count -%}
+      {%- set ip = module.rand.weighted_choice(['198.51.100.', '203.0.113.', '192.0.2.'], [45, 35, 20])
+          ~ module.rand.number.integer(1, 254) -%}
+      {%- if ip not in clients | map(attribute='ip') | list -%}
+        {%- do clients.append({'ip': ip, 'w': module.rand.number.lognormal(0, 1.0),
+            'app': module.rand.weighted_choice(['Chrome', 'Firefox', 'cURL'], [62, 30, 8])}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set counters = {} -%}
+  {%- for i in range(1, params.snort_instances + 1) -%}
+    {%- do counters.update({i: module.rand.number.integer(1000, 60000)}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'clients': clients,
+      'cw': clients | map(attribute='w') | list,
+      'sw': params.web_servers | map(attribute='weight') | list,
+      'q': [], 'hist': {}, 'counters': counters,
+      'next_due': now + (interval * 3600) | int,
+      'last_client': none, 'last_server': none}) -%}
+{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set clients = shared.get('clients') -%}
+{%- set servers = params.web_servers -%}
+{%- set hour = timestamp.hour -%}
+{%- set load = (1.35 if 7 <= hour < 19 else (0.9 if 19 <= hour < 23 else 0.45)) / 0.975 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Queue one TCP connection; its 430002 is due at `at`. `hits` are
+    the signatures its packets will trigger. -#}
+{%- macro conn(c, srv, port, at, hits, episode=false) -%}
+  {%- do q.append({'due': at, 'kind': 'start', 'episode': episode,
+      's': {'c': c, 'srv': srv, 'port': port, 'hits': hits, 'dropped': false, 'high': false}}) -%}
+{%- endmacro -%}
+
+{#- Weighted pick of k distinct signatures from `pool`. -#}
+{%- macro pick_sigs(pool, weight, k, out) -%}
+  {%- set left = pool | list -%}
+  {%- for n in range(k) -%}
+    {%- if left -%}
+      {%- set g = module.rand.weighted_choice(left, left | map(attribute=weight) | list) -%}
+      {%- do out.append(g) -%}
+      {%- do left.remove(g) -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{#- Probing: HTTP requests to one server that trigger k distinct
+    signatures, 1-3 connections per signature, then optionally an
+    ordinary connection. The same law serves background and episode. -#}
+{%- macro probe_burst(c, srv, chosen, follow_port, episode=false) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for g in chosen -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(25, 1.1) | int -%}{%- endif -%}
+    {%- for a in range(module.rand.weighted_choice([1, 2, 3], [55, 32, 13])) -%}
+      {%- if not loop.first -%}{%- set t.v = t.v + gap(4, 0.8) | int -%}{%- endif -%}
+      {{- conn(c, srv, 80, t.v, [g], episode) -}}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- if follow_port -%}
+    {{- conn(c, srv, follow_port, t.v + gap(90, 1.0) | int, [], episode) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Background arrivals, independent random streams. -#}
+{%- if module.rand.chance(0.02 * load) -%}
+  {#- Ordinary visits: a few connections, mostly HTTPS. -#}
+  {%- set c = module.rand.weighted_choice(clients, shared.get('cw')) -%}
+  {%- set srv = module.rand.weighted_choice(servers, shared.get('sw')) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4], [58, 24, 11, 7])) -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(15, 1.4) | int -%}{%- endif -%}
+    {%- set port = 443 if module.rand.chance(0.82) else 80 -%}
+    {%- set hits = [] -%}
+    {%- if port == 80 -%}
+      {%- if module.rand.chance(0.05) -%}
+        {%- do hits.append(module.rand.weighted_choice(alert_sigs, alert_sigs | map(attribute='bg') | list)) -%}
+      {%- endif -%}
+      {%- if module.rand.chance(0.012) -%}
+        {%- do hits.append(module.rand.weighted_choice(drop_sigs, drop_sigs | map(attribute='bg') | list)) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {{- conn(c, srv, port, t.v, hits) -}}
+  {%- endfor -%}
+{%- endif -%}
+{%- if module.rand.chance(0.004) -%}
+  {#- Probing clients: scanners, broken tools, crawlers. -#}
+  {%- set c = module.rand.weighted_choice(clients, shared.get('cw')) -%}
+  {%- set srv = module.rand.weighted_choice(servers, shared.get('sw')) -%}
+  {%- set chosen = [] -%}
+  {{- pick_sigs(sigs, 'burst', module.rand.weighted_choice([1, 2, 3, 4, 5], [44, 24, 16, 10, 6]), chosen) -}}
+  {%- set follow = module.rand.weighted_choice([none, 443, 80], [50, 30, 20]) -%}
+  {{- probe_burst(c, srv, chosen, follow) -}}
+{%- endif -%}
+{%- if module.rand.chance(0.008) -%}
+  {#- Connection attempts to ports the access policy blocks. -#}
+  {%- set c = module.rand.weighted_choice(clients, shared.get('cw')) -%}
+  {%- set srv = module.rand.weighted_choice(servers, shared.get('sw')) -%}
+  {%- set port = module.rand.choice(params.closed_ports) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for a in range(module.rand.weighted_choice([1, 2, 3], [60, 28, 12])) -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(3, 0.7) | int -%}{%- endif -%}
+    {%- do q.append({'due': t.v, 'kind': 'block', 'episode': false,
+        's': {'c': c, 'srv': srv, 'port': port}}) -%}
+  {%- endfor -%}
+{%- endif -%}
+
+{#- 2. Episode: due by source time, exponential start delay (mean
+    20 min, flat over the day like background probing), next due from
+    the actual start, never catching up. -#}
+{%- if params.anomaly_mode and now >= shared.get('next_due') and module.rand.chance(1 / 1200) -%}
+  {%- set pool = namespace(c=[], w=[]) -%}
+  {%- for cl in clients -%}
+    {%- if cl.ip != shared.get('last_client') -%}
+      {%- do pool.c.append(cl) -%}{%- do pool.w.append(cl.w) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set c = module.rand.weighted_choice(pool.c, pool.w) -%}
+  {%- set spool = namespace(s=[], w=[]) -%}
+  {%- for srv in servers -%}
+    {%- if srv.ip != shared.get('last_server') -%}
+      {%- do spool.s.append(srv) -%}{%- do spool.w.append(srv.weight) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set srv = module.rand.weighted_choice(spool.s, spool.w) -%}
+  {%- set chosen = [] -%}
+  {{- pick_sigs(drop_sigs, 'burst', module.rand.weighted_choice([3, 4, 5], [58, 28, 14]), chosen) -}}
+  {{- probe_burst(c, srv, chosen, 443, true) -}}
+  {%- do shared.update({'last_client': c.ip, 'last_server': srv.ip,
+      'next_due': now + (interval * 3600) | int}) -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due record, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+{%- set s = e.s -%}
+{%- set kind = e.kind -%}
+
+{%- for k in hist | list -%}
+  {%- set kept = hist[k] | selectattr('0', 'ge', now - guard_s) | list -%}
+  {%- if kept -%}{%- do hist.update({k: kept}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
+{%- endfor -%}
+
+{%- set counters = shared.get('counters') -%}
+{%- if kind in ['start', 'block'] -%}
+  {%- set key = s.c.ip ~ '>' ~ s.srv.ip -%}
+  {%- if kind == 'start' and s.port == 443 and not e.episode -%}
+    {#- Guard on the final chain step only: an ordinary HTTPS
+        connection that would follow drops of three or more distinct
+        signatures from the same client to the same server within the
+        chain window keeps its time and server but goes to another
+        client, drawn by the background weights. -#}
+    {%- if hist.get(key, []) | map(attribute='1') | unique | list | length >= 3 -%}
+      {%- set alt = namespace(c=none) -%}
+      {%- for n in range(40) -%}
+        {%- if alt.c is none -%}
+          {%- set cand = module.rand.weighted_choice(clients, shared.get('cw')) -%}
+          {%- if hist.get(cand.ip ~ '>' ~ s.srv.ip, []) | map(attribute='1') | unique | list | length < 3 -%}
+            {%- set alt.c = cand -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if alt.c is none -%}{{ dispatch.drop() }}{%- endif -%}
+      {%- do s.update({'c': alt.c}) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set inst = module.rand.number.integer(1, params.snort_instances) -%}
+  {%- do counters.update({inst: counters[inst] + module.rand.number.integer(1, 60)}) -%}
+  {%- do s.update({'inst': inst, 'cid': counters[inst], 'first': now,
+      'first_text': timestamp.strftime('%Y-%m-%dT%H:%M:%SZ'),
+      'spt': module.rand.number.integer(1024, 65535)}) -%}
+  {%- if kind == 'start' -%}
+    {%- set t = namespace(v=now) -%}
+    {%- for g in s.hits -%}
+      {%- set t.v = t.v + (module.rand.number.lognormal(module.math.log(1.2), 0.8) | round | int) -%}
+      {%- do q.append({'due': t.v, 'kind': 'ips', 'episode': e.episode, 's': s, 'g': g}) -%}
+    {%- endfor -%}
+    {%- if s.hits | selectattr('drop') | list -%}
+      {%- set dur = module.rand.number.lognormal(module.math.log(2), 0.8) | round | int -%}
+    {%- elif s.port == 443 -%}
+      {%- set dur = module.rand.number.lognormal(module.math.log(40), 1.3) | round | int -%}
+    {%- else -%}
+      {%- set dur = module.rand.number.lognormal(module.math.log(2), 1.0) | round | int -%}
+    {%- endif -%}
+    {%- do q.append({'due': t.v + dur, 'kind': 'end', 'episode': e.episode, 's': s}) -%}
+  {%- endif -%}
+{%- elif kind == 'ips' -%}
+  {%- do s.update({'high': true}) -%}
+  {%- if e.g.drop -%}
+    {%- do s.update({'dropped': true}) -%}
+    {%- set key = s.c.ip ~ '>' ~ s.srv.ip -%}
+    {%- do hist.update({key: (hist.get(key, []) + [[now, e.g.gid ~ ':' ~ e.g.sid]])[-24:]}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 4. The syslog message; field order follows the Elastic cisco_ftd
+    fixtures of FTD 6.6+ security events. -#}
+{%- set c = s.c -%}
+{%- set srv = s.srv -%}
+{%- set http = s.port == 80 -%}
+{%- set f = [] -%}
+{%- set common_net = [('SrcIP', c.ip), ('DstIP', srv.ip), ('SrcPort', s.spt), ('DstPort', s.port),
+    ('Protocol', 'tcp'), ('IngressInterface', 'outside'), ('EgressInterface', 'dmz'),
+    ('IngressZone', 'Outside'), ('EgressZone', 'DMZ')] -%}
+{%- set corr = [('DeviceUUID', params.device_uuid), ('InstanceID', s.inst),
+    ('FirstPacketSecond', s.first_text), ('ConnectionID', s.cid)] -%}
+{%- set app = [('Client', c.app if http else 'SSL client'), ('ApplicationProtocol', 'HTTP' if http else 'HTTPS')] -%}
+{%- if kind == 'ips' -%}
+  {%- set code = '430001' -%}
+  {%- set g = e.g -%}
+  {%- do f.extend(corr) -%}{%- do f.extend(common_net) -%}
+  {%- do f.extend([('Priority', g.prio), ('GID', g.gid), ('SID', g.sid), ('Revision', g.rev),
+      ('Message', g.msg), ('Classification', g.cls), ('User', 'No Authentication Required')]) -%}
+  {%- do f.extend(app) -%}
+  {%- do f.extend([('IntrusionPolicy', params.intrusion_policy), ('ACPolicy', params.ac_policy),
+      ('AccessControlRuleName', params.allow_rule), ('NAPPolicy', params.nap_policy)]) -%}
+  {%- if g.drop -%}{%- do f.append(('InlineResult', 'Dropped')) -%}{%- endif -%}
+  {%- do f.extend([('IngressVRF', 'Global'), ('EgressVRF', 'Global')]) -%}
+{%- else -%}
+  {%- set code = '430003' if kind == 'end' else '430002' -%}
+  {%- set blocked = kind == 'block' or s.dropped -%}
+  {%- set rule = params.block_rule if kind == 'block' else params.allow_rule -%}
+  {%- set action = 'Block' if blocked else 'Allow' -%}
+  {%- if kind == 'block' -%}
+    {%- set cnt = (0, 0, 0, 0) -%}
+  {%- elif kind == 'start' -%}
+    {%- set cnt = module.rand.weighted_choice([(2, 1, 140, 74), (1, 0, 74, 0)], [80, 20]) -%}
+  {%- elif s.dropped -%}
+    {%- set ib = module.rand.number.lognormal(module.math.log(700), 0.6) | int -%}
+    {%- set rb = module.rand.number.lognormal(module.math.log(250), 0.8) | int -%}
+    {%- set cnt = (module.rand.number.integer(3, 7), module.rand.number.integer(1, 4), ib, rb) -%}
+  {%- elif http -%}
+    {%- set ib = module.rand.number.lognormal(module.math.log(600), 0.5) | int -%}
+    {%- set rb = module.rand.number.lognormal(module.math.log(900), 0.6) | int -%}
+    {%- set cnt = (module.rand.number.integer(4, 8), module.rand.number.integer(3, 7), ib, rb) -%}
+  {%- else -%}
+    {%- set ib = module.rand.number.lognormal(module.math.log(1800), 0.9) | int -%}
+    {%- set rb = module.rand.number.lognormal(module.math.log(30000), 1.6) | int -%}
+    {%- set cnt = ([3, ib // 160 + module.rand.number.integer(0, 3)] | max,
+        [2, rb // 1200 + module.rand.number.integer(0, 3)] | max, ib, rb) -%}
+  {%- endif -%}
+  {%- do f.append(('EventPriority', 'High' if s.get('high') else 'Low')) -%}
+  {%- do f.extend(corr) -%}
+  {%- do f.append(('AccessControlRuleAction', action)) -%}
+  {%- do f.extend(common_net) -%}
+  {%- do f.extend([('IngressVRF', 'Global'), ('EgressVRF', 'Global'), ('ACPolicy', params.ac_policy),
+      ('AccessControlRuleName', rule), ('Prefilter Policy', params.prefilter_policy),
+      ('User', 'No Authentication Required')]) -%}
+  {%- if kind == 'end' -%}
+    {%- do f.extend(app) -%}
+    {%- set dur = now - s.first -%}
+    {%- do f.append(('ConnectionDuration', dur)) -%}
+  {%- endif -%}
+  {%- do f.extend([('InitiatorPackets', cnt[0]), ('ResponderPackets', cnt[1]),
+      ('InitiatorBytes', cnt[2]), ('ResponderBytes', cnt[3]), ('NAPPolicy', params.nap_policy)]) -%}
+  {%- if kind == 'end' and http and not s.dropped -%}
+    {%- do f.extend([('HTTPResponse', module.rand.weighted_choice([301, 200, 404], [78, 16, 6])),
+        ('ReferencedHost', srv.host), ('URL', 'http://' ~ srv.host ~ module.rand.choice(paths))]) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set pieces = [] -%}
+{%- for kv in f -%}{%- do pieces.append(kv[0] ~ ': ' ~ kv[1]) -%}{%- endfor -%}
+{%- set raw = timestamp.strftime('%Y-%m-%dT%H:%M:%SZ') ~ ' ' ~ params.ftd_hostname ~ '  %FTD-'
+    ~ params.syslog_severity ~ '-' ~ code ~ ': ' ~ pieces | join(', ') -%}
+
+{#- 5. ECS document, following the Elastic cisco_ftd mapping. -#}
+{%- set names = {'EventPriority': 'event_priority', 'DeviceUUID': 'device_uuid', 'InstanceID': 'instance_id',
+    'FirstPacketSecond': 'first_packet_second', 'ConnectionID': 'connection_id',
+    'AccessControlRuleAction': 'access_control_rule_action', 'SrcIP': 'src_ip', 'DstIP': 'dst_ip',
+    'SrcPort': 'src_port', 'DstPort': 'dst_port', 'Protocol': 'protocol',
+    'IngressInterface': 'ingress_interface', 'EgressInterface': 'egress_interface',
+    'IngressZone': 'ingress_zone', 'EgressZone': 'egress_zone', 'IngressVRF': 'ingress_vrf',
+    'EgressVRF': 'egress_vrf', 'ACPolicy': 'ac_policy', 'AccessControlRuleName': 'access_control_rule_name',
+    'Prefilter Policy': 'prefilter_policy', 'User': 'user', 'Client': 'client',
+    'ApplicationProtocol': 'application_protocol', 'ConnectionDuration': 'connection_duration',
+    'InitiatorPackets': 'initiator_packets', 'ResponderPackets': 'responder_packets',
+    'InitiatorBytes': 'initiator_bytes', 'ResponderBytes': 'responder_bytes', 'NAPPolicy': 'nap_policy',
+    'HTTPResponse': 'http_response', 'ReferencedHost': 'referenced_host', 'URL': 'url',
+    'IntrusionPolicy': 'intrusion_policy', 'InlineResult': 'inline_result'} -%}
+{%- set sec_keys = ['Priority', 'GID', 'SID', 'Revision', 'Message', 'Classification'] -%}
+{%- set se = {} -%}
+{%- set sec = {} -%}
+{%- for kv in f -%}
+  {%- if kv[0] in sec_keys -%}{%- do sec.update({kv[0] | lower: kv[1] | string}) -%}
+  {%- else -%}{%- do se.update({names[kv[0]]: kv[1]}) -%}{%- endif -%}
+{%- endfor -%}
+{%- set iso = timestamp.strftime('%Y-%m-%dT%H:%M:%S+00:00') -%}
+{%- if code == '430001' -%}
+  {%- set event = {'action': 'intrusion-detected', 'category': ['intrusion_detection'], 'kind': 'alert',
+      'type': ['info', 'denied'] if e.g.drop else ['info']} -%}
+{%- else -%}
+  {%- set event = {'action': 'connection-started' if code == '430002' else 'connection-finished',
+      'category': ['network'], 'kind': 'event',
+      'type': ['connection', 'start' if code == '430002' else 'end', 'denied' if blocked else 'allowed']} -%}
+  {%- if code == '430003' -%}
+    {%- do event.update({'start': s.first_text | replace('Z', '+00:00'), 'end': iso, 'duration': dur * 1000000000}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- do event.update({'code': code, 'severity': params.syslog_severity, 'timezone': 'UTC', 'original': raw}) -%}
+{%- set cisco = {'security_event': se} -%}
+{%- if sec -%}{%- do cisco.update({'security': sec}) -%}{%- endif -%}
+{%- set record = {'@timestamp': iso, 'ecs': {'version': '8.17.0'}, 'event': event,
+  'observer': {'hostname': params.ftd_hostname, 'product': 'ftd', 'type': 'idps', 'vendor': 'Cisco',
+    'ingress': {'interface': {'name': 'outside'}, 'zone': 'Outside'},
+    'egress': {'interface': {'name': 'dmz'}, 'zone': 'DMZ'}},
+  'source': {'ip': c.ip, 'port': s.spt}, 'destination': {'ip': srv.ip, 'port': s.port},
+  'network': {'transport': 'tcp', 'iana_number': '6', 'direction': 'inbound'},
+  'related': {'ip': [c.ip, srv.ip], 'hosts': [params.ftd_hostname]}} -%}
+{%- if code == '430001' -%}
+  {%- do record.update({'rule': {'id': e.g.sid | string, 'version': e.g.rev | string, 'ruleset': params.ac_policy},
+      'message': e.g.msg}) -%}
+{%- else -%}
+  {%- do record.update({'rule': {'name': rule, 'ruleset': params.ac_policy}}) -%}
+  {%- do record.source.update({'packets': cnt[0], 'bytes': cnt[2]}) -%}
+  {%- do record.destination.update({'packets': cnt[1], 'bytes': cnt[3]}) -%}
+{%- endif -%}
+{%- do record.update({'cisco': {'ftd': cisco}}) -%}
+{{ record | tojson }}
