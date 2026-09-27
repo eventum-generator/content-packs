@@ -1,92 +1,269 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set clock = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set event_time = clock if previous is none or clock > previous else previous + module.datetime.timedelta(seconds=30) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set stage = shared.get('anomaly_stage', -1) -%}
-{%- set phase = shared.get('routine_phase', 0) -%}
-{%- set routine_count = shared.get('routine_count', 0) -%}
-{%- if params.anomaly_mode and stage == -1 and phase == 0 and routine_count >= params.anomaly_delay_sessions -%}
-  {%- set stage = 0 -%}
+{#- One Kaspersky NGFW 1.0 device logging the Firewall session stream.
+    Each one-second tick emits at most one record: the earliest due
+    session start or session end. Client activity is a superposition
+    of independent per-client random processes; the anomaly episode
+    only adds three sessions for one client and never touches the
+    background queue. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set big = 50000000 -%}
+{%- set guard_s = 7200 -%}
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.client_count < 4 or params.client_first + params.client_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set clients = [] -%}
+  {%- set weights = [] -%}
+  {%- set syn = {} -%}
+  {%- for n in range(params.client_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do clients.append(ip) -%}
+    {%- do weights.append(module.rand.number.lognormal(0, 0.5)) -%}
+    {%- do syn.update({ip: module.rand.weighted_choice([52, 60], [85, 15])}) -%}
+  {%- endfor -%}
+  {%- for ip in params.file_servers + params.cloud_destinations + [params.dns_server] -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+  {%- endfor -%}
+  {%- if params.file_servers | length < 1 or params.cloud_destinations | length < 2 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set web = [] -%}
+  {%- for n in range(40) -%}
+    {%- do web.append('198.51.100.' ~ module.rand.number.integer(2, 250)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'clients': clients,
+      'weights': weights, 'syn': syn, 'web': web, 'q': [], 'hist': {},
+      'next_id': module.rand.number.integer(100000, 9000000),
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_client': none, 'last_dest': none}) -%}
 {%- endif -%}
-{%- set chain = 0 <= stage < 4 -%}
-{%- set started = stage % 2 == 0 if chain else phase == 0 -%}
-{%- if started -%}
-  {%- set session_id = (shared.get('next_session_id', 900000) + 1) % 100000000 -%}
-  {%- do shared.set('next_session_id', session_id) -%}
-  {%- if chain -%}
-    {%- set profile = 'large_smb' -%}
-    {%- set transfer_index = stage // 2 -%}
+{%- set clients = shared.get('clients') -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set load = (1.45 if 6 <= hour < 16 else (0.8 if 16 <= hour < 20
+    else 0.35)) / 0.883 -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Queue one session. Sizes are decided now; the start record is due
+    at `at`, the end record is queued when the start is emitted. -#}
+{%- macro open_session(client, profile, dst, at, down=0, up=0, burst=0,
+    scale=0, episode=false) -%}
+  {%- if profile == 'dns' -%}
+    {%- set d = {'proto': 'UDP', 'dpt': 53, 'rule': 'Users to DNS',
+        'up': module.rand.number.integer(55, 90),
+        'down': module.rand.number.integer(80, 420),
+        'dur': 30 + gap(4, 0.8) | int} -%}
+    {#- Assumed: a UDP session is removed after a 30 s idle timeout
+        plus a random sweep delay, so rt/end fall after the reply. -#}
+  {%- elif profile == 'smb' -%}
+    {%- set rate = module.rand.number.lognormal(module.math.log(20000000), 0.6) -%}
+    {%- set d = {'proto': 'TCP', 'dpt': 445, 'rule': 'Users to file servers',
+        'down': down, 'up': up or (down * module.rand.number.floating(0.01, 0.03)) | int
+          + module.rand.number.integer(1500, 9000),
+        'dur': (down / rate) | int + gap(3, 0.8) | int} -%}
   {%- else -%}
-    {%- set routine_index = shared.get('routine_index', -1) + 1 -%}
-    {%- do shared.set('routine_index', routine_index % 240) -%}
-    {%- set profile = 'large_smb' if routine_index in [6, 126] else
-      ('small_smb' if routine_index % 20 == 19 else
-       ('dns' if routine_index % 20 == 18 else
-        ('http' if routine_index % 20 == 17 else 'https'))) -%}
-    {%- set transfer_index = 1 if routine_index == 126 else 0 -%}
-    {%- do shared.set('routine_count', [routine_count + 1, params.anomaly_delay_sessions] | min) -%}
-    {%- do shared.set('routine_phase', 1) -%}
+    {%- set rate = module.rand.number.lognormal(module.math.log(2000000), 0.5) -%}
+    {%- set d = {'proto': 'TCP', 'dpt': 80 if profile == 'http' else 443,
+        'rule': 'Users to Internet', 'down': down, 'up': up,
+        'dur': ([down, up] | max / rate) | int + gap(20, 1.2) | int} -%}
   {%- endif -%}
-  {%- set src = params.large_smb_source_ip if profile == 'large_smb' else
-    module.rand.choice(['10.20.1.21', '10.20.1.22', '10.20.1.23', '10.20.1.24']) -%}
-  {%- set dst = params.large_smb_destination_ip if profile == 'large_smb' else
-    ('10.20.2.8' if profile == 'small_smb' else
-     module.rand.choice(['198.51.100.12', '198.51.100.13'])) -%}
-  {%- set dpt = 445 if profile in ['large_smb', 'small_smb'] else
-    (53 if profile == 'dns' else (80 if profile == 'http' else 443)) -%}
-  {%- set bytes_out = (75000000 if transfer_index == 0 else 82000000) if profile == 'large_smb' else
-    (module.rand.number.integer(100000, 500000) if profile == 'small_smb' else
-     (module.rand.number.integer(500, 2000) if profile == 'dns' else
-      module.rand.number.integer(2000, 80000))) -%}
-  {%- set bytes_in = 2800000 if profile == 'large_smb' else
-    (module.rand.number.integer(2000, 9000) if profile == 'small_smb' else
-     module.rand.number.integer(300, 1500)) -%}
-  {%- set session = {'id': session_id, 'src': src, 'dst': dst, 'spt': module.rand.number.integer(49152, 61000),
-    'dpt': dpt, 'profile': profile, 'start': event_time, 'bytes_in': bytes_in, 'bytes_out': bytes_out,
-    'rule': 'Internal SMB inspection' if profile == 'large_smb' else 'Office access'} -%}
-  {%- do shared.set('active_session', session) -%}
+  {%- do d.update({'client': client, 'profile': profile, 'dst': dst,
+      'burst': burst, 'scale': scale, 'episode': episode}) -%}
+  {%- do q.append({'due': at, 'kind': 'start', 's': d}) -%}
+{%- endmacro -%}
+
+{%- macro web_down() -%}
+{{- (module.rand.number.lognormal(module.math.log(40000), 1.6)) | int + 300 -}}
+{%- endmacro -%}
+{%- macro web_up() -%}
+{{- (module.rand.number.lognormal(module.math.log(3000), 1.0)) | int + 200 -}}
+{%- endmacro -%}
+{%- macro upload_size() -%}
+{{- (module.rand.number.lognormal(module.math.log(35000000), 1.0)) | int + 100000 -}}
+{%- endmacro -%}
+{#- SMB transfer size: a per-burst scale times per-file variation. -#}
+{%- macro smb_size(scale) -%}
+{{- (scale * module.rand.number.lognormal(0, 0.7)) | int + 2000 -}}
+{%- endmacro -%}
+
+{#- 1. Background arrivals: one merged Poisson stream of independent
+    clients, weighted per client, modulated by office hours. -#}
+{%- if module.rand.chance(0.05 * load) -%}
+  {%- set c = module.rand.weighted_choice(clients, shared.get('weights')) -%}
+  {%- set kind = module.rand.weighted_choice(['web', 'cloud', 'smb', 'http', 'dns'],
+      [62, 8, 18, 6, 6]) -%}
+  {%- if kind in ['web', 'cloud', 'http'] and module.rand.chance(0.6) -%}
+    {{- open_session(c, 'dns', params.dns_server, now) -}}
+  {%- endif -%}
+  {%- set lag = now + module.rand.weighted_choice([0, 1, 2], [40, 45, 15]) -%}
+  {%- if kind == 'web' or kind == 'http' -%}
+    {{- open_session(c, 'https' if kind == 'web' else 'http',
+        module.rand.choice(shared.get('web')[:[(module.rand.number.exponential(0.12)) | int + 1, 40] | min]),
+        lag, down=web_down() | int, up=web_up() | int) -}}
+  {%- elif kind == 'cloud' -%}
+    {%- set upl = module.rand.chance(0.18) -%}
+    {{- open_session(c, 'https', module.rand.choice(params.cloud_destinations), lag,
+        down=web_down() | int,
+        up=(upload_size() | int) if upl else (web_up() | int)) -}}
+  {%- elif kind == 'smb' -%}
+    {%- set scale = module.rand.number.lognormal(module.math.log(300000), 2.2) -%}
+    {%- set burst = module.rand.weighted_choice([0, 1, 2, 3, 4, 5, 6],
+        [55, 22, 11, 6, 3, 2, 1]) -%}
+    {{- open_session(c, 'smb', module.rand.choice(params.file_servers), now,
+        down=smb_size(scale) | int, burst=burst, scale=scale) -}}
+  {%- else -%}
+    {{- open_session(c, 'dns', params.dns_server, now) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, never catching up. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set c = module.rand.choice(clients | reject('equalto', shared.get('last_client')) | list) -%}
+    {%- set dest = module.rand.choice(params.cloud_destinations
+        | reject('equalto', shared.get('last_dest')) | list) -%}
+    {%- set srv = module.rand.choice(params.file_servers) -%}
+    {#- Read sizes from the upper tail of the background SMB size law
+        (lognormal, median 300 kB, sigma 2.31) above 55 MB. -#}
+    {%- set z0 = module.math.log(55000000 / 300000) / 2.31 -%}
+    {%- set r1 = (300000 * module.math.exp(2.31 * (z0 + module.rand.number.exponential(z0)))) | int -%}
+    {%- set r2 = (300000 * module.math.exp(2.31 * (z0 + module.rand.number.exponential(z0)))) | int -%}
+    {%- set u = namespace(v=0) -%}
+    {%- for attempt in range(40) -%}
+      {%- if u.v < 55000000 -%}{%- set u.v = upload_size() | int -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set u.v = [u.v, 55000000 + module.rand.number.integer(0, 20000000)] | max -%}
+    {%- set t2 = now + (r1 / 20000000) | int + gap(3, 0.8) | int + gap(120, 0.7) | int -%}
+    {%- set t3 = t2 + (r2 / 20000000) | int + gap(3, 0.8) | int + gap(420, 0.7) | int -%}
+    {{- open_session(c, 'smb', srv, now, down=r1, episode=true) -}}
+    {{- open_session(c, 'smb', srv, t2, down=r2, episode=true) -}}
+    {{- open_session(c, 'https', dest, t3, down=web_down() | int, up=u.v, episode=true) -}}
+    {%- do shared.update({'start_at': none, 'last_client': c, 'last_dest': dest,
+        'next_due': now + (interval * 3600) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due record, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+{%- set s = e.s -%}
+{%- set started = e.kind == 'start' -%}
+
+{%- if started -%}
+  {%- set sid = shared.get('next_id') + module.rand.number.integer(1, 40) -%}
+  {%- do shared.set('next_id', sid) -%}
+  {%- do s.update({'id': sid, 'start': now,
+      'spt': module.rand.number.integer(49152, 65535)}) -%}
+  {%- do q.append({'due': now + s.dur, 'kind': 'end', 's': s}) -%}
+  {%- set up_b = s.up if s.proto == 'UDP' else shared.get('syn')[s.client] -%}
+  {%- set down_b = 0 -%}
+  {%- set cpk = 1 -%}
+  {%- set spk = 0 -%}
 {%- else -%}
-  {%- set session = shared.get('active_session') -%}
-  {%- do shared.set('active_session', none) -%}
-  {%- if not chain -%}
-    {%- do shared.set('routine_phase', 0) -%}
+  {%- set up_b = s.up -%}
+  {%- set down_b = s.down -%}
+  {#- Guard on the final chain step only: an ordinary upload that would
+      follow two large reads from one server shrinks below 50 MB. -#}
+  {%- if s.profile == 'https' and not s.episode and up_b >= big -%}
+    {%- set blocked = namespace(v=false) -%}
+    {%- for srv in params.file_servers -%}
+      {%- set n = hist.get(s.client, []) | selectattr('1', 'equalto', srv)
+          | selectattr('0', 'ge', now - guard_s) | list | length -%}
+      {%- if n >= 2 -%}{%- set blocked.v = true -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if blocked.v -%}
+      {%- set up_b = module.rand.number.integer(5000000, 45000000) -%}
+    {%- endif -%}
   {%- endif -%}
+  {%- if s.proto == 'UDP' -%}
+    {%- set cpk = module.rand.weighted_choice([1, 2], [90, 10]) -%}
+    {%- set spk = cpk -%}
+    {%- set up_b = up_b * cpk -%}
+    {%- set down_b = down_b * cpk -%}
+  {%- else -%}
+    {#- Data segments per direction, plus delayed ACKs for the other
+        direction's data (one ACK per about two segments). -#}
+    {%- set spk0 = (down_b / module.rand.number.floating(1100, 1460)) | round(0, 'ceil') | int + 2 -%}
+    {%- set cpk0 = (up_b / module.rand.number.floating(1100, 1460)) | round(0, 'ceil') | int + 3 -%}
+    {%- set spk = [spk0, (cpk0 / module.rand.number.floating(1.6, 2.2)) | int] | max -%}
+    {%- set cpk = [cpk0, (spk0 / module.rand.number.floating(1.6, 2.2)) | int] | max -%}
+    {%- set up_b = [up_b, cpk * 52] | max -%}
+    {%- set down_b = [down_b, spk * 52] | max -%}
+  {%- endif -%}
+  {#- Follow-ups of an ended session, the same for every session. -#}
+  {%- if s.profile == 'smb' -%}
+    {%- if down_b >= big -%}
+      {%- set h = hist.get(s.client, []) | selectattr('0', 'ge', now - guard_s) | list -%}
+      {%- do h.append([now, s.dst]) -%}
+      {%- do hist.update({s.client: h[-6:]}) -%}
+      {%- if module.rand.chance(0.25) -%}
+        {{- open_session(s.client, 'https', module.rand.choice(params.cloud_destinations),
+            now + gap(600, 0.8) | int, down=web_down() | int,
+            up=upload_size() | int) -}}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if s.burst > 0 -%}
+      {{- open_session(s.client, 'smb', s.dst, now + gap(40, 1.0) | int,
+          down=smb_size(s.scale) | int, burst=s.burst - 1, scale=s.scale) -}}
+    {%- endif -%}
+  {%- endif -%}
+  {%- for k in hist | list -%}
+    {%- if not (hist[k] | selectattr('0', 'ge', now - guard_s) | list) -%}
+      {%- do hist.pop(k) -%}
+    {%- endif -%}
+  {%- endfor -%}
 {%- endif -%}
-{%- if chain -%}
-  {%- do shared.set('anomaly_stage', stage + 1) -%}
-{%- endif -%}
-{%- set duration = 0 if started else (event_time - session.start).total_seconds() | int -%}
-{%- set client_bytes = 64 if started else session.bytes_in -%}
-{%- set server_bytes = 0 if started else session.bytes_out -%}
-{%- set client_packets = 1 if started else (40000 if session.profile == 'large_smb' else
-  (module.math.ceil(client_bytes / 300) | int)) -%}
-{%- set server_packets = 0 if started else (module.math.ceil(server_bytes / 1400) | int) -%}
+
+{%- set duration = now - s.start -%}
 {%- set name = 'Session start' if started else 'Firewall' -%}
-{%- set ext = 'rt=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%SZ') ~ ' dtz=UTC+00:00'
-  ~ ' cs4=Low cs4Label=Priority devicePayloadId=' ~ session.id
-  ~ ' cs1=' ~ session.rule ~ ' cs1Label=SecurityRule act=Inspect FullMatch=yes'
-  ~ ' start=' ~ session.start.strftime('%Y-%m-%dT%H:%M:%SZ')
-  ~ (' end=' ~ event_time.strftime('%Y-%m-%dT%H:%M:%SZ') if not started else '')
+{%- set iso = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set start_dt = module.datetime.datetime.fromtimestamp(s.start, utc) -%}
+{%- set ext = 'rt=' ~ iso.strftime('%Y-%m-%dT%H:%M:%SZ') ~ ' dtz=UTC+00:00'
+  ~ ' cs4=Low cs4Label=Priority devicePayloadId=' ~ s.id
+  ~ ' cs1=' ~ s.rule ~ ' cs1Label=SecurityRule act=Inspect FullMatch=yes'
+  ~ ' start=' ~ start_dt.strftime('%Y-%m-%dT%H:%M:%SZ')
+  ~ (' end=' ~ iso.strftime('%Y-%m-%dT%H:%M:%SZ') if not started else '')
   ~ ' cn1=' ~ duration ~ ' cn1Label=Duration'
-  ~ ' cn2=' ~ client_packets ~ ' cn2Label=ClientPackets'
-  ~ ' cn3=' ~ server_packets ~ ' cn3Label=ServerPackets'
-  ~ ' in=' ~ client_bytes ~ ' out=' ~ server_bytes
-  ~ ' dvchost=' ~ params.device_host ~ ' src=' ~ session.src ~ ' dst=' ~ session.dst
-  ~ ' proto=TCP spt=' ~ session.spt ~ ' dpt=' ~ session.dpt
-  ~ ' KasperskyNGFWTCPRedir=no app=Unknown' -%}
+  ~ ' cn2=' ~ cpk ~ ' cn2Label=ClientPackets'
+  ~ ' cn3=' ~ spk ~ ' cn3Label=ServerPackets'
+  ~ ' in=' ~ up_b ~ ' out=' ~ down_b
+  ~ ' dvchost=' ~ params.device_host ~ ' src=' ~ s.client ~ ' dst=' ~ s.dst
+  ~ ' proto=' ~ s.proto ~ ' spt=' ~ s.spt ~ ' dpt=' ~ s.dpt
+  ~ ' KasperskyNGFWTCPRedir=no app=Unknown'
+  ~ (' sproc=Unknown' if not started else '') -%}
 {%- set raw = 'CEF:0|Kaspersky|NGFW|' ~ params.device_version ~ '|Firewall|' ~ name ~ '|Unknown|' ~ ext -%}
 {%- set event = {'kind': 'event', 'dataset': 'kaspersky.ngfw', 'category': ['network'],
-  'type': ['start'] if started else ['end'], 'action': name, 'original': raw,
-  'start': session.start.isoformat()} -%}
+  'type': ['connection', 'start'] if started else ['connection', 'end'],
+  'action': name, 'original': raw, 'start': start_dt.isoformat()} -%}
 {%- if not started -%}
-  {%- do event.update({'end': event_time.isoformat(), 'duration': duration * 1000000000}) -%}
+  {%- do event.update({'end': iso.isoformat(), 'duration': duration * 1000000000}) -%}
 {%- endif -%}
-{%- set record = {'@timestamp': event_time.isoformat(), 'ecs': {'version': '8.17.0'},
+{%- set record = {'@timestamp': iso.isoformat(), 'ecs': {'version': '8.17.0'},
   'event': event,
   'observer': {'hostname': params.device_host, 'vendor': 'Kaspersky', 'product': 'NGFW', 'version': params.device_version},
-  'source': {'ip': session.src, 'port': session.spt, 'bytes': client_bytes},
-  'destination': {'ip': session.dst, 'port': session.dpt, 'bytes': server_bytes},
-  'network': {'transport': 'tcp', 'protocol': 'smb' if session.profile in ['large_smb', 'small_smb'] else session.profile,
-    'bytes': client_bytes + server_bytes, 'packets': client_packets + server_packets},
-  'kaspersky': {'ngfw': {'session_id': session.id | string, 'rule': session.rule, 'action': 'Inspect'}}} -%}
+  'source': {'ip': s.client, 'port': s.spt, 'bytes': up_b, 'packets': cpk},
+  'destination': {'ip': s.dst, 'port': s.dpt, 'bytes': down_b, 'packets': spk},
+  'network': {'transport': s.proto | lower,
+    'protocol': {'https': 'tls'}.get(s.profile, s.profile),
+    'bytes': up_b + down_b, 'packets': cpk + spk},
+  'related': {'ip': [s.client, s.dst]},
+  'rule': {'name': s.rule},
+  'kaspersky': {'ngfw': {'session_id': s.id | string, 'action': 'Inspect', 'full_match': 'yes'}}} -%}
 {{ record | tojson }}
