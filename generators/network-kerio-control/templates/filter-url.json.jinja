@@ -1,34 +1,217 @@
-{%- set previous = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous is none or timestamp > previous else previous + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (params.anomaly_interval_events + 4) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= params.anomaly_interval_events -%}
-{%- set step = tick - params.anomaly_interval_events if chain else -1 -%}
-{%- if chain -%}
-  {%- set action = 'DENY' -%}
-  {%- set rule = 'Restricted Sites' -%}
-  {%- set client_ip = params.target_client_ip -%}
-  {%- set user_name = params.target_user -%}
-  {%- set url = 'http://' ~ params.target_domain ~ ['/', '/admin', '/config', '/backup'][step] -%}
-{%- else -%}
-  {%- set action = module.rand.weighted_choice(['ALLOW', 'DENY'], [85, 15]) -%}
-  {%- set rule = 'Web Access' if action == 'ALLOW' else 'Blocked Categories' -%}
-  {%- set client_ip = module.rand.choice(['192.0.2.20', '192.0.2.21', '192.0.2.22']) -%}
-  {%- set user_name = module.rand.choice(['user-one', 'user-two', 'visitor']) -%}
-  {%- set url = module.rand.choice(['http://updates.example.test/packages/index', 'http://intranet.example.test/home']) if action == 'ALLOW' else 'http://games.example.test/play' -%}
+{#- One Kerio Control firewall writing URL content-rule matches (rules
+    with "Log the traffic") to the Filter log. Each one-second tick
+    emits at most one record: the earliest due request. Users browse as
+    independent random processes; the anomaly episode only adds its own
+    requests for one user and never touches the background queue. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set guard_s = 4000 -%}
+{%- set names = ['jsmith', 'mbrown', 'akowalski', 'dlee', 'epetrova',
+    'fgarcia', 'hmuller', 'ikhan', 'jnovak', 'kwilson', 'lrossi',
+    'mchen', 'nsilva', 'oivanov', 'pdubois', 'rkumar', 'sjohansson',
+    'tnguyen', 'vmoreau', 'wtaylor', 'yhoffmann', 'zlopez', 'abaker',
+    'bclark', 'cdavis', 'dmartin', 'eadams', 'gwhite', 'hscott',
+    'jyoung', 'kmorgan', 'lwalker', 'mhill', 'nward', 'pcooper',
+    'rbell', 'sgreen', 'tfox', 'vhall', 'wking'] -%}
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if not (4 <= params.user_count <= names | length)
+      or params.client_first + params.user_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- if params.anonymizer_hosts | length < 3 or params.tunnel_hosts | length < 2 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set users = [] -%}
+  {%- set weights = [] -%}
+  {%- for n in range(params.user_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do users.append([names[n], ip]) -%}
+    {%- do weights.append(module.rand.number.lognormal(0, 0.6)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'users': users,
+      'weights': weights, 'q': [], 'hist': {},
+      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'last_user': none, 'last_anon': none, 'last_tunnel': none}) -%}
 {%- endif -%}
-{%- set raw = '[' ~ event_time.strftime('%d/%b/%Y %H:%M:%S') ~ '] '
-  ~ action ~ ' URL ' ~ "'" ~ rule ~ "'" ~ ' ' ~ client_ip ~ ' '
-  ~ user_name ~ ' HTTP GET ' ~ url -%}
-{%- set record = {'@timestamp': event_time.isoformat(),
-  'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'dataset': 'kerio.control_filter',
-    'category': ['web'], 'type': ['access'], 'action': action,
-    'original': raw},
-  'host': {'name': params.firewall_host},
-  'source': {'ip': client_ip}, 'user': {'name': user_name},
-  'http': {'request': {'method': 'GET'}}, 'url': {'full': url},
-  'related': {'ip': [client_ip], 'user': [user_name]},
-  'kerio': {'control': {'filter_rule': rule, 'filter_action': action}}} -%}
+{%- set users = shared.get('users') -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set load = (1.5 if 7 <= hour < 17 else (0.8 if 17 <= hour < 21
+    else 0.3)) / 0.95 -%}
+
+{%- set updates = [
+    ['update.antivirus.example', 'Allow automatic updates and MS Windows activation'],
+    ['download.osvendor.example', 'Allow automatic updates and MS Windows activation'],
+    ['activation.osvendor.example', 'Allow automatic updates and MS Windows activation']] -%}
+{%- set software = ['download.officesuite.example', 'dl.pdfreader.example',
+    'cdn.browser.example', 'files.drivervendor.example', 'get.archiver.example'] -%}
+{%- set social = ['www.friendbook.example', 'www.chirper.example',
+    'www.photogram.example', 'www.clipstream.example'] -%}
+{%- set sharing = ['upload.fileshare.example', 'drive.cloudbox.example',
+    'send.transfer.example'] -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Queue one request due at `at`. -#}
+{%- macro req(user, kind, host, at, method='GET', episode=false) -%}
+  {%- do q.append({'due': at, 'user': user, 'kind': kind, 'host': host,
+      'method': method, 'episode': episode}) -%}
+{%- endmacro -%}
+
+{#- A burst of `n` requests of one kind, spaced by random gaps. -#}
+{%- macro burst(user, kind, hosts, n, median, sigma, stay, post=0) -%}
+  {%- set t = namespace(at=now, host=module.rand.choice(hosts)) -%}
+  {%- for i in range(n) -%}
+    {%- if i > 0 -%}
+      {%- set t.at = t.at + gap(median, sigma) | int -%}
+      {%- if not module.rand.chance(stay) -%}{%- set t.host = module.rand.choice(hosts) -%}{%- endif -%}
+    {%- endif -%}
+    {{- req(user, kind, t.host, t.at, 'POST' if module.rand.chance(post) else 'GET') -}}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{%- macro exe_host(tunnel_share) -%}
+{{- module.rand.choice(params.tunnel_hosts) if module.rand.chance(tunnel_share) else module.rand.choice(software) -}}
+{%- endmacro -%}
+
+{#- 1. Background arrivals: one merged Poisson stream of independent
+    users, weighted per user, modulated by office hours. -#}
+{%- if module.rand.chance(0.03 * load) -%}
+  {%- set u = module.rand.weighted_choice(users, shared.get('weights')) -%}
+  {%- set kind = module.rand.weighted_choice(['update', 'exe', 'social', 'sharing', 'anon'],
+      [28, 12, 31, 13, 16]) -%}
+  {%- if kind == 'update' -%}
+    {%- set h = module.rand.choice(updates) -%}
+    {{- burst(u, 'update', [h[0]], module.rand.weighted_choice([1, 2, 3, 4], [50, 25, 15, 10]), 3, 0.9, 1) -}}
+  {%- elif kind == 'exe' -%}
+    {{- burst(u, 'exe', [exe_host(0.14)], module.rand.weighted_choice([1, 2], [82, 18]), 25, 1.2, 1) -}}
+  {%- elif kind == 'social' -%}
+    {{- burst(u, 'social', social, module.rand.weighted_choice([1, 2, 3, 4, 5, 6],
+        [42, 24, 14, 9, 6, 5]), 25, 1.3, 0.7) -}}
+  {%- elif kind == 'sharing' -%}
+    {{- burst(u, 'sharing', sharing, module.rand.weighted_choice([1, 2, 3], [58, 28, 14]),
+        40, 1.2, 0.6, 0.25) -}}
+  {%- else -%}
+    {%- set n = module.rand.weighted_choice([1, 2, 3, 4], [55, 29, 12, 4]) -%}
+    {{- burst(u, 'anon', params.anonymizer_hosts, n, 45, 1.3, 0.35) -}}
+    {#- Some users look for software after a blocked proxy page. -#}
+    {%- if module.rand.chance(0.22) -%}
+      {{- req(u, 'exe', exe_host(0.35), now + gap(300, 1.0) | int + gap(40, 1.0) | int * (n - 1)) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Episode: due by source time, random start delay, next due from
+    the actual start, never catching up. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
+    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
+  {%- endif -%}
+  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set u = module.rand.choice(users | reject('equalto', shared.get('last_user')) | list) -%}
+    {%- set a1 = module.rand.choice(params.anonymizer_hosts | reject('equalto', shared.get('last_anon')) | list) -%}
+    {%- set a2 = module.rand.choice(params.anonymizer_hosts | reject('equalto', a1) | list) -%}
+    {%- set th = module.rand.choice(params.tunnel_hosts | reject('equalto', shared.get('last_tunnel')) | list) -%}
+    {%- set t = namespace(at=now) -%}
+    {{- req(u, 'anon', a1, t.at, episode=true) -}}
+    {%- set t.at = t.at + gap(45, 1.3) | int -%}
+    {{- req(u, 'anon', a2, t.at, episode=true) -}}
+    {%- if module.rand.chance(0.4) -%}
+      {%- set t.at = t.at + gap(45, 1.3) | int -%}
+      {{- req(u, 'anon', module.rand.choice(params.anonymizer_hosts), t.at, episode=true) -}}
+    {%- endif -%}
+    {%- set t.at = t.at + [gap(420, 0.6) | int, 3000] | min -%}
+    {{- req(u, 'exe', th, t.at, episode=true) -}}
+    {%- do shared.update({'start_at': none, 'last_user': u, 'last_anon': a1,
+        'last_tunnel': th, 'next_due': now + (interval * 3600) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due request, otherwise nothing. -#}
+{%- set pick = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due <= now and e.due < pick.due -%}
+    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = q.pop(pick.i) -%}
+{%- set user_name = e.user[0] -%}
+{%- set client_ip = e.user[1] -%}
+{%- set host = e.host -%}
+
+{#- Blocked anonymizer pages per user within the guard window. -#}
+{%- set h = hist.get(user_name, []) | selectattr('0', 'ge', now - guard_s) | list -%}
+{%- if e.kind == 'anon' -%}
+  {%- do h.append([now, host]) -%}
+{%- endif -%}
+{%- if h -%}{%- do hist.update({user_name: h[-8:]}) -%}{%- elif user_name in hist -%}{%- do hist.pop(user_name) -%}{%- endif -%}
+{#- Guard on the final chain step only: an ordinary tunnel-client
+    download after blocks on two different anonymizers within the
+    window comes from an ordinary software host instead. -#}
+{%- if e.kind == 'exe' and not e.episode and host in params.tunnel_hosts
+    and (h | map(attribute='1') | unique | list | length) >= 2 -%}
+  {%- set host = module.rand.choice(software) -%}
+{%- endif -%}
+
+{%- if e.kind == 'update' -%}
+  {%- set action = 'ALLOW' -%}
+  {%- set rule = 'Allow automatic updates and MS Windows activation' -%}
+  {%- if host.startswith('update.') -%}
+    {%- set path = '/antivirus/datfiles/4.x/dat-' ~ module.rand.number.integer(4100, 9800) ~ '.zip' -%}
+  {%- elif host.startswith('activation.') -%}
+    {%- set path = module.rand.choice(['/licensing/activate', '/licensing/validate', '/genuine/check']) -%}
+  {%- else -%}
+    {%- set path = '/updates/kb' ~ module.rand.number.integer(4000000, 5099999) ~ '/'
+        ~ module.rand.string.hex(16) | lower ~ '.cab' -%}
+  {%- endif -%}
+{%- elif e.kind == 'exe' -%}
+  {%- set action = 'ALLOW' -%}
+  {%- set rule = 'Log executable downloads' -%}
+  {%- set product = host.split('.')[1] -%}
+  {%- set path = '/' ~ product ~ '/' ~ module.rand.number.integer(1, 24) ~ '.'
+      ~ module.rand.number.integer(0, 9) ~ '/' ~ product
+      ~ module.rand.choice(['-setup.exe', '-x64.msi', '_installer.exe', '-win64.exe']) -%}
+{%- elif e.kind == 'social' -%}
+  {%- set action = 'DENY' -%}
+  {%- set rule = 'Deny social networks' -%}
+  {%- set path = module.rand.weighted_choice(['/', '/feed', '/messages',
+      '/watch?v=' ~ module.rand.string.letters(11)], [45, 20, 15, 20]) -%}
+{%- elif e.kind == 'sharing' -%}
+  {%- set action = 'DENY' -%}
+  {%- set rule = 'Deny file sharing' -%}
+  {%- set path = '/upload' if e.method == 'POST' else module.rand.weighted_choice(['/',
+      '/s/' ~ module.rand.string.hex(12) | lower], [55, 45]) -%}
+{%- else -%}
+  {%- set action = 'DENY' -%}
+  {%- set rule = 'Deny anonymizers' -%}
+  {%- set path = module.rand.weighted_choice(['/', '/index.php',
+      '/browse.php?u=http%3A%2F%2F' ~ module.rand.choice(social)], [50, 20, 30]) -%}
+{%- endif -%}
+
+{%- set url = 'http://' ~ host ~ path -%}
+{%- set iso = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set raw = '[' ~ iso.strftime('%d/%b/%Y %H:%M:%S') ~ '] ' ~ action ~ " URL '"
+  ~ rule ~ "' " ~ client_ip ~ ' ' ~ user_name ~ ' HTTP ' ~ e.method ~ ' ' ~ url -%}
+{%- set record = {'@timestamp': iso.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'kerio_control.filter',
+    'category': ['web', 'network'],
+    'type': ['access', 'allowed' if action == 'ALLOW' else 'denied'],
+    'action': action, 'original': raw},
+  'observer': {'hostname': params.firewall_host, 'vendor': 'GFI',
+    'product': 'Kerio Control', 'type': 'firewall'},
+  'rule': {'name': rule},
+  'source': {'ip': client_ip},
+  'user': {'name': user_name},
+  'http': {'request': {'method': e.method}},
+  'url': {'full': url, 'scheme': 'http', 'domain': host,
+    'path': path.split('?')[0]},
+  'related': {'ip': [client_ip], 'user': [user_name], 'hosts': [host]},
+  'kerio_control': {'filter': {'rule_type': 'URL', 'action': action}}} -%}
 {{ record | tojson }}
