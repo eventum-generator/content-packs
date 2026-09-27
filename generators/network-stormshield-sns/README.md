@@ -22,7 +22,7 @@ Traffic is modelled as independent random processes, not measured SNS rates:
 
 ## Anomaly Chain
 
-One admin workstation opens interactive SSH sessions to three different servers and then pulls a bulk transfer of 100 MB or more over SSH:
+One admin workstation opens interactive SSH sessions to three different servers and then pulls a bulk transfer of 100 MiB (104,857,600 bytes) or more over SSH:
 
 | Step | Record | Condition |
 | --- | --- | --- |
@@ -32,9 +32,9 @@ One admin workstation opens interactive SSH sessions to three different servers 
 | 4 | `l_connection`, `proto=ssh` | source S, `rcvd` (`destination.bytes`) >= 104857600 |
 
 - **Linking fields:** `source.ip` (`src`), `destination.ip` (`dst`), `network.protocol`, `destination.bytes` (`rcvd`), time. The whole sequence spans at most one hour; measured spans are 6-15 minutes with the default interval and 2-14 minutes with a 6-hour interval.
-- **Recurrence:** one episode per `anomaly_interval_hours` of source time (default 24, minimum 2). When an episode is due, it starts after a random delay that follows the same day curve as admin work (mean about 18 minutes in office hours, 40 minutes in the evening, 2 hours at night). The next episode is due one interval after the actual start; missed intervals are not caught up.
+- **Recurrence:** one episode per `anomaly_interval_hours` of source time (default 24, minimum 2). The first episode is due one interval after the first record; each next one is due one interval after the previous actual start. When an episode is due, it starts after a random delay that follows the same day curve as admin work (mean about 18 minutes in office hours, 40 minutes in the evening, 2 hours at night). The next episode is due one interval after the actual start; missed intervals are not caught up.
 - **Variation:** the workstation is drawn with the same per-workstation weights as ordinary admin work and differs from the previous episode; servers are drawn from that workstation's own server set with its own weights, so every workstation/server pair of an episode also occurs in ordinary traffic. Session gaps, durations and volumes come from the ordinary distributions.
-- **Background overlap:** alarm 85 to three or more different servers within an hour, transfers of 100 MB and more, and transfers after sessions to two servers all occur in ordinary traffic in both modes. Only the complete order is reserved: an ordinary transfer of 100 MB or more that closes within about 67 minutes after the same source's alarms for three different servers carries a smaller volume instead.
+- **Background overlap:** alarm 85 to three or more different servers within an hour, transfers of 100 MiB and more, and transfers after sessions to two servers all occur in ordinary traffic in both modes. Only the complete order is reserved: an ordinary transfer of 100 MB or more that closes within about 67 minutes after the same source's alarms for three different servers carries a smaller volume instead.
 - **Detection idea:** per source, count distinct servers with alarm 85 in a sliding hour and flag an SSH connection record with a large `rcvd` that follows a fan-out to three or more servers - an operator touching many servers and then copying data out.
 - **Modes:** `anomaly_mode` defaults to `true`. With `false` the generator produces only the background described above, without the complete sequence.
 
@@ -84,7 +84,7 @@ Output: `generators/network-stormshield-sns/output/events.json`. Extract `event.
 
 ## Sample output
 
-The final step of an episode (bulk SSH transfer after alarms for three different servers), copied from the default anomaly-mode capture:
+The final step of an episode (bulk SSH transfer after alarms for three different servers), copied byte for byte from the default anomaly-mode capture:
 
 ```json
 {"@timestamp": "2026-09-27T04:51:09+00:00", "destination": {"bytes": 200593679, "domain": "srv_k8s03", "ip": "10.20.0.93", "port": 22}, "ecs": {"version": "8.17.0"}, "event": {"action": "connection_closed", "category": ["network"], "dataset": "stormshield.sns", "duration": 3267236206, "end": "2026-09-27T04:51:09+00:00", "kind": "event", "original": "id=firewall time=\"2026-09-27 04:51:09\" fw=\"sns-fw-01\" tz=+0000 startime=\"2026-09-27 04:51:05\" pri=5 confid=01 slotlevel=2 ruleid=5 srcif=\"Ethernet1\" srcifname=\"in\" ipproto=tcp proto=ssh src=10.10.5.21 srcport=34939 srcportname=ephemeral_fw srcname=adm_ws11 dst=10.20.0.93 dstport=22 dstportname=ssh dstname=srv_k8s03 modsrc=10.10.5.21 modsrcport=34939 origdst=10.20.0.93 origdstport=22 ipv=4 sent=5780117 rcvd=200593679 duration=3.27 action=pass logtype=\"connection\"", "start": "2026-09-27T04:51:05+00:00", "type": ["connection", "end", "allowed"]}, "network": {"bytes": 206373796, "protocol": "ssh", "transport": "tcp", "type": "ipv4"}, "observer": {"ingress": {"interface": {"id": "Ethernet1", "name": "in"}}, "name": "sns-fw-01", "product": "SNS", "type": "firewall", "vendor": "Stormshield"}, "related": {"hosts": ["adm_ws11", "srv_k8s03"], "ip": ["10.10.5.21", "10.20.0.93"]}, "rule": {"id": "5"}, "source": {"bytes": 5780117, "ip": "10.10.5.21", "port": 34939}, "stormshield": {"sns": {"action": "pass", "confid": "01", "logtype": "connection", "priority": 5, "slotlevel": 2}}}
@@ -97,7 +97,7 @@ The final step of an episode (bulk SSH transfer after alarms for three different
 - That alarm 85 is raised for interactive sessions and not for scp-style transfers is a modelling assumption; the documentation does not describe the trigger.
 - No address translation is modelled (`modsrc`/`origdst` equal `src`/`dst`); `tz=+0000`, local time equals UTC. At most one record per second.
 - Host names, addresses, rule numbers, rates and volumes are synthetic. SNS 5.x is not claimed.
-- An ordinary SSH transfer of 100 MB or more that would complete the chain carries a smaller volume but keeps its original duration, so these rare transfers show a low throughput. Gaps between the sessions of one episode are capped at 15 minutes, while ordinary admin gaps are not.
+- An ordinary SSH transfer of 100 MiB or more that would complete the chain carries a smaller volume but keeps its original duration, so these rare transfers show a low throughput. Gaps between the sessions of one episode are capped at 15 minutes, while ordinary admin gaps are not.
 
 ## References
 
