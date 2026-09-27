@@ -20,7 +20,7 @@ Shares were measured over four synthetic days of the default configuration (abou
 - a hash-first detection: a file MD5, sometimes rescanned, sometimes followed by a malicious URL contact;
 - beacon-like repeats: one malicious URL contacted two to six times over one or two hours.
 
-Most endpoints have one user. A few are shared hosts with several users, and three are service accounts. Indicators come from `samples/malicious_urls.json`, `samples/phishing_urls.json` and `samples/hashes.json`, each with fixed feed record fields (mask, first and last seen dates, popularity, threat name, category or industry, file hashes and size). All domains use reserved `.test`, `.example` and `.invalid` names, and all addresses are documentation or RFC 1918 ranges.
+Most endpoints have one user. A few are shared hosts with several users, and six run under two service accounts (`svc-sccm`, `svc-build`, three endpoints each). Indicators come from `samples/malicious_urls.json`, `samples/phishing_urls.json` and `samples/hashes.json`, each with fixed feed record fields (mask, first and last seen dates, popularity, threat name, category or industry, file hashes and size). All domains use reserved `.test`, `.example` and `.invalid` names, and all addresses are documentation or RFC 1918 ranges.
 
 ## Anomaly Chain
 
