@@ -6,38 +6,38 @@ The source inventory has six staff accounts: two accountants, one sales and one 
 
 ## Event Types
 
-Shares are measured in the default `anomaly_mode: false` capture (25 h 05 min, 8,660 records). Counts for the paired default `true` capture (8,716 records, two episodes) are shown for comparison.
+Shares are measured in the default `anomaly_mode: false` capture (72 h, 25,088 records). Counts for the paired default `true` capture (25,126 records, six episodes) are shown for comparison.
 
 | System event | Selected behavior | Category | Share (background) | Count (with anomaly) |
 |---|---|---|---:|---:|
-| `_$Access$_.Access` | Successful controlled read with one nested logged row | database / access | 89.02% | 7,754 |
-| `_$Access$_.AccessDenied` | Object-level Read permission denial | database / access, denied | 3.95% | 345 |
-| `_$Session$_.AuthenticationError` | Failed attempt; no native authenticated UUID is asserted | authentication / start (failure) | 3.00% | 251 |
-| `_$Session$_.Authentication` | Successful authentication opens a session | authentication / start | 2.88% | 250 |
-| `_$User$_.Update` | Administrator updates another staff account; unproven native Data omitted | iam / change | 0.55% | 49 |
-| `_$User$_.New` | Administrator creates one temporary account | iam / creation | 0.23% | 24 |
-| `_$User$_.Delete` | Administrator deletes that temporary incarnation | iam / deletion | 0.23% | 24 |
-| `_$InfoBase$_.EventLogReduce` | Administrator reduces records older than the assumed cutoff | configuration / deletion | 0.14% | 19 |
+| `_$Access$_.Access` | Successful controlled read with one nested logged row | database / access | 89.19% | 22,454 |
+| `_$Access$_.AccessDenied` | Object-level Read permission denial | database / access, denied | 3.96% | 981 |
+| `_$Session$_.AuthenticationError` | Failed attempt; no native authenticated UUID is asserted | authentication / start (failure) | 3.03% | 778 |
+| `_$Session$_.Authentication` | Successful authentication opens a session | authentication / start | 2.85% | 672 |
+| `_$User$_.Update` | Administrator updates another staff account; unproven native Data omitted | iam / change | 0.53% | 120 |
+| `_$User$_.New` | Administrator creates one temporary account | iam / creation | 0.16% | 44 |
+| `_$User$_.Delete` | Administrator deletes that temporary incarnation | iam / deletion | 0.16% | 44 |
+| `_$InfoBase$_.EventLogReduce` | Administrator reduces records older than the assumed cutoff | configuration / deletion | 0.12% | 33 |
 
-Captures of 25 h 05 min hold 8,582-9,223 records in both modes, about 350 per hour. Rates are synthetic workload settings, not vendor production frequencies, and they do not vary by time of day.
+Captures of 72 h hold 24,942-25,541 records in both modes, about 350 per hour. Rates are synthetic workload settings, not vendor production frequencies, and they do not vary by time of day.
 
 ## Background Model
 
-One template renders every source second in UTC; most seconds produce no record. All background decisions are random draws, with no fixed period, rotation or script. Rates below are measured over four 100-hour background captures (400 hours); distributions over all ten background captures (500 hours).
+One template renders every source second in UTC; most seconds produce no record. All background decisions are random draws, with no fixed period, rotation or script. Rates and distributions below are measured over seven 72-hour background captures (504 hours).
 
 - **Staff activity.** Each record picks its actor by weight (accountants dominate) and an object the actor may read, or a payroll denial for Sales or Warehouse. About a third of reads start a burst of quick follow-up reads by the same user a few seconds apart.
 - **Sessions.** The capture window opens mid-stream. Most staff already hold a session that began earlier, so their first records reuse pre-window session numbers. A session lasts a random lifetime (median about 70 minutes, lognormal). The next operation after it ends authenticates first, and the operation follows seconds later. Session and connection numbers grow in random steps, because sessions outside the selected output also consume numbers. An administrator also opens a fresh session for half of its management tasks unless its current session is under two minutes old.
-- **Failed logins.** A failed attempt is retried after a few seconds to a minute. A retry fails again with probability 0.5 for administrators and 0.4 for other staff, and a run ends in a successful login 85% of the time. Administrators account for about half of the runs, because they log in to several tools. Measured: about 54 runs of two or more failures a day, 9.2 of four or more, and 6.7 administrator runs of four or more.
+- **Failed logins.** A failed attempt is retried after a few seconds to a minute. A retry fails again with probability 0.5 for administrators and 0.4 for other staff, and a run ends in a successful login 85% of the time. Administrators account for about half of the runs, because they log in to several tools. Measured: about 55 runs of two or more failures a day, 10 of four or more, and 6.9 administrator runs of four or more.
 - **Temporary accounts.** A quarter of administrator logins that follow failed attempts open a short maintenance session. In it the administrator creates a temporary account seconds after the login, the account logs in and checks the payroll register, and the account is removed, usually followed by an old-log reduction. Other lifecycles arrive as a Poisson process with a mean spacing of 10 hours. In total there are about 16 lifecycles a day. Measured across all of them:
-  - creation is preceded by three or more of the creator's failed logins within 30 minutes about 7.6 times a day, and by four or more about 4.8 times a day;
-  - the account logs in 3 s to 38 min after creation (median about 1 minute);
-  - it reads the payroll register 1-49 times (median 5), a few seconds to a few minutes apart;
-  - the creator deletes it in 92% of lifecycles, 10 s to 2.9 h after the last read (median about 2 minutes);
-  - lifespans run from 69 s to 3 h (median about 7 minutes), and 73% last under 15 minutes;
-  - 59% of deletions are followed within minutes by a reduction by the same administrator.
-- **Other administration.** Standalone reductions average about one a day, and staff updates about 45 a day.
+  - creation is preceded by three or more of the creator's failed logins within 30 minutes about 8.3 times a day, and by four or more about 5.2 times a day;
+  - the account logs in 3 s to 43 min after creation (median about 1 minute);
+  - it reads the payroll register 1-57 times (median 6), a few seconds to a few minutes apart;
+  - the creator deletes it in 86% of lifecycles, 8 s to 7.6 h after the last read (median about 2 minutes);
+  - lifespans run from 72 s to 7.6 h (median about 8 minutes), and 75% last under 15 minutes;
+  - 67% of deletions are followed within 30 minutes by a reduction by the deleting administrator.
+- **Other administration.** Standalone reductions average about 0.9 a day, and staff updates about 45 a day.
 
-**Guard.** One background rule keeps ordinary traffic from completing the anomaly by coincidence. It sits at the chain's threshold and last step: when an account created within 30 minutes of four or more of its creator's failed logins is deleted by that creator, the creator runs no log reduction for the next 30 minutes. Failed logins from episodes count too. While an administrator runs an episode, the other administrator deletes such an account instead. An episode waits to start while its administrator is under this hold. All shorter sequences remain in background, including four or more failures, a login, a creation and a deletion of that account by the same administrator. Session termination is outside the selected output, because its native record body was not established, so the stream does not show when a session ended.
+**Guard.** One background rule keeps ordinary traffic from completing the anomaly by coincidence, and it acts only on the chain's last step. The template follows every emitted record, episode records included, with the same ordered matcher a detector uses: per user name, four failed logins, a successful login, a creation, the deletion of that incarnation and an event-log reduction, the first matched failure at most 30 minutes before the reduction. A background reduction that would complete this sequence is not recorded; its time, its administrator and every earlier record stay as they are, and no other record is moved, delayed or given to another account. Reductions after 30 minutes, reductions by the other administrator and all shorter sequences remain in background, including four or more failures, a login, a creation and a deletion of that account by the same administrator. Session termination is outside the selected output, because its native record body was not established, so the stream does not show when a session ended.
 
 ## Anomaly Chain
 
@@ -49,20 +49,19 @@ One template renders every source second in UTC; most seconds produce no record.
 4. Its session closes outside the selected output, and the same administrator deletes that exact incarnation, usually within a few minutes.
 5. The same administrator then reduces old event-log records.
 
-Every shorter part of this sequence also occurs in background, as described above. What background never contains is the whole ordered sequence joined by one administrator and one incarnation within 30 minutes. Episode timing and counts are drawn within background ranges, not from identical distributions: the temporary login comes sooner (median 40 s), reads are a little more numerous and closer together, and the deletion and reduction always follow within minutes. Episode steps use only seconds that background leaves free, so episodes never delay or re-phase background work. The episode's successful login replaces the administrator's session, as a background retry does.
+Every shorter part of this sequence also occurs in background, as described above. What background never contains is the whole ordered sequence joined by one administrator and one incarnation within 30 minutes of the first matched failure. Episode timing and counts are drawn within background ranges, not from identical distributions: the temporary login comes sooner (median 40 s), reads are a little more numerous and closer together, and the deletion and reduction always follow within minutes. Episode steps use only seconds that background leaves free, so episodes never delay or re-phase background work. The episode's successful login replaces the administrator's session, as a background retry does.
 
 Linking fields: `user.name`/`user.id` and `client.address` of the administrator; the incarnation UUID in `user.target.id` on creation and deletion; the temporary account's `user.id`; session/connection numbers; and source time. The target UUID/name on user-management records is synthetic collector enrichment from the inventory, not a claimed native Data member. Failed attempts carry only the attempted username and zero session/connection, not verified native failure bytes. Payroll reads are recorded access occurrences; repeated synthetic employee keys do not prove distinct people, returned amounts or exfiltration.
 
-**Recurrence.** `anomaly_interval_hours` is measured in source time and clamped to at least one hour. The first episode becomes due one interval after the window start. Its first failed attempt follows 1-600 s later, or later still while background occupies the seconds, a temporary name is busy or the administrator is under the guard hold. The next episode is due one interval after that actual first attempt, so start times drift later and never catch up. Consecutive episodes alternate the two administrators, use a different temporary name, and always get a fresh incarnation UUID.
+**Recurrence.** `anomaly_interval_hours` is measured in source time and clamped to at least one hour. Background rates do not vary by time of day, so start times are drawn uniformly. The first episode starts at a random time within the first interval, or the first 24 hours when the interval is longer. Each later one starts at a random time within a window of a quarter of the interval (at most 6 hours) centred on one interval after the previous episode's actual first failed attempt. The first attempt takes the next second that background leaves free, and waits while no temporary name is free; the previous episode's name is never reused for the next one. Consecutive episodes alternate the two administrators, use a different temporary name, and always get a fresh incarnation UUID.
 
 Measured episodes, with intervals taken between creations:
 
-- The default 12 h interval gives two per 25 h 05 min window and eight per 100 h. Creations were 12.02-12.15 h after the window start and 12.05-12.48 h apart.
-- A 6 h interval gives four per 25 h 05 min window and 16 per 100 h, 6.02-6.60 h apart.
-- The minimum 1 h interval gives 22 episodes per 25 h 05 min, 0.99-1.37 h apart.
-- Across 70 episodes: 4-17 failed attempts in the 15 minutes before the login, 3-31 payroll reads, and 220-1,638 s from the first detected failure to the reduction.
+- The default 12 h interval gives six per 72 h window. The first chain began 9.96 h after the window start; creations were 10.98-12.39 h apart, and episode starts fell at 9, 22, 9, 21, 9 and 20 UTC.
+- A 6 h interval gives twelve per 72 h window, creations 5.39-6.65 h apart.
+- Across these 18 episodes: 2-29 payroll reads and 329-1,604 s from the first matched failure to the reduction.
 
-**Counts.** At the default interval, episodes add two occurrences a day to each partial step, against the background rates above. Over the pooled 12 h captures (300 h with anomalies, 500 h without), administrator runs of four or more failures occur 7.8 times a day with anomalies against 6.9 without (z 1.0). Creations preceded by four or more creator failures occur 7.4 times a day with anomalies against 4.7 without (z 3.3 over those 800 hours). One week of each mode is expected to give z of about 1.6 for this count. At 6 h the second count rises to about 9 a day, and at 1 h the partial-step counts reveal the mode.
+**Counts.** At the default interval, episodes add two occurrences a day to each partial step, against the background rates above. In the default 72 h pair against all six default background captures (432 h), administrator runs of four or more failures occur 7.3 times a day with anomalies against 6.8 without (z 0.3), and creations preceded by four or more creator failures 6.7 against 5.4 (z 0.8). At 6 h the second count rises to about 9 a day, and at 1 h the partial-step counts reveal the mode.
 
 Detection idea: join four or more failures of one administrator, its successful login, a user creation by it within minutes, and the new incarnation's payroll reads. Then join the deletion of that same UUID by the same administrator and a following event-log reduction. These signals do not establish recent-log erasure or exfiltration.
 
@@ -152,16 +151,14 @@ end: '2026-09-26T01:05:00+00:00'
 eventum generate --path generators/application-1c/generator.batch.yml --id one-c-batch --live-mode false --keep-order true
 ```
 
-This window yields about 8,600-9,000 records with two episodes at the default interval. A live run shows only background until the first interval has passed. `--keep-order true` preserves source order through the asynchronous writer. Timestamps are rendered in UTC whatever the CLI time zone. Check that the output is non-empty and that no errors were logged, because the CLI can exit with status 0 after template-render failures.
+This window yields about 8,600-9,000 records with one to three episodes at the default interval. A live run shows the first episode at a random time within the first interval. `--keep-order true` preserves source order through the asynchronous writer. Timestamps are rendered in UTC whatever the CLI time zone. Check that the output is non-empty and that no errors were logged, because the CLI can exit with status 0 after template-render failures.
 
 ## Validation
 
-Twenty finite captures were generated from the final source, all with exit status 0 and empty `-vvv` logs:
+Nine finite 72 h captures were generated from the final source, all with exit status 0 and empty logs:
 
-- four default pairs (`true`/`false`) of 25 h 05 min;
-- two pairs of 25 h 05 min with every event parameter overridden and a 6 h interval, using a Unicode, quote and ampersand infobase name, a `+03:00` window and `--timezone Europe/Moscow`;
-- one 25 h 05 min run at the 1 h minimum;
-- 100-hour captures: two with anomalies at 12 h, one at 6 h, and four without.
+- one default pair (`true`/`false`) and five more default `false` captures used for calibration;
+- one pair with every event parameter overridden and a 6 h interval, using a Unicode, quote and ampersand infobase name, a `+03:00` window and `--timezone Europe/Moscow`.
 
 A streaming verifier checks:
 
@@ -170,31 +167,22 @@ A streaming verifier checks:
 - object permissions, and authentication before every operation, with pre-window sessions constant until the next login;
 - monotonic session numbers;
 - the temporary-incarnation lifecycle and bounded state;
-- episode recurrence (on creation times), rotation, causal joins and duplicate chain matches;
+- complete chains with the same ordered matcher and 30-minute window as the guard, episode recurrence (on creation times), rotation and causal joins;
 - zero complete chains without anomalies;
 - tolerance comparisons of every background decision between the modes: rates, category mixes, two-sample KS on timing distributions, exact small-sample tests on values beyond the other mode's range, and the rate of creations preceded by one to four creator failures;
 - determinism checks for fixed periods, name rotation, repeated gaps, aligned clocks and constant counter steps, per capture and pooled.
 
-All 20 captures, 21 pairs (8 on/off, 11 off/off, 2 on/on) and 5 pooled comparisons pass. The calibrated `mode_compare.py` comparison returns OK for every default, custom and 100-hour pair (12 h and 6 h) and for the off/off pairs. It fails only the 1 h run, as the counts section expects.
+All nine captures, three pairs (2 on/off, 1 off/off) and 2 pooled comparisons pass. The calibrated `mode_compare.py` comparison (calibrated on five background captures) returns OK for the default and the 6 h pair, with 6 and 12 chain occurrences against none.
 
-Nine negative inputs are each rejected by their intended check:
-
-- the previous source's captures (fixed 2-hour lifecycle, 10-second clock);
-- background with repeated failures removed;
-- a 20-minute lifespan floor;
-- background without creations after three or more creator failures (the earlier guard);
-- a fixed temporary-name rotation;
-- a mode swapped in both directions;
-- a 6 h capture checked against 12 h;
-- an episode reusing the previous episode's temporary name.
+Near misses were measured over the seven background captures (504 hours, 63 occurrences of the chain without its reduction). Reductions by the same administrator after such a prefix occur 0.34 times per prefix-hour between 30 and 60 minutes after the first failure (0-0.6 per 5-minute bin). Inside the 30-minute window they occur only where later failed logins of that administrator had already pushed the prefix out of the matcher's eight partial matches (two cases). Reductions by the other administrator occur 0.23 per prefix-hour inside the window and 0.31 outside it.
 
 ## Sample Output
 
-This user-creation record is row 4,162 of the default `true` capture, the creation step of its first episode, pretty-printed with non-ASCII characters unescaped. The target identity is inventory enrichment, and its `Roles` array is only the selected native Data subset:
+This user-creation record is row 3,417 of the default `true` capture, the creation step of its first episode, pretty-printed with non-ASCII characters unescaped. The target identity is inventory enrichment, and its `Roles` array is only the selected native Data subset:
 
 ```json
 {
-  "@timestamp": "2026-09-25T12:08:13+00:00",
+  "@timestamp": "2026-09-25T09:58:28+00:00",
   "ecs": {
     "version": "8.11.0"
   },
@@ -218,37 +206,37 @@ This user-creation record is row 4,162 of the default `true` capture, the creati
     "name": "AccountingDemo"
   },
   "user": {
-    "name": "admin01",
-    "id": "00000000-0000-0000-0000-000000000105",
+    "name": "admin02",
+    "id": "00000000-0000-0000-0000-000000000106",
     "target": {
-      "name": "svc_audit_04",
-      "id": "1c308303-6015-45cd-83cf-960eaf475628"
+      "name": "svc_audit_01",
+      "id": "7b14a0fa-6a8e-4e19-93f5-8f7d1f85d958"
     }
   },
   "client": {
-    "address": "ADM-WS-01"
+    "address": "ADM-WS-02"
   },
   "related": {
     "user": [
-      "admin01",
-      "svc_audit_04"
+      "admin02",
+      "svc_audit_01"
     ],
     "hosts": [
-      "ADM-WS-01"
+      "ADM-WS-02"
     ]
   },
   "message": "Пользователи.Новый пользователь",
   "one_c": {
     "event_log": {
       "level": "Information",
-      "date": "2026-09-25T12:08:13+00:00",
+      "date": "2026-09-25T09:58:28+00:00",
       "application": "Enterprise",
       "application_presentation": "1C:Enterprise",
       "event_name": "_$User$_.New",
       "event_presentation": "Пользователи.Новый пользователь",
-      "user_id": "00000000-0000-0000-0000-000000000105",
-      "user_name": "admin01",
-      "computer": "ADM-WS-01",
+      "user_id": "00000000-0000-0000-0000-000000000106",
+      "user_name": "admin02",
+      "computer": "ADM-WS-02",
       "metadata_name": "",
       "metadata_presentation": "",
       "comment": "",
@@ -260,8 +248,8 @@ This user-creation record is row 4,162 of the default `true` capture, the creati
       "data_presentation": "",
       "transaction_status": "NotApplicable",
       "transaction_id": "",
-      "connection": 596,
-      "session": 1511,
+      "connection": 390,
+      "session": 1724,
       "server_name": "srvr-1c-01.example.test",
       "port": 1541,
       "sync_port": 1542,
@@ -287,5 +275,5 @@ Synthetic behavior limits:
 - Temporary accounts always log in from their creator's workstation.
 - Staff sessions end silently after a random lifetime, and pre-window sessions are assumed rather than observed.
 - The random draws have long tails, so individual episodes or lifecycles can be unusually long.
-- Administrator failed logins are frequent by design (about 6.7 runs of four or more a day), so that the chain's first steps occur in background at a comparable rate.
+- Administrator failed logins are frequent by design (about 6.9 runs of four or more a day), so that the chain's first steps occur in background at a comparable rate.
 - Short anomaly intervals make partial-step counts diagnostic, as described in Anomaly Chain.
