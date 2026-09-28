@@ -9,12 +9,13 @@
 {%- if shared.get('queue') is not none and (not shared.get('queue') or shared.get('queue')[0][0] > now) -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set hq = module.heapq -%}
 {%- set hour = 3600 -%}
-{#- A background credential-theft alert on an account is moved to
-    another account when, within this window, one Vault user raised
-    "Active dormant Vault user" and then "Privileged access to the Vault
-    during irregular hours" on that account: the full chain stays
+{#- A background credential-theft alert on an account is not raised
+    when, within this window (the chain window, counted from the
+    "Active dormant Vault user" alert as in the matcher), one Vault user
+    raised that alert and then "Privileged access to the Vault during
+    irregular hours" on that account: the full chain stays
     episode-only. -#}
-{%- set guard = 6 * hour -%}
+{%- set guard = 4 * hour -%}
 {%- set vault_incidents_per_day = 150 -%}
 {%- set theft_incidents_per_day = 55 -%}
 {#- Hour-of-day acceptance (UTC). off: nights and weekends (irregular
@@ -91,6 +92,19 @@
     {{- trows(vsrc(a) | int, a, t + (ln(900, 0.7) | int), false) -}}
   {%- endif -%}
 {%- endmacro -%}
+{%- macro ep_start(lo, hi, pw) -%}
+  {#- Episode start in [lo, hi], drawn by rejection with the hour-of-day
+      profile of background dormant-then-irregular incidents ('off'):
+      weight p for the first episode, p^2 + 0.02 for the next ones. -#}
+  {%- set w = namespace(t=none, x=lo) -%}
+  {%- for _ in range(400) if w.t is none -%}
+    {%- set w.x = lo + module.rand.number.integer(0, hi - lo) -%}
+    {%- set d = module.datetime.datetime.fromtimestamp(w.x, module.datetime.timezone.utc) -%}
+    {%- set p = profiles.off.we if d.weekday() >= 5 else profiles.off.wd[d.hour] -%}
+    {%- if module.rand.chance(p if pw == 1 else (p * p + 0.02) / 1.02) -%}{%- set w.t = w.x -%}{%- endif -%}
+  {%- endfor -%}
+  {{- w.t if w.t is not none else w.x -}}
+{%- endmacro -%}
 {%- macro armed(hist) -%}
   {#- 'y' when one Vault user raised 26 and later 23 in this history. -#}
   {%- set st = namespace(dorm=[], hit=false) -%}
@@ -156,7 +170,7 @@
   {%- endfor -%}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
   {%- if params.anomaly_mode -%}
-    {{- push(now + hour + module.rand.number.integer(0, [hour, interval // 8] | min), {'k': 'ep'}) -}}
+    {{- push(ep_start(now, now + ([interval, 24 * hour] | min), 1) | int, {'k': 'eps'}) -}}
   {%- endif -%}
 {%- endif -%}
 {%- set q = shared.get('queue') -%}
@@ -178,20 +192,6 @@
       {{- trows(it.i, module.rand.weighted_choice(s.acc, s.accw), top[0], false) -}}
     {%- endif -%}
     {{- push(top[0] + (ln(sources[it.i].med, 1.1) | int), it) -}}
-  {%- elif it.k == 'ep' -%}
-    {#- Episode due: the start is drawn from a window of at most
-        min(interval / 4, 6 h) after the due time, weighted by the
-        hour-of-day profile of background dormant-then-irregular
-        incidents (floor 0.05, so any hour stays possible). -#}
-    {%- set win = [interval // 4, 6 * hour] | min -%}
-    {%- set w = namespace(t=none) -%}
-    {%- for _ in range(400) if w.t is none -%}
-      {%- set x = top[0] + module.rand.number.integer(0, win - 1) -%}
-      {%- set d = module.datetime.datetime.fromtimestamp(x, module.datetime.timezone.utc) -%}
-      {%- set p = profiles.off.we if d.weekday() >= 5 else profiles.off.wd[d.hour] -%}
-      {%- if module.rand.chance([p, 0.05] | max) -%}{%- set w.t = x -%}{%- endif -%}
-    {%- endfor -%}
-    {{- push(w.t if w.t is not none else top[0] + module.rand.number.integer(0, win - 1), {'k': 'eps'}) -}}
   {%- elif it.k == 'eps' -%}
     {#- Episode: a Vault user raises 26 and 23 on one of its accounts,
         then a source machine that uses that account raises a
@@ -219,7 +219,8 @@
     {%- set t = vrows('23', pick.v, pick.a, start + (ln(90, 0.8) | int), true) | int -%}
     {{- trows(pick.s, pick.a, t + (ln(900, 0.7) | int), true) -}}
     {%- do shared.update({'ep_last_v': pick.v, 'ep_last_a': pick.a}) -%}
-    {{- push(start + interval + module.rand.number.integer(0, [hour, interval // 8] | min), {'k': 'ep'}) -}}
+    {%- set win = [interval // 4, 6 * hour] | min -%}
+    {{- push(ep_start(start + interval - win // 2, start + interval + win // 2, 2) | int, {'k': 'eps'}) -}}
   {%- else -%}
     {%- set out.due = top[0] -%}
     {%- set out.item = it -%}
@@ -230,21 +231,19 @@
 {%- set a = namespace(v=it.a, s=it.s) -%}
 {%- set ac = accounts[a.v] -%}
 {%- set keep = ac.hist | selectattr(0, 'ge', out.due - guard) | list -%}
-{%- if keep | length > 100 -%}{%- set keep = keep[-100:] -%}{%- endif -%}
 {%- do ac.update({'hist': keep}) -%}
-{%- if it.c == '1' and not it.ep and armed(keep) -%}
-  {#- Guarded: move this background theft alert to another pair of a
-      source machine and one of its accounts that is not armed. -#}
-  {%- set m = namespace(go=true) -%}
-  {%- for _ in range(40) if m.go -%}
-    {%- set s = module.rand.weighted_choice(range(sources | length) | list, sources | map(attribute='w') | list) -%}
-    {%- set b = module.rand.weighted_choice(sources[s].acc, sources[s].accw) -%}
-    {%- set bk = accounts[b].hist | selectattr(0, 'ge', out.due - guard) | list -%}
-    {%- if not armed(bk) -%}{%- set a.v = b -%}{%- set a.s = s -%}{%- set m.go = false -%}{%- endif -%}
-  {%- endfor -%}
-  {%- set ac = accounts[a.v] -%}
+{%- if it.c == '1' and armed(keep) -%}
+  {%- if it.ep -%}
+    {#- The episode's theft alert completes the chain: like the
+        matcher, forget the account's earlier alerts. -#}
+    {%- do ac.update({'hist': []}) -%}
+  {%- else -%}
+    {#- Guarded, final chain step only: this background theft alert
+        would complete the chain on its account, so it is not raised.
+        Its time, account and source are not reused elsewhere. -#}
+    {{- dispatch.drop() -}}
+  {%- endif -%}
 {%- endif -%}
-{%- if ac.hist | length > 100 -%}{%- do ac.update({'hist': ac.hist[-100:]}) -%}{%- endif -%}
 {%- do ac.hist.append([out.due, it.c, it.v]) -%}
 {#- Recent background alerts, bounded: the pool episodes draw from. -#}
 {%- if not it.ep -%}
