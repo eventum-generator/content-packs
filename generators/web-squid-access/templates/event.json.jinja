@@ -5,13 +5,18 @@
 {%- if step == 'routine' -%}
   {%- do shared.pop('to_attack', none) -%}
   {%- if params.anomaly_mode -%}
+    {#- Recurrence: the first start is uniform over the first
+        min(interval, 24 h) of the run; each next one is uniform in a
+        window of width min(interval / 4, 6 h) centred on the actual
+        start plus the interval. -#}
     {%- set interval = [params.anomaly_interval_hours | float, 1] | max * 3600 -%}
-    {%- set due = shared.get('next_episode_epoch', utc.timestamp() + interval) -%}
-    {%- if utc.timestamp() >= due -%}
+    {%- set due = shared.get('next_episode_epoch', none) -%}
+    {%- if due is none -%}
+      {%- do shared.set('next_episode_epoch', utc.timestamp() + module.rand.number.floating(0, [interval, 86400] | min)) -%}
+    {%- elif utc.timestamp() >= due -%}
+      {%- set half = ([interval / 4, 21600] | min) / 2 -%}
       {%- do shared.set('to_attack', true) -%}
-      {%- do shared.set('next_episode_epoch', utc.timestamp() + interval) -%}
-    {%- else -%}
-      {%- do shared.set('next_episode_epoch', due) -%}
+      {%- do shared.set('next_episode_epoch', utc.timestamp() + interval + module.rand.number.floating(-half, half)) -%}
     {%- endif -%}
   {%- endif -%}
   {%- set kind = module.rand.weighted_choice(['get','connect','denied','conditional'], [70,18,7,5]) -%}
@@ -24,6 +29,26 @@
 {%- set origin = params.anomaly_origin_ip if resource.target else resource.origin_ip -%}
 {%- set domain = url.split('/')[2].split(':')[0] -%}
 {%- set mime = resource.mime -%}
+{#- Background reloads of a blocked page: an ordinary 403 denial of a
+    named user starts, in 10% of cases, one to four more denials of the
+    same user and URL 5-30 s apart. -#}
+{%- if step == 'routine' -%}
+  {%- set burst = shared.get('deny_burst', none) -%}
+  {%- if burst is not none and utc.timestamp() >= burst.due -%}
+    {%- set kind = 'denied' -%}
+    {%- set src = burst.src -%}{%- set actor = burst.actor -%}{%- set url = burst.url -%}
+    {%- set origin = '-' -%}{%- set domain = url.split('/')[2].split(':')[0] -%}
+    {%- set resource = {'cacheable': false, 'target': false, 'mime': 'text/html', 'bytes': 1500} -%}
+    {%- if burst.left > 1 -%}
+      {%- set burst = {'src': src, 'actor': actor, 'url': url, 'left': burst.left - 1, 'due': utc.timestamp() + module.rand.weighted_choice([5, 10, 15, 20, 30], [50, 20, 12, 10, 8]) - 1} -%}
+    {%- else -%}
+      {%- set burst = none -%}
+    {%- endif -%}
+  {%- elif burst is none and kind == 'denied' and actor != '-' and module.rand.chance(0.1) -%}
+    {%- set burst = {'src': src, 'actor': actor, 'url': url, 'left': module.rand.weighted_choice([1, 2, 3, 4], [50, 25, 15, 10]), 'due': utc.timestamp() + module.rand.weighted_choice([5, 10, 15, 20, 30], [50, 20, 12, 10, 8]) - 1} -%}
+  {%- endif -%}
+  {%- do shared.set('deny_burst', burst) -%}
+{%- endif -%}
 {%- set method = 'GET' -%}
 {%- set status = 200 -%}
 {%- set result = 'TCP_MISS' -%}
@@ -40,6 +65,31 @@
   {%- endif -%}
 {%- endfor -%}
 {%- do shared.set('cache', cache) -%}
+{#- Guard: an ordinary 200 GET that would complete three denials and
+    one 200 GET of the same user and URL, the first denial at most
+    chain_window_s earlier, is sent to another URL of the pool at the
+    same time. The episode's own last download completes the chain and
+    clears the history of its user and URL. -#}
+{%- set chain_window_s = 300 -%}
+{%- set now_s = logged_at.timestamp() -%}
+{%- set history = shared.get('access_history', {}) -%}
+{%- set hkey = actor ~ ' ' ~ url -%}
+{%- set h = history.get(hkey, {'fails': [], 'armed': none}) -%}
+{%- if step == 'routine' and actor != '-' and h.armed is not none and h.armed >= now_s - chain_window_s and (kind == 'get' or (kind == 'conditional' and not (resource.cacheable and url in cache))) -%}
+  {%- set others = [] -%}
+  {%- for i in range(samples.resources | length) if (params.anomaly_url if samples.resources[i].target else samples.resources[i].url) != url -%}{%- do others.append(samples.resources[i]) -%}{%- endfor -%}
+  {%- set resource = module.rand.choice(others) -%}
+  {%- set url = params.anomaly_url if resource.target else resource.url -%}
+  {%- set origin = params.anomaly_origin_ip if resource.target else resource.origin_ip -%}
+  {%- set domain = url.split('/')[2].split(':')[0] -%}
+  {%- set mime = resource.mime -%}
+  {%- set peer_host = origin -%}
+  {%- set variance = module.rand.number.integer(98, 102) if resource.cacheable else module.rand.number.integer(75, 125) -%}
+  {%- set estimated_bytes = (resource.bytes * variance / 100)|int -%}
+  {%- set bytes = estimated_bytes if estimated_bytes > 180 else 180 -%}
+  {%- set hkey = actor ~ ' ' ~ url -%}
+  {%- set h = history.get(hkey, {'fails': [], 'armed': none}) -%}
+{%- endif -%}
 {%- if kind == 'connect' -%}
   {%- set tunnel = samples.tunnels.pick() -%}
   {%- set method = 'CONNECT' -%}{%- set result = 'TCP_TUNNEL' -%}{%- set url = tunnel.hostport -%}
@@ -81,6 +131,23 @@
     {%- do cache.pop((cache.keys() | list)[0]) -%}
   {%- endif -%}
   {%- do shared.set('cache', cache) -%}
+{%- endif -%}
+{%- if actor != '-' -%}
+  {%- set hkey = actor ~ ' ' ~ url -%}
+  {%- set h = history.get(hkey, {'fails': [], 'armed': none}) -%}
+  {%- set fails = h.fails | select('ge', now_s - chain_window_s) | list -%}
+  {%- set armed = h.armed if h.armed is not none and h.armed >= now_s - chain_window_s else none -%}
+  {%- if result == 'TCP_DENIED' -%}
+    {%- do fails.append(now_s) -%}
+  {%- elif status == 200 and method == 'GET' and fails | length >= 3 -%}
+    {%- set armed = [armed if armed is not none else fails[-3], fails[-3]] | max -%}
+  {%- endif -%}
+  {%- if step == 'allowed_2' or (not fails and armed is none) -%}
+    {%- do history.pop(hkey, none) -%}
+  {%- else -%}
+    {%- do history.update({hkey: {'fails': fails[-8:], 'armed': armed}}) -%}
+  {%- endif -%}
+  {%- do shared.set('access_history', history) -%}
 {%- endif -%}
 {%- set epoch = '%.3f' % logged_at.timestamp() -%}
 {%- set original = epoch ~ ' ' ~ ('%6d' % duration) ~ ' ' ~ src ~ ' ' ~ result ~ '/' ~ status ~ ' ' ~ bytes ~ ' ' ~ method ~ ' ' ~ url ~ ' ' ~ actor ~ ' ' ~ peer ~ '/' ~ peer_host ~ ' ' ~ mime -%}
