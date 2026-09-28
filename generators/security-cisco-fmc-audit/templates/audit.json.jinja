@@ -7,7 +7,7 @@
     milliseconds. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
-{%- set guard_ms = 14400000 -%}
+{%- set chain_s = 3600 -%}
 {%- macro d(lo, med, sig, hi) -%}
   {#- Offset lognormal in seconds, upper tail redrawn; returns ms. -#}
   {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
@@ -28,14 +28,14 @@
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
   {%- set admins = [] -%}
   {%- for row in samples.admins -%}
-    {%- do admins.append({'user': row.user, 'ip': row.ip, 'alt_ip': row.alt_ip, 'med': row.median_hours, 'stage': 'idle', 'ops': [], 'sip': row.ip, 'episode': false, 'resume': none, 'last_op': none, 'last_policy': none, 'hist': [], 'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (absence(row.median_hours) | float))}) -%}
+    {%- do admins.append({'user': row.user, 'ip': row.ip, 'alt_ip': row.alt_ip, 'med': row.median_hours, 'stage': 'idle', 'ops': [], 'sip': row.ip, 'episode': false, 'resume': none, 'last_op': none, 'last_policy': none, 'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (absence(row.median_hours) | float))}) -%}
   {%- endfor -%}
   {%- set policies = [] -%}
   {%- for row in samples.nat_policies -%}{%- do policies.append(row if row is string else row[0]) -%}{%- endfor -%}
   {%- set prefixes = [] -%}
   {%- for row in samples.object_prefixes -%}{%- do prefixes.append(row if row is string else row[0]) -%}{%- endfor -%}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
-  {%- do shared.update({'admins': admins, 'policies': policies, 'prefixes': prefixes, 'objects': {}, 'sys': [], 'last_ms': now - 1, 'next_due': admins | map(attribute='due') | min, 'ep_active': false, 'ep_last_admin': none, 'ep_last_policy': none, 'ep_start': now + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min))}) -%}
+  {%- do shared.update({'admins': admins, 'policies': policies, 'prefixes': prefixes, 'objects': {}, 'sys': [], 'last_ms': now - 1, 'next_due': admins | map(attribute='due') | min, 'ep_active': false, 'ep_last_admin': none, 'ep_last_policy': none, 'chains': {}, 'ep_start': now + module.rand.number.integer(0, [interval, 86400000] | min)}) -%}
 {%- endif -%}
 {%- set admins = shared.get('admins') -%}
 {%- set policies = shared.get('policies') -%}
@@ -54,8 +54,10 @@
     administrator out of session (weighted by own session rate, not the
     previous episode's, no own session due within 3 h). The episode is
     an extra session: the administrator's own schedule resumes unchanged
-    afterwards, other administrators are untouched. The next due is one
-    interval after this start. -#}
+    afterwards, other administrators are untouched. The first start is
+    uniform over the first min(interval, 24 h); each next one is uniform
+    in a window of width min(interval / 4, 6 h) centred on this start
+    plus the interval. -#}
 {%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') -%}
   {%- set ca = [] -%}
   {%- for a in admins -%}
@@ -70,6 +72,7 @@
     {%- set policy = module.rand.choice(pc) -%}
     {%- set a = admins[ai] -%}
     {%- set start = now + module.rand.number.integer(0, 999) -%}
+    {%- set half = module.builtins.int([interval / 4, 21600000] | min / 2) -%}
     {#- Same op kinds and gaps as an ordinary session: views around a
         create, a save of one NAT policy, more views, and a second save
         of the same policy (the change reverted). -#}
@@ -82,20 +85,23 @@
     {%- do ops.append(['save', policy]) -%}
     {%- for _ in range(module.rand.number.integer(0, 2)) -%}{%- do ops.append([module.rand.weighted_choice(['view_nat', 'view_editor', 'view_dash'], [28, 26, 16]), none]) -%}{%- endfor -%}
     {%- do a.update({'episode': true, 'resume': a.due, 'due': start, 'pending_ops': ops}) -%}
-    {%- do shared.update({'ep_active': true, 'ep_last_admin': ai, 'ep_last_policy': policy, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min)), 'next_due': [shared.get('next_due'), start] | min}) -%}
+    {%- do shared.update({'ep_active': true, 'ep_last_admin': ai, 'ep_last_policy': policy, 'ep_start': start + interval + module.rand.number.integer(-half, half), 'next_due': [shared.get('next_due'), start] | min}) -%}
   {%- endif -%}
 {%- endif -%}
 {%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{#- Chain prefixes per user@ip on record seconds: [t0, policies] for each
+    NetworkObject create at t0 still within chain_s, with the policies
+    saved since. -#}
+{%- set chains = shared.get('chains') -%}
 {%- macro chain_done(a, policy, t) -%}
-  {#- True when this administrator created an object and then saved the
-      policy within the guard window, so saving it again now would
-      complete the anomaly sequence. -#}
-  {%- set ns = namespace(created=false, hit=false) -%}
-  {%- for h in a.hist if t - h[0] <= guard_ms -%}
-    {%- if h[1] == 'create' -%}{%- set ns.created = true -%}
-    {%- elif h[1] == 'save' and h[2] == policy and ns.created -%}{%- set ns.hit = true -%}{%- endif -%}
+  {#- True when saving the policy at t (ms) would complete the chain for
+      this user@ip (a create at most chain_s before and a save of the
+      same policy since): the guard then leaves the save out. -#}
+  {%- set hit = namespace(v=false) -%}
+  {%- for p in chains.get(a.user ~ '@' ~ a.sip, []) if t // 1000 - p[0] <= chain_s and policy in p[1] -%}
+    {%- set hit.v = true -%}
   {%- endfor -%}
-  {{- 'y' if ns.hit else '' -}}
+  {{- 'y' if hit.v else '' -}}
 {%- endmacro -%}
 {%- set out = namespace(kind=none, user=none, uip=none, sender=none, target=none, rec=0) -%}
 {%- for _ in range(24) if out.kind is none and shared.get('next_due') <= now -%}
@@ -180,8 +186,6 @@
               {#- Saved again later in the session (a rule fixed or reverted). -#}
               {%- do a.ops.insert(module.rand.number.integer(1, a.ops | length), ['save', policy]) -%}
             {%- endif -%}
-          {%- else -%}
-            {%- set frame.kind = 'view_editor' -%}
           {%- endif -%}
         {%- endif -%}
       {%- else -%}
@@ -200,9 +204,16 @@
     {%- endif -%}
     {%- if frame.kind is not none -%}
       {%- do a.update({'last_op': frame.kind, 'due': rec + (frame.gap if frame.gap is not none else ms(op_gap()) | int)}) -%}
-      {%- if frame.kind in ['create', 'save'] -%}{%- do a.hist.append([rec, frame.kind, frame.target]) -%}{%- endif -%}
-      {#- Bounded guard memory: this administrator's changes of the last 4 h. -#}
-      {%- for _ in range(a.hist | length) if a.hist and rec - a.hist[0][0] > guard_ms -%}{%- do a.hist.pop(0) -%}{%- endfor -%}
+      {%- if frame.kind in ['create', 'save'] -%}
+        {%- set ck = a.user ~ '@' ~ a.sip -%}
+        {%- set kept = [] -%}
+        {%- for p in chains.get(ck, []) if rec // 1000 - p[0] <= chain_s -%}
+          {%- if frame.kind == 'save' and frame.target not in p[1] -%}{%- do p[1].append(frame.target) -%}{%- endif -%}
+          {%- do kept.append(p) -%}
+        {%- endfor -%}
+        {%- if frame.kind == 'create' -%}{%- do kept.append([rec // 1000, []]) -%}{%- endif -%}
+        {%- do chains.update({ck: kept}) -%}
+      {%- endif -%}
       {%- set out.kind = frame.kind -%}{%- set out.user = a.user -%}{%- set out.uip = a.sip -%}{%- set out.target = frame.target -%}{%- set out.rec = rec -%}
       {%- set out.sender = 'mojo_server.pl' if frame.kind == 'view_dash' else 'sfdccsm' -%}
       {%- do shared.set('last_ms', rec) -%}
