@@ -4,17 +4,21 @@ Produces ECS JSON for Network Policy Server (NPS) RADIUS decisions from the Wind
 
 ## Event Types
 
-| Event ID | Baseline weight | Category |
+| Event ID | Share of records | Category |
 |---|---:|---|
-| 6272, access granted | 88% | Authentication |
-| 6273, access denied | 11.8% | Authentication |
+| 6272, access granted | 87.7% | Authentication |
+| 6273, access denied | 12.1% | Authentication |
 | 6274, request discarded | 0.2% | Authentication |
 
-Weights and the one-event-per-30-seconds cadence are illustrative defaults, not measured rates. The 6274 branch represents an internal EAP processing error (reason code 1), not a credential denial.
+Shares are measured over five background-only seven-day captures. Each 30-second tick is either a retry of a pending burst or an ordinary decision for a random account (91.8% grant, 8% denial, 0.2% discard). An ordinary denial starts a retry burst in 30% of cases: one to six more denials of the same account and station (weights 40/25/15/10/6/4), 30, 60, 90 or 120 seconds apart (weights 45/30/15/10), and 80% of bursts end with a grant. In those captures, runs of one to nine denials of one account and station occurred, with 274 runs of four, 203 of five and 123 of six. Weights, the cadence and the retry law are illustrative defaults, not measured rates. The 6274 branch represents an internal EAP processing error (reason code 1), not a credential denial.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), the first episode begins after six hours, then recurs every `anomaly_interval_seconds` (six hours by default): four 6273 credential denials followed by one 6272 grant for `finance.admin` from station `DA-7A-11-B2-6F-48`. Each decision is 30 seconds apart, so the five-event sequence spans two minutes. Every episode has fresh native `EventRecordID` values. The selected wireless profile carries `AccountSessionIdentifier: -`, so it does not supply a session key. Correlate on `winlog.event_data.SubjectUserName`, `CallingStationID`, `ClientName`, and `ProxyPolicyName` within a five-minute window. The same account and station also produce ordinary grants and occasional denials in both modes; one account, station, event ID, reason code, or policy alone is not an anomaly marker.
+With `anomaly_mode: true` (the default), each episode is four 6273 credential denials followed by one 6272 grant for `finance.admin` from station `DA-7A-11-B2-6F-48`. Each decision is 30 seconds apart, so the five-event sequence spans two minutes. Every episode has fresh native `EventRecordID` values. The selected wireless profile carries `AccountSessionIdentifier: -`, so it does not supply a session key. Correlate on `winlog.event_data.SubjectUserName` and `CallingStationID` (with `ClientName` and `ProxyPolicyName` as context) within a five-minute window: four denials followed by a grant, the first denial at most 300 seconds before the grant. The same account and station also produce ordinary grants, denials and retry bursts in both modes; one account, station, event ID, reason code, or policy alone is not an anomaly marker.
+
+Recurrence: the first episode starts at a time drawn uniformly within the first `min(anomaly_interval_seconds, 24 h)` of the run; the background has no hour-of-day curve, so no hour is preferred. Each next episode is due `anomaly_interval_seconds` after the actual start of the previous one and starts at a time drawn uniformly within a window of `w = min(interval / 4, 6 h)` centred on that due time. Consecutive starts are therefore `interval ± w/2` apart (6 h ± 45 min by default), start times do not drift, and missed intervals are never caught up. In one seven-day default capture, 28 episodes started, with gaps of 5.31-6.73 h; with a three-hour interval, 56 episodes had gaps of 2.63-3.36 h.
+
+Only the complete ordered chain is absent from background: an ordinary grant that would complete four denials of the same account and station, the first at most 300 seconds earlier, does not happen - the retrying user gives up - and that 30-second tick carries no record. No other record is changed or moved. Such empty ticks occurred 108-142 times per seven-day background capture (about 0.6% of ticks); they are the only gaps in the 30-second grid. In seven background-only seven-day captures, 1,088 sequences of four denials of one account and station occurred within 300 seconds; a grant of the same account and station followed 0 times inside the window and 86-107 times per 60-second bin in the next 300 seconds, while the share of grants among other accounts' decisions stayed level (89.9-91.7% in the bins inside the window, 87.9-88.9% after it).
 
 `ClientIPAddress` identifies the RADIUS client or access point, not the user's device. `CallingStationID` identifies the station MAC, while `CalledStationID` contains the access point BSSID and SSID. The sequence does not imply a policy change. Set `anomaly_mode: false` for background decisions without the five-event chain.
 
@@ -27,7 +31,7 @@ Edit `event.template.params` in `generator.yml`:
 | Parameter | Default | Purpose |
 |---|---|---|
 | `anomaly_mode` | `true` | Include recurring failure-to-success episodes; `false` emits only background |
-| `anomaly_interval_seconds` | `21600` | Time between episode starts; the first follows one interval; use a positive value above 150 seconds |
+| `anomaly_interval_seconds` | `21600` | Mean time between episode starts (each start within ± `min(interval / 8, 3 h)` of its due time); the first falls within `min(interval, 24 h)` of the run start; use a value above 600 seconds |
 | `host_name` | `nps01.corp.example` | NPS server name |
 | `domain` | `CORP` | Account domain |
 | `radius_client_name` | `office-wifi-ap` | RADIUS client name |
@@ -52,15 +56,15 @@ uv run --project ../eventum eventum generate --path generators/identity-microsof
 uv run --project ../eventum eventum generate --path generators/identity-microsoft-nps/generator.yml --id microsoft-nps --live-mode true
 ```
 
-For a finite batch, copy `generator.yml` beside the original, add `start` and `end` to `input.cron`, and use `--live-mode false --keep-order true`. Without these bounds, the first command generates as fast as possible until interrupted. Live mode emits one event every 30 seconds. Eventum croniter reads seconds from the sixth cron field (`*/30`).
+For a finite batch, copy `generator.yml` beside the original, add `start` and `end` to `input.cron`, and use `--live-mode false --keep-order true`. Without these bounds, the first command generates as fast as possible until interrupted. Live mode emits one event every 30 seconds; each record carries a random sub-second offset within its tick in 100-nanosecond units: the native XML `SystemTime` has nine fractional digits (the last two zero), as in the published 6274 record, and `winlog.time_created` has seven, as in Elastic's 6272 fixture. Eventum croniter reads seconds from the sixth cron field (`*/30`).
 
 ## Sample Output
 
-This complete 6272 grant was copied from the first episode of the final default/anomaly-on run:
+This complete 6272 grant ends the first episode of the seven-day default anomaly-on capture:
 
 ```json
 {
-  "@timestamp": "2026-09-27T06:02:30+00:00",
+  "@timestamp": "2026-09-01T02:34:30.008103+00:00",
   "client": {
     "ip": "10.20.1.20"
   },
@@ -74,7 +78,7 @@ This complete 6272 grant was copied from the first episode of the final default/
     ],
     "code": "6272",
     "kind": "event",
-    "original": "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Security-Auditing\" Guid=\"{54849625-5478-4994-A5BA-3E3B0328C30D}\"/><EventID>6272</EventID><Version>1</Version><Level>0</Level><Task>12552</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2026-09-27T06:02:30.000000000Z\"/><EventRecordID>210726</EventRecordID><Correlation/><Execution ProcessID=\"584\" ThreadID=\"4712\"/><Channel>Security</Channel><Computer>nps01.corp.example</Computer><Security/></System><EventData><Data Name=\"SubjectUserSid\">S-1-5-21-3124921703-1242075836-1035668124-1120</Data><Data Name=\"SubjectUserName\">finance.admin</Data><Data Name=\"SubjectDomainName\">CORP</Data><Data Name=\"FullyQualifiedSubjectUserName\">CORP\\finance.admin</Data><Data Name=\"SubjectMachineSID\">S-1-0-0</Data><Data Name=\"SubjectMachineName\">-</Data><Data Name=\"FullyQualifiedSubjectMachineName\">-</Data><Data Name=\"MachineInventory\">-</Data><Data Name=\"CalledStationID\">00-19-92-74-3C-A1:CORP</Data><Data Name=\"CallingStationID\">DA-7A-11-B2-6F-48</Data><Data Name=\"NASIPv4Address\">10.20.1.20</Data><Data Name=\"NASIPv6Address\">-</Data><Data Name=\"NASIdentifier\">office-wifi-ap</Data><Data Name=\"NASPortType\">Wireless - IEEE 802.11</Data><Data Name=\"NASPort\">0</Data><Data Name=\"ClientName\">office-wifi-ap</Data><Data Name=\"ClientIPAddress\">10.20.1.20</Data><Data Name=\"ProxyPolicyName\">Corporate WiFi RADIUS</Data><Data Name=\"NetworkPolicyName\">Corporate WiFi</Data><Data Name=\"AuthenticationProvider\">Windows</Data><Data Name=\"AuthenticationServer\">nps01.corp.example</Data><Data Name=\"AuthenticationType\">PEAP</Data><Data Name=\"EAPType\">Microsoft: Secured password (EAP-MSCHAP v2)</Data><Data Name=\"AccountSessionIdentifier\">-</Data><Data Name=\"QuarantineState\">Full Access</Data><Data Name=\"QuarantineSessionIdentifier\">-</Data><Data Name=\"LoggingResult\">Accounting information was written to the local log file.</Data></EventData></Event>",
+    "original": "<Event xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"><System><Provider Name=\"Microsoft-Windows-Security-Auditing\" Guid=\"{54849625-5478-4994-A5BA-3E3B0328C30D}\"/><EventID>6272</EventID><Version>1</Version><Level>0</Level><Task>12552</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime=\"2026-09-01T02:34:30.008103200Z\"/><EventRecordID>210307</EventRecordID><Correlation/><Execution ProcessID=\"584\" ThreadID=\"4712\"/><Channel>Security</Channel><Computer>nps01.corp.example</Computer><Security/></System><EventData><Data Name=\"SubjectUserSid\">S-1-5-21-3124921703-1242075836-1035668124-1120</Data><Data Name=\"SubjectUserName\">finance.admin</Data><Data Name=\"SubjectDomainName\">CORP</Data><Data Name=\"FullyQualifiedSubjectUserName\">CORP\\finance.admin</Data><Data Name=\"SubjectMachineSID\">S-1-0-0</Data><Data Name=\"SubjectMachineName\">-</Data><Data Name=\"FullyQualifiedSubjectMachineName\">-</Data><Data Name=\"MachineInventory\">-</Data><Data Name=\"CalledStationID\">00-19-92-74-3C-A1:CORP</Data><Data Name=\"CallingStationID\">DA-7A-11-B2-6F-48</Data><Data Name=\"NASIPv4Address\">10.20.1.20</Data><Data Name=\"NASIPv6Address\">-</Data><Data Name=\"NASIdentifier\">office-wifi-ap</Data><Data Name=\"NASPortType\">Wireless - IEEE 802.11</Data><Data Name=\"NASPort\">0</Data><Data Name=\"ClientName\">office-wifi-ap</Data><Data Name=\"ClientIPAddress\">10.20.1.20</Data><Data Name=\"ProxyPolicyName\">Corporate WiFi RADIUS</Data><Data Name=\"NetworkPolicyName\">Corporate WiFi</Data><Data Name=\"AuthenticationProvider\">Windows</Data><Data Name=\"AuthenticationServer\">nps01.corp.example</Data><Data Name=\"AuthenticationType\">PEAP</Data><Data Name=\"EAPType\">Microsoft: Secured password (EAP-MSCHAP v2)</Data><Data Name=\"AccountSessionIdentifier\">-</Data><Data Name=\"QuarantineState\">Full Access</Data><Data Name=\"QuarantineSessionIdentifier\">-</Data><Data Name=\"LoggingResult\">Accounting information was written to the local log file.</Data></EventData></Event>",
     "outcome": "success",
     "provider": "Microsoft-Windows-Security-Auditing",
     "type": [
@@ -145,9 +149,9 @@ This complete 6272 grant was copied from the first episode of the final default/
     ],
     "opcode": "Info",
     "provider_name": "Microsoft-Windows-Security-Auditing",
-    "record_id": "210726",
+    "record_id": "210307",
     "task": "Network Policy Server",
-    "time_created": "2026-09-27T06:02:30.000000000Z"
+    "time_created": "2026-09-01T02:34:30.0081032Z"
   }
 }
 ```
@@ -158,4 +162,4 @@ The generator targets version 1 of the NPS `Microsoft-Windows-Security-Auditing`
 
 The `EventData` names and per-event shape follow published Windows records: a [version-1 wireless 6272 record](https://airheads.hpe.com/discussion/server2008-r2-aruba-620-radius-issues) and an [independent complete 6272 XML export](https://al.twohill.nz/2018/Filtering-Windows-Event-Logs-and-Exporting-Into-Excel/), a [version-1 wireless 6273 XML record](https://learn.microsoft.com/en-us/answers/questions/2617618/network-policy-server-no-domain-controller-availab), and a [version-1 6274 XML record with reason code 1](https://learn.microsoft.com/en-us/answers/questions/1251168/network-policy-server-discarded-the-request-for-a). The 6274 capture is from a PEAP deployment rather than this sample Wi-Fi access point. [Elastic's Windows Security integration fixture](https://github.com/elastic/integrations/blob/main/packages/system/data_stream/security/_dev/test/pipeline/test-security-6272-nps-subject.json-expected.json) informs the ECS and `winlog` field layout; the XML remains the source record.
 
-These captures establish 27, 27, and 25 `EventData` fields for the selected 6272, 6273, and 6274 variants respectively. The 6272 grant has quarantine fields and no reason fields; the 6274 discard has neither `MachineInventory` nor `LoggingResult`. Event IDs 6275-6280, NPS operational logs, and accounting files are outside this generator. Actual event rates and optional field values depend on Windows version, access point, authentication method, and policy. No client endpoint IP is synthesized from the RADIUS client IP.
+These captures establish 27, 27, and 25 `EventData` fields for the selected 6272, 6273, and 6274 variants respectively. The 6272 grant has quarantine fields and no reason fields; the 6274 discard has neither `MachineInventory` nor `LoggingResult`. Event IDs 6275-6280, NPS operational logs, and accounting files are outside this generator. Actual event rates and optional field values depend on Windows version, access point, authentication method, and policy. No client endpoint IP is synthesized from the RADIUS client IP. Generator state holds the next episode due time, at most one pending retry burst and, per account and station, the denial times of the last 300 seconds; stale entries are pruned when the pair next appears, so the state is bounded by the 21 account and station pairs.
