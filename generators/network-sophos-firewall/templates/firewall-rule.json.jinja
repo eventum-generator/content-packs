@@ -7,7 +7,30 @@
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
-{%- set guard_s = 5400 -%}
+{#- Chain window of the detector (first denial to allowed start),
+    shared by the background guard. -#}
+{%- set guard_s = 3600 -%}
+{#- Background load factor by UTC hour, mean 1 over the day. -#}
+{%- macro load_at(h) -%}
+{{- (1.5 if 6 <= h < 16 else (0.8 if 16 <= h < 20 else 0.3)) / 0.883 -}}
+{%- endmacro -%}
+{#- A second in [a, b), density proportional to the load curve (sq
+    false) or to its square plus a small floor (sq true). -#}
+{%- macro pick_time(a, b, sq) -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- for hh in range(a // 3600, (b - 1) // 3600 + 1) -%}
+    {%- set lo = [hh * 3600, a] | max -%}
+    {%- set hi = [hh * 3600 + 3600, b] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = load_at(hh % 24) | float -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set sl = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.integer(sl[0], sl[1] - 1) -}}
+{%- endmacro -%}
 {%- set probe_ports = [22, 135, 445, 1433, 3389, 5985, 8080] -%}
 {%- set open_ports = {'file': [445], 'intranet': [443], 'terminal': [3389],
     'linux': [443]} -%}
@@ -68,17 +91,17 @@
       'regular': clients[params.admin_count:], 'admins': clients[:params.admin_count],
       'weights': weights, 'macs': macs, 'servers': servers, 'targets': targets,
       'dns': servers | dictsort | selectattr('1', 'equalto', 'dns') | map(attribute='0') | list,
-      'web': web, 'pool': pool, 'q': [], 'hist': {},
-      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'web': web, 'pool': pool, 'q': [], 'partial': {},
+      'next_due': none,
+      'start_at': pick_time(now, now + ([interval, 24] | min * 3600) | int,
+          false) | int,
       'last_client': none, 'last_server': none}) -%}
 {%- endif -%}
 {%- set q = shared.get('q') -%}
-{%- set hist = shared.get('hist') -%}
 {%- set servers = shared.get('servers') -%}
 {%- set admins = shared.get('admins') -%}
 {%- set hour = timestamp.astimezone(utc).hour -%}
-{%- set load = (1.5 if 6 <= hour < 16 else (0.8 if 16 <= hour < 20
-    else 0.3)) / 0.883 -%}
+{%- set load = load_at(hour) | float -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
@@ -199,20 +222,21 @@
   {%- endif -%}
 {%- endif -%}
 
-{#- 2. Episode: due by source time, random start delay, next due from
-    the actual start, never catching up. -#}
+{#- 2. Episode: the first starts within min(interval, 24 h), its time
+    drawn from the load curve; each later one in a window of
+    min(interval / 4, 6 h) centred on its due time (previous start
+    plus the interval), weighted by the squared load curve. -#}
 {%- if params.anomaly_mode -%}
-  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
-    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
-  {%- endif -%}
-  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {%- if now >= shared.get('start_at') -%}
     {%- set c = module.rand.choice(shared.get('regular') | reject('equalto', shared.get('last_client')) | list) -%}
     {%- set dst = module.rand.choice(shared.get('targets') | reject('equalto', shared.get('last_server')) | list) -%}
     {%- set closed = probe_ports | reject('in', open_ports[servers[dst]]) | list -%}
     {%- set k = module.rand.weighted_choice([3, 4], [65, 35]) -%}
     {{- probe_burst(c, dst, module.rand.shuffle(closed)[:k], true, true) -}}
-    {%- do shared.update({'start_at': none, 'last_client': c, 'last_server': dst,
-        'next_due': now + (interval * 3600) | int}) -%}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+    {%- do shared.update({'last_client': c, 'last_server': dst, 'next_due': due,
+        'start_at': pick_time(due - half, due + half, true) | int}) -%}
   {%- endif -%}
 {%- endif -%}
 
@@ -228,24 +252,46 @@
 {%- set s = e.s -%}
 {%- set kind = e.kind -%}
 
-{%- for k in hist | list -%}
-  {%- set kept = hist[k] | selectattr('0', 'ge', now - guard_s) | list -%}
-  {%- if kept -%}{%- do hist.update({k: kept}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
-{%- endfor -%}
-
-{%- if kind == 'deny' and not s.episode and s.role != 'internet' -%}
-  {%- set key = s.client ~ '>' ~ s.dst -%}
-  {%- do hist.update({key: (hist.get(key, []) + [[now, s.port]])[-12:]}) -%}
+{#- Per-client replica of the chain detector over emitted records:
+    partial matches [next step, first denial time, server, port 1,
+    port 2]. Steps: TCP denials to an internal server on three
+    distinct ports, then an allowed Start to it, the first denial at
+    most guard_s before the Start; completion starts over. Unlike the
+    audit matcher, partial matches are not capped at eight, so a
+    client probing several servers within the hour cannot push a
+    complete prefix out of the guard. -#}
+{%- set pm = shared.get('partial') -%}
+{%- set parts = pm.get(s.client, []) | selectattr('1', 'ge', now - guard_s) | list -%}
+{%- set cm = namespace(done=false, new=[]) -%}
+{%- if kind == 'deny' and s.proto == 'TCP' -%}
+  {%- for p in parts -%}
+    {%- if p[0] == 1 and s.dst == p[2] and s.port != p[3] -%}
+      {%- do cm.new.append([2, p[1], p[2], p[3], s.port]) -%}
+    {%- elif p[0] == 2 and s.dst == p[2] and s.port not in [p[3], p[4]] -%}
+      {%- do cm.new.append([3, p[1], p[2], p[3], p[4]]) -%}
+    {%- else -%}
+      {%- do cm.new.append(p) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if s.role != 'internet' -%}
+    {%- do cm.new.append([1, now, s.dst, s.port, none]) -%}
+  {%- endif -%}
+{%- elif kind == 'start' and parts | selectattr('0', 'equalto', 3)
+    | selectattr('2', 'equalto', s.dst) | list -%}
+  {#- Guard on the final chain step only: an ordinary allowed
+      connection that would complete the chain is not made. -#}
+  {%- if not s.episode -%}{{ dispatch.drop() }}{%- endif -%}
+  {%- set cm.done = true -%}
+{%- else -%}
+  {%- set cm.new = parts -%}
+{%- endif -%}
+{%- if cm.done or not cm.new -%}
+  {%- do pm.pop(s.client, none) -%}
+{%- else -%}
+  {%- do pm.update({s.client: cm.new}) -%}
 {%- endif -%}
 
 {%- if kind == 'start' -%}
-  {#- Guard on the final chain step only: an ordinary allowed
-      connection that would follow denials on three or more distinct
-      ports of the same server is not made. -#}
-  {%- if not s.episode and s.role != 'internet' -%}
-    {%- set seen = hist.get(s.client ~ '>' ~ s.dst, []) | map(attribute='1') | unique | list -%}
-    {%- if seen | length >= 3 -%}{{ dispatch.drop() }}{%- endif -%}
-  {%- endif -%}
   {%- set pool = shared.get('pool') -%}
   {%- set cid = pool.pop(module.rand.number.integer(0, pool | length - 1)) -%}
   {%- do s.update({'id': cid, 'start': now, 'spt': module.rand.number.integer(49152, 65535)}) -%}
