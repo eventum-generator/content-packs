@@ -1,42 +1,510 @@
-{%- set step = vars.step -%}
-{%- if step == 'normal_connect' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- set count = shared.get('routine_sessions', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_sessions -%}
-    {%- do shared.set('routine_sessions', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_sessions', count) -%}{%- endif -%}
+{#- MongoDB Community 7.0 mongod, structured JSON log file (logv2), shipped through the Elastic mongodb.log pipeline.
+    Discrete-event model: one input tick per second. Independent processes (pooled service connections, service slow
+    queries, batch jobs, people opening shell/Compass sessions, rare credential-failure bursts) queue native rows in
+    time order; each tick emits at most one due row and idle ticks are dropped. -#}
+{%- set N = module.rand.number -%}
+{%- set R = module.rand -%}
+{%- set M = module.math -%}
+{%- set J = module.json -%}
+{%- set now = (timestamp.timestamp() * 1000) | round | int -%}
+{%- set horizon = now + 1000 -%}
+{#- Chain window of the detection idea (first failure -> bulk read), in ms. -#}
+{%- set W = 1800000 -%}
+{#- Relative activity by local hour: people (HC) and services (SC). -#}
+{%- set HC = [0.04, 0.03, 0.03, 0.03, 0.04, 0.07, 0.16, 0.42, 0.78, 0.97, 1.0, 0.95, 0.72, 0.88, 1.0, 0.96, 0.86, 0.62, 0.36, 0.22, 0.15, 0.1, 0.07, 0.05] -%}
+{%- set SC = [0.36, 0.31, 0.28, 0.27, 0.3, 0.38, 0.5, 0.68, 0.86, 0.96, 1.0, 1.0, 0.97, 1.0, 1.0, 0.97, 0.92, 0.85, 0.76, 0.66, 0.56, 0.48, 0.42, 0.38] -%}
+
+{%- if not shared.get('init', false) -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- module.builtins.int('MongoDB anomaly_mode must be boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean or not M.isfinite(params.anomaly_interval_hours) or not 6 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- module.builtins.int('MongoDB anomaly_interval_hours must be a number in 6..8760') -}}
+  {%- endif -%}
+  {%- if params.db_host is not string or not module.re.fullmatch('[a-zA-Z0-9][a-zA-Z0-9.-]{0,252}', params.db_host) -%}
+    {{- module.builtins.int('MongoDB db_host must be an ASCII host name') -}}
+  {%- endif -%}
+  {%- if params.log_timezone is not string or not module.re.fullmatch('[+-](0[0-9]|1[0-4]):[0-5][0-9]', params.log_timezone) -%}
+    {{- module.builtins.int('MongoDB log_timezone must be an offset like +00:00') -}}
+  {%- endif -%}
+  {%- set offm = ((params.log_timezone[1:3] | int) * 60 + (params.log_timezone[4:6] | int)) * (-1 if params.log_timezone[0] == '-' else 1) -%}
+  {%- set CO = [] -%}
+  {%- for r in samples.collections -%}
+    {%- do CO.append({'ns': r.ns, 'db': r.db, 'coll': r.coll, 'docs': r.docs, 'size': r.avg_size}) -%}
+  {%- endfor -%}
+  {%- set CL = [] -%}
+  {%- for r in samples.clients -%}
+    {%- do CL.append({'key': r.key, 'kind': r.kind, 'grp': r.grp, 'user': r.user, 'ip': r.ip, 'plo': r.port_lo, 'phi': r.port_hi, 'pool': r.pool, 'comp': r.compressors, 'doc': r.doc}) -%}
+  {%- endfor -%}
+  {%- set QS = [] -%}
+  {%- for r in samples.queries -%}
+    {%- do QS.append({'id': r.id, 'grps': r.grps, 'w': r.weight, 'coll': r.coll, 'cmd': r.cmd, 'body': r.body, 'ptype': r.ptype, 'pvals': r.pvals, 'plan': r.plan, 'qh': r.qh, 'pck': r.pck, 'keys': r.keys, 'ret': r.ret, 'cache': r.cache, 'dur': r.dur, 'disk': r.disk}) -%}
+  {%- endfor -%}
+  {%- set XS = [] -%}
+  {%- for r in samples.exports -%}
+    {%- do XS.append({'id': r.id, 'grps': r.grps, 'w': r.weight, 'coll': r.coll, 'filter': r.filter, 'ptype': r.ptype, 'pvals': r.pvals, 'sel': r.sel}) -%}
+  {%- endfor -%}
+  {%- set HU = [] -%}
+  {%- for i in range(CL | length) if CL[i].kind in ['shell', 'compass'] -%}
+    {%- do HU.append(i) -%}
+  {%- endfor -%}
+  {%- if HU | length < 2 or CL | length > 32 or CO | length > 32 -%}
+    {{- module.builtins.int('MongoDB needs two or more people clients and bounded samples') -}}
+  {%- endif -%}
+  {%- set OPEN = {} -%}
+  {%- set P = [] -%}
+  {#- mongod has been up for weeks: connection ids start high; service pools and their monitoring connections are already open. -#}
+  {%- set ctr = namespace(v=N.integer(40000, 90000), base=0, low=0) -%}
+  {%- set ctr.low = ctr.v -%}
+  {%- for c in CL -%}
+    {%- set ci = loop.index0 -%}
+    {%- if c.kind in ['app', 'exporter'] -%}
+      {%- set ctr.base = ctr.base + 2 -%}
+      {%- for j in range(c.pool) -%}
+        {%- set ctr.low = ctr.low - N.integer(1, 900) -%}
+        {%- do OPEN.update({ctr.low: {'ip': c.ip, 'port': N.integer(c.plo, c.phi), 'uuid': R.crypto.uuid4()}}) -%}
+        {%- do P.append({'k': 'slot', 'c': ci, 'cid': ctr.low, 'due': now + (N.exponential(1 / (2400000 if c.kind == 'app' else 21600000)) | int)}) -%}
+      {%- endfor -%}
+      {%- if c.kind == 'app' -%}
+        {%- do P.append({'k': 'sq', 'c': ci, 'due': now + (N.exponential(1 / 90000) | int)}) -%}
+      {%- endif -%}
+      {%- do P.append({'k': 'sf', 'c': ci, 'due': now + (N.exponential(1 / 129600000) | int)}) -%}
+    {%- elif c.kind in ['cron', 'report'] -%}
+      {%- do P.append({'k': 'job', 'c': ci, 'due': now + (N.exponential(1 / (1800000 if c.kind == 'cron' else 18000000)) | int)}) -%}
+    {%- else -%}
+      {%- do P.append({'k': 'hu', 'c': ci, 'due': now + (N.exponential(1 / 3300000) | int)}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if params.anomaly_mode -%}
+    {#- First episode: within the first min(interval, 24 h), hour drawn from the people hour curve, then a random start delay. -#}
+    {%- set span = ([params.anomaly_interval_hours, 24] | min * 3600000) | int -%}
+    {%- set f = namespace(t=now + N.integer(0, span), ok=false) -%}
+    {%- for _ in range(400) if not f.ok -%}
+      {%- set u = now + N.integer(0, span) -%}
+      {%- if N.floating(0, 1) < HC[((u // 1000 + offm * 60) // 3600) % 24] -%}
+        {%- set f.t = u -%}
+        {%- set f.ok = true -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do P.append({'k': 'ep', 'due': f.t + (N.exponential(1 / 360000) | int)}) -%}
+  {%- endif -%}
+  {%- do shared.update({'init': true, 'offm': offm, 'CO': CO, 'CL': CL, 'QS': QS, 'XS': XS, 'HU': HU, 'OPEN': OPEN, 'P': P, 'Q': [], 'PRE': {}, 'S': {'ctr': ctr.v, 'cnt': ctr.base + OPEN | length, 'seq': 0, 'prev': none}}) -%}
 {%- endif -%}
-{%- if step in ['normal_connect','attack_connect'] -%}
-  {%- set conn = (shared.get('connection_counter', 100) % 2147483647) + 1 -%}
-  {%- do shared.set('connection_counter', conn) -%}{%- do shared.set('active_connection', conn) -%}
-  {%- set port = module.rand.number.integer(40000, 62000) -%}{%- do shared.set('active_port', port) -%}
+{%- set offm = shared.get('offm') -%}
+{%- set CO = shared.get('CO') -%}
+{%- set CL = shared.get('CL') -%}
+{%- set QS = shared.get('QS') -%}
+{%- set XS = shared.get('XS') -%}
+{%- set HU = shared.get('HU') -%}
+{%- set OPEN = shared.get('OPEN') -%}
+{%- set P = shared.get('P') -%}
+{%- set Q = shared.get('Q') -%}
+{%- set PRE = shared.get('PRE') -%}
+{%- set S = shared.get('S') -%}
+{%- set X = {} -%}
+
+{%- macro lh(t) -%}{{- ((t // 1000 + offm * 60) // 3600) % 24 -}}{%- endmacro -%}
+
+{%- macro push(t, c, id, ctx, msg, attr, cnt) -%}
+  {%- do S.update({'seq': S.seq + 1}) -%}
+  {%- do module.bisect.insort(Q, [t, S.seq, c, id, ctx, msg, attr, cnt]) -%}
+{%- endmacro -%}
+
+{#- Mirror of the detection matcher, keyed by client IP: three failed authentications of one user, a successful one of
+    that user, then a getMore on crm.customers, all within W of the first failure. Partial matches advance on every
+    matching row, the last eight are kept, completion resets the IP. -#}
+{%- macro feed(ip, t, typ, user) -%}
+  {%- set new = [] -%}
+  {%- set st = namespace(done=false) -%}
+  {%- for p in PRE.get(ip, []) if t - p[1] <= W -%}
+    {%- if not st.done -%}
+      {%- set hit = (p[0] < 3 and typ == 'F' and user == p[2]) or (p[0] == 3 and typ == 'S' and user == p[2]) or (p[0] == 4 and typ == 'G') -%}
+      {%- if hit and p[0] == 4 -%}
+        {%- set st.done = true -%}
+      {%- elif hit -%}
+        {%- do new.append([p[0] + 1, p[1], p[2]]) -%}
+      {%- else -%}
+        {%- do new.append(p) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if not st.done and typ == 'F' -%}
+    {%- do new.append([1, t, user]) -%}
+  {%- endif -%}
+  {%- if st.done or not new -%}
+    {%- do PRE.pop(ip, none) -%}
+  {%- else -%}
+    {%- do PRE.update({ip: new[-8:]}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro completes(ip, t) -%}
+  {%- set st = namespace(v='') -%}
+  {%- for p in PRE.get(ip, []) if p[0] == 4 and t - p[1] <= W -%}
+    {%- set st.v = 'y' -%}
+  {%- endfor -%}
+  {{- st.v -}}
+{%- endmacro -%}
+
+{%- macro accept(t, ci) -%}
+  {%- set c = CL[ci] -%}
+  {%- set cid = S.ctr -%}
+  {%- do S.update({'ctr': cid + 1}) -%}
+  {%- set conn = {'ip': c.ip, 'port': N.integer(c.plo, c.phi), 'uuid': R.crypto.uuid4()} -%}
+  {%- do OPEN.update({cid: conn}) -%}
+  {%- set remote = conn.ip ~ ':' ~ conn.port -%}
+  {%- do push(t, 'NETWORK', 22943, 'listener', 'Connection accepted', {'remote': remote, 'isLoadBalanced': false, 'uuid': {'$uuid': conn.uuid}, 'connectionId': cid}, 1) -%}
+  {%- set t2 = t + (N.lognormal(M.log(3), 0.8) | round | int) -%}
+  {%- do push(t2, 'NETWORK', 51800, 'conn' ~ cid, 'client metadata', {'remote': remote, 'client': 'conn' ~ cid, 'negotiatedCompressors': c.comp, 'doc': c.doc}, 0) -%}
+  {%- do X.update({'cid': cid, 't': t2, 'remote': remote}) -%}
+{%- endmacro -%}
+
+{%- macro endc(t, cid) -%}
+  {%- set conn = OPEN.pop(cid) -%}
+  {%- do push(t, 'NETWORK', 22944, 'conn' ~ cid, 'Connection ended', {'remote': conn.ip ~ ':' ~ conn.port, 'isLoadBalanced': false, 'uuid': {'$uuid': conn.uuid}, 'connectionId': cid}, -1) -%}
+{%- endmacro -%}
+
+{#- SCRAM-SHA-256 with speculative saslStart in hello: two conversation steps; a wrong password fails at step 2. -#}
+{%- macro auth(t, ci, cid, remote, ok) -%}
+  {%- set c = CL[ci] -%}
+  {%- set s1 = N.lognormal(M.log(70), 0.5) | round | int -%}
+  {%- set s2 = N.lognormal(M.log(260 if ok else 230), 0.5) | round | int -%}
+  {%- set total = s1 + s2 + (N.lognormal(M.log(2600 if c.kind in ['shell', 'compass'] else 1400), 0.7) | round | int) -%}
+  {%- set a = {'client': remote, 'isSpeculative': true, 'isClusterMember': false, 'mechanism': 'SCRAM-SHA-256', 'user': c.user, 'db': 'admin'} -%}
+  {%- if not ok -%}
+    {%- do a.update({'error': 'AuthenticationFailed: SCRAM authentication failed, storedKey mismatch'}) -%}
+  {%- endif -%}
+  {%- do a.update({'result': 0 if ok else 18, 'metrics': {'conversation_duration': {'micros': total, 'summary': [{'step': 1, 'step_total': 2, 'duration_micros': s1}, {'step': 2, 'step_total': 2, 'duration_micros': s2}]}}, 'doc': c.doc, 'extraInfo': {}}) -%}
+  {%- set ta = t + (total // 1000) + N.integer(0, 1) -%}
+  {%- do push(ta, 'ACCESS', 5286306 if ok else 5286307, 'conn' ~ cid, 'Successfully authenticated' if ok else 'Failed to authenticate', a, 0) -%}
+  {%- do feed(c.ip, ta, 'S' if ok else 'F', c.user) -%}
+  {%- set tf = ta -%}
+  {%- if ok -%}
+    {%- set el = N.lognormal(M.log(4 if c.kind in ['shell', 'compass'] else 2), 1.0) | round | int -%}
+    {%- set tf = ta + el -%}
+    {%- do push(tf, 'NETWORK', 6788700, 'conn' ~ cid, 'Received first command on ingress connection since session start or auth handshake', {'elapsedMillis': el}, 0) -%}
+  {%- endif -%}
+  {%- do X.update({'t': tf}) -%}
+{%- endmacro -%}
+
+{%- macro pval(ptype, pvals) -%}
+  {%- if ptype == 'int' -%}{{- J.dumps(N.integer(pvals[0], pvals[1])) -}}
+  {%- elif ptype == 'enum' -%}{{- J.dumps(R.choice(pvals)) -}}
+  {%- elif ptype == 'code' -%}{{- J.dumps(pvals[0] ~ R.string.digits(pvals[1])) -}}
+  {%- elif ptype == 'email' -%}{{- J.dumps(pvals[0] ~ R.string.digits(pvals[1]) ~ '@example.net') -}}
+  {%- else -%}{{- 'null' -}}{%- endif -%}
+{%- endmacro -%}
+
+{%- macro storage(ms, p) -%}
+  {%- if N.floating(0, 1) < p -%}
+    {%- set rd = N.lognormal(M.log(ms * 180), 0.6) | round | int -%}
+    {{- J.dumps({'data': {'bytesRead': [rd, 4096] | max * N.integer(3, 9), 'timeReadingMicros': [(ms * 1000 * N.floating(0.05, 0.4)) | int, 1] | max}}) -}}
+  {%- else -%}{{- '{}' -}}{%- endif -%}
+{%- endmacro -%}
+
+{#- One read operation. Only operations above slowms (100 ms) are logged, as "Slow query" (51803). -#}
+{%- macro query(t, ci, cid, q, lsid) -%}
+  {%- set c = CL[ci] -%}
+  {%- set co = CO[q.coll] -%}
+  {%- set conn = OPEN[cid] -%}
+  {%- set body = J.loads(J.dumps(q.body).replace('"$P"', pval(q.ptype, q.pvals))) -%}
+  {%- if q.plan == 'COLLSCAN' -%}
+    {%- set keys = 0 -%}
+    {%- set docs = co.docs + N.integer(0, co.docs // 200) -%}
+    {%- set ms = (docs * (1.2 + co.size / 1000) * N.lognormal(0, 0.25) / 1000) | round | int -%}
+  {%- else -%}
+    {%- set keys = M.exp(N.floating(M.log(q['keys'][0] + 1), M.log(q['keys'][1] + 1))) | round | int -%}
+    {%- set docs = keys -%}
+    {%- set ms = N.lognormal(M.log(q.dur[0]), q.dur[1]) | round | int -%}
+  {%- endif -%}
+  {%- if ms > 100 -%}
+    {%- set lim = body.get('limit', 101) if q.cmd == 'find' else 101 -%}
+    {%- set ret = N.integer(q.ret[0], q.ret[1]) if q.ret[1] > 0 else [docs, lim] | min -%}
+    {%- set cmd = {'find': co.coll} if q.cmd == 'find' else {'aggregate': co.coll} -%}
+    {%- do cmd.update(body) -%}
+    {%- do cmd.update({'lsid': {'id': {'$uuid': lsid or R.crypto.uuid4()}}, '$db': co.db}) -%}
+    {%- set a = {'type': 'command', 'ns': co.ns} -%}
+    {%- if c.doc.application is defined -%}
+      {%- do a.update({'appName': c.doc.application.name}) -%}
+    {%- endif -%}
+    {%- do a.update({'command': cmd, 'planSummary': q.plan, 'planningTimeMicros': N.lognormal(M.log(900 if q.cache == 'multi' else 180), 0.6) | round | int, 'keysExamined': keys, 'docsExamined': docs}) -%}
+    {%- if q.cache == 'plan' -%}
+      {%- do a.update({'fromPlanCache': true}) -%}
+    {%- elif q.cache == 'multi' -%}
+      {%- do a.update({'fromMultiPlanner': true}) -%}
+    {%- endif -%}
+    {%- set y = ([docs / 1000, ms / 10] | max * N.floating(0.8, 1.0)) | int -%}
+    {%- do a.update({'nBatches': 1, 'cursorExhausted': true, 'numYields': y, 'nreturned': ret, 'queryHash': q.qh, 'planCacheKey': q.pck, 'queryFramework': 'sbe' if q.cmd == 'aggregate' else 'classic', 'reslen': 120 + ((ret * (co.size if q.cmd == 'find' else 64)) * N.floating(0.8, 1.2)) | int, 'locks': {'FeatureCompatibilityVersion': {'acquireCount': {'r': y + 1}}, 'Global': {'acquireCount': {'r': y + 1}}}, 'storage': J.loads(storage(ms, q.disk)), 'cpuNanos': (ms * 1000000 * N.floating(0.55, 0.97)) | int, 'remote': conn.ip ~ ':' ~ conn.port, 'protocol': 'op_msg', 'durationMillis': ms}) -%}
+    {%- do push(t + ms, 'COMMAND', 51803, 'conn' ~ cid, 'Slow query', a, 0) -%}
+  {%- endif -%}
+  {%- do X.update({'t': t + ms}) -%}
+{%- endmacro -%}
+
+{#- One getMore of an export cursor (16 MiB batches); logged when above slowms. The guard drops an ordinary
+    crm.customers getMore that would complete the chain. -#}
+{%- macro getmore(t, s) -%}
+  {%- set x = s.cur -%}
+  {%- set co = CO[x.coll] -%}
+  {%- set conn = OPEN[s.cid] -%}
+  {%- set n = [x.left, (16777216 / (co.size * N.floating(0.97, 1.05))) | int] | min -%}
+  {%- set last = n >= x.left -%}
+  {%- set ex = (co.docs - x.seen) if last else [(n / x.sel * N.floating(0.85, 1.15)) | int, co.docs - x.seen] | min -%}
+  {%- set ms = ((ex * 1.2 + n * 18) * N.lognormal(0, 0.3) / 1000) | round | int -%}
+  {%- do x.update({'left': x.left - n, 'seen': x.seen + ex}) -%}
+  {%- set tg = t + ms -%}
+  {%- set cust = co.ns == 'crm.customers' -%}
+  {%- if ms > 100 and not (cust and not s.ep and completes(conn.ip, tg)) -%}
+    {%- set a = {'type': 'command', 'ns': co.ns} -%}
+    {%- if CL[s.c].doc.application is defined -%}
+      {%- do a.update({'appName': CL[s.c].doc.application.name}) -%}
+    {%- endif -%}
+    {%- do a.update({'command': {'getMore': x.id, 'collection': co.coll, 'lsid': {'id': {'$uuid': s.lsid}}, '$db': co.db}, 'originatingCommand': {'find': co.coll, 'filter': x.filter, 'lsid': {'id': {'$uuid': s.lsid}}, '$db': co.db}, 'planSummary': 'COLLSCAN', 'cursorid': x.id, 'keysExamined': 0, 'docsExamined': ex, 'nBatches': 1}) -%}
+    {%- if last -%}
+      {%- do a.update({'cursorExhausted': true}) -%}
+    {%- endif -%}
+    {%- set y = ([ex / 1000, ms / 10] | max * N.floating(0.8, 1.0)) | int -%}
+    {%- do a.update({'numYields': y, 'nreturned': n, 'queryFramework': 'classic', 'reslen': 110 + (n * co.size * N.floating(0.97, 1.03)) | int, 'locks': {'FeatureCompatibilityVersion': {'acquireCount': {'r': y + 1}}, 'Global': {'acquireCount': {'r': y + 1}}}, 'storage': J.loads(storage(ms, 0.5)), 'cpuNanos': (ms * 1000000 * N.floating(0.6, 0.97)) | int, 'remote': conn.ip ~ ':' ~ conn.port, 'protocol': 'op_msg', 'durationMillis': ms}) -%}
+    {%- do push(tg, 'COMMAND', 51803, 'conn' ~ s.cid, 'Slow query', a, 0) -%}
+    {%- if cust -%}
+      {%- do feed(conn.ip, tg, 'G', none) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- do X.update({'t': tg, 'last': last}) -%}
+{%- endmacro -%}
+
+{%- macro pickw(items) -%}
+  {%- set tot = items | sum(attribute='w') -%}
+  {%- set st = namespace(r=N.floating(0, tot), i=-1) -%}
+  {%- for it in items if st.i < 0 -%}
+    {%- set st.r = st.r - it.w -%}
+    {%- if st.r <= 0 or loop.last -%}
+      {%- set st.i = loop.index0 -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- st.i -}}
+{%- endmacro -%}
+
+{#- New session of a client. Wrong-password attempts: people fail a first attempt with p 0.12 and each retry with 0.5
+    (up to 6), and 8% of their sessions start from a stale remembered password (retry failure 0.7, up to 9); batch
+    jobs almost never fail. After each failure a person gives up with p 0.1. -#}
+{%- macro spawn(t, ci, ep, burst) -%}
+  {%- set c = CL[ci] -%}
+  {%- set human = c.kind in ['shell', 'compass'] -%}
+  {%- set f = namespace(n=0, p=0.12 if human else 0.003, q=0.5, cap=6) -%}
+  {%- if human and N.floating(0, 1) < 0.08 -%}
+    {%- set f.p = 1.0 -%}
+    {%- set f.q = 0.7 -%}
+    {%- set f.cap = 9 -%}
+  {%- endif -%}
+  {%- for _ in range(9) -%}
+    {%- if f.n < f.cap and N.floating(0, 1) < (f.p if f.n == 0 else f.q) -%}
+      {%- set f.n = f.n + 1 -%}
+    {%- else -%}
+      {%- break -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set ops = 1 + ([N.lognormal(M.log(3 if human else 2 if c.kind == 'cron' else 5), 0.8) | int, 40] | min) -%}
+  {%- set s = {'k': 'sess', 'c': ci, 'st': 'att', 'due': t, 'f': f.n, 'gu': 0.1 if human else 0.0, 'ops': ops, 'pexp': 0.05 if human else 0.12 if c.kind == 'report' else 0.0, 'mon': human or c.kind in ['cron', 'report'], 'mons': [], 'cid': none, 'lsid': R.crypto.uuid4(), 'ep': false, 'pre': 0, 'need': false, 'ff': none, 'cur': none} -%}
+  {%- if burst -%}
+    {%- do s.update({'f': 2 + ([N.lognormal(M.log(2), 0.7) | int, 10] | min), 'retry': 15000}) -%}
+  {%- endif -%}
+  {%- if ep -%}
+    {%- do s.update({'ep': true, 'f': R.weighted_choice([3, 4, 5], [55, 30, 15]), 'gu': 0.0, 'pre': R.weighted_choice([0, 1, 2], [40, 40, 20]), 'need': true}) -%}
+  {%- endif -%}
+  {%- if P | length < 64 -%}
+    {%- do P.append(s) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro choose_export(t, s) -%}
+  {%- set c = CL[s.c] -%}
+  {%- set pool = [] -%}
+  {%- for x in XS if c.grp in x.grps and (not s.ep or CO[x.coll].ns == 'crm.customers') -%}
+    {%- do pool.append(x) -%}
+  {%- endfor -%}
+  {%- set x = pool[pickw(pool) | int] -%}
+  {%- set co = CO[x.coll] -%}
+  {%- set filt = J.loads(J.dumps(x.filter).replace('"$P"', pval(x.ptype, x.pvals))) -%}
+  {%- set total = (co.docs * x.sel * N.floating(0.9, 1.1)) | int -%}
+  {#- The opening find returns the first 101 documents quickly and is not logged. -#}
+  {%- do s.update({'cur': {'id': N.integer(10 ** 17, 9 * 10 ** 18), 'coll': x.coll, 'filter': filt, 'sel': x.sel, 'left': total - 101, 'seen': [(101 / x.sel) | int, co.docs] | min}}) -%}
+{%- endmacro -%}
+
+{#- Main loop: run every process step due before the end of this tick, earliest first. -#}
+{%- for _ in range(60) -%}
+  {%- set pk = namespace(i=-1, t=0) -%}
+  {%- for p in P -%}
+    {%- if pk.i < 0 or p.due < pk.t -%}
+      {%- set pk.i = loop.index0 -%}
+      {%- set pk.t = p.due -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if pk.i < 0 or pk.t >= horizon -%}
+    {%- break -%}
+  {%- endif -%}
+  {%- set p = P[pk.i] -%}
+  {%- set t = p.due -%}
+  {%- set c = CL[p.c] if p.c is defined else none -%}
+  {%- if p.k == 'slot' -%}
+    {#- Pooled service connection: idle-timeout close, reopen on demand. -#}
+    {%- if p.cid is not none -%}
+      {%- do endc(t, p.cid) -%}
+      {%- do p.update({'cid': none, 'due': t + (N.lognormal(M.log(15000), 1.2) | int) + 1}) -%}
+    {%- else -%}
+      {%- do accept(t, p.c) -%}
+      {%- set cid = X.cid -%}
+      {%- do auth(X.t, p.c, cid, X.remote, true) -%}
+      {%- do p.update({'cid': cid, 'ready': X.t, 'due': X.t + (N.lognormal(M.log(2400000 if c.kind == 'app' else 21600000), 0.9) | int)}) -%}
+    {%- endif -%}
+  {%- elif p.k == 'sq' -%}
+    {#- Service reads: a thinned Poisson process following the service hour curve. -#}
+    {%- if N.floating(0, 1) < SC[lh(t) | int] -%}
+      {%- set conns = [] -%}
+      {#- A pool hands out an idle connection that is ready and not about to be idle-closed. -#}
+      {%- for o in P if o.k == 'slot' and o.c == p.c and o.cid is not none and o.get('ready', 0) < t and o.due > t + 60000 -%}
+        {%- do conns.append(o.cid) -%}
+      {%- endfor -%}
+      {%- set qs = [] -%}
+      {%- for q in QS if c.grp in q.grps -%}
+        {%- do qs.append(q) -%}
+      {%- endfor -%}
+      {%- if conns and qs -%}
+        {%- do query(t, p.c, R.choice(conns), qs[pickw(qs) | int], none) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- do p.update({'due': t + 1 + (N.exponential(1 / 120000) | int)}) -%}
+  {%- elif p.k == 'sf' -%}
+    {#- Rare credential-failure burst of a service instance (stale secret), then a working connection. -#}
+    {%- do spawn(t, p.c, false, true) -%}
+    {%- do p.update({'due': t + (N.exponential(1 / 129600000) | int)}) -%}
+  {%- elif p.k == 'job' -%}
+    {%- if c.kind == 'report' or N.floating(0, 1) < SC[lh(t) | int] -%}
+      {%- do spawn(t, p.c, false, false) -%}
+    {%- endif -%}
+    {%- do p.update({'due': t + 1 + (N.exponential(1 / (1500000 if c.kind == 'cron' else 18000000)) | int)}) -%}
+  {%- elif p.k == 'hu' -%}
+    {%- if N.floating(0, 1) < HC[lh(t) | int] -%}
+      {%- do spawn(t, p.c, false, false) -%}
+    {%- endif -%}
+    {%- do p.update({'due': t + 1 + (N.exponential(1 / 3300000) | int)}) -%}
+  {%- elif p.k == 'ep' -%}
+    {#- Episode start: an ordinary person, rotated, weighted like background (equal session rates). -#}
+    {%- set cand = [] -%}
+    {%- for ci in HU if CL[ci].key != S.prev -%}
+      {%- do cand.append(ci) -%}
+    {%- endfor -%}
+    {%- set ci = R.choice(cand) -%}
+    {%- do S.update({'prev': CL[ci].key}) -%}
+    {%- do spawn(t, ci, true, false) -%}
+    {#- Next start: in [due - w/2, due + w/2], due = this start + interval, w = min(interval / 4, 6 h), weighted by
+        people-curve^2 + 0.05, then a random delay. -#}
+    {%- set iv = (params.anomaly_interval_hours * 3600000) | int -%}
+    {%- set w = ([params.anomaly_interval_hours / 4, 6] | min * 3600000) | int -%}
+    {%- set f = namespace(t=t + iv + N.integer(-(w // 2), w // 2), ok=false) -%}
+    {%- for _ in range(400) if not f.ok -%}
+      {%- set u = t + iv + N.integer(-(w // 2), w // 2) -%}
+      {%- set h = HC[lh(u) | int] -%}
+      {%- if N.floating(0, 1.05) < h * h + 0.05 -%}
+        {%- set f.t = u -%}
+        {%- set f.ok = true -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do p.update({'due': f.t + (N.exponential(1 / 360000) | int)}) -%}
+  {%- elif p.k == 'sess' -%}
+    {%- set human = c.kind in ['shell', 'compass'] -%}
+    {%- if p.st == 'att' -%}
+      {#- One connect attempt: the driver's two monitoring connections, then the authenticating pool connection. -#}
+      {%- set tt = namespace(v=t, mons=[]) -%}
+      {%- if p.mon -%}
+        {%- for _ in range(2) -%}
+          {%- do accept(tt.v, p.c) -%}
+          {%- do tt.mons.append(X.cid) -%}
+          {%- set tt.v = X.t + (N.lognormal(M.log(2), 0.8) | round | int) -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- do accept(tt.v, p.c) -%}
+      {%- set cid = X.cid -%}
+      {%- if p.f > 0 -%}
+        {%- if p.ff is none -%}
+          {%- do p.update({'ff': tt.v}) -%}
+        {%- endif -%}
+        {%- do auth(X.t, p.c, cid, X.remote, false) -%}
+        {%- set te = X.t + (N.lognormal(M.log(3), 0.8) | round | int) -%}
+        {%- do endc(te, cid) -%}
+        {%- for m in tt.mons -%}
+          {%- set te = te + (N.lognormal(M.log(2), 0.8) | round | int) -%}
+          {%- do endc(te, m) -%}
+        {%- endfor -%}
+        {%- do p.update({'f': p.f - 1}) -%}
+        {%- if N.floating(0, 1) < p.gu -%}
+          {%- do P.pop(pk.i) -%}
+        {%- else -%}
+          {%- do p.update({'due': te + (N.lognormal(M.log(p.get('retry', 9000)), 0.45) | int)}) -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- do auth(X.t, p.c, cid, X.remote, true) -%}
+        {%- do p.update({'st': 'op', 'cid': cid, 'mons': tt.mons, 'due': X.t + (N.lognormal(M.log(20000 if human else 800), 1.0) | int)}) -%}
+      {%- endif -%}
+    {%- elif p.st == 'op' -%}
+      {%- set late = p.need and p.ff is not none and t - p.ff > 1200000 -%}
+      {%- if p.ops <= 0 and not p.need -%}
+        {%- do p.update({'st': 'end', 'due': t + (N.lognormal(M.log(4000 if human else 300), 1.0) | int)}) -%}
+      {%- elif (p.need and (p.pre <= 0 or late)) or (not p.ep and p.pexp > 0 and N.floating(0, 1) < p.pexp) -%}
+        {%- do choose_export(t, p) -%}
+        {%- do p.update({'st': 'gm', 'need': false, 'due': t + (N.lognormal(M.log(40), 0.6) | int)}) -%}
+      {%- else -%}
+        {%- set qs = [] -%}
+        {%- for q in QS if c.grp in q.grps -%}
+          {%- do qs.append(q) -%}
+        {%- endfor -%}
+        {%- set te = t -%}
+        {%- if qs -%}
+          {%- do query(t, p.c, p.cid, qs[pickw(qs) | int], p.lsid) -%}
+          {%- set te = X.t -%}
+        {%- endif -%}
+        {%- do p.update({'ops': p.ops - 1, 'pre': p.pre - 1, 'due': te + (N.lognormal(M.log(40000 if human else 1500), 1.0) | int)}) -%}
+      {%- endif -%}
+    {%- elif p.st == 'gm' -%}
+      {%- do getmore(t, p) -%}
+      {%- if X['last'] -%}
+        {%- do p.update({'st': 'op', 'cur': none, 'due': X.t + (N.lognormal(M.log(30000 if human else 2000), 1.0) | int)}) -%}
+      {%- else -%}
+        {%- do p.update({'due': X.t + (N.lognormal(M.log(120), 0.6) | int)}) -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- set te = t -%}
+      {%- do endc(te, p.cid) -%}
+      {%- for m in p.mons -%}
+        {%- set te = te + (N.lognormal(M.log(2), 0.8) | round | int) -%}
+        {%- do endc(te, m) -%}
+      {%- endfor -%}
+      {%- do P.pop(pk.i) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+
+{%- if Q | length > 400 or OPEN | length > 400 or PRE | length > 32 -%}
+  {{- module.builtins.int('MongoDB bounded state exceeded') -}}
 {%- endif -%}
-{%- set conn = shared.get('active_connection', 101) -%}
-{%- set port = shared.get('active_port', 42000) -%}
-{%- set attack = step.startswith('attack_') -%}
-{%- set src = params.anomaly_ip if attack else params.normal_ip -%}
-{%- set remote = src ~ ':' ~ port -%}
-{%- set ctx = 'conn' ~ conn -%}
-{%- set component = 'NETWORK' -%}{%- set log_id = 51800 -%}{%- set msg = 'client metadata' -%}
-{%- set action = 'client-metadata' -%}{%- set event_category = ['network'] -%}{%- set event_type = ['connection'] -%}
-{%- set attr = {'remote':remote,'client':ctx,'doc':{'application':{'name':'MongoDB Shell'},'driver':{'name':'MongoDB Internal Client','version':'7.0.0'},'os':{'type':'Linux','name':'Ubuntu','architecture':'x86_64','version':'6.6'}}} -%}
-{%- if step in ['normal_slow','attack_slow_1','attack_slow_2','attack_slow_3'] -%}
-  {%- set component = 'COMMAND' -%}{%- set log_id = 51803 -%}{%- set msg = 'Slow query' -%}
-  {%- set action = 'slow-query' -%}{%- set event_category = ['database'] -%}{%- set event_type = ['info'] -%}
-  {%- set coll = samples.collections.pick() -%}
-  {%- set ns = params.anomaly_namespace if attack else coll.namespace -%}
-  {%- set collection = ns.split('.')[1] -%}
-  {%- set docs = (50000 if step == 'attack_slow_1' else (100000 if step == 'attack_slow_2' else 150000)) if attack else coll.docs_examined -%}
-  {%- set returned = (5000 if step == 'attack_slow_1' else (10000 if step == 'attack_slow_2' else 15000)) if attack else coll.nreturned -%}
-  {%- set duration = (350 if step == 'attack_slow_1' else (600 if step == 'attack_slow_2' else 850)) if attack else 120 -%}
-  {%- set command = {'find':collection,'filter':{},'batchSize':10000 if attack else 100,'$db':ns.split('.')[0]} -%}
-  {%- set attr = {'type':'command','ns':ns,'appName':'MongoDB Shell','command':command,'planSummary':'COLLSCAN','keysExamined':0,'docsExamined':docs,'nreturned':returned,'numYields':12 if attack else 1,'reslen':returned * 150,'remote':remote,'protocol':'op_msg','durationMillis':duration} -%}
-{%- elif step in ['normal_disconnect','attack_disconnect'] -%}
-  {%- set log_id = 22944 -%}{%- set msg = 'end connection {remote} ({connectionCount}{word} now open)' -%}
-  {%- set action = 'disconnect' -%}{%- set event_type = ['end'] -%}
-  {%- set attr = {'remote':remote,'connectionCount':4,'word':' connections'} -%}
+{%- if not Q or Q[0][0] >= horizon -%}
+  {%- do dispatch.drop() -%}
 {%- endif -%}
-{%- set native = {'t':{'$date':timestamp.isoformat(timespec='milliseconds')},'s':'I','c':component,'id':log_id,'ctx':ctx,'svc':'R','msg':msg,'attr':attr} -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':action,'category':event_category,'dataset':'mongodb.log','kind':'event','original':native|tojson,'type':event_type},'host':{'name':params.db_host,'ip':[params.db_ip]},'log':{'level':'info'},'message':msg,'mongodb':{'log':native},'observer':{'hostname':params.db_host,'ip':params.db_ip,'product':'MongoDB','type':'database','vendor':'MongoDB'},'related':{'ip':[src]},'source':{'ip':src,'port':port},'tags':['mongodb-structured-log','preserve_original_event']} -%}
-{{- out | tojson -}}
+{%- set row = Q.pop(0) -%}
+{%- set t = row[0] -%}
+{%- set attr = row[6] -%}
+{%- if row[7] != 0 -%}
+  {%- do S.update({'cnt': S.cnt + row[7]}) -%}
+  {%- do attr.update({'connectionCount': S.cnt}) -%}
+{%- endif -%}
+{%- set dt = module.datetime -%}
+{%- set local = dt.datetime.fromtimestamp(t // 1000, dt.timezone(dt.timedelta(minutes=offm))).replace(microsecond=(t % 1000) * 1000) -%}
+{%- set native = local.isoformat(timespec='milliseconds') -%}
+{%- set cq = '"' ~ row[2] ~ '"' -%}
+{%- set idq = row[3] | string -%}
+{%- set raw = '{"t":{"$date":"' ~ native ~ '"},"s":"I",  "c":' ~ cq ~ ',' ~ (' ' * ([11 - cq | length, 0] | max)) ~ '"id":' ~ idq ~ ',' ~ (' ' * ([8 - idq | length, 0] | max)) ~ '"ctx":"' ~ row[4] ~ '","msg":' ~ J.dumps(row[5]) ~ ',"attr":' ~ J.dumps(attr, separators=(',', ':'), ensure_ascii=false) ~ '}' -%}
+{%- set utc = local.astimezone(dt.timezone.utc) -%}
+{%- set created = [now, t] | max + (N.lognormal(M.log(350), 0.6) | int) -%}
+{%- set ingested = created + (N.lognormal(M.log(1200), 0.5) | int) -%}
+{%- macro iso(ms) -%}{{- dt.datetime.fromtimestamp(ms // 1000, dt.timezone.utc).replace(microsecond=(ms % 1000) * 1000).isoformat(timespec='milliseconds').replace('+00:00', 'Z') -}}{%- endmacro -%}
+{%- set out = {'@timestamp': iso(t), 'data_stream': {'dataset': 'mongodb.log', 'namespace': 'default', 'type': 'logs'}, 'ecs': {'version': '8.11.0'}, 'event': {'category': ['database'], 'created': iso(created), 'dataset': 'mongodb.log', 'ingested': iso(ingested), 'kind': 'event', 'module': 'mongodb', 'original': raw, 'type': ['access'] if row[2] == 'ACCESS' else ['info']}, 'host': {'name': params.db_host}, 'input': {'type': 'logfile'}, 'log': {'file': {'path': '/var/log/mongodb/mongod.log'}, 'level': 'I'}, 'message': row[5], 'mongodb': {'log': {'attr': attr, 'component': row[2], 'context': row[4], 'id': row[3]}}, 'tags': ['preserve_original_event']} -%}
+{{- J.dumps(out, separators=(',', ':'), ensure_ascii=false) -}}
