@@ -11,6 +11,28 @@
 {%- endfor -%}
 {%- set admins = [{'user': params.normal_user, 'ip': params.normal_source_ip},
     {'user': params.unusual_user, 'ip': params.unusual_source_ip}] -%}
+{#- Office-hours intensity by UTC hour; the mean over a day is 1. -#}
+{%- set curve = [] -%}
+{%- for h in range(24) -%}
+  {%- do curve.append((1.45 if 6 <= h < 16 else (0.8 if 16 <= h < 20
+      else 0.35)) / 0.883) -%}
+{%- endfor -%}
+{#- A start time in [lo, hi), density curve (first episode) or
+    curve^2 plus a small floor (later episodes). -#}
+{%- macro pick_time(lo, hi, squared) -%}
+  {%- set r = namespace(t=lo, ok=false) -%}
+  {%- set top = (curve | max) ** 2 + 0.05 if squared else curve | max -%}
+  {%- for attempt in range(500) -%}
+    {%- if not r.ok -%}
+      {%- set t = module.rand.number.integer(lo | int, (hi | int) - 1) -%}
+      {%- set c = curve[(t // 3600) % 24] -%}
+      {%- if module.rand.number.floating(0, top) < (c * c + 0.05 if squared else c) -%}
+        {%- set r.t = t -%}{%- set r.ok = true -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.t -}}
+{%- endmacro -%}
 {%- if not shared.get('initialized', false) -%}
   {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {%- for name in [params.normal_user, params.unusual_user] + aliases_all -%}
@@ -37,14 +59,16 @@
     {%- do pool.update({name: {'present': false, 'applied': false,
         'priv': 1, 'removing': false, 'reserved': false}}) -%}
   {%- endfor -%}
+  {#- First episode inside the first min(interval, 24 h), its hour
+      drawn from the background hour curve. -#}
   {%- do shared.update({'initialized': true, 'aliases': pool, 'procs': [],
-      'hist': [], 'consec': {}, 'sequence': module.rand.number.integer(1, 5000),
-      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'parts': [], 'consec': {}, 'sequence': module.rand.number.integer(1, 5000),
+      'start_at': pick_time(now, now + ([interval, 24] | min) * 3600, false) | trim | int,
       'last_actor': none, 'last_alias': none}) -%}
 {%- endif -%}
 {%- set pool = shared.get('aliases') -%}
 {%- set procs = shared.get('procs') -%}
-{%- set hist = shared.get('hist') -%}
+{%- set parts = shared.get('parts') -%}
 {%- set consec = shared.get('consec') -%}
 {%- if shared.get('consec_t') is none -%}{%- do shared.set('consec_t', {}) -%}{%- endif -%}
 {%- set consec_t = shared.get('consec_t') -%}
@@ -52,10 +76,7 @@
 {%- for u in consec_t -%}
   {%- if now - consec_t[u] > 300 -%}{%- do consec.update({u: 0}) -%}{%- endif -%}
 {%- endfor -%}
-{#- Office-hours intensity; mean over a day is about 0.883. -#}
-{%- set hour = timestamp.astimezone(utc).hour -%}
-{%- set load = (1.45 if 6 <= hour < 16 else (0.8 if hour < 20 and hour >= 16
-    else 0.35)) / 0.883 -%}
+{%- set load = curve[timestamp.astimezone(utc).hour] -%}
 
 {%- macro spawn(kind, user, ip, delay, fails=none, ops=none, episode=false,
     target=none, guard=true) -%}
@@ -120,13 +141,11 @@
   {%- endif -%}
 {%- endfor -%}
 
-{#- 2. Episode: due by source time, random start delay, next due from
-    the actual start, never catching up. -#}
+{#- 2. Episode: starts at a drawn time once an administrator and an
+    account are free; the next one is due one interval after the actual
+    start and starts in a window centred on that due time. -#}
 {%- if params.anomaly_mode -%}
-  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
-    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
-  {%- endif -%}
-  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {%- if now >= shared.get('start_at') -%}
     {%- set free = namespace(v=[]) -%}
     {%- for name in aliases_all -%}
       {%- if not pool[name].present and not pool[name].reserved -%}
@@ -149,9 +168,10 @@
       {{- spawn('admin', actor.user, actor.ip, 0, fails=3,
           ops=['enable', 'create', 'privilege', 'apply', 'time'],
           episode=true, target=alias) -}}
-      {%- do shared.update({'start_at': none, 'last_alias': alias,
-          'last_actor': actor.user,
-          'next_due': now + (interval * 3600) | int}) -%}
+      {%- set due = now + (interval * 3600) | int -%}
+      {%- set half = ([interval / 4, 6] | min) * 1800 -%}
+      {%- do shared.update({'last_alias': alias, 'last_actor': actor.user,
+          'start_at': pick_time(due - half, due + half, true) | trim | int}) -%}
     {%- endif -%}
   {%- endif -%}
 {%- endif -%}
@@ -175,6 +195,7 @@
 {%- set step = none -%}
 {%- set done = false -%}
 
+{%- set rec = none -%}
 {%- if pick.i >= 0 -%}
   {%- set p = procs[pick.i] -%}
   {%- if p.stage == 'fail' -%}
@@ -195,31 +216,18 @@
   {%- elif p.stage == 'accept' -%}
     {%- set step = 'accepted' -%}
     {#- Guard on the final chain step only: an ordinary account login
-        that would complete the full ordered chain fails instead. -#}
+        that would complete a partial chain (first failure at most
+        1800 s earlier, as in the detector) does not happen. -#}
     {%- if p.kind == 'svc' and p.guard -%}
       {%- set g = namespace(block=false) -%}
-      {%- set want = ['F', 'F', 'S', 'E', 'C', 'V', 'Y', 'T'] -%}
-      {%- for h0 in hist -%}
-        {%- if not g.block and h0.a == 'F' and h0.i == p.ip
-            and h0.u != p.user and now - h0.t <= 2400 -%}
-          {%- set m = namespace(k=0) -%}
-          {%- for h in hist[loop.index:] -%}
-            {%- if m.k < 8 and h.a == want[m.k] -%}
-              {%- if (h.a in ['F', 'S'] and h.u == h0.u and h.p == h0.p)
-                  or (h.a in ['E', 'T'] and h.u == h0.u)
-                  or (h.a in ['C', 'V'] and h.u == p.user)
-                  or h.a == 'Y' -%}
-                {%- set m.k = m.k + 1 -%}
-              {%- endif -%}
-            {%- endif -%}
-          {%- endfor -%}
-          {%- if m.k == 8 -%}{%- set g.block = true -%}{%- endif -%}
+      {%- for q in parts -%}
+        {%- if q.k == 9 and now - q.t0 <= 1800 and q.T == p.user
+            and q.I == p.ip and q.A != p.user -%}
+          {%- set g.block = true -%}
         {%- endif -%}
       {%- endfor -%}
       {%- if g.block -%}
-        {%- set step = 'failed' -%}
-        {%- do consec.update({p.user: consec.get(p.user, 0) + 1}) -%}
-        {%- do consec_t.update({p.user: now}) -%}
+        {%- set step = none -%}
         {%- set done = true -%}
       {%- endif -%}
     {%- endif -%}
@@ -268,11 +276,18 @@
         {%- endif -%}
       {%- endfor -%}
       {%- set mine = absent.present | select('in', p.changes) | list -%}
+      {#- Changes pending in another session are not visible here. -#}
+      {%- set visible = namespace(v=[]) -%}
+      {%- for name in absent.present -%}
+        {%- if pool[name].applied or name in p.changes -%}
+          {%- do visible.v.append(name) -%}
+        {%- endif -%}
+      {%- endfor -%}
       {%- if op == 'any' -%}
         {%- set op = module.rand.weighted_choice(
             ['create', 'privilege', 'remove', 'password', 'enable', 'time'],
             [20 if absent.v else 0,
-             (18 if absent.present else 0) + (30 if mine else 0),
+             (18 if visible.v else 0) + (30 if mine else 0),
              12 * (absent.removable | length), 14, 24, 22]) -%}
       {%- endif -%}
       {%- set step = op -%}
@@ -287,7 +302,7 @@
         {%- elif mine and module.rand.chance(0.8) -%}
           {%- set tgt = module.rand.choice(mine) -%}
         {%- else -%}
-          {%- set tgt = module.rand.choice(absent.present) -%}
+          {%- set tgt = module.rand.choice(visible.v) -%}
         {%- endif -%}
         {%- set old = pool[tgt].priv -%}
         {%- if p.episode -%}
@@ -302,7 +317,7 @@
         {%- set tgt = module.rand.choice(absent.removable) -%}
         {%- do pool[tgt].update({'removing': true}) -%}
       {%- elif op == 'password' -%}
-        {%- set tgt = module.rand.choice(absent.present + [p.user] * 2) -%}
+        {%- set tgt = module.rand.choice(visible.v + [p.user] * 2) -%}
       {%- endif -%}
       {%- if op in ['create', 'privilege', 'remove', 'password', 'enable'] -%}
         {%- if tgt and tgt not in p.changes -%}{%- do p.changes.append(tgt) -%}{%- endif -%}
@@ -362,8 +377,8 @@
         'destination': {'ip': params.router_ip, 'port': 22},
         'network': {'transport': 'tcp'},
         'eltex': {'esr': {'ssh': {'protocol': 'ssh2'}}}}) -%}
-    {%- do hist.append({'t': now, 'a': 'S' if accepted else 'F', 'u': actor,
-        'i': src, 'p': port}) -%}
+    {%- set rec = {'a': 'S' if accepted else 'F', 'u': actor, 'i': src,
+        'p': port} -%}
   {%- elif step in ['opened', 'closed'] -%}
     {%- set group = 'AAA-LOCAL' -%}
     {%- set mnemonic = 'SESSION' -%}
@@ -382,7 +397,7 @@
     {%- set event_type = ['change'] -%}
     {%- do extra.update({'user': {'name': actor},
         'eltex': {'esr': {'privilege_level': 15}}}) -%}
-    {%- do hist.append({'t': now, 'a': 'E', 'u': actor}) -%}
+    {%- set rec = {'a': 'E', 'u': actor} -%}
   {%- elif step in ['create', 'remove'] -%}
     {%- set group = 'USER' -%}
     {%- set mnemonic = 'ADD' -%}
@@ -392,7 +407,7 @@
     {%- set category = ['iam'] -%}
     {%- set event_type = ['creation'] if created else ['deletion'] -%}
     {%- do extra.update({'user': {'target': {'name': tgt}}}) -%}
-    {%- if created -%}{%- do hist.append({'t': now, 'a': 'C', 'u': tgt}) -%}{%- endif -%}
+    {%- if created -%}{%- set rec = {'a': 'C', 'u': tgt} -%}{%- endif -%}
   {%- elif step == 'privilege' -%}
     {%- set group = 'USER' -%}
     {%- set mnemonic = 'INFO' -%}
@@ -403,7 +418,7 @@
     {%- set event_type = ['change'] -%}
     {%- do extra.update({'user': {'target': {'name': tgt}},
         'eltex': {'esr': {'privilege': {'old': old, 'new': new}}}}) -%}
-    {%- do hist.append({'t': now, 'a': 'V', 'u': tgt}) -%}
+    {%- set rec = {'a': 'V', 'u': tgt} -%}
   {%- elif step == 'password' -%}
     {%- set group = 'USER' -%}
     {%- set mnemonic = 'INFO' -%}
@@ -420,7 +435,7 @@
     {%- set action = 'configuration_applied' -%}
     {%- set category = ['configuration'] -%}
     {%- set event_type = ['change'] -%}
-    {%- do hist.append({'t': now, 'a': 'Y'}) -%}
+    {%- set rec = {'a': 'Y'} -%}
   {%- elif step == 'time' -%}
     {%- set group = 'TIME' -%}
     {%- set mnemonic = 'INFO' -%}
@@ -429,9 +444,43 @@
     {%- set category = ['configuration'] -%}
     {%- set event_type = ['change'] -%}
     {%- do extra.update({'user': {'name': actor}}) -%}
-    {%- do hist.append({'t': now, 'a': 'T', 'u': actor}) -%}
+    {%- set rec = {'a': 'T', 'u': actor} -%}
   {%- endif -%}
-  {%- if hist | length > 150 -%}{%- do hist.pop(0) -%}{%- endif -%}
+  {#- Partial chains under every binding a detector could choose:
+      a matching record adds the advanced copy and the partial keeps
+      waiting. Steps: 1-2 failures (A, P), 3 success (A, P), 4 enable
+      (A), 5 creation (binds T), 6 privilege (T), 7 apply, 8 clock (A),
+      9 login of T from I. Partials live 1800 s from their first
+      failure; a completion resets nothing. -#}
+  {%- if rec is not none -%}
+    {%- set out = [] -%}
+    {%- set seen = [] -%}
+    {%- for q in parts -%}
+      {%- if now - q.t0 <= 1800 -%}
+        {%- set sig = [q.k, q.t0, q.A, q.I, q.P, q.T] | join('|') -%}
+        {%- if sig not in seen -%}{%- do seen.append(sig) -%}{%- do out.append(q) -%}{%- endif -%}
+        {%- set ok = (q.k in [1, 2] and rec.a == 'F' and rec.u == q.A
+                and rec.p == q.P)
+            or (q.k == 3 and rec.a == 'S' and rec.u == q.A and rec.p == q.P)
+            or (q.k == 4 and rec.a == 'E' and rec.u == q.A)
+            or (q.k == 5 and rec.a == 'C')
+            or (q.k == 6 and rec.a == 'V' and rec.u == q.T)
+            or (q.k == 7 and rec.a == 'Y')
+            or (q.k == 8 and rec.a == 'T' and rec.u == q.A) -%}
+        {%- if ok -%}
+          {%- set nq = dict(q, k=q.k + 1, T=rec.u if q.k == 5 else q.T) -%}
+          {%- set sig = [nq.k, nq.t0, nq.A, nq.I, nq.P, nq.T] | join('|') -%}
+          {%- if sig not in seen -%}{%- do seen.append(sig) -%}{%- do out.append(nq) -%}{%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if rec.a == 'F' -%}
+      {%- do out.append({'k': 1, 't0': now, 'A': rec.u, 'I': rec.i,
+          'P': rec.p, 'T': none}) -%}
+    {%- endif -%}
+    {%- do parts.clear() -%}
+    {%- do parts.extend(out) -%}
+  {%- endif -%}
 {%- elif module.rand.chance(0.1 * load) -%}
   {%- set kind = module.rand.weighted_choice(['permit', 'deny', 'nat', 'ips'], [620, 200, 150, 15]) -%}
   {%- set flow = samples.flows.where(decision='denied' if kind == 'deny' else 'permitted').pick() -%}
