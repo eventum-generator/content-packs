@@ -1,63 +1,300 @@
-{%- set step = vars.step -%}
-{%- set kind = step -%}
-{%- set event_time = timestamp.astimezone(module.datetime.timezone.utc) + module.datetime.timedelta(milliseconds=module.rand.number.integer(0, 9999)) -%}
-{%- set interval = [params.anomaly_interval_hours|float, 2] | max * 3600 -%}
-{%- set due = shared.get('anomaly_next_at', event_time + module.datetime.timedelta(seconds=interval)) -%}
-{%- do shared.set('anomaly_next_at', due) -%}
-{%- if step == 'routine' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- if shared.get('session_active', false) -%}
-    {%- set actor = shared.get('session_actor') -%}
-    {%- set src = shared.get('session_ip') -%}
-    {%- set kind = 'normal_logout' if shared.get('session_edits', 0) >= 2 else module.rand.weighted_choice(['normal_logout', 'normal_config', 'normal_target'], [90, 4, 6]) -%}
-  {%- elif shared.get('pending_login_actor') -%}
-    {%- set actor = shared.pop('pending_login_actor') -%}
-    {%- set src = shared.pop('pending_login_ip') -%}
-    {%- set kind = 'normal_login' -%}
-  {%- elif (not shared.get('remote_enabled', true) or not shared.get('auth_logging_enabled', true)) and ((shared.get('recovery_due') and event_time >= shared.get('recovery_due')) or (params.anomaly_mode and event_time >= due)) -%}
-    {%- set actor = params.normal_admin -%}
-    {%- set src = params.normal_admin_ip -%}
-    {%- set kind = 'normal_login' -%}
-    {%- if not shared.get('auth_logging_enabled', true) -%}{%- do shared.set('to_recovery_auth', true) -%}{%- endif -%}
-    {%- if not shared.get('remote_enabled', true) -%}{%- do shared.set('to_recovery_target', true) -%}{%- endif -%}
+{#- Cisco ISE Administrative and Operational Audit over remote syslog.
+    One input tick per second. Every administrator runs an independent
+    session process (thinned Poisson starts on an office-hour curve,
+    retries, edits, logout). Rows are queued with millisecond times and
+    emitted in time order; idle ticks are dropped. -#}
+{%- set H = 3600000 -%}
+{%- set W = 1800000 -%}
+{%- set now = (timestamp.timestamp() * 1000) | round | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set epoch = module.datetime.datetime(1970, 1, 1, tzinfo=utc) -%}
+{%- set curve = [0.05, 0.04, 0.04, 0.04, 0.05, 0.10, 0.25, 0.55, 0.85, 1.0, 1.0, 0.95, 0.80, 0.90, 1.0, 0.95, 0.80, 0.55, 0.30, 0.20, 0.15, 0.10, 0.08, 0.06] -%}
+{%- set admins = params.admins -%}
+{%- set weights = params.admin_weights -%}
+{%- set cats = ['Passed Authentications', 'Failed Attempts', 'RADIUS Accounting', 'System Statistics'] -%}
+{%- set chain_cats = cats[:3] -%}
+{%- set tgts = ['RemoteCollector', 'BackupCollector'] -%}
+{%- set interval = ([params.anomaly_interval_hours | float, 2.0] | max * H) | int -%}
+
+{#- Activity level at time t (ms): hour curve times weekday factor. -#}
+{%- macro level(t) -%}{{ curve[(t // H) % 24] * (0.3 if ((t // 86400000) + 3) % 7 >= 5 else 1.0) }}{%- endmacro -%}
+
+{#- Next session start of admin i after t: thinning at a peak rate. -#}
+{%- macro next_start(i, t) -%}
+  {%- set ns = namespace(t=t) -%}
+  {%- set rate = 5.0 * weights[i] / (weights | sum) / 3600000 -%}
+  {%- for k in range(2000) -%}
+    {%- set ns.t = ns.t + (module.rand.number.exponential(rate) | int) + 1 -%}
+    {%- if module.rand.number.floating(0, 1) < level(ns.t) | float -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {{- ns.t -}}
+{%- endmacro -%}
+
+{#- Episode time in [a, b), weighted by level^2 + floor, plus start delay. -#}
+{%- macro ep_time(a, b) -%}
+  {%- set ns = namespace(t=a) -%}
+  {%- for k in range(5000) -%}
+    {%- set ns.t = module.rand.number.integer(a, b - 1) -%}
+    {%- set lv = level(ns.t) | float -%}
+    {%- if module.rand.number.floating(0, 1.02) < lv * lv + 0.02 -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {{- ns.t + (module.rand.number.exponential(1 / 180000) | int) -}}
+{%- endmacro -%}
+
+{%- if not shared.get('init') -%}
+  {%- set plan = {} -%}
+  {%- for a in admins -%}
+    {%- do plan.update({a: [[next_start(loop.index0, now) | int, 'start']]}) -%}
+  {%- endfor -%}
+  {%- set seq0 = module.rand.number.integer(150000, 900000) -%}
+  {%- do shared.update({'init': true, 'plan': plan, 'sess': {}, 'sdis': {}, 'cf': {}, 'mt': {},
+      'cat': {'Passed Authentications': [true, 'INFO'], 'Failed Attempts': [true, 'INFO'], 'RADIUS Accounting': [true, 'INFO'], 'System Statistics': [true, 'INFO']},
+      'tgt': {'RemoteCollector': true, 'BackupCollector': true},
+      'mid': seq0 - module.rand.number.integer(20, 90), 'seq': seq0, 'cv': module.rand.number.integer(900, 3000),
+      'last': now, 'ep': none, 'ep_plan': [], 'ep_prev': {}, 'next_t': 0}) -%}
+  {%- if params.anomaly_mode -%}
+    {%- do shared.set('ep_start', ep_time(now, now + [interval, 24 * H] | min) | int) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- if now < shared.get('next_t') -%}{%- do dispatch.drop() -%}{%- endif -%}
+
+{#- Pick the earliest due item. -#}
+{%- set plan = shared.get('plan') -%}
+{%- set pick = namespace(t=none, who=none) -%}
+{%- for a in admins -%}
+  {%- if plan[a] and (pick.t is none or plan[a][0][0] < pick.t) -%}{%- set pick.t = plan[a][0][0] -%}{%- set pick.who = a -%}{%- endif -%}
+{%- endfor -%}
+{%- if shared.get('ep_plan') and shared.get('ep_plan')[0][0] < pick.t -%}{%- set pick.t = shared.get('ep_plan')[0][0] -%}{%- set pick.who = '#ep' -%}{%- endif -%}
+{%- if shared.get('ep_start') is not none and shared.get('ep_start') < pick.t -%}{%- set pick.t = shared.get('ep_start') -%}{%- set pick.who = '#start' -%}{%- endif -%}
+
+{%- if pick.t > now -%}
+  {%- do shared.set('next_t', pick.t) -%}
+  {%- do dispatch.drop() -%}
+{%- endif -%}
+
+{#- Episode start: rotate the actor, weighted as background, among
+    administrators who are offline for the whole episode. -#}
+{%- if pick.who == '#start' -%}
+  {%- set rows = [] -%}
+  {%- set tt = namespace(t=now + module.rand.number.integer(1, 999)) -%}
+  {%- for k in range(3) -%}
+    {%- do rows.append([tt.t, 'fail']) -%}
+    {%- set tt.t = tt.t + (module.rand.number.lognormal(9.39, 0.8) | int) + 1 -%}
+  {%- endfor -%}
+  {%- do rows.append([tt.t, 'login']) -%}
+  {%- set tt.t = tt.t + ([module.rand.number.lognormal(11.92, 0.7), 900000] | min | int) -%}
+  {%- do rows.append([tt.t, 'xcat']) -%}
+  {%- set tt.t = tt.t + ([module.rand.number.lognormal(11.41, 0.7), 600000] | min | int) -%}
+  {%- do rows.append([tt.t, 'xtgt']) -%}
+  {%- set tt.t = tt.t + (module.rand.number.lognormal(12.39, 0.8) | int) + 1 -%}
+  {%- do rows.append([tt.t, 'logout']) -%}
+  {%- set cand = namespace(names=[], w=[]) -%}
+  {%- for a in admins -%}
+    {%- set head = plan[a][0] if plan[a] else none -%}
+    {%- if a != shared.get('ep_prev').get('actor') and shared.get('cf').get(a, 0) <= 1 and head and head[1] == 'start' and head[0] > tt.t + 60000 -%}
+      {%- set cand.names = cand.names + [a] -%}{%- set cand.w = cand.w + [weights[loop.index0]] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set cat_ok = shared.get('cat')['Passed Authentications'][0] or shared.get('cat')['Failed Attempts'][0] or shared.get('cat')['RADIUS Accounting'][0] -%}
+  {%- set tgt_ok = shared.get('tgt')['RemoteCollector'] or shared.get('tgt')['BackupCollector'] -%}
+  {%- if cand.names and cat_ok and tgt_ok -%}
+    {%- set actor = module.rand.weighted_choice(cand.names, cand.w) -%}
+    {%- set ip = params.admin_ips[admins.index(actor)] if module.rand.chance(0.78) else params.jump_host_ip -%}
+    {%- do shared.update({'ep': {'actor': actor, 'ip': ip, 'first': true}, 'ep_plan': rows, 'ep_start': none, 'next_t': rows[0][0]}) -%}
   {%- else -%}
-    {%- set actor = module.rand.weighted_choice([params.normal_admin, params.anomaly_admin], [80, 20]) -%}
-    {%- set src = params.anomaly_admin_ip if actor == params.anomaly_admin else params.normal_admin_ip -%}
-    {%- set kind = module.rand.weighted_choice(['normal_login', 'normal_fail'], [95, 5]) -%}
+    {#- No administrator is free for the whole episode, or no category or
+        target is left enabled: retry after a random 5-60 minutes, so
+        the start does not follow the change that freed them, and
+        without holding back background rows. -#}
+    {%- do shared.update({'ep_start': now + module.rand.number.integer(300000, 3600000), 'next_t': 0}) -%}
   {%- endif -%}
-{%- elif step.startswith('recovery_') -%}
-  {%- set actor = params.normal_admin -%}
-  {%- set src = params.normal_admin_ip -%}
+  {%- do dispatch.drop() -%}
+{%- endif -%}
+
+{#- Background session start: build the whole session plan. -#}
+{%- if pick.who != '#ep' and plan[pick.who][0][1] == 'start' -%}
+  {%- set a = pick.who -%}
+  {%- set s = plan[a][0][0] -%}
+  {%- set rows = [] -%}
+  {%- set tt = namespace(t=s) -%}
+  {%- set nf = [module.rand.weighted_choice([0, 1, 2, 3, 4], [80, 9, 5, 4, 2]), 4 - shared.get('cf').get(a, 0)] | min -%}
+  {%- for k in range(nf) -%}
+    {%- do rows.append([tt.t, 'fail']) -%}
+    {%- set tt.t = tt.t + (module.rand.number.lognormal(9.39, 0.8) | int) + 1 -%}
+  {%- endfor -%}
+  {%- if nf == 0 or not module.rand.chance(0.12) -%}
+    {%- do rows.append([tt.t, 'login']) -%}
+    {%- set end = tt.t + (module.rand.number.lognormal(13.64, 0.9) | int) + 2000 -%}
+    {#- Routine sessions make random edits; logging-maintenance sessions
+        disable a category and/or a target first and often re-enable
+        them before logging out. -#}
+    {%- set intents = [] -%}
+    {%- if module.rand.chance(0.3) -%}
+      {%- if module.rand.chance(0.85) -%}{%- do intents.append('mcat') -%}{%- endif -%}
+      {%- if module.rand.chance(0.5) -%}{%- do intents.append('mtgt') -%}{%- endif -%}
+      {%- for j in range(module.rand.weighted_choice([0, 1, 2], [50, 35, 15])) -%}{%- do intents.append('edit') -%}{%- endfor -%}
+      {%- for j in range(intents | select('in', ['mcat', 'mtgt']) | list | length) -%}{%- if module.rand.chance(0.6) -%}{%- do intents.append('mre') -%}{%- endif -%}{%- endfor -%}
+      {%- if not intents -%}{%- do intents.append('edit') -%}{%- endif -%}
+    {%- else -%}
+      {%- for j in range(module.rand.weighted_choice([0, 1, 2, 3], [55, 27, 13, 5])) -%}{%- do intents.append('edit') -%}{%- endfor -%}
+    {%- endif -%}
+    {%- set times = [] -%}
+    {%- for j in intents -%}{%- do times.append(module.rand.number.integer(tt.t + 1000, end - 1000)) -%}{%- endfor -%}
+    {%- for x in times | sort -%}{%- do rows.append([x, intents[loop.index0]]) -%}{%- endfor -%}
+    {%- do rows.append([end, 'logout']) -%}
+  {%- endif -%}
+  {%- do plan.update({a: rows}) -%}
+  {%- do shared.get('sess').update({a: params.admin_ips[admins.index(a)] if module.rand.chance(0.78) else params.jump_host_ip}) -%}
+  {%- do shared.get('sdis').update({a: []}) -%}
+{%- endif -%}
+
+{#- Pop the row to emit. -#}
+{%- if pick.who == '#ep' -%}
+  {%- set row = shared.get('ep_plan').pop(0) -%}
+  {%- set actor = shared.get('ep').actor -%}
+  {%- set ip = shared.get('ep').ip -%}
 {%- else -%}
-  {%- set actor = params.anomaly_admin -%}
-  {%- set src = params.anomaly_admin_ip -%}
+  {%- set row = plan[pick.who].pop(0) -%}
+  {%- set actor = pick.who -%}
+  {%- set ip = shared.get('sess')[actor] -%}
 {%- endif -%}
-{%- if kind == 'normal_fail' -%}
-  {%- do shared.set('pending_login_actor', actor) -%}
-  {%- do shared.set('pending_login_ip', src) -%}
-{%- elif kind in ['normal_login', 'login_success'] -%}
-  {%- do shared.update({'session_active': true, 'session_actor': actor, 'session_ip': src, 'session_edits': 0}) -%}
-{%- elif kind in ['normal_logout', 'attack_logout', 'recovery_logout'] -%}
-  {%- do shared.pop('session_active', none) -%}
-  {%- do shared.pop('session_actor', none) -%}
-  {%- do shared.pop('session_ip', none) -%}
-  {%- do shared.pop('session_edits', none) -%}
-  {%- if params.anomaly_mode and event_time >= due and shared.get('remote_enabled', true) and shared.get('auth_logging_enabled', true) -%}
-    {%- do shared.set('to_attack', true) -%}
+{%- set t = row[0] -%}
+{%- set kind = row[1] -%}
+
+{#- Decide configuration edits from the current object state. -#}
+{%- set ed = {} -%}
+{%- set bg_edit = kind in ['edit', 'mcat', 'mtgt', 'mre'] -%}
+{%- if bg_edit -%}
+  {%- set en_c = [] -%}{%- for n in cats -%}{%- if shared.get('cat')[n][0] -%}{%- do en_c.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set en_t = [] -%}{%- for n in tgts -%}{%- if shared.get('tgt')[n] -%}{%- do en_t.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set mine = shared.get('sdis').get(actor, []) -%}
+  {%- if kind == 'mcat' and en_c -%}
+    {%- set name = module.rand.choice(en_c) -%}
+    {%- do ed.update({'type': 'cat', 'name': name, 'on': false, 'sev': shared.get('cat')[name][1]}) -%}
+  {%- elif kind == 'mtgt' and en_t -%}
+    {%- do ed.update({'type': 'tgt', 'name': module.rand.choice(en_t)}) -%}
+  {%- elif kind == 'mre' and mine -%}
+    {%- set m = mine.pop() -%}
+    {%- if m[0] == 'cat' and not shared.get('cat')[m[1]][0] -%}
+      {%- do ed.update({'type': 'cat', 'name': m[1], 'on': true, 'sev': shared.get('cat')[m[1]][1]}) -%}
+    {%- elif m[0] == 'tgt' and not shared.get('tgt')[m[1]] -%}
+      {%- do ed.update({'type': 'tgt', 'name': m[1]}) -%}
+    {%- endif -%}
   {%- endif -%}
-{%- elif kind in ['normal_config', 'normal_target'] -%}
-  {%- do shared.set('session_edits', shared.get('session_edits', 0) + 1) -%}
-{%- elif kind == 'login_fail_1' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- do shared.set('anomaly_next_at', event_time + module.datetime.timedelta(seconds=interval)) -%}
 {%- endif -%}
-{%- set msg_number = shared.get('message_number', 27384) + 1 -%}
-{%- set seq = shared.get('sequence', 188270) + 1 -%}
-{%- do shared.set('message_number', msg_number) -%}
-{%- do shared.set('sequence', seq) -%}
-{%- set mid = '%010d' % msg_number -%}
-{%- set seq_text = '%010d' % seq -%}
-{%- set version = shared.get('config_version', 2732) -%}
+{%- if bg_edit and not ed -%}
+  {%- if module.rand.chance(0.15) -%}
+    {%- set dis = [] -%}{%- for n in tgts -%}{%- if not shared.get('tgt')[n] -%}{%- do dis.append(n) -%}{%- endif -%}{%- endfor -%}
+    {%- set name = module.rand.choice(dis) if dis and module.rand.chance(0.85) else module.rand.choice(tgts) -%}
+    {%- do ed.update({'type': 'tgt', 'name': name}) -%}
+  {%- else -%}
+    {%- set dis = [] -%}{%- for n in cats -%}{%- if not shared.get('cat')[n][0] -%}{%- do dis.append(n) -%}{%- endif -%}{%- endfor -%}
+    {%- set name = module.rand.choice(dis) if dis and module.rand.chance(0.65) else module.rand.choice(cats) -%}
+    {%- set cur = shared.get('cat')[name] -%}
+    {%- if not cur[0] -%}
+      {%- do ed.update({'type': 'cat', 'name': name, 'on': true, 'sev': cur[1]}) -%}
+    {%- elif module.rand.chance(0.35) -%}
+      {%- do ed.update({'type': 'cat', 'name': name, 'on': false, 'sev': cur[1]}) -%}
+    {%- else -%}
+      {%- do ed.update({'type': 'cat', 'name': name, 'on': true, 'sev': module.rand.choice(['INFO', 'WARN', 'DEBUG', 'ERROR'] | reject('equalto', cur[1]) | list)}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- elif kind == 'xcat' -%}
+  {%- set en = [] -%}{%- for n in chain_cats -%}{%- if shared.get('cat')[n][0] -%}{%- do en.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set pref = en | reject('equalto', shared.get('ep_prev').get('cat')) | list -%}
+  {%- set name = module.rand.choice(pref or en or chain_cats) -%}
+  {%- do ed.update({'type': 'cat', 'name': name, 'on': not en, 'sev': shared.get('cat')[name][1]}) -%}
+  {%- do shared.get('ep_prev').update({'cat': name}) -%}
+{%- elif kind == 'xtgt' -%}
+  {%- set en = [] -%}{%- for n in tgts -%}{%- if shared.get('tgt')[n] -%}{%- do en.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set pref = en | reject('equalto', shared.get('ep_prev').get('tgt')) | list -%}
+  {%- set name = module.rand.choice(pref or en or tgts) -%}
+  {%- do ed.update({'type': 'tgt', 'name': name}) -%}
+  {%- do shared.get('ep_prev').update({'tgt': name}) -%}
+{%- endif -%}
+{%- set cat_disable = ed.get('type') == 'cat' and not ed.get('on') -%}
+{%- set tgt_disable = ed.get('type') == 'tgt' and shared.get('tgt')[ed.get('name')] -%}
+
+{#- Mirror of the chain matcher per actor|IP (steps: 3 failures, success,
+    category disable, target disable within W of the first step). -#}
+{%- set mkey = actor ~ '|' ~ ip -%}
+{%- set parts = [] -%}
+{%- for p in shared.get('mt').get(mkey, []) -%}{%- if t - p[1] <= W -%}{%- do parts.append(p) -%}{%- endif -%}{%- endfor -%}
+{%- set flags = [kind in ['fail'], kind in ['fail'], kind in ['fail'], kind == 'login', cat_disable, tgt_disable] -%}
+{%- set completes = namespace(v=false) -%}
+{%- for p in parts -%}{%- if p[0] == 5 and flags[5] -%}{%- set completes.v = true -%}{%- endif -%}{%- endfor -%}
+
+{#- Guard on the final step only: a background target disable that would
+    complete the chain inside W is dropped (no state change). -#}
+{%- if completes.v and bg_edit -%}
+  {%- if not plan[actor] -%}{%- do plan[actor].append([next_start(admins.index(actor), t) | int, 'start']) -%}{%- endif -%}
+  {%- do shared.set('next_t', 0) -%}
+  {%- do dispatch.drop() -%}
+{%- endif -%}
+
+{%- set newparts = namespace(l=[], done=false) -%}
+{%- for p in parts -%}
+  {%- if not newparts.done -%}
+    {%- if flags[p[0]] -%}
+      {%- if p[0] == 5 -%}{%- set newparts.done = true -%}{%- else -%}{%- set newparts.l = newparts.l + [[p[0] + 1, p[1]]] -%}{%- endif -%}
+    {%- else -%}
+      {%- set newparts.l = newparts.l + [p] -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if newparts.done -%}
+  {%- do shared.get('mt').pop(mkey, none) -%}
+{%- else -%}
+  {%- if flags[0] -%}{%- set newparts.l = newparts.l + [[1, t]] -%}{%- endif -%}
+  {%- if newparts.l -%}{%- do shared.get('mt').update({mkey: newparts.l[-8:]}) -%}{%- else -%}{%- do shared.get('mt').pop(mkey, none) -%}{%- endif -%}
+{%- endif -%}
+
+{#- Apply state. -#}
+{%- set cf = shared.get('cf') -%}
+{%- if kind == 'fail' -%}
+  {%- do cf.update({actor: cf.get(actor, 0) + 1}) -%}
+{%- elif kind == 'login' -%}
+  {%- do cf.update({actor: 0}) -%}
+{%- endif -%}
+{%- if bg_edit and (cat_disable or tgt_disable) -%}
+  {%- do shared.get('sdis').get(actor, []).append([ed.type, ed.name]) -%}
+{%- endif -%}
+{%- if ed.get('type') == 'cat' -%}
+  {%- do shared.get('cat').update({ed.name: [ed.on, ed.sev]}) -%}
+{%- elif ed.get('type') == 'tgt' -%}
+  {%- set old_status = 'ENABLED' if shared.get('tgt')[ed.name] else 'DISABLED' -%}
+  {%- set new_status = 'DISABLED' if shared.get('tgt')[ed.name] else 'ENABLED' -%}
+  {%- do shared.get('tgt').update({ed.name: not shared.get('tgt')[ed.name]}) -%}
+{%- endif -%}
+
+{#- Next background session once this one is over; next episode due from
+    the actual start of this one. -#}
+{%- if pick.who != '#ep' and not plan[actor] -%}
+  {%- do plan[actor].append([next_start(admins.index(actor), t) | int, 'start']) -%}
+{%- endif -%}
+{%- if pick.who == '#ep' and shared.get('ep').first -%}
+  {%- do shared.get('ep').update({'first': false}) -%}
+  {%- do shared.get('ep_prev').update({'actor': actor}) -%}
+  {%- set due = t + interval -%}
+  {%- set half = ([interval // 4, 6 * H] | min) // 2 -%}
+  {%- do shared.set('ep_start', ep_time(due - half, due + half) | int) -%}
+{%- endif -%}
+{%- if pick.who == '#ep' and not shared.get('ep_plan') -%}{%- do shared.set('ep', none) -%}{%- endif -%}
+{%- do shared.set('next_t', 0) -%}
+
+{#- Native counters: message number and sequence advance together with
+    the node's other audit records; configuration version with every
+    deployment change. -#}
+{%- set gap_s = [(t - shared.get('last')) / 1000, 0] | max -%}
+{%- set inc = 1 + (module.numpy.random.poisson(gap_s / 45) | int) -%}
+{%- do shared.update({'mid': shared.get('mid') + inc, 'seq': shared.get('seq') + inc, 'last': t}) -%}
+{%- set cv = shared.get('cv') + (module.numpy.random.poisson(gap_s / 2400) | int) + (1 if ed else 0) -%}
+{%- do shared.set('cv', cv) -%}
+{%- set mid = '%010d' % shared.get('mid') -%}
+{%- set seq = shared.get('seq') -%}
+{%- set event_time = epoch + module.datetime.timedelta(milliseconds=t) -%}
+
 {%- set code = '51001' -%}
 {%- set desc = 'Administrator-Login: Administrator authentication succeeded' -%}
 {%- set action = 'administrator-login' -%}
@@ -67,74 +304,48 @@
 {%- set outcome = 'success' -%}
 {%- set detail = {} -%}
 {%- set config_fields = '' -%}
-{%- if kind in ['normal_fail', 'login_fail_1', 'login_fail_2', 'login_fail_3'] -%}
+{%- if kind == 'fail' -%}
   {%- set code = '51000' -%}
   {%- set desc = 'Administrator-Login: Administrator authentication failed' -%}
   {%- set operation = 'Authentication failed due to invalid user or password\\, or account is disabled/locked' -%}
   {%- set category = none -%}
   {%- set event_type = none -%}
   {%- set outcome = 'failure' -%}
-{%- elif kind in ['normal_logout', 'attack_logout', 'recovery_logout'] -%}
+{%- elif kind == 'logout' -%}
   {%- set code = '51002' -%}
   {%- set desc = 'Administrator-Login: Administrator logged off' -%}
   {%- set operation = 'User logged out' -%}
-{%- elif kind in ['normal_config', 'disable_auth_logging', 'recovery_auth'] -%}
+{%- elif ed.get('type') == 'cat' -%}
   {%- set code = '52001' -%}
   {%- set desc = 'Configuration-Changes: Changed configuration' -%}
   {%- set action = 'configuration-changes' -%}
   {%- set category = ['iam', 'configuration'] -%}
   {%- set event_type = ['change', 'info'] -%}
   {%- set outcome = none -%}
-  {%- set name = 'Passed Authentications' if kind in ['disable_auth_logging', 'recovery_auth'] or module.rand.number.integer(1, 10) <= 3 else 'System Statistics' -%}
-  {%- if kind == 'recovery_auth' -%}
-    {%- do shared.pop('to_recovery_auth', none) -%}
-    {%- set local = 'enable' -%}
-  {%- elif kind == 'disable_auth_logging' -%}
-    {%- set local = 'disable' -%}
-  {%- elif name == 'Passed Authentications' -%}
-    {%- set local = 'disable' if shared.get('auth_logging_enabled', true) else 'enable' -%}
-  {%- else -%}
-    {%- set local = 'disable' if shared.get('stats_logging', true) else 'enable' -%}
-  {%- endif -%}
-  {%- do shared.set('auth_logging_enabled' if name == 'Passed Authentications' else 'stats_logging', local == 'enable') -%}
-  {%- set targets = [] if local == 'disable' else ['LogCollector'] -%}
-  {%- set target_text = '{}' if not targets else '{LogCollector}' -%}
-  {%- set change = 'Object modified:\\, Log Severity Level = INFO\\,Local Logging = ' ~ local ~ '\\,Assigned Targets = ' ~ target_text -%}
-  {%- set operation = 'LoggingCategories "' ~ name ~ '" has been edited successfully.' -%}
+  {%- set local = 'enable' if ed.on else 'disable' -%}
+  {%- set targets = ['LogCollector'] if ed.on else [] -%}
+  {%- set change = 'Object modified:\\, Log Severity Level = ' ~ ed.sev ~ '\\,Local Logging = ' ~ local ~ '\\,Assigned Targets = {' ~ (targets | join(',')) ~ '}' -%}
+  {%- set operation = 'LoggingCategories "' ~ ed.name ~ '" has been edited successfully.' -%}
   {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
-  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSCategory, ObjectName=' ~ name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
-  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSCategory', 'name': name}, 'local_logging': local, 'assigned_targets': targets, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
-  {%- set version = version + 1 -%}
-  {%- do shared.set('config_version', version) -%}
-{%- elif kind in ['normal_target', 'disable_collector', 'recovery_target'] -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSCategory, ObjectName=' ~ ed.name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSCategory', 'name': ed.name}, 'local_logging': local, 'assigned_targets': targets, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
+{%- elif ed.get('type') == 'tgt' -%}
   {%- set code = '52001' -%}
   {%- set desc = 'Configuration-Changes: Changed configuration' -%}
   {%- set action = 'configuration-changes' -%}
   {%- set category = ['iam', 'configuration'] -%}
   {%- set event_type = ['change', 'info'] -%}
   {%- set outcome = none -%}
-  {%- set name = 'RemoteCollector' if kind in ['disable_collector', 'recovery_target'] or module.rand.number.integer(1, 10) <= 3 else 'BackupCollector' -%}
-  {%- if kind == 'recovery_target' -%}{%- do shared.pop('to_recovery_target', none) -%}{%- endif -%}
-  {%- set old_status = 'ENABLED' if shared.get('remote_enabled' if name == 'RemoteCollector' else 'backup_enabled', true) else 'DISABLED' -%}
-  {%- set new_status = 'DISABLED' if old_status == 'ENABLED' else 'ENABLED' -%}
-  {%- do shared.set('remote_enabled' if name == 'RemoteCollector' else 'backup_enabled', new_status == 'ENABLED') -%}
-  {%- set target_ip = params.remote_collector_ip if name == 'RemoteCollector' else params.backup_collector_ip -%}
-  {%- set target_description = 'Remote UDP Collector' if name == 'RemoteCollector' else 'Backup UDP Collector' -%}
+  {%- set target_ip = params.remote_collector_ip if ed.name == 'RemoteCollector' else params.backup_collector_ip -%}
+  {%- set target_description = 'Remote UDP Collector' if ed.name == 'RemoteCollector' else 'Backup UDP Collector' -%}
   {%- set change = 'Object modified:\\,Port = 514\\,IP Address = ' ~ target_ip ~ '\\,Facility Code = LOCAL6\\,Length = 1024\\,Description = ' ~ target_description ~ '\\,Include Alarms = FALSE\\,Old status = ' ~ old_status ~ ' New status = ' ~ new_status ~ '\\,' -%}
-  {%- set operation = 'LoggingTargets "' ~ name ~ '" has been edited successfully.' -%}
+  {%- set operation = 'LoggingTargets "' ~ ed.name ~ '" has been edited successfully.' -%}
   {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
-  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSLogTarget, ObjectName=' ~ name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
-  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSLogTarget', 'name': name}, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
-  {%- set version = version + 1 -%}
-  {%- do shared.set('config_version', version) -%}
-{%- endif -%}
-{%- if not shared.get('remote_enabled', true) or not shared.get('auth_logging_enabled', true) -%}
-  {%- if not shared.get('recovery_due') -%}{%- do shared.set('recovery_due', event_time + module.datetime.timedelta(hours=1)) -%}{%- endif -%}
-{%- else -%}
-  {%- do shared.pop('recovery_due', none) -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSLogTarget, ObjectName=' ~ ed.name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSLogTarget', 'name': ed.name}, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
 {%- endif -%}
 {%- set inner_time = event_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] -%}
-{%- set payload = inner_time ~ ' +00:00 ' ~ seq_text ~ ' ' ~ code ~ ' NOTICE ' ~ desc ~ ', ConfigVersionId=' ~ version ~ ', ' ~ config_fields ~ 'AdminInterface=GUI, AdminIPAddress=' ~ src ~ ', ' -%}
+{%- set payload = inner_time ~ ' +00:00 ' ~ ('%010d' % seq) ~ ' ' ~ code ~ ' NOTICE ' ~ desc ~ ', ConfigVersionId=' ~ cv ~ ', ' ~ config_fields ~ 'AdminInterface=GUI, AdminIPAddress=' ~ ip ~ ', ' -%}
 {%- if code in ['51001', '51002'] -%}{%- set payload = payload ~ 'AdminSession=AdminGUI_Session, ' -%}{%- endif -%}
 {%- set payload = payload ~ 'AdminName=' ~ actor ~ ', ' -%}
 {%- if code in ['51000', '51001', '51002'] -%}
@@ -143,7 +354,7 @@
   {%- set payload = payload ~ config_tail -%}
 {%- endif -%}
 {%- set original = '<181>' ~ event_time.strftime('%b %e %H:%M:%S') ~ ' ' ~ params.ise_name ~ ' CISE_Administrative_and_Operational_Audit ' ~ mid ~ ' 1 0 ' ~ payload -%}
-{%- set cise = {'admin': {'interface': 'GUI'}, 'category': {'name': 'CISE_Administrative_and_Operational_Audit'}, 'config_version': {'id': version}, 'message': {'code': code, 'description': desc, 'id': mid}, 'segment': {'number': 0, 'total': 1}} -%}
+{%- set cise = {'admin': {'interface': 'GUI'}, 'category': {'name': 'CISE_Administrative_and_Operational_Audit'}, 'config_version': {'id': cv}, 'message': {'code': code, 'description': desc, 'id': mid}, 'segment': {'number': 0, 'total': 1}} -%}
 {%- if code in ['51001', '51002'] -%}{%- do cise.admin.update({'session': 'AdminGUI_Session'}) -%}{%- endif -%}
 {%- if code in ['51000', '51001', '51002'] -%}{%- do cise.update({'operation_message': {'text': operation}}) -%}{%- endif -%}
 {%- do cise.update(detail) -%}
@@ -151,5 +362,5 @@
 {%- if category is not none -%}{%- do event.update({'category': category}) -%}{%- endif -%}
 {%- if event_type is not none -%}{%- do event.update({'type': event_type}) -%}{%- endif -%}
 {%- if outcome is not none -%}{%- do event.update({'outcome': outcome}) -%}{%- endif -%}
-{%- set out = {'@timestamp': event_time.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': event, 'cisco_ise': {'log': cise}, 'client': {'ip': src, 'user': {'name': actor}}, 'host': {'hostname': params.ise_name}, 'observer': {'name': params.ise_name, 'product': 'Identity Services Engine', 'vendor': 'Cisco', 'version': '3.4'}, 'log': {'level': 'notice', 'syslog': {'priority': 181, 'severity': {'name': 'notice'}}}, 'message': payload, 'related': {'hosts': [params.ise_name], 'ip': [src], 'user': [actor]}, 'user': {'name': actor}} -%}
+{%- set out = {'@timestamp': event_time.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': event, 'cisco_ise': {'log': cise}, 'client': {'ip': ip, 'user': {'name': actor}}, 'host': {'hostname': params.ise_name}, 'observer': {'name': params.ise_name, 'product': 'Identity Services Engine', 'vendor': 'Cisco', 'version': '3.4'}, 'log': {'level': 'notice', 'syslog': {'priority': 181, 'severity': {'name': 'notice'}}}, 'message': payload, 'related': {'hosts': [params.ise_name], 'ip': [ip], 'user': [actor]}, 'user': {'name': actor}} -%}
 {{- out | tojson -}}
