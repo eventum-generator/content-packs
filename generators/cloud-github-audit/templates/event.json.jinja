@@ -19,6 +19,23 @@
 {%- set task_weights = [120, 6, 9, 3, 1.5, 4, 3.5, 4.5, 2.5] -%}
 {%- set hour_weight = [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.8, 0.8, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 1.5, 0.9, 0.9, 0.9, 0.5, 0.5, 0.5] -%}
 {%- set starts_per_minute = (task_weights|sum) / 1440 / 0.954 -%}
+{#- A time in [a, b), density proportional to the hour profile (sq
+    false) or to its square plus a small floor (sq true). -#}
+{%- macro pick_time(a, b, sq) -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- for hh in range((a // 3600)|int, ((b - 0.001) // 3600)|int + 1) -%}
+    {%- set lo = [hh * 3600, a]|max -%}
+    {%- set hi = [hh * 3600 + 3600, b]|min -%}
+    {%- if hi > lo -%}
+      {%- set c = hour_weight[hh % 24] -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set sl = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.floating(sl[0], sl[1]) -}}
+{%- endmacro -%}
 {%- if not shared.get('st') -%}
   {%- set base = params.sensitive_repo_id -%}
   {%- set repos = {} -%}
@@ -30,7 +47,7 @@
     {%- do repos.update({name: {'kind': 'd', 'id': [base, base - 4187203, base - 1093318][loop.index0], 'exists': true, 'protected': true, 'collab': {}, 'topics': [], 'busy': none}}) -%}
   {%- endfor -%}
   {%- set poll_s = 120 -%}
-  {%- do shared.set('st', {'repos': repos, 'queue': [{'due': ev + 21600 * module.rand.number.lognormal(0, 0.8), 'k': 'org'}], 'serial': 1, 'org_member': false, 'mem': {}, 'last_id': base, 'last_id_t': ev, 'ep': {'due': ev + interval, 'plan': none, 'active': false, 'last': [none, none, none]}, 'poll': {'s': poll_s, 'phase': module.rand.number.floating(0, poll_s), 'k': -1, 'lat': 0, 'last': 0}}) -%}
+  {%- do shared.set('st', {'repos': repos, 'queue': [{'due': ev + 21600 * module.rand.number.lognormal(0, 0.8), 'k': 'org'}], 'serial': 1, 'org_member': false, 'mem': {}, 'last_id': base, 'last_id_t': ev, 'ep': {'plan': pick_time(ev, ev + [interval, 86400]|min, false)|float, 'active': false, 'last': [none, none, none]}, 'poll': {'s': poll_s, 'phase': module.rand.number.floating(0, poll_s), 'k': -1, 'lat': 0, 'last': 0}}) -%}
 {%- endif -%}
 {%- set st = shared.get('st') -%}
 
@@ -58,8 +75,9 @@
   {%- do push({'due': ev + 9000 * module.rand.number.lognormal(0, 0.7), 'k': 'mk', 'r': repo}) -%}
 {%- endmacro -%}
 {#- Background guard: would a destroy of repo by owner complete the
-    ordered anomaly shape inside the correlation window? Writes the
-    earliest contributing grant time into out.t1, or leaves it none. -#}
+    ordered anomaly shape inside the correlation window (1800 s from
+    the grant, as the detector counts)? Writes the earliest
+    contributing grant time into out.t1, or leaves it none. -#}
 {%- macro completes_shape(out, owner, repo) -%}
   {%- for a in st.mem.get(repo, []) -%}
     {%- if a[1] == 'repo.add_member' and a[2] == owner and a[6] == 'write' and ev - a[0] <= window -%}
@@ -276,10 +294,12 @@
       {%- elif step == 'destroy' -%}
         {%- set out = {'t1': none} -%}
         {%- do completes_shape(out, it.o, it.r) -%}
+        {#- A deletion that would complete the shape is abandoned: no
+            record, the repository stays, the task ends. -#}
         {%- if out.t1 is none -%}
           {%- do destroy(res, it.o, it.r) -%}
         {%- else -%}
-          {%- do push(dict(it, due=out.t1 + window + 180 * module.rand.number.lognormal(0, 0.8))) -%}
+          {%- do r.update({'busy': none}) -%}
         {%- endif -%}
       {%- else -%}
         {%- if step == 'correct' and held is not none and module.rand.chance(0.35) -%}
@@ -312,10 +332,12 @@
       {%- if step[0] == 'destroy' -%}
         {%- set out = {'t1': none} -%}
         {%- do completes_shape(out, it.o, it.r) -%}
+        {#- A deletion that would complete the shape is abandoned: no
+            record, the repository stays, the task ends. -#}
         {%- if out.t1 is none -%}
           {%- do destroy(res, it.o, it.r) -%}
         {%- else -%}
-          {%- do push(dict(it, due=out.t1 + window + 180 * module.rand.number.lognormal(0, 0.8))) -%}
+          {%- do r.update({'busy': none}) -%}
         {%- endif -%}
       {%- else -%}
         {%- if step[0] == 'pbd' and r.protected -%}
@@ -361,7 +383,9 @@
     {%- if r.exists and r.id == it.id and r.busy == it.token -%}
       {%- if it.i == 0 -%}
         {%- do grant(res, it.o, it.x, it.r, 'write') -%}
-        {%- do st.ep.update({'due': ev + interval}) -%}
+        {%- set due = ev + interval -%}
+        {%- set half = [interval / 4, 21600]|min / 2 -%}
+        {%- do st.ep.update({'plan': pick_time(due - half, due + half, true)|float}) -%}
       {%- elif it.i == 1 -%}
         {%- do change(res, it.o, it.x, it.r, 'admin') -%}
       {%- elif it.i == 2 -%}
@@ -376,6 +400,7 @@
       {%- if it.i < 4 -%}{%- do push(dict(it, i=it.i + 1, due=ev + it.gaps[it.i])) -%}{%- endif -%}
     {%- else -%}
       {%- do st.ep.update({'active': false}) -%}
+      {%- if it.i == 0 -%}{%- do st.ep.update({'plan': ev}) -%}{%- endif -%}
       {%- if r.busy == it.token -%}{%- do r.update({'busy': none}) -%}{%- endif -%}
     {%- endif -%}
   {%- endif -%}
@@ -384,19 +409,11 @@
 {#- Arrivals: independent ordinary task starts, then a due episode. -#}
 {%- set hour = module.datetime.datetime.fromtimestamp(ev, utc).hour -%}
 {%- if module.rand.chance(starts_per_minute * hour_weight[hour]) -%}{%- do push({'due': ev, 'k': 'start'}) -%}{%- endif -%}
-{#- Once an episode is due, its start is drawn over the following
-    min(interval, 24 h) from the daily profile of ordinary task starts
-    (15-minute slots weighted by the hour profile, uniform inside a
-    slot); it begins on the first eligible minute from that time. -#}
-{%- if params.anomaly_mode and not st.ep.active and ev >= st.ep.due and st.ep.plan is none -%}
-  {%- set slots = ([interval, 86400]|min / 900)|int -%}
-  {%- set weights = [] -%}
-  {%- for i in range(slots) -%}
-    {%- do weights.append(hour_weight[module.datetime.datetime.fromtimestamp(st.ep.due + i * 900, utc).hour]) -%}
-  {%- endfor -%}
-  {%- set slot = module.rand.weighted_choice(range(slots)|list, weights) -%}
-  {%- do st.ep.update({'plan': st.ep.due + slot * 900 + module.rand.number.floating(0, 900)}) -%}
-{%- endif -%}
+{#- Episode start: the first is drawn within min(interval, 24 h) from
+    the hour profile; each later one within min(interval / 4, 6 h)
+    centred on one interval after the previous actual grant, weighted
+    by the squared hour profile. It begins on the first eligible minute
+    from that time. -#}
 {%- if params.anomaly_mode and not st.ep.active and st.ep.plan is not none and ev >= st.ep.plan -%}
   {%- set cands = [] -%}
   {%- for name in disposable -%}
