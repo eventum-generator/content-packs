@@ -30,23 +30,23 @@ Interactive clients follow office hours (peak around 11:30 UTC, about 15% of the
 
 ## Event Types
 
-Shares were measured over seven 48-hour `anomaly_mode: false` runs with default parameters (2,625-2,857 requests per day). Every row is `event.category: web`, `event.type: access`; `event.outcome` is `failure` for status 400 and above.
+Shares were measured over six 48-hour `anomaly_mode: false` runs with default parameters (2,596-2,907 requests per day). Every row is `event.category: web`, `event.type: access`; `event.outcome` is `failure` for status 400 and above.
 
 | Request | Share | Status | Outcome |
 | --- | --- | --- | --- |
-| Monitor `/api/status?site=main` | 50.4% | `200 0 0` | success |
-| Page (`/Default.htm`, `/news.htm`, `/reports.htm`, ...) | 10.5% | `200 0 0` | success |
-| Static asset (`/DeptLogo.gif`, `/styles/site.css`, `/scripts/site.js`) | 10.0% | `200 0 0` | success |
-| Static asset revalidation | 8.6% | `304 0 0` | success |
-| Authenticated `/exports/<file>` download | 4.3% | `200 0 0` | success |
-| Scanner probe | 3.2% | `404 0 2`, `403 14 0` or `200 0 0` | mixed |
-| Legacy `/favicon-old.ico` | 3.1% | `404 0 2` | failure |
+| Monitor `/api/status?site=main` | 49.8% | `200 0 0` | success |
+| Page (`/Default.htm`, `/news.htm`, `/reports.htm`, ...) | 10.9% | `200 0 0` | success |
+| Static asset (`/DeptLogo.gif`, `/styles/site.css`, `/scripts/site.js`) | 10.2% | `200 0 0` | success |
+| Static asset revalidation | 9.1% | `304 0 0` | success |
+| Authenticated `/exports/<file>` download | 4.6% | `200 0 0` | success |
+| Legacy `/favicon-old.ico` | 3.2% | `404 0 2` | failure |
+| Scanner probe | 2.3% | `404 0 2`, `403 14 0` or `200 0 0` | mixed |
 | `/admin/` directory | 2.2% | `403 14 0` | failure |
-| `/exports/` directory | 2.2% | `403 14 0` | failure |
-| Page revalidation | 1.4% | `304 0 0` | success |
+| `/exports/` directory | 2.1% | `403 14 0` | failure |
+| Page revalidation | 1.6% | `304 0 0` | success |
 | iPhone `apple-touch-icon` files | 1.3% | `404 0 2` | failure |
 | `/backup/` (removed path) | 1.2% | `404 0 2` | failure |
-| Export retry or mistyped file | 0.8% | `404 0 2` | failure |
+| Export retry or mistyped file | 0.9% | `404 0 2` | failure |
 | Stale link from a legacy page | 0.6% | `404 0 2` | failure |
 
 ## Anomaly Chain
@@ -58,13 +58,13 @@ Shares were measured over seven 48-hour `anomaly_mode: false` runs with default 
 3. `GET /exports/` returns `403 14 0`.
 4. `GET /exports/<file>` returns `200 0 0` with the client's Windows account in `cs-username`.
 
-The requests link through `c-ip` and time only; the chosen W3C profile has no request or session identifier. Gaps between the steps come from the same distribution as ordinary sensitive-area activity (a few seconds to a few minutes), and episodes are typically under three minutes: 29-161 s in the 50 validation episodes. The gaps have no upper bound, so a longer episode is possible.
+The requests link through `c-ip` and time only; the chosen W3C profile has no request or session identifier. Gaps between the steps come from the same distribution as ordinary sensitive-area activity (a few seconds to a few minutes), and episodes are typically under three minutes: 21-139 s in the 20 validation episodes. The gaps have no upper bound, so a longer episode is possible.
 
-Recurrence runs on generated timestamps, so fast sample generation keeps the same event-time schedule. The first episode is due `anomaly_interval_hours` after the first generated timestamp; each episode begins at a random point 0-10 minutes after it is due, and the next one is due one interval after that actual start. Start times therefore drift later by about five minutes per episode on average. There is no catch-up queue: at most one episode is pending, and an episode never overlaps the next. The default interval is 6 hours; values below 3 hours are treated as 3 hours. The floor exists because every episode adds four sensitive-area requests: at intervals of 1-2 hours they measurably raise the `/backup/` share and the night-time sensitive activity of the episode clients compared with the same background without episodes.
+Recurrence runs on generated timestamps, so fast sample generation keeps the same event-time schedule. The first episode starts within the first `anomaly_interval_hours` (at most 24 hours) of generated time, at a moment drawn in proportion to the office-hours curve of the background. Each later episode is due one interval after the previous actual start and begins within a window centred on that due time, `w = min(interval / 4, 6 h)` wide (±45 minutes at the default 6 hours), at a moment weighted by the square of the office-hours curve plus a small floor, so episodes lean towards busy hours without a fixed clock time. There is no catch-up queue: at most one episode is pending, and an episode never overlaps the next. The default interval is 6 hours; values below 3 hours are treated as 3 hours. The floor exists because every episode adds four sensitive-area requests: at intervals of 1-2 hours they measurably raise the `/backup/` share and the night-time sensitive activity of the episode clients compared with the same background without episodes.
 
 Each episode picks a records user or script host other than the previous episode's actor, weighted by that client's current activity, so office-hours users rarely act at night and script hosts carry most night episodes, and one of that client's own export files, different from the previous episode's file when the client has another. The episode uses that client's address, User-Agent and account, and it does not pause or shift the client's ordinary traffic.
 
-Every step, and every partial sequence of the chain, also occurs in ordinary traffic of both modes, from the same clients: over five 48-hour default runs the background held about 18 `/backup/` -> `/admin/` -> `/exports/` and 15 `/admin/` -> `/exports/` -> download sequences per day within 15 minutes, 175 same-client sensitive-area pairs under 10 minutes and 33 runs of three consecutive client errors. What background never contains is the complete ordered sequence ending in a download within 30 minutes from one client: an ordinary download that would complete it inside a window drawn per decision from 30-60 minutes is skipped. Across 15 off runs (48 h each), complete ordinary sequences occurred 0 times under 30 minutes, 85 times between 30 and 60 minutes (shortest 32 minutes) and 120 times between 1 and 2 hours. A detection can therefore correlate `/backup/` 404, `/admin/` 403.14 and `/exports/` 403.14 followed by a successful export download from the same `c-ip` within 15 minutes. The access row does not show how the client obtained its access or how many bytes it downloaded. The correlation assumes IIS sees the client directly; behind a load balancer, `c-ip` can be the proxy address unless a forwarded-client field is logged.
+Every step, and every partial sequence of the chain, also occurs in ordinary traffic of both modes, from the same clients: over five 48-hour default runs the background held about 19 `/backup/` -> `/admin/` -> `/exports/` and 17 `/admin/` -> `/exports/` -> download sequences per day within 15 minutes, 186 same-client sensitive-area pairs under 10 minutes and 32 runs of three consecutive client errors. What background never contains is the complete ordered sequence ending in a download within 15 minutes of the `/backup/` request from one client. The generator tracks each client's own requests exactly as such a detection would (every row of that `c-ip`, episode rows included) and does not write an ordinary download that would complete the sequence inside that window; no other request is moved, delayed or given to another client. Across seven 48-hour off runs, complete ordinary sequences occurred 0 times within 15 minutes, 30 times between 15 and 30 minutes (shortest 903 s), 52 times between 30 and 60 minutes and 50 times between 1 and 2 hours. Downloads by other clients after such a partial sequence continue at the same rate on both sides of the 15-minute mark (about 5 per hour). A detection can therefore correlate `/backup/` 404, `/admin/` 403.14 and `/exports/` 403.14 followed by a successful export download from the same `c-ip` within 15 minutes. The access row does not show how the client obtained its access or how many bytes it downloaded. The correlation assumes IIS sees the client directly; behind a load balancer, `c-ip` can be the proxy address unless a forwarded-client field is logged.
 
 Set `anomaly_mode: false` to generate only background. The episode requests are omitted; the clients, accounts, paths, User-Agents and status combinations of the chain still occur independently.
 
@@ -120,7 +120,7 @@ eventum generate --path generators/web-microsoft-iis/finite.yml --id web-microso
 - Timestamps have one-second resolution, as in the native row, so `@timestamp` never carries a fraction.
 - Windows authentication is shown only as the account on successful export downloads; the anonymous `401 2 5` challenge that precedes it on a real server is not modeled, and directory probes are anonymous.
 - The monitor polls about once a minute with a random gap (16-204 s) rather than on an exact interval, and interactive rates follow one UTC office-hours curve.
-- The skipped-download rule guarantees only 30 minutes: a detector with a longer window finds ordinary B-A-E-download sequences (about 3 per day between 30 and 60 minutes, about 4 per day between 1 and 2 hours).
+- The skipped-download rule covers exactly 15 minutes from the `/backup/` request: a detector with a longer window finds ordinary B-A-E-download sequences (about 2 per day between 15 and 30 minutes, about 4 per day between 30 and 60 minutes and about 4 per day between 1 and 2 hours).
 - Clients, pages, files and rates are synthetic scenario assumptions rather than Microsoft-published traffic.
 
 ## Sample Output
@@ -128,7 +128,7 @@ eventum generate --path generators/web-microsoft-iis/finite.yml --id web-microso
 An episode download (step 4, without a referer), copied from a default-parameter validation run:
 
 ```json
-{"@timestamp": "2026-09-25T12:13:37+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": "success", "duration": 392000000, "original": "2026-09-25 12:13:37 10.20.0.10 GET /exports/payroll.csv - 443 CONTOSO\\lwhite 10.20.1.23 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64)+AppleWebKit/537.36+(KHTML,+like+Gecko)+Chrome/150.0.0.0+Safari/537.36+Edg/150.0.0.0 - 200 0 0 392"}, "host": {"name": "WEB-IIS-01", "ip": "10.20.0.10"}, "source": {"ip": "10.20.1.23"}, "destination": {"ip": "10.20.0.10", "port": 443}, "http": {"request": {"method": "GET"}, "response": {"status_code": 200}}, "url": {"path": "/exports/payroll.csv"}, "user_agent": {"original": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/150.0.0.0 Safari/537.36 Edg/150.0.0.0"}, "iis": {"access": {"sub_status": 0, "win32_status": 0}}, "user": {"name": "CONTOSO\\lwhite"}}
+{"@timestamp": "2026-09-25T09:24:43+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": "success", "duration": 409000000, "original": "2026-09-25 09:24:43 10.20.0.10 GET /exports/payroll.csv - 443 CONTOSO\\svc-etl 10.20.5.22 Mozilla/5.0+(Windows+NT+10.0;+Microsoft+Windows+10.0.20348;+en-US)+PowerShell/7.4.6 - 200 0 0 409"}, "host": {"name": "WEB-IIS-01", "ip": "10.20.0.10"}, "source": {"ip": "10.20.5.22"}, "destination": {"ip": "10.20.0.10", "port": 443}, "http": {"request": {"method": "GET"}, "response": {"status_code": 200}}, "url": {"path": "/exports/payroll.csv"}, "user_agent": {"original": "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.20348; en-US) PowerShell/7.4.6"}, "iis": {"access": {"sub_status": 0, "win32_status": 0}}, "user": {"name": "CONTOSO\\svc-etl"}}
 ```
 
 ## References

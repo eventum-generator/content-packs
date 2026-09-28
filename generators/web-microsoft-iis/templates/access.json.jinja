@@ -53,6 +53,20 @@
   {%- endif -%}
   {{- num.exponential(1 / mean) -}}
 {%- endmacro -%}
+{%- macro draw_start(a, b, squared) -%}
+  {#- Episode start in [a, b) on a one-minute grid, weighted by the
+      office-hours curve (first start) or its square plus a floor
+      (later starts, centred on the due time). -#}
+  {%- set n = [((b - a) / 60) | int, 1] | max -%}
+  {%- set weights = [] -%}
+  {%- for i in range(n) -%}
+    {%- set h = ((a + i * 60 + 30) % 86400) / 3600 -%}
+    {%- set f = 0.15 + 0.85 * math.exp(-(((h - 11.5) / 3.2) ** 2)) -%}
+    {%- do weights.append(f * f + 0.05 if squared else f) -%}
+  {%- endfor -%}
+  {%- set i = rand.weighted_choice(range(n) | list, weights) -%}
+  {{- [a + i * 60 + num.floating(0, 60), b] | min -}}
+{%- endmacro -%}
 {%- macro step_gap() -%}
   {{- 2 + num.lognormal(math.log(18), 0.8) -}}
 {%- endmacro -%}
@@ -132,7 +146,7 @@
       'files': files, 'browse': browse, 'sensitive': sensitive,
       'nb': T + (gap(browse, T, row.role in browsers) | float if browse > 0 else 0),
       'ns': T + (gap(sensitive, T, row.role in browsers) | float if sensitive > 0 else 0),
-      'g1': -1.0e18, 'g2': -1.0e18, 'g3': -1.0e18
+      'parts': []
     }) -%}
   {%- endfor -%}
   {%- if params.anomaly_mode and eligible | length < 2 -%}
@@ -141,7 +155,7 @@
   {%- do shared.update({
     'clients': clients, 'eligible': eligible, 'queue': [], 'last_window': none,
     'interval_s': ([params.anomaly_interval_hours, 3] | max) * 3600,
-    'ep_next': T + ([params.anomaly_interval_hours, 3] | max) * 3600,
+    'ep_next': draw_start(T, T + ([[params.anomaly_interval_hours, 3] | max, 24] | min) * 3600, false) | float,
     'ep': none, 'ep_client': none, 'ep_file': none
   }) -%}
 {%- endif -%}
@@ -240,9 +254,8 @@
       {%- do c.update({'ns': st.t + gap(c.sensitive, st.t, diurnal) | float}) -%}
     {%- endif -%}
   {%- endfor -%}
-  {#- Episode: due one interval after the previous actual start (the
-      first one interval after the first render), begins 0-10 min after
-      it is due, rotates client and export file. -#}
+  {#- Episode: begins at its drawn start time (see draw_start), rotates
+      client and export file. -#}
   {%- if params.anomaly_mode and shared.get('ep') is none and shared.get('ep_next') < W -%}
     {%- set last = shared.get('ep_client') -%}
     {%- set candidates = shared.get('eligible') | reject('equalto', last) | list -%}
@@ -259,7 +272,7 @@
     {%- set c = clients[ci] -%}
     {%- set files = c.files | reject('equalto', shared.get('ep_file')) | list or c.files -%}
     {%- set f = rand.choice(files) -%}
-    {%- set st = namespace(t=[shared.get('ep_next'), T] | max + num.floating(0, 600)) -%}
+    {%- set st = namespace(t=[shared.get('ep_next'), T] | max) -%}
     {%- for ch in 'BAED' -%}
       {%- if not loop.first -%}
         {%- set st.t = st.t + step_gap() | float -%}
@@ -272,12 +285,12 @@
     {%- do shared.set('queue', (shared.get('queue') + new) | sort(attribute='t')) -%}
   {%- endif -%}
 {%- endif -%}
-{#- Write the earliest due request. Ordinary downloads that would
-    complete /backup/ -> /admin/ -> /exports/ -> download from one client
-    within a window drawn per decision from 30-60 minutes are skipped, so
-    the complete chain stays specific to episodes without a cliff at one
-    window length. The check uses ordinary rows only, identical in both
-    modes. -#}
+{#- Write the earliest due request. Each client carries the partial
+    /backup/ 404 -> /admin/ 403 -> /exports/ 403 sequences of its
+    written rows, as a sequence matcher keyed by c-ip sees them (every
+    row, episode rows included; a completion resets the client). An
+    ordinary download that would complete one within 15 minutes of its
+    /backup/ row is not written; nothing else changes. -#}
 {%- set queue = shared.get('queue') -%}
 {%- set out = namespace(item=none, sec=0) -%}
 {%- for _ in range(8) -%}
@@ -285,16 +298,42 @@
     {%- set it = queue.pop(0) -%}
     {%- set sec = ([it.t, T] | max) | int -%}
     {%- set c = clients[it.c] -%}
-    {%- if it.ep -%}
-      {%- set out.item = it -%}
-      {%- set out.sec = sec -%}
-    {%- elif not (it.k == 'D' and sec - c.g3 <= num.floating(1800, 3600)) -%}
-      {%- if it.k == 'B' or (it.k == 'Q' and it.p == '/backup/') -%}
-        {%- do c.update({'g1': sec}) -%}
-      {%- elif it.k == 'A' or (it.k == 'Q' and it.p == '/admin/') -%}
-        {%- do c.update({'g2': [c.g2, c.g1] | max}) -%}
-      {%- elif it.k == 'E' or (it.k == 'Q' and it.p == '/exports/') -%}
-        {%- do c.update({'g3': [c.g3, c.g2] | max}) -%}
+    {%- if it.p == '/backup/' and it.s == 404 -%}
+      {%- set step = 0 -%}
+    {%- elif it.p == '/admin/' and it.s == 403 -%}
+      {%- set step = 1 -%}
+    {%- elif it.p == '/exports/' and it.s == 403 -%}
+      {%- set step = 2 -%}
+    {%- elif it.p.startswith('/exports/') and it.p | length > 9 and it.s == 200 -%}
+      {%- set step = 3 -%}
+    {%- else -%}
+      {%- set step = none -%}
+    {%- endif -%}
+    {%- set parts = c.parts | selectattr(1, 'ge', sec - 900) | list -%}
+    {%- if step == 3 and not it.ep and parts | selectattr(0, 'equalto', 3) | list -%}
+      {#- guard: the download is not written -#}
+    {%- else -%}
+      {%- if step is not none -%}
+        {%- set m = namespace(new=[], done=false) -%}
+        {%- for p in parts -%}
+          {%- if not m.done -%}
+            {%- if p[0] == step and step == 3 -%}
+              {%- set m.done = true -%}
+            {%- elif p[0] == step -%}
+              {%- do m.new.append([step + 1, p[1]]) -%}
+            {%- else -%}
+              {%- do m.new.append(p) -%}
+            {%- endif -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if m.done -%}
+          {%- do c.update({'parts': []}) -%}
+        {%- else -%}
+          {%- if step == 0 -%}
+            {%- do m.new.append([1, sec]) -%}
+          {%- endif -%}
+          {%- do c.update({'parts': m.new[-8:]}) -%}
+        {%- endif -%}
       {%- endif -%}
       {%- set out.item = it -%}
       {%- set out.sec = sec -%}
@@ -308,7 +347,11 @@
 {%- set c = clients[it.c] -%}
 {%- if it.ep -%}
   {%- if it.n == 1 -%}
-    {%- do shared.set('ep_next', out.sec + shared.get('interval_s')) -%}
+    {#- Next due one interval after this actual start; the start is
+        drawn within [due - w/2, due + w/2], w = min(interval / 4, 6 h). -#}
+    {%- set iv = shared.get('interval_s') -%}
+    {%- set half = ([iv / 4, 21600] | min) / 2 -%}
+    {%- do shared.set('ep_next', draw_start(out.sec + iv - half, out.sec + iv + half, true) | float) -%}
   {%- elif it.n == 4 -%}
     {%- do shared.set('ep', none) -%}
   {%- endif -%}
