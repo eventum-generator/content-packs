@@ -6,14 +6,14 @@ Generates a selected Vault v1.18.0 file-audit profile for KV v2 reads and lists,
 
 | Operation family | Native operation and path | Share, default on / off | ECS category |
 |---|---|---:|---|
-| KV v2 read, application/billing | `read`, `secret/data/{app,billing}/*` | 48.7% / 47.4% | authentication |
-| KV v2 read, payroll | `read`, `secret/data/payroll/*` | 30.1% / 30.4% | authentication |
-| Token self-lookup | `read`, `auth/token/lookup-self` | 10.5% / 10.8% | authentication |
-| KV v2 metadata list | `list`, `secret/metadata/{app,billing,payroll}` | 10.1% / 10.7% | authentication |
-| Denied audit-device deletion | `delete`, `sys/audit/file` | 0.46% / 0.52% | authentication |
+| KV v2 read, application/billing | `read`, `secret/data/{app,billing}/*` | 49.7% / 48.1% | authentication |
+| KV v2 read, payroll | `read`, `secret/data/payroll/*` | 28.8% / 30.1% | authentication |
+| Token self-lookup | `read`, `auth/token/lookup-self` | 10.4% / 10.5% | authentication |
+| KV v2 metadata list | `list`, `secret/metadata/{app,billing,payroll}` | 10.4% / 10.8% | authentication |
+| Denied audit-device deletion | `delete`, `sys/audit/file` | 0.54% / 0.36% | authentication |
 | Token self-renewal | `update`, `auth/token/renew-self` | 0.20% / 0.19% | authentication |
 
-Shares are measured over the 9,161 operations of the final default captures with anomalies on and off. They are training assumptions, not production frequencies. Each operation produces two entries, `type: request` and `type: response`, with the same `request.id`. `mode: all` renders the request before the response for each input timestamp. The six-field cron expression with `count: 1` gives one operation per 30-second input slot, or 2,880 operations and 5,760 audit entries per full day. The source time of each operation is a random instant inside its slot. Preserve output order with `--keep-order true`.
+Shares are measured over the 17,321 operations of the final default captures with anomalies on and off; the denied DELETE share varies between runs (0.32-0.50% over six default background captures). They are training assumptions, not production frequencies. Each operation produces two entries, `type: request` and `type: response`, with the same `request.id`. `mode: all` renders the request before the response for each input timestamp. The six-field cron expression with `count: 1` gives one operation per 30-second input slot, or 2,880 operations and 5,760 audit entries per full day. The source time of each operation is a random instant inside its slot. Preserve output order with `--keep-order true`.
 
 ## Selected Source Profile
 
@@ -33,7 +33,7 @@ path "secret/metadata/*" {
 
 The default policy supplies self-lookup and self-renewal. The four userpass users are provisioned before the selected window with `token_policies=training-reader`, `token_period=24h`, `token_explicit_max_ttl=0`, and service tokens. There are no identity policies, use limits, or audit DELETE/sudo grants. Change the ACL mount paths too when changing `secret_mount`. Policy names alone do not prove authorization.
 
-Initial logins happened at random moments between 10 minutes and about 17 hours before the first timestamp. The 52 version-1 secrets were created at random moments 1 to 30 days before it. Each client renews its token the way the Vault API `LifetimeWatcher` schedules it: after two thirds of the 24-hour lease plus one third of a grace drawn from 10-20% of the lease. That is 16.8 to 17.6 hours after login or the previous renewal; in the final captures renewal gaps were 60,500 to 63,390 seconds. A long-running watcher keeps its first grace; here the grace is drawn again for every cycle. Renewal extends expiration while the request is handled, and the following lookups report that instant as `last_renewal`. Stored `auth.token_ttl` remains the creation period of 86,400 seconds. Lookup `response.data.ttl` reports remaining lifetime. Renewal does not create a new token or change its original issue time.
+Initial logins happened at random moments between 10 minutes and about 17 hours before the first timestamp. The 52 version-1 secrets were created at random moments 1 to 30 days before it. Each client renews its token the way the Vault API `LifetimeWatcher` schedules it: after two thirds of the 24-hour lease plus one third of a grace drawn from 10-20% of the lease. That is 16.8 to 17.6 hours after login or the previous renewal; in the final captures renewal gaps were 60,490 to 63,370 seconds. A long-running watcher keeps its first grace; here the grace is drawn again for every cycle. Renewal extends expiration while the request is handled, and the following lookups report that instant as `last_renewal`. Stored `auth.token_ttl` remains the creation period of 86,400 seconds. Lookup `response.data.ttl` reports remaining lifetime. Renewal does not create a new token or change its original issue time.
 
 The secret inventory contains 12 application/billing paths and 40 payroll paths, with synthetic values. Every read returns data plus KV version metadata. Lists contain the sorted child names from this inventory before hashing. No secret write, deletion, version change, token creation, or revocation is included.
 
@@ -41,21 +41,23 @@ Background traffic comes from independent processes that behave the same with an
 
 - **Single operations.** Each input slot not taken by another process draws an actor (weights 45/25/20/10) and a read, list or lookup. A read targets a random payroll secret in 35% of cases, otherwise a random application/billing secret.
 - **Payroll batches.** About 12 per day, one actor reads a run of distinct payroll secrets: an ascending employee range in 60% of batches, a random subset otherwise. Lengths are log-normal with a median of about 6 reads and runs of 10 or more reads occur several times a day. A batch takes each slot with probability 0.8, so it interleaves with other traffic.
-- **Denied audit-device deletions.** About 8 attempts per day by any actor; 35% are retried by the same actor after a log-normal delay (median 45 seconds). The actor must not have read three payroll secrets in the preceding 420 seconds. That combination is the anomaly shape, and it is the only shape withheld from the background.
+- **Denied audit-device deletions.** About 8 attempts per day by an actor drawn by weight (30/25/25/20); 35% are retried by the same actor after a log-normal delay (median 45 seconds).
 - **Token renewals** as described above, taking precedence over all other work.
 - **Client connections.** A client reuses its ephemeral source port until it has been idle for more than 90 seconds, then connects from a new random port in 32768-60999.
+
+**Guard.** One background rule keeps ordinary traffic from completing the anomaly by coincidence, and it acts only on the chain's last step. The template follows every emitted request with the same ordered matcher a detector uses: per actor, three distinct payroll reads followed by an audit DELETE, the first of those reads at most 400 seconds before the DELETE. An ordinary DELETE attempt or retry that would complete this sequence is dropped: no record is made, its actor is not replaced, and the input slot goes to the next pending work. DELETEs after 400 seconds, DELETEs by other actors, and DELETEs after repeated or earlier payroll reads remain in background.
 
 ## Anomaly Chain
 
 `event.template.params.anomaly_mode` defaults to `true`. Setting it to `false` produces only the background above, without the complete sequence.
 
-Each episode is one existing actor reading ten distinct payroll secrets, then attempting to delete `sys/audit/file`. The reads follow the payroll batch process: the same pacing, and an ascending employee range or a random subset. The DELETE follows at the actor's next step. Its explicit reader ACL permits the reads and rejects the audit DELETE. Both entries for the denied operation retain valid authentication, `policy_results.allowed=false`, the core permission error, and a hashed `response.data.error`. The audit device remains enabled. In the final captures an episode spanned 288 to 500 seconds from the first read to the DELETE.
+Each episode is one existing actor reading ten distinct payroll secrets, then attempting to delete `sys/audit/file`. The reads follow the payroll batch process: the same pacing, and an ascending employee range or a random subset. The DELETE follows at the actor's next step. Its explicit reader ACL permits the reads and rejects the audit DELETE. Both entries for the denied operation retain valid authentication, `policy_results.allowed=false`, the core permission error, and a hashed `response.data.error`. The audit device remains enabled. In the final captures an episode spanned 272 to 618 seconds from the first read to the DELETE.
 
-The first episode is due one interval after the first input timestamp. The next one is due one interval after the actual first read of the previous episode; there is no backlog of missed episodes. An episode yields each slot to renewals, retries, pending deletion attempts and running batches, so it starts up to a few minutes after it is due. The recurrence therefore drifts slightly later: consecutive starts were 24.007 to 24.019 hours apart at the default interval, 12.004 to 12.017 hours at 12 hours, and 6.003 to 6.016 hours at 6 hours. Each episode uses a different actor from the previous one and a different starting payroll secret. Fresh operation UUIDs are drawn for every operation.
+Background rates do not vary by time of day, so start times are drawn uniformly. The first episode starts at a random time within the first interval, or the first 24 hours when the interval is longer. Each later one starts at a random time within a window of a quarter of the interval (at most 6 hours) centred on one interval after the actual first read of the previous episode; there is no backlog of missed episodes. An episode yields each slot to renewals, retries, pending deletion attempts and running batches, and waits while every eligible actor runs a batch, so it starts up to a few minutes after its drawn time. At the default interval the first episode started 22.6 hours after the window start and consecutive starts were 22.7 to 26.5 hours apart; at 12 hours they were 10.6 to 13.5 hours apart. Each episode uses a different actor from the previous one and a different starting payroll secret. Fresh operation UUIDs are drawn for every operation.
 
-Every element of the chain also occurs on its own in both modes: runs of ten or more payroll reads by one actor, repeated payroll reads by one actor within a minute, and denied audit DELETEs by all four actors, including retries and DELETEs preceded by one or two payroll reads. A detection rule has to combine them: three or more distinct payroll reads by one token and entity, followed by that token's denied `sys/audit/file` DELETE within about seven minutes. These records do not prove exfiltration, a successful audit shutdown, or why a valid identity behaved this way.
+Every element of the chain also occurs on its own in both modes: runs of ten or more payroll reads by one actor, repeated payroll reads by one actor within a minute, and denied audit DELETEs by all four actors, including retries and DELETEs preceded by one or two payroll reads. A detection rule has to combine them: three or more distinct payroll reads by one token and entity, followed by that token's denied `sys/audit/file` DELETE within 400 seconds of the first of them. These records do not prove exfiltration, a successful audit shutdown, or why a valid identity behaved this way.
 
-State consists of four token contexts, the fixed 52-secret inventory with creation times, at most three running batches, a few pending retries, one current pair, and one episode context. Recent payroll read times are kept only for 420 seconds per actor. No request UUID history, new secret, account, or token collection grows during generation.
+State consists of four token contexts, the fixed 52-secret inventory with creation times, at most three running batches, a few pending retries, one current pair, and one episode context. The chain guard keeps at most eight partial matches per actor, each for 400 seconds. No request UUID history, new secret, account, or token collection grows during generation.
 
 ## Reference Field Map and Limits
 
@@ -91,7 +93,7 @@ Edit `event.template.params` in `generator.yml`:
 | Name | Default | Purpose |
 |---|---|---|
 | `anomaly_mode` | `true` | Periodic episodes mixed with background; `false` produces background only |
-| `anomaly_interval_hours` | `24` | Hours from one episode's first read to the next episode becoming due, 6 to 8,760 |
+| `anomaly_interval_hours` | `24` | Hours from one episode's first read to the centre of the next episode's start window, 6 to 8,760 |
 | `vault_host` | `vault-01.corp.example` | Vault node and collector hostname |
 | `vault_ip` | `10.20.2.18` | Vault node address |
 | `collector_id` | `65fa5f58-a1d2-49d1-b4cc-05228dd270f3` | Stable collector ID |
@@ -140,15 +142,17 @@ eventum generate --path generators/security-hashicorp-vault/generator.yml --id v
 
 The shipped cron input has no end, so a batch run continues until it is stopped. For a finite batch, add `start` and `end` to the cron input in a copy of the configuration and choose a window of at least two intervals.
 
-Final validation used finite 76-hour-20-minute windows. The default and custom (12-hour interval, other host, fourth account and a Unicode KV mount) captures each contain 18,322 entries and 9,161 operations, with 3/0 and 6/0 episodes with anomalies on/off. A 100-hour-20-minute window at the minimum 6-hour interval contains 24,082 entries, 12,041 operations, and 16/0 episodes. Background decisions were compared between the modes and against six further independent background-only captures per configuration.
+Final validation used finite 144-hour-20-minute windows. The default and custom (12-hour interval, other host, fourth account and a Unicode KV mount) captures each contain 34,642 entries and 17,321 operations, with 5/0 and 12/0 episodes with anomalies on/off. Background decisions were compared between the modes and against five (default) and four (custom) further independent background-only captures. The calibrated `mode_compare.py` comparison returns OK for both pairs.
+
+Near misses were measured over the eleven background captures, keyed to the matcher state (time since the first read of the latest three-distinct-read sequence). DELETEs by the same actor occur 0 times inside 400 seconds and 0.11-0.18 per hour in each 50-second bin from 400 to 800 seconds, close to an actor's ordinary DELETE rate of about 0.11 per hour. DELETEs by other actors occur 0.33 per hour inside the window and 0.36 outside it.
 
 ## Sample Output
 
-This complete denied response is row 5,794 of the final default capture with anomalies on. It ends the first episode: `svc-api` read ten payroll secrets from 00:01:12 and attempted the DELETE at 00:08:07. The request and response share the operation UUID, and the denied DELETE does not disable auditing.
+This complete denied response is row 5,454 of the final default capture with anomalies on. It ends the first episode: `svc-api` read ten payroll secrets from 22:36:33 and attempted the DELETE at 22:43:25. The request and response share the operation UUID, and the denied DELETE does not disable auditing.
 
 ```json
 {
-  "@timestamp": "2026-09-27T00:08:07.137Z",
+  "@timestamp": "2026-09-26T22:43:25.293Z",
   "agent": {
     "ephemeral_id": "8dcba887-bc9d-44cb-bfcd-ed7aa7216748",
     "id": "65fa5f58-a1d2-49d1-b4cc-05228dd270f3",
@@ -176,10 +180,10 @@ This complete denied response is row 5,794 of the final default capture with ano
       "authentication"
     ],
     "dataset": "hashicorp_vault.audit",
-    "id": "5dc7f56f-71d8-42ed-9983-6845456aca4b",
-    "ingested": "2026-09-27T00:08:09Z",
+    "id": "0728bc8f-1033-462e-bc19-39a17b7e0c3d",
+    "ingested": "2026-09-26T22:43:32Z",
     "kind": "event",
-    "original": "{\"auth\":{\"accessor\":\"hmac-sha256:8bfe54d69390a4adc95d16a826f3792753ddd31cfe36ded64625ae4b0a765b3d\",\"client_token\":\"hmac-sha256:758dc31f91fd147aca412e25f6f312ca5e72641f15ddd6c21ee7ba78bd8f168a\",\"display_name\":\"userpass-svc-api\",\"entity_id\":\"49263c43-35ab-4df6-a747-1715203590ba\",\"metadata\":{\"username\":\"svc-api\"},\"policies\":[\"default\",\"training-reader\"],\"policy_results\":{\"allowed\":false},\"token_policies\":[\"default\",\"training-reader\"],\"token_issue_time\":\"2026-09-25T11:19:25Z\",\"token_ttl\":86400,\"token_type\":\"service\"},\"error\":\"1 error occurred:\\n\\t* permission denied\\n\\n\",\"request\":{\"client_id\":\"49263c43-35ab-4df6-a747-1715203590ba\",\"client_token\":\"hmac-sha256:758dc31f91fd147aca412e25f6f312ca5e72641f15ddd6c21ee7ba78bd8f168a\",\"client_token_accessor\":\"hmac-sha256:8bfe54d69390a4adc95d16a826f3792753ddd31cfe36ded64625ae4b0a765b3d\",\"id\":\"5dc7f56f-71d8-42ed-9983-6845456aca4b\",\"mount_class\":\"secret\",\"mount_point\":\"sys/\",\"mount_type\":\"system\",\"namespace\":{\"id\":\"root\"},\"operation\":\"delete\",\"path\":\"sys/audit/file\",\"remote_address\":\"10.20.8.12\",\"remote_port\":48901,\"request_uri\":\"/v1/sys/audit/file\"},\"response\":{\"mount_class\":\"secret\",\"mount_point\":\"sys/\",\"mount_type\":\"system\",\"data\":{\"error\":\"hmac-sha256:ec125ce39ac232369c1e227ed31f30b8b1a43010aa94029c6b423af8d061ce97\"}},\"time\":\"2026-09-27T00:08:07.137460537Z\",\"type\":\"response\"}",
+    "original": "{\"auth\":{\"accessor\":\"hmac-sha256:8bfe54d69390a4adc95d16a826f3792753ddd31cfe36ded64625ae4b0a765b3d\",\"client_token\":\"hmac-sha256:758dc31f91fd147aca412e25f6f312ca5e72641f15ddd6c21ee7ba78bd8f168a\",\"display_name\":\"userpass-svc-api\",\"entity_id\":\"49263c43-35ab-4df6-a747-1715203590ba\",\"metadata\":{\"username\":\"svc-api\"},\"policies\":[\"default\",\"training-reader\"],\"policy_results\":{\"allowed\":false},\"token_policies\":[\"default\",\"training-reader\"],\"token_issue_time\":\"2026-09-25T15:49:12Z\",\"token_ttl\":86400,\"token_type\":\"service\"},\"error\":\"1 error occurred:\\n\\t* permission denied\\n\\n\",\"request\":{\"client_id\":\"49263c43-35ab-4df6-a747-1715203590ba\",\"client_token\":\"hmac-sha256:758dc31f91fd147aca412e25f6f312ca5e72641f15ddd6c21ee7ba78bd8f168a\",\"client_token_accessor\":\"hmac-sha256:8bfe54d69390a4adc95d16a826f3792753ddd31cfe36ded64625ae4b0a765b3d\",\"id\":\"0728bc8f-1033-462e-bc19-39a17b7e0c3d\",\"mount_class\":\"secret\",\"mount_point\":\"sys/\",\"mount_type\":\"system\",\"namespace\":{\"id\":\"root\"},\"operation\":\"delete\",\"path\":\"sys/audit/file\",\"remote_address\":\"10.20.8.12\",\"remote_port\":38729,\"request_uri\":\"/v1/sys/audit/file\"},\"response\":{\"mount_class\":\"secret\",\"mount_point\":\"sys/\",\"mount_type\":\"system\",\"data\":{\"error\":\"hmac-sha256:ec125ce39ac232369c1e227ed31f30b8b1a43010aa94029c6b423af8d061ce97\"}},\"time\":\"2026-09-26T22:43:25.293801903Z\",\"type\":\"response\"}",
     "outcome": "failure",
     "type": [
       "info",
@@ -203,7 +207,7 @@ This complete denied response is row 5,794 of the final default capture with ano
         "policy_results": {
           "allowed": false
         },
-        "token_issue_time": "2026-09-25T11:19:25Z",
+        "token_issue_time": "2026-09-25T15:49:12Z",
         "token_policies": [
           "default",
           "training-reader"
@@ -216,7 +220,7 @@ This complete denied response is row 5,794 of the final default capture with ano
         "client_id": "49263c43-35ab-4df6-a747-1715203590ba",
         "client_token": "hmac-sha256:758dc31f91fd147aca412e25f6f312ca5e72641f15ddd6c21ee7ba78bd8f168a",
         "client_token_accessor": "hmac-sha256:8bfe54d69390a4adc95d16a826f3792753ddd31cfe36ded64625ae4b0a765b3d",
-        "id": "5dc7f56f-71d8-42ed-9983-6845456aca4b",
+        "id": "0728bc8f-1033-462e-bc19-39a17b7e0c3d",
         "mount_class": "secret",
         "mount_point": "sys/",
         "mount_type": "system",
@@ -226,7 +230,7 @@ This complete denied response is row 5,794 of the final default capture with ano
         "operation": "delete",
         "path": "sys/audit/file",
         "remote_address": "10.20.8.12",
-        "remote_port": 48901,
+        "remote_port": 38729,
         "request_uri": "/v1/sys/audit/file"
       },
       "response": {
@@ -269,7 +273,7 @@ This complete denied response is row 5,794 of the final default capture with ano
     "file": {
       "path": "/var/log/vault/audit.json"
     },
-    "offset": 9110941
+    "offset": 8467024
   },
   "message": "1 error occurred:\n\t* permission denied\n\n",
   "related": {
@@ -282,7 +286,7 @@ This complete denied response is row 5,794 of the final default capture with ano
   },
   "source": {
     "ip": "10.20.8.12",
-    "port": 48901
+    "port": 38729
   },
   "tags": [
     "hashicorp-vault-audit"
