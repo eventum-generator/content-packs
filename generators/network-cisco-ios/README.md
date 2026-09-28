@@ -1,38 +1,44 @@
 # Cisco IOS Syslog
 
-Generates ECS-compatible remote syslog from one Cisco IOS router, modeled on the IOS 15SY message format and the Elastic Cisco IOS log integration. Native messages cover IPv4 ACL decisions, SSH logins, configuration commands, configuration changes, and line-protocol state.
+Generates remote syslog from one Cisco IOS router as the Elastic Cisco IOS integration stores it: ACL decisions, SSH logins, configuration commands and changes, and interface line-protocol changes. It is intended for SIEM content that correlates access-list changes with administrator logins.
 
-The profile assumes TCP syslog collection, the default `local7` facility, numbered messages, UTC timestamps with milliseconds, ACL entries with `log`, and configuration-change notifications enabled with `archive log config` / `notify syslog`. In `OUTSIDE_IN`, a sequence-100 logged deny blocks the controlled flow until a sequence-50 permit is inserted before it; the other modeled flows match separate pre-existing ACEs. `event.original` uses the `<PRI>sequence: device timestamp: %FACILITY-SEVERITY-MNEMONIC: text` form from the [Elastic sample event](https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/sample_event.json); the transport peer is recorded separately in `log.source.address`. The input emits one event every five seconds.
+The profile is a router that sends to a TCP syslog collector with the default `local7` facility, message counters (`service sequence-numbers`), UTC timestamps with milliseconds and year (`service timestamps log datetime msec year`), logged ACEs, SSH login logging (`login on-failure log`, `login on-success log`) and configuration logging (`archive log config` / `notify syslog`). `event.original` has the frame of the Elastic sample event, `<PRI>count: Mon dd yyyy HH:MM:SS.mmm: %FACILITY-SEVERITY-MNEMONIC: text`. The other fields are the ones the integration's ingest pipeline produces for each message: ACL records carry the access list, the five-tuple, `event.action` `deny`/`allow` and a Community ID; `LOGIN_SUCCESS` carries the user, source address and port 22; `LOGIN_FAILED`, `CFGLOG_LOGGEDCMD`, `CONFIG_I` and `UPDOWN` are not parsed further by the pipeline and carry only `message`.
 
-Reference field coverage: **35/35 leaf fields** in the Elastic sample event. This is output-shape coverage, not a claim that every value or every IOS message family is modeled.
+The network model: `OUTSIDE_IN` (the `acl_name` parameter) permits the server services in `samples/services.json` and ends with a logged deny (ACE 100), so client applications that try the management servers `10.50.2.15`-`10.50.2.19` on 443 are denied. Administrators occasionally insert a temporary `host`-to-`host` permit ahead of ACE 100 and remove it later with `no <sequence>`. `EDGE_FILTER` denies unsolicited internet connections to the outside address `192.0.2.10`.
 
 ## Event Types
 
-| Native message | Meaning | Routine selection weight |
-| --- | --- | ---: |
-| `%SEC-6-IPACCESSLOGP` | Logged TCP ACL decision | 96.8% |
-| `%SEC_LOGIN-5-LOGIN_SUCCESS` | Successful SSH login | 1.0% |
-| `%SEC_LOGIN-4-LOGIN_FAILED` | Failed SSH login | 0.8% |
-| `%PARSER-5-CFGLOG_LOGGEDCMD` | Configuration command notification | 0.8% |
-| `%SYS-5-CONFIG_I` | Configuration changed | 0.5% |
-| `%LINEPROTO-5-UPDOWN` | Interface line-protocol transition | 0.1% |
+Shares measured in a 73-hour default capture with `anomaly_mode: true` (42,510 events).
 
-These are synthetic selection weights for a router with ACL logging, not measured Cisco production frequencies. ACL permit/deny is determined by the selected flow, ACL, and current rule state. A flow is not randomly permitted and denied under the same unchanged ACL. Routine source ports vary, and a bounded five-minute cache prevents repeated first-packet records for the same ACL/action/five-tuple. The 128-entry cache supports the shipped one-event-per-five-second rate; increasing the input count or cadence is outside this selected profile. The controlled sample row follows the configured client, target and ACL in both modes. The pack does not simulate IOS five-minute ACL packet aggregation or rate-limit summaries.
+| Message | Category | Content | Share |
+| --- | --- | --- | ---: |
+| `%SEC-6-IPACCESSLOGP` `OUTSIDE_IN` permitted | network | Client connection to a permitted service, or to a management server while a temporary permit exists | 80.03% |
+| `%SEC-6-IPACCESSLOGP` `EDGE_FILTER` denied | network | Internet probe of the outside address | 12.58% |
+| `%SEC-6-IPACCESSLOGP` `OUTSIDE_IN` denied | network | Management-server retries and connections to closed ports | 6.44% |
+| `%SEC_LOGIN-5-LOGIN_SUCCESS` | network | SSH login of an administrator or the config backup account | 0.34% |
+| `%PARSER-5-CFGLOG_LOGGEDCMD` | network | Logged configuration command | 0.27% |
+| `%SYS-5-CONFIG_I` | network | Configuration change from a vty session | 0.15% |
+| `%SEC_LOGIN-4-LOGIN_FAILED` | network | Failed SSH login | 0.15% |
+| `%LINEPROTO-5-UPDOWN` | network | Interface line protocol down or up | 0.05% |
+
+`event.category` is `network` for every message, as the pipeline sets it. Rates are synthetic, not measured Cisco production frequencies. Background activity is a set of independent random processes: business connections that follow a UTC working-hours curve, per-pair retries of management servers, internet probes in short bursts, sessions of six administrators (`samples/admins.json`) with random arrival times, mistyped passwords (one to five failures, sometimes giving up), configuration commands, temporary permits held for a lognormal time (median 45 minutes) and removed by any administrator, a config backup account (`oxidized`) that polls at random intervals and sometimes fails three times in a row, and occasional interface flaps. An ACL decision always follows the current rule set. Source ports are random; the same first-packet record is not repeated for one ACL, action and five-tuple inside the five-minute log interval.
 
 ## Anomaly Chain
 
-The default `anomaly_mode: true` repeats the intrusion sequence every hour. `anomaly_interval_hours` controls the recurrence and first wait, with a minimum of 0.5 hours. The first episode starts one hour and five seconds after the first event; its scheduler uses generated UTC timestamps and waits for a closed ACL and any current maintenance to finish:
+With `anomaly_mode: true` (default) an episode repeats every `anomaly_interval_hours` (default 24, minimum 4). One administrator workstation is used throughout:
 
-1. `OUTSIDE_IN` denies TCP from `10.99.2.41` on a new ephemeral TCP port to `10.50.2.15:443`.
-2. Three `%SEC_LOGIN-4-LOGIN_FAILED` records for `admin` from `10.99.2.41` are followed by `%SEC_LOGIN-5-LOGIN_SUCCESS` from the same IP.
-3. `%PARSER-5-CFGLOG_LOGGEDCMD` records entering `OUTSIDE_IN` and inserting `50 permit tcp host 10.99.2.41 host 10.50.2.15 eq 443 log` before the existing sequence-100 logged deny.
-4. `%SYS-5-CONFIG_I` records the change; the previously denied flow is then permitted by `OUTSIDE_IN`.
+1. `OUTSIDE_IN` denies the workstation's connection to its management server on 443.
+2. Three to five `LOGIN_FAILED` for the workstation owner's account from that address, then `LOGIN_SUCCESS`.
+3. `CFGLOG_LOGGEDCMD` records `ip access-list extended OUTSIDE_IN` and `<seq> permit tcp host <workstation> host <server> eq 443 log`; `CONFIG_I` follows from the same address.
+4. `OUTSIDE_IN` permits the workstation's connection to that server on 443.
 
-The nine records span 40 seconds. Each episode uses a different source port, retained for its denied/permitted flow records, and fresh native syslog sequence values. IOS emits no session identifier for these message families. Correlate on router, login user and remote IP, command text, ACL name, and the source/destination tuple before and after the change. A parser command record identifies the user but does not carry the management client's IP or a session ID; joining it to the login is a time-based inference, not a native IOS session link.
+Linking fields: the workstation address (`source.ip` of the flows, `[Source: ]` in the login messages, the address in `CONFIG_I`), the server (`destination.ip`) and the ACE text. The whole chain takes a few minutes and always completes within 30 minutes of the denied connection. The permit is later removed like any temporary permit: an administrator logs in, logs `no <seq>`, `CONFIG_I` follows, and later connections of the pair are denied again.
 
-Both modes also contain a one-time ordinary ACL maintenance test after 360 routine events: `admin` inserts the same sequence-50 permit and tests the flow, then `netops` re-enters the ACL, removes the permit, and sees it denied again. Failed-login bursts are absent from this maintenance sequence. Thus `admin`, the IPs, command, permit record, and deny record each appear in background; a detection must correlate the suspicious order and timing. After each anomalous change, the ACL remains open for about ten minutes. The routine operator then logs entry into the ACL, removal of that exact permit, a configuration-change notification, and the now-denied flow. These are observable cleanup records, rather than a silent state reset. The next episode cannot start until the ACL is closed.
+Recurrence: the first episode starts within the first min(interval, 24 h) of the run, at an hour weighted by the square of the administrator activity curve. Each later episode starts in a window of min(interval / 4, 6 h) centred one interval after the previous actual start, weighted the same way, plus a random delay of about a minute. Missed episodes are not replayed. At intervals of 8 hours or less the start times necessarily cover night hours. The workstation differs from the previous episode's and is chosen with the background session weights; the failure count, gaps between steps, ACE sequence number and removal follow the background distributions.
 
-Set `event.template.params.anomaly_mode: false` for background only. It still produces logins, failures, configuration commands, ACL decisions, and the ordinary maintenance test, but never the failed-login-to-permit sequence.
+Every action, address, account, workstation-to-server pair and account-to-address pair of the chain also occurs in ordinary background, in both modes: denied retries to the same server, typo failures and give-ups, the backup account's failure runs, self-granted and other temporary permits, and permitted connections while those exist. Only the complete ordered sequence within 30 minutes is kept out of the background: if a background permitted connection would complete it, that connection is not logged. Detection idea: per source address, a denied connection to a server on 443, at least three failed logins and a successful login, a configuration change, and a permitted connection to the same server within 30 minutes.
+
+Set `anomaly_mode: false` for background only; that mode never contains the complete chain.
 
 ## Parameters
 
@@ -42,149 +48,53 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `router_name`, `router_ip` | `edge-ios-01`, `10.30.0.1` | Single router identity |
-| `normal_user`, `normal_source_ip` | `netops`, `10.30.1.24` | Routine operator and management address |
-| `anomaly_user`, `anomaly_source_ip` | `admin`, `10.99.2.41` | User and remote address shared by the intrusion sequence |
-| `anomaly_target_ip`, `acl_name` | `10.50.2.15`, `OUTSIDE_IN` | Protected target and edited ACL |
-| `maintenance_after_events` | `360` | Routine events before the one-time maintenance test |
-| `anomaly_interval_hours` | `1` | Hours before and between episode starts, minimum 0.5; delayed by any active maintenance or recovery |
-| `anomaly_mode` | `true` | Include the intrusion sequence; `false` emits background only |
+| `router_ip` | `10.30.0.1` | Router address; the collector peer in `log.source.address` |
+| `acl_name` | `OUTSIDE_IN` | Name of the edited ACL protecting the servers |
+| `anomaly_mode` | `true` | Include the anomaly chain; `false` emits background only |
+| `anomaly_interval_hours` | `24` | Hours between episode starts, 4 to 8760 |
 
-The one-time maintenance delay counts ordinary selections, while anomaly recurrence uses event time. Keep `maintenance_after_events` between 1 and 1,000,000. The modeled normal ACE 30 permits `normal_source_ip` to `10.50.2.20:443`; that tuple must differ from the controlled client/target tuple, so it cannot override the modeled deny. This is a selected ACL profile, not a general ACL engine. The controlled ACE permits only TCP port 443; a sample collision on the same client/target with port 22 remains denied.
+Administrators, clients, services and restricted pairs come from `samples/admins.json`, `samples/clients.json`, `samples/services.json` and `samples/restricted.json`. An administrator entry has `user`, `ip` (workstation), `weight` (session rate) and `target` (a management server the workstation retries on 443).
 
 ### Output Parameters
 
-The shipped configuration writes to `output/events.json` locally. It has no top-level `${params.*}` or `${secrets.*}` placeholders. Change `output.file.path` or the output plugin when sending data to a SIEM.
+The shipped output writes JSON lines to `output/events.json`. Replace the `output` section, for example with an `opensearch` or `tcp` output, to send events elsewhere; the configuration has no `${params.*}` or `${secrets.*}` placeholders.
 
 ## Usage
 
-From the content-packs repository root, run live at one event every five seconds:
+Live, one tick per second:
 
 ```bash
-uv run --project ../eventum eventum generate --path generators/network-cisco-ios/generator.yml --id network-cisco-ios --live-mode true --keep-order true
+eventum generate --path generators/network-cisco-ios/generator.yml --id network-cisco-ios --live-mode true
 ```
 
-For a finite accelerated sample containing two complete default episodes and their cleanup, create a temporary config next to the generator:
+Finite sample mode: add `start` and `end` to the `cron` input (for example `start: "2026-09-25T00:00:00+00:00"` and `end: "2026-09-28T01:00:00+00:00"`, which contains at least two default episodes), then run:
 
-~~~bash
-uv run --project ../eventum python - <<'PYCODE'
-from pathlib import Path
-from yaml import safe_load, safe_dump
-root = Path("generators/network-cisco-ios")
-config = safe_load((root / "generator.yml").read_text())
-config["input"][0]["cron"].update(
-    start="2026-09-25T00:00:00+00:00",
-    end="2026-09-25T02:15:00+00:00",
-)
-(root / ".sample-finite.yml").write_text(safe_dump(config, sort_keys=False))
-PYCODE
-flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/network-cisco-ios/.sample-finite.yml --id network-cisco-ios-sample --live-mode false --keep-order true
-rm generators/network-cisco-ios/.sample-finite.yml
-~~~
-
-This run exits normally after 1,621 events. Set `anomaly_mode: false` in the temporary config for the same background window without the intrusion sequence. If increasing `anomaly_interval_hours`, extend the window to at least two intervals plus fifteen minutes. Four longer 24-hour-15-minute default/custom runs produced 17,461 events each: 24 hourly episodes or eight three-hourly episodes in enabled mode, zero in disabled mode. All enabled episodes ended with observable ACL cleanup.
+```bash
+eventum generate --path generators/network-cisco-ios/generator.yml --id network-cisco-ios --live-mode false --keep-order true
+```
 
 ## Sample Output
 
-A complete `CFGLOG_LOGGEDCMD` event from the intrusion sequence in a real enabled-mode run:
+The permit command of an episode, a line from a real default run:
 
 ```json
-{
-  "@timestamp": "2026-09-25T01:00:35+00:00",
-  "agent": {
-    "ephemeral_id": "c0ffee00-1111-4444-8888-123456789abc",
-    "id": "c0ffee00-1111-4444-8888-123456789abc",
-    "name": "syslog-collector",
-    "type": "filebeat",
-    "version": "8.17.0"
-  },
-  "cisco": {
-    "ios": {
-      "access_list": "OUTSIDE_IN",
-      "command": "50 permit tcp host 10.99.2.41 host 10.50.2.15 eq 443 log",
-      "facility": "PARSER",
-      "message_count": 100728
-    }
-  },
-  "data_stream": {
-    "dataset": "cisco_ios.log",
-    "namespace": "default",
-    "type": "logs"
-  },
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "elastic_agent": {
-    "id": "c0ffee00-1111-4444-8888-123456789abc",
-    "snapshot": false,
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "configuration-command",
-    "agent_id_status": "verified",
-    "category": [
-      "configuration"
-    ],
-    "code": "CFGLOG_LOGGEDCMD",
-    "dataset": "cisco_ios.log",
-    "ingested": "2026-09-25T01:00:35+00:00",
-    "kind": "event",
-    "original": "<189>100728: Sep 25 2026 01:00:35.000 UTC: %PARSER-5-CFGLOG_LOGGEDCMD: User:admin  logged command:50 permit tcp host 10.99.2.41 host 10.50.2.15 eq 443 log",
-    "provider": "firewall",
-    "sequence": 100728,
-    "severity": 5,
-    "timezone": "+00:00",
-    "type": [
-      "change"
-    ]
-  },
-  "input": {
-    "type": "tcp"
-  },
-  "log": {
-    "level": "notification",
-    "source": {
-      "address": "10.30.0.1:49152"
-    },
-    "syslog": {
-      "priority": 189
-    }
-  },
-  "message": "User:admin  logged command:50 permit tcp host 10.99.2.41 host 10.50.2.15 eq 443 log",
-  "observer": {
-    "hostname": "edge-ios-01",
-    "ip": "10.30.0.1",
-    "product": "IOS",
-    "type": "router",
-    "vendor": "Cisco"
-  },
-  "related": {
-    "user": [
-      "admin"
-    ]
-  },
-  "tags": [
-    "preserve_original_event",
-    "cisco-ios",
-    "forwarded"
-  ],
-  "user": {
-    "name": "admin"
-  }
-}
+{"@timestamp": "2026-09-25T11:37:42.893Z", "agent": {"ephemeral_id": "960a0fda-a7b7-4362-9018-34b1d0d119c4", "id": "f00ff835-626e-4a18-a8a2-0bb3ebb7503f", "name": "syslog-collector", "type": "filebeat", "version": "8.17.0"}, "cisco": {"ios": {"facility": "PARSER", "message_count": 1827406}}, "data_stream": {"dataset": "cisco_ios.log", "namespace": "default", "type": "logs"}, "ecs": {"version": "8.17.0"}, "elastic_agent": {"id": "f00ff835-626e-4a18-a8a2-0bb3ebb7503f", "snapshot": false, "version": "8.17.0"}, "event": {"agent_id_status": "verified", "category": ["network"], "code": "CFGLOG_LOGGEDCMD", "dataset": "cisco_ios.log", "ingested": "2026-09-25T11:37:43Z", "original": "<189>1827406: Sep 25 2026 11:37:42.893: %PARSER-5-CFGLOG_LOGGEDCMD: User:admin  logged command:90 permit tcp host 10.30.1.31 host 10.50.2.16 eq 443 log", "provider": "firewall", "sequence": 1827406, "severity": 5, "timezone": "+00:00", "type": ["info"]}, "input": {"type": "tcp"}, "log": {"level": "notification", "source": {"address": "10.30.0.1:29659"}, "syslog": {"priority": 189}}, "message": "User:admin  logged command:90 permit tcp host 10.30.1.31 host 10.50.2.16 eq 443 log", "observer": {"product": "IOS", "type": "router", "vendor": "Cisco"}, "tags": ["preserve_original_event", "cisco-ios", "forwarded"]}
 ```
 
-## References and Limits
+## Limitations
 
-- [Cisco IOS Release 15SY IPv6 Embedded Management Components](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/ipv6_nman/configuration/15-sy/ip6n-15-sy-book/ip6-emb-mgmt.html): remote TCP syslog transport.
-- [Cisco IOS system message logging](https://www.cisco.com/c/en/us/td/docs/routers/access/wireless/software/guide/SysMsgLogging.html): sequence/timestamp format and default `local7` facility.
-- [Cisco IOS ACL logging](https://sec.cloudapps.cisco.com/security/center/resources/access_control_list_logging.html): `IPACCESSLOGP` text, first-packet records, and five-minute aggregation.
-- [Cisco IOS named ACL configuration](https://www.cisco.com/c/en/us/support/docs/security/ios-firewall/23602-confaccesslists.html): `ip access-list extended`, `permit tcp`, and `no permit` syntax.
-- [Cisco IOS 15SY ACL sequence numbering](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_data_acl/configuration/15-sy/sec-data-acl-15-sy-book/sec-acl-seq-num-persistent.html): insert an ACE before a later deny.
-- [Cisco IOS/IOS XE Common Criteria audit examples](https://www.cisco.com/c/dam/en_us/solutions/industries/government/security_certification/pdfs/catalyst-3850-catalyst-6500-agd.pdf): `SEC_LOGIN`, `PARSER`, `SYS`, and ACL message bodies. Examples include an IOS 15.1(2)SY3 Catalyst 6500.
-- [Cisco configuration-change notification](https://www.cisco.com/c/en/us/td/docs/routers/ios-xe/system-management/system-management/m_cm-config-logger-0.html): `archive log config` / `notify syslog` prerequisites and `CFGLOG_LOGGEDCMD` example.
-- [Elastic Cisco IOS raw test records](https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/_dev/test/pipeline/test-cisco-ios.log) and [sample event](https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/sample_event.json): native framing and normalized field shape.
+- Only first-packet `IPACCESSLOGP` records are produced; five-minute aggregated counts, `IPACCESSLOGRL` rate-limit summaries and other protocols are not modeled. At most one message is emitted per second.
+- The message counter skips random values to stand for messages outside the modeled families (for example SSH or logout messages).
+- Collector metadata (`agent`, `elastic_agent`, `data_stream`, `log.source.address`, `event.ingested` truncated to seconds) is synthetic, patterned on the Elastic sample event. Output was checked against the pipeline source, not by running the pipeline.
+- The `CONFIG_I` user/vty/address form comes from the Elastic sample and a device capture without an IOS version; full raw parity with one IOS release is not established.
+- Command records name the user but not the session; joining them to a login is time-based.
 
-A `CFGLOG_LOGGEDCMD` record proves that a command was logged, not that the command succeeded. The template therefore omits `event.outcome` for parser and configuration notifications. Collector and ECS metadata are synthetic, based on the Elastic example. No real device, collector, or traffic is contacted.
+## References
 
-The user/vty/IP variant of `CONFIG_I` is supported by a [firsthand device record](https://community.cisco.com/t5/switching/logging-vty-connections/m-p/1630480) without an IOS version. The official Common Criteria guide also shows the console variant. Full same-version raw parity across all modeled families is not established. The 15SY TCP command and user/vty/IP record were available in the search index at review time; direct opens returned cache misses, and the older ESM PDF link redirected to generic support.
+- [Elastic Cisco IOS sample event](https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/sample_event.json), [ingest pipeline](https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/elasticsearch/ingest_pipeline/default.yml) and [raw test records](https://github.com/elastic/integrations/blob/main/packages/cisco_ios/data_stream/log/_dev/test/pipeline/test-cisco-ios.log)
+- [Cisco IOS system message logging](https://www.cisco.com/c/en/us/td/docs/routers/access/wireless/software/guide/SysMsgLogging.html): message format, sequence numbers, `local7`
+- [Cisco IOS ACL logging](https://sec.cloudapps.cisco.com/security/center/resources/access_control_list_logging.html): `IPACCESSLOGP` first-packet and five-minute behavior
+- [Cisco IOS 15SY IP access list sequence numbering](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/sec_data_acl/configuration/15-sy/sec-data-acl-15-sy-book/sec-acl-seq-num-persistent.html): inserting and removing numbered entries
+- [Cisco IOS/IOS XE Common Criteria guide](https://www.cisco.com/c/dam/en_us/solutions/industries/government/security_certification/pdfs/catalyst-3850-catalyst-6500-agd.pdf): `SEC_LOGIN`, `PARSER` and `SYS` message bodies
+- [Cisco configuration change notification and logging](https://www.cisco.com/c/en/us/td/docs/routers/ios-xe/system-management/system-management/m_cm-config-logger-0.html): `CFGLOG_LOGGEDCMD`
+- [Cisco IOS 15SY embedded management components](https://www.cisco.com/c/en/us/td/docs/ios-xml/ios/ipv6_nman/configuration/15-sy/ip6n-15-sy-book/ip6-emb-mgmt.html): `logging host ... transport tcp`
