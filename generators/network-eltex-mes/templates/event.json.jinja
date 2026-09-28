@@ -57,48 +57,100 @@
     {%- do queue.append({'due': due, 'k': 'adm', 'a': loop.index0}) -%}
   {%- endfor -%}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
-  {%- do shared.update({'queue': queue, 'eps': eps, 'ports': ports, 'admins': admins, 'receiver': true, 'rcv_reserved': false, 'repairs': [], 'recent': [], 'last_ms': now - 1, 'next_due': queue | map(attribute='due') | min, 'ep_active': false, 'ep_last_admin': none, 'ep_last_port': none, 'ep_due': now + interval, 'ep_start': now + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min))}) -%}
+  {%- do shared.update({'queue': queue, 'eps': eps, 'ports': ports, 'admins': admins, 'receiver': true, 'repairs': [], 'recent': [], 'last_ms': now - 1, 'next_due': queue | map(attribute='due') | min, 't_init': now, 'ep_active': false, 'ep_last_admin': none, 'ep_last_port': none, 'ep_start': now + module.builtins.int(module.rand.number.floating(0, 1) * ([interval, 86400000] | min)), 'ep_end': now + ([interval, 86400000] | min)}) -%}
 {%- endif -%}
 {%- set queue = shared.get('queue') -%}
 {%- set eps = shared.get('eps') -%}
 {%- set ports = shared.get('ports') -%}
 {%- set admins = shared.get('admins') -%}
 {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
-{#- Episode start: the first tick at or after due + random delay with an idle
-    administrator (not the previous episode's, next own login more than an
-    hour away, at most one pending failure) and a server port (not the
-    previous episode's) that is up at 10G with a present MAC. The episode
-    takes no ordinary slot: the administrator's own schedule resumes
-    unchanged afterwards. The next due is one interval after this start. -#}
-{%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') and shared.get('receiver') -%}
-  {%- set ca = [] -%}
+{#- Episode start: the first tick at or after the drawn start time with an
+    idle administrator (not the previous episode's, next own login more
+    than an hour away, at most one pending failure) and a server port (not
+    the previous episode's) that is up at 10G with a present MAC. The first
+    start is uniform over the first min(interval, 24 h); the next one is
+    due one interval after the actual start and is drawn uniformly from a
+    window of width min(interval / 4, 6 h) centred on that due time. The
+    episode takes no ordinary slot: the administrator's own schedule
+    resumes unchanged afterwards. Among free administrators the episode
+    login arrives as an ordinary login would: each fires with intensity
+    proportional to f(e) / S(e + 1 h), e the time since its last logout,
+    f and S the density and survival of the ordinary absence, so the time
+    from logout to the episode login follows the ordinary absence despite
+    the one-hour condition. -#}
+{%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') -%}
+  {#- The last tick of the window forces a start, so every start lies in
+      the window; the administrator is then drawn with the same weights. -#}
+  {%- set forced = now + 1000 > shared.get('ep_end') -%}
+  {#- The rate rises over the last hour of the window, the same for every
+      administrator, so late starts spread over its last minutes instead
+      of piling up on the final tick. -#}
+  {%- set ramp = [1, 3600000 / ([shared.get('ep_end') - now, 1000] | max)] | max -%}
+  {%- set m = module.math -%}
+  {%- set zmax = (m.log(172800) - m.log(12000)) / 1.1 -%}
+  {%- set pool = namespace(idx=[], w=[]) -%}
   {%- for a in admins -%}
-    {%- if a.stage == 'idle' and a.fails <= 1 and loop.index0 != shared.get('ep_last_admin') and a.due > now + 3600000 -%}{%- do ca.append(loop.index0) -%}{%- endif -%}
+    {%- if a.stage == 'idle' and a.fails <= 1 and loop.index0 != shared.get('ep_last_admin') and a.due > now + 3600000 -%}
+      {%- set e = [(now - (a.get('out') or shared.get('t_init'))) / 1000, 1] | max -%}
+      {%- set z = (m.log(e) - m.log(12000)) / 1.1 -%}
+      {%- set zl = (m.log(e + 3600) - m.log(12000)) / 1.1 -%}
+      {%- set dens = m.exp(-z * z / 2) / m.sqrt(2 * m.pi) / (e * 1.1) -%}
+      {%- set surv = [0.5 * (m.erfc(zl / m.sqrt(2)) - m.erfc(zmax / m.sqrt(2))), 1e-9] | max -%}
+      {%- if forced -%}
+        {%- do pool.idx.append(loop.index0) -%}{%- do pool.w.append(dens / surv) -%}
+      {%- elif module.rand.chance([20 * ramp * dens / surv, 1] | min) -%}
+        {%- do pool.idx.append(loop.index0) -%}{%- do pool.w.append(1) -%}
+      {%- endif -%}
+    {%- endif -%}
   {%- endfor -%}
+  {%- if forced and not pool.idx -%}
+    {#- Fallback at the last tick: the previous episode's administrator
+        is allowed too. -#}
+    {%- for a in admins -%}
+      {%- if a.stage == 'idle' and a.fails <= 1 and a.due > now + 3600000 -%}
+        {%- set e = [(now - (a.get('out') or shared.get('t_init'))) / 1000, 1] | max -%}
+        {%- set z = (m.log(e) - m.log(12000)) / 1.1 -%}
+        {%- set zl = (m.log(e + 3600) - m.log(12000)) / 1.1 -%}
+        {%- set dens = m.exp(-z * z / 2) / m.sqrt(2 * m.pi) / (e * 1.1) -%}
+        {%- set surv = [0.5 * (m.erfc(zl / m.sqrt(2)) - m.erfc(zmax / m.sqrt(2))), 1e-9] | max -%}
+        {%- do pool.idx.append(loop.index0) -%}{%- do pool.w.append(dens / surv) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
   {%- set cp = [] -%}
   {%- for name, p in ports | dictsort -%}
     {%- if p.server and p.up and p.speed == '10G' and p.hold is none and name != shared.get('ep_last_port') and eps | selectattr('port', 'equalto', name) | selectattr('present') | list -%}{%- do cp.append(name) -%}{%- endif -%}
   {%- endfor -%}
-  {%- if ca and cp -%}
-    {%- set ai = module.rand.choice(ca) -%}
+  {%- if forced and not cp -%}
+    {%- for name, p in ports | dictsort -%}
+      {%- if p.server and p.up and p.hold is none and eps | selectattr('port', 'equalto', name) | selectattr('present') | list -%}{%- do cp.append(name) -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if pool.idx and cp -%}
+    {%- set ai = module.rand.weighted_choice(pool.idx, pool.w) -%}
     {%- set pn = module.rand.choice(cp) -%}
     {%- set a = admins[ai] -%}
-    {%- set start = now + module.rand.number.integer(0, 999) -%}
+    {%- set start = [now + module.rand.number.integer(0, 999), shared.get('ep_end')] | min -%}
     {%- do a.update({'episode': true, 'resume': a.due, 'ep_port': pn, 'due': start}) -%}
     {%- for item in queue if item.k == 'adm' and item.a == ai -%}{%- do item.update({'due': start}) -%}{%- endfor -%}
     {%- do ports[pn].update({'hold': 'ep'}) -%}
-    {%- do shared.update({'ep_active': true, 'rcv_reserved': true, 'ep_last_admin': ai, 'ep_last_port': pn, 'ep_due': start + interval, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min)), 'next_due': [shared.get('next_due'), start] | min}) -%}
+    {%- set half = module.builtins.int([interval / 4, 21600000] | min / 2) -%}
+    {%- do shared.update({'ep_active': true, 'ep_last_admin': ai, 'ep_last_port': pn, 'ep_start': start + interval - half + module.builtins.int(module.rand.number.floating(0, 1) * 2 * half), 'ep_end': start + interval + half, 'next_due': [shared.get('next_due'), start] | min}) -%}
+  {%- elif forced -%}
+    {%- do shared.update({'ep_miss': shared.get('ep_miss', 0) + 1}) -%}
   {%- endif -%}
 {%- endif -%}
 {%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- macro prefix_live(t) -%}
   {#- True when the recent rows already hold the chain up to the logging
-      file clear within the detection window, so an ordinary receiver
-      deletion now would complete it. Checked over every candidate start,
-      a superset of a streaming matcher. -#}
+      file clear with its first rejection at most 3600 s before t (the
+      detection window, same anchor), so an ordinary receiver deletion now
+      would complete it. Checked over every candidate start, a superset of
+      a streaming matcher. A completed chain clears nothing, so its own
+      prefix keeps blocking ordinary deletions until the window ends. -#}
   {%- set rec = shared.get('recent') -%}
   {%- set ns = namespace(found=false) -%}
-  {%- for i in range(rec | length) if not ns.found and rec[i][1] == 'R' and t - rec[i][0] <= 3900000 -%}
+  {%- for i in range(rec | length) if not ns.found and rec[i][1] == 'R' and t - rec[i][0] <= 3600000 -%}
     {%- set st = namespace(n=1, j=none) -%}
     {%- for j in range(i + 1, rec | length) if st.j is none -%}
       {%- if rec[j][2] == rec[i][2] -%}
@@ -297,8 +349,14 @@
       {%- elif kind == 'clear' -%}
         {%- set frame.op = 'clear' -%}
       {%- elif kind == 'rdel' -%}
-        {%- if a.episode or (shared.get('receiver') and not shared.get('rcv_reserved') and not prefix_live(rec)) -%}
-          {%- do shared.update({'receiver': false, 'rcv_reserved': false}) -%}
+        {%- if a.episode and not shared.get('receiver') -%}
+          {#- Another administrator deleted the receiver meanwhile: the
+              episode administrator re-adds it, then deletes it. -#}
+          {%- do shared.set('receiver', true) -%}
+          {%- set frame.op = 'radd' -%}
+          {%- do a.ops.insert(0, ['rdel', none]) -%}
+        {%- elif shared.get('receiver') and (a.episode or not prefix_live(rec)) -%}
+          {%- do shared.set('receiver', false) -%}
           {%- set frame.op = 'rdel' -%}
           {{- later(['radd', none], 0.7) -}}
         {%- endif -%}
@@ -312,7 +370,7 @@
     {%- elif a.stage == 'sess' -%}
       {%- set frame.op = 'disconnect' -%}
       {%- do shared.set('repairs', shared.get('repairs') + (a.get('owed') or [])) -%}
-      {%- do a.update({'owed': [], 'stage': 'idle'}) -%}
+      {%- do a.update({'owed': [], 'stage': 'idle', 'out': rec}) -%}
       {%- if a.episode -%}
         {%- do a.update({'episode': false, 'ep_port': none}) -%}
         {%- do shared.set('ep_active', false) -%}
@@ -412,8 +470,8 @@
     {%- do details.update({'syslog_server': {'ip': params.syslog_server_ip}}) -%}
   {%- endif -%}
 {%- endif -%}
-{#- Bounded guard memory: chain-relevant rows of the last 65 minutes. -#}
-{%- for _ in range(recent | length) if recent and rec - recent[0][0] > 3900000 -%}{%- do recent.pop(0) -%}{%- endfor -%}
+{#- Bounded guard memory: chain-relevant rows of the last 60 minutes. -#}
+{%- for _ in range(recent | length) if recent and rec - recent[0][0] > 3600000 -%}{%- do recent.pop(0) -%}{%- endfor -%}
 {%- set raw = component ~ '-' ~ severity ~ '-' ~ mnemonic ~ ': ' ~ body -%}
 {%- set event = {'@timestamp': moment.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'},
     'event': {'action': action, 'category': category, 'dataset': 'eltex.mes.syslog', 'kind': 'event', 'module': 'eltex', 'original': raw, 'outcome': outcome, 'type': event_type},

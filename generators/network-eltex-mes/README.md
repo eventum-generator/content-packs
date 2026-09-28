@@ -4,21 +4,21 @@ Generates syslog messages of one Eltex MES5324 access switch as ECS JSON: HTTPS 
 
 ## Event Types
 
-Measured on a 120-hour default capture (`anomaly_mode: true`, 6,304 events). All classes occur in both modes.
+Measured on a 156-hour default capture (`anomaly_mode: true`, 8,015 events). All classes occur in both modes.
 
 | Native class | `event.action` | Share | Category |
 |---|---|---:|---|
-| `BRG_MACNTFY-I-MAC_CHANGED` (`Removed`) | `mac_removed` | 41.4% | network |
-| `BRG_MACNTFY-I-MAC_CHANGED` (`learnt`) | `mac_learned` | 41.4% | network |
-| `AAA-I-CONNECT` | `login_accepted` | 2.6% | authentication |
-| `AAA-I-DISCONNECT` | `session_terminated` | 2.6% | authentication |
-| `LINK-W-Down` | `interface_down` | 2.5% | network |
-| `LINK-W-Up` | `interface_up` | 2.5% | network |
-| `AAA-W-REJECT` | `login_rejected` | 1.9% | authentication |
-| `SYSLOG-N-CLEARLOGGINGFILE` | `logging_file_cleared` | 1.6% | configuration |
-| `LINK-N-PortConfRecover` | `interface_speed_changed` | 1.6% | configuration, network |
-| `SYSLOG-N-NOSYSLOGSERVER` | `syslog_server_deleted` | 1.0% | configuration |
-| `SYSLOG-N-NEWSYSLOGSERVER` | `syslog_server_added` | 1.0% | configuration |
+| `BRG_MACNTFY-I-MAC_CHANGED` (`Removed`) | `mac_removed` | 41.7% | network |
+| `BRG_MACNTFY-I-MAC_CHANGED` (`learnt`) | `mac_learned` | 41.7% | network |
+| `LINK-W-Down` | `interface_down` | 2.6% | network |
+| `LINK-W-Up` | `interface_up` | 2.6% | network |
+| `AAA-I-CONNECT` | `login_accepted` | 2.4% | authentication |
+| `AAA-I-DISCONNECT` | `session_terminated` | 2.4% | authentication |
+| `AAA-W-REJECT` | `login_rejected` | 2.0% | authentication |
+| `LINK-N-PortConfRecover` | `interface_speed_changed` | 1.8% | configuration, network |
+| `SYSLOG-N-CLEARLOGGINGFILE` | `logging_file_cleared` | 1.4% | configuration |
+| `SYSLOG-N-NOSYSLOGSERVER` | `syslog_server_deleted` | 0.8% | configuration |
+| `SYSLOG-N-NEWSYSLOGSERVER` | `syslog_server_added` | 0.8% | configuration |
 
 The switch has eight ports: four access uplinks (`te1/0/1`-`te1/0/4`, twelve MAC addresses each) and four dual-rate 1G/10G server ports (`te1/0/5`-`te1/0/8`, three MAC addresses each, configured for 10G). Every endpoint, port and administrator follows its own random schedule; there is no fixed period, rotation or global wave.
 
@@ -38,14 +38,14 @@ Sequence, one episode:
 2. `AAA-I-CONNECT` for the same user and source.
 3. `LINK-N-PortConfRecover` sets a server port to 1G; `LINK-W-Down` for that port follows within seconds, then `MAC_CHANGED Removed` for its addresses.
 4. `SYSLOG-N-CLEARLOGGINGFILE` clears the local logging file.
-5. `SYSLOG-N-NOSYSLOGSERVER` removes the auxiliary receiver, then the session disconnects.
-6. Restoration follows the ordinary repair path: the next administrator to log in sets the port back to 10G (Up and relearning follow) and re-adds the receiver. Measured from about 2 minutes to about 7.5 hours after the episode across the final and review captures; the delay depends on the next administrator login.
+5. `SYSLOG-N-NOSYSLOGSERVER` removes the auxiliary receiver, then the session disconnects. If another administrator removed the receiver while the episode ran, the episode administrator first re-adds it (`SYSLOG-N-NEWSYSLOGSERVER`), as any administrator repairs it, then removes it.
+6. Restoration follows the ordinary repair path: the next administrator to log in sets the port back to 10G (Up and relearning follow) and re-adds the receiver. Measured from about 7 minutes to about 2 hours after the episode in the final captures (earlier captures up to about 7.5 hours); the delay depends on the next administrator login.
 
-Linking fields: `user.name` and `source.ip` for steps 1-2, `interface.name` for step 3, `observer.name` and time for the actorless configuration lines. The native configuration messages carry no user, so attribution to the preceding login is temporal only. Measured episode spans: about 2 to 13 minutes. All gaps are drawn from the same distributions as background typing and operations.
+Linking fields: `user.name` and `source.ip` for steps 1-2, `interface.name` for step 3, `observer.name` and time for the actorless configuration lines. The native configuration messages carry no user, so attribution to the preceding login is temporal only. Measured episode spans: about 1 to 7 minutes. All gaps are drawn from the same distributions as background typing and operations.
 
-Recurrence: the first episode is due `anomaly_interval_hours` after the first event (default 24, minimum 6). The episode starts at a random delay of up to 30 minutes (up to an eighth of the interval for short intervals) after it is due, on the first moment an idle administrator and a server port that is up at 10G with a present MAC are available; it waits otherwise. The next episode is due one interval after the actual start. Missed episodes are not replayed. Each episode picks a different administrator and server port than the previous one, at random. The episode administrator is one whose own next login is more than an hour away, and that schedule resumes unchanged, so the episode suspends or shifts no background activity, except that ordinary receiver deletions on the episode port are skipped while the episode runs, and the episode waits until the receiver is present. Measured: 4 episodes in 120 hours at 24 hours (start gaps 24.5, 24.5 and 25.2 hours), 9 in 120 hours at 12 hours.
+Recurrence: the first episode starts within the first `anomaly_interval_hours` or 24 hours of generation, whichever is shorter (default interval 24, minimum 6). Each later episode is due one interval after the previous actual start and starts within a window centred on that due time, a quarter of the interval wide but at most 6 hours (default: 21 to 27 hours after the previous start); every start falls inside its window. A start time is drawn uniformly in the window; from then on, each free administrator (idle, own next login more than an hour away, not the previous episode's) opens the episode at a rate proportional to the ordinary absence density at the time since its last logout, divided by the chance of its next ordinary login being more than an hour away. That rate rises over the window's last hour, and on the window's last second one of the free administrators is picked with the same weights; if none is free, the previous episode's administrator may be used, and if that is not possible either, the start waits for the first free administrator (never observed in the measured captures). If no port meets the conditions, any up port is used. The time from an administrator's logout to an episode login therefore follows the ordinary absence distribution. The background has no daily cycle, so start times are uniform over the day. Episodes that did not start are not replayed afterwards. Each episode also picks a server port that is up at 10G with a present MAC, different from the previous episode's. The episode administrator's own schedule resumes unchanged, so the episode suspends or shifts no background activity; other administrators keep working, including receiver removals, during the episode. Measured on 156-hour captures: 7 episodes at 24 hours (start gaps 26.6, 26.1, 25.1, 25.4, 22.8 and 22.8 hours), 13 per capture at 12 hours (10.6-13.4 hours). Over 72 episodes the time from the administrator's logout to the episode login matched ordinary absences (median 2.8 hours against 3.1).
 
-Detection idea: within one hour, a run of three or more failed logins by one account followed by success, then on the same switch a port speed change, link loss and MAC removal on that port, a logging file clear and removal of a syslog destination. Each step alone, and any shorter prefix, is ordinary administration here.
+Detection idea: within one hour, a run of three or more failed logins by one account followed by success, then on the same switch a port speed change, link loss and MAC removal on that port, a logging file clear and removal of a syslog destination. Each step alone, and any shorter prefix, is ordinary administration here. The only background adjustment acts on the final step: an ordinary receiver removal that would complete the whole sequence, with the first failed login at most one hour earlier, is not performed, and nothing else changes. The check stays active after an episode completes: its own sequence keeps blocking ordinary removals until its one-hour window ends, so no ordinary removal completes it a second time.
 
 ## Parameters
 
@@ -95,10 +95,10 @@ eventum generate --path generators/network-eltex-mes/generator.yml --id mes --li
 
 ## Sample Output
 
-An episode's first failed login, copied from the default capture:
+An episode's first failed login, copied from the final default capture (line 217):
 
 ```json
-{"@timestamp": "2026-09-21T00:29:09.760+00:00", "destination": {"ip": "10.40.0.11"}, "ecs": {"version": "8.17.0"}, "eltex": {"mes": {"component": "AAA", "details": {"connection": {"auth_method": "local user table", "type": "https"}}, "mnemonic": "REJECT", "severity_code": "W"}}, "event": {"action": "login_rejected", "category": ["authentication"], "dataset": "eltex.mes.syslog", "kind": "event", "module": "eltex", "original": "AAA-W-REJECT: New https connection for user netops, source 10.40.1.25 destination 10.40.0.11, local user table REJECTED.", "outcome": "failure", "type": ["start", "denied"]}, "log": {"level": "warning"}, "message": "AAA-W-REJECT: New https connection for user netops, source 10.40.1.25 destination 10.40.0.11, local user table REJECTED.", "observer": {"hostname": "mes-access-01", "ip": ["10.40.0.11"], "model": "MES5324", "name": "mes-access-01", "product": "MES", "type": "switch", "vendor": "Eltex"}, "source": {"ip": "10.40.1.25"}, "user": {"name": "netops"}}
+{"@timestamp": "2026-09-20T02:12:41.653+00:00", "destination": {"ip": "10.40.0.11"}, "ecs": {"version": "8.17.0"}, "eltex": {"mes": {"component": "AAA", "details": {"connection": {"auth_method": "local user table", "type": "https"}}, "mnemonic": "REJECT", "severity_code": "W"}}, "event": {"action": "login_rejected", "category": ["authentication"], "dataset": "eltex.mes.syslog", "kind": "event", "module": "eltex", "original": "AAA-W-REJECT: New https connection for user i.petrov, source 10.40.1.31 destination 10.40.0.11, local user table REJECTED.", "outcome": "failure", "type": ["start", "denied"]}, "log": {"level": "warning"}, "message": "AAA-W-REJECT: New https connection for user i.petrov, source 10.40.1.31 destination 10.40.0.11, local user table REJECTED.", "observer": {"hostname": "mes-access-01", "ip": ["10.40.0.11"], "model": "MES5324", "name": "mes-access-01", "product": "MES", "type": "switch", "vendor": "Eltex"}, "source": {"ip": "10.40.1.31"}, "user": {"name": "i.petrov"}}
 ```
 
 ## Limitations
