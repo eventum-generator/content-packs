@@ -4,18 +4,18 @@ Synthetic SharePoint Server 2019 Unified Logging Service (ULS) trace rows for SI
 
 ## Event types
 
-Shares are measured on a 96-hour default capture (`anomaly_mode: true`, 24-hour interval, Monday to Friday, 20,966 rows).
+Shares are measured on a 96-hour default capture (`anomaly_mode: true`, 24-hour interval, Monday to Friday, 20,957 rows).
 
 | ULS tag | Category (Area: SharePoint Foundation) | Level | Share | ECS category | Meaning |
 | --- | --- | --- | ---: | --- | --- |
-| `xmnv` | Logging Correlation Data | Medium | 30.8% | `process`, `web` | Correlation data: `Name=Request (...)`, `Name=Timer Job job-workflow`, `Site=...` |
+| `xmnv` | Logging Correlation Data | Medium | 30.7% | `process`, `web` | Correlation data: `Name=Request (...)`, `Name=Timer Job job-workflow`, `Site=...` |
 | `nasq` | Monitoring | Medium | 18.8% | `process`, `web` | Entering monitored scope (request or timer job) |
 | `b4ly` | Monitoring | Medium | 18.8% | `process`, `web` | Leaving monitored scope, with execution time, CPU ms and SQL query count |
 | `avwhz` | Asp Runtime | Medium | 13.3% | `web` | SPRequestModule.BeginRequestHandler end, with the build number |
 | `agb9s` | Authentication Authorization | Medium | 13.3% | `authentication` | Request identity (`IsAuthenticated`, `UserIdentityName`, claims count) |
-| `af32k` | Claims Authentication | Medium | 1.2% | `authentication` | Windows sign-in challenge: 401 for an unauthenticated request |
-| `b6p2` | General | Medium | 1.2% | `web` | HTTP 401 response sent |
-| `aoxsq` | Runtime | Medium | 1.1% | `web` | HTTP 302 response sent (site-root and access-denied redirects) |
+| `af32k` | Claims Authentication | Medium | 1.4% | `authentication` | Windows sign-in challenge: 401 for an unauthenticated request |
+| `b6p2` | General | Medium | 1.4% | `web` | HTTP 401 response sent |
+| `aoxsq` | Runtime | Medium | 0.8% | `web` | HTTP 302 response sent (site-root and access-denied redirects) |
 | `ahk8y` | Legacy Workflow Infrastructure | Verbose | 0.5% | `process` | Workflow instance begins processing |
 | `b6p4` | Database | VerboseEx | 0.5% | `database` | Workflow-association SQL command |
 | `tzkv` | Database | Verbose | 0.5% | `database` | Parameters of that SQL command |
@@ -25,8 +25,8 @@ A browser request writes `nasq`, `xmnv Name=Request (...)`, `avwhz`, `agb9s`, `x
 Background, identical in both modes:
 
 - 37 accounts (8 site owners, the search crawl account `svc_crawl`) open sessions at lognormal intervals thinned by a weekday business-hours curve; a session is a geometric number of requests with lognormal gaps and tends to stay on one site.
-- Requests: site home pages, library views, document downloads, uploads, site-root redirects (302), and browsing of sites without access (302 to `AccessDenied.aspx`, retried up to three more times within minutes).
-- Site owners also open the permissions page (`user.aspx`), grant permissions from the share dialog (`POST aclinv.aspx`) and remove a grant later (`POST user.aspx`, planned for 75% of grants: 40% are quick reverts after a lognormal delay with a 15-minute median, the rest follow after a median of three hours; 45% of removals come right after the owner downloads one to six documents of that site). So grant-then-download, several downloads then a removal, and grant-then-removal within the hour all occur in background.
+- Requests: site home pages, library views, document downloads, uploads, site-root redirects (302), and browsing of sites without access (302 to `AccessDenied.aspx`, retried up to three more times within minutes; afterwards most users go back to a site they can open).
+- Site owners also open the permissions page (`user.aspx`), grant permissions from the share dialog (`POST aclinv.aspx`) and remove a grant later (`POST user.aspx`, planned for 75% of grants: 40% are quick reverts after a lognormal delay with a 15-minute median, the rest follow after a median of three hours; 45% of removals come right after the owner downloads one to six documents of that site). So grant-then-download, several downloads then a removal, and grant-then-removal within the hour all occur in background, for every owner and site they own (pooled over several captures; a single 96 h capture misses a few owner-site pairs).
 - Uploads to the six sites with a legacy workflow start workflow instances; the job-workflow timer job runs on a five-minute schedule with a random start latency and processes each instance one to three times.
 
 ## Anomaly Chain
@@ -39,11 +39,11 @@ With `anomaly_mode: true` (the default), one site owner on one of their sites, i
 
 Linking fields: `user.name` (from the `agb9s` identity of each request) and `sharepoint.site.url` (from `xmnv Site=`), within one hour from grant to removal. Each request has its own `sharepoint.uls.correlation_id`. Every request of the chain is built by the background request builder with background delays; the owners, sites, pages and documents all appear in ordinary traffic of both modes.
 
-Recurrence: the first episode is due one hour after the start of generation; each episode starts after a random delay of up to `min(1 h, interval / 8)` past its due time, and the start is then thinned by the same weekday business-hours curve as background sessions, so a due time at night usually waits for the morning. The next episode is due `anomaly_interval_hours` (default 24, minimum 6) after the actual start; missed episodes are not replayed. The owner differs from the previous episode's owner and the site from the previous episode's site.
+Recurrence: episodes recur by event time every `anomaly_interval_hours` (default 24, minimum 6). The first start is drawn within the first `min(interval, 24 h)` of generation; each later start is drawn in a window of width `w = min(interval / 4, 6 h)` centred on the previous actual start plus the interval, so the random offset from the due time is up to `w / 2` either way. Both draws are weighted by the square of the background weekday business-hours curve plus a small floor, so episodes sit mostly in office hours, more tightly than background sessions do. At intervals of 8 hours or less the starts necessarily cover the whole clock, nights included; at 12 hours every second start falls in the evening or night. Missed episodes are not replayed, and background traffic is not paused or shifted around an episode. The owner differs from the previous episode's owner and the site from the previous episode's site; the owner is drawn uniformly among site owners and the site uniformly among their sites, as background grants are spread.
 
-Measured: default capture 4 episodes in 96 h, chain starts 24.44-24.93 h apart, grant-to-removal spans 16-23 min, owner and site rotated each time; 12-hour interval capture 6 episodes in 96 h, chain starts 12.19-26.08 h apart, grant-to-removal spans 11-26 min, owner and site rotated each time. Gaps well above the interval come from due times at night that waited for the morning.
+Measured (96-hour Monday-Friday captures): default 4 episodes, first grant 15.1 h after the start (15:07), grants 22.20-25.35 h apart, all between 13:57 and 16:29, grant-to-removal spans 7-20 min; 12-hour interval 8 episodes, grants 10.63-12.83 h apart, alternating 09:36-11:04 and 21:52-22:58, spans 5-33 min. Owner and site rotated every time in both.
 
-Detection idea: per account and site, a share-dialog grant, three or more document downloads and a permission removal within one hour - an owner widening access, taking documents and reverting the change. ULS carries no permission delta: which principal was granted or removed is only in the SharePoint audit log, so this is a hunting lead, not proof. Background never contains the full ordered chain: when a planned background removal would complete it, the owner opens the permissions page (`GET user.aspx`) instead. Every shorter shape still occurs in background: across five 96-hour background captures, per capture 5-14 grant-then-removal pairs within the hour (with up to two downloads in between), 4-11 grants followed by three or more downloads within the hour, and 3-10 removals preceded by three or more downloads within the hour.
+Detection idea: per account and site, a share-dialog grant, three or more document downloads and a permission removal within one hour - an owner widening access, taking documents and reverting the change. ULS carries no permission delta: which principal was granted or removed is only in the SharePoint audit log, so this is a hunting lead, not proof. Background never contains the full ordered chain: a planned background removal is decided when it is due, after every earlier request has been built, and when it would complete the chain within the same one-hour window (compared at the 10 ms ULS resolution) the owner opens the permissions page (`GET user.aspx`) at that moment instead; times, account and site stay as they were, in both modes. Every shorter shape still occurs in background: across five 96-hour background captures, per capture 5-10 grant-then-removal pairs within the hour (with up to two downloads in between), 9-12 grants followed by three or more downloads within the hour, and 3-8 removals preceded by three or more downloads within the hour. Just outside the window the full shape does occur (grant to removal of 60-70 min: 0, 70-80 min: 1, 80-90 min: 1 across the five captures) and the counts on either side of the hour change smoothly.
 
 With `anomaly_mode: false`, the output is background only.
 
@@ -84,14 +84,20 @@ From the content-packs repository:
 eventum generate --path generators/application-sharepoint-server-uls/generator.yml --id sharepoint-uls --live-mode true
 ```
 
-For a finite batch, add `start` and `end` to the `cron` input and run with `--live-mode false`. The file output is overwritten when a run starts.
+For a finite batch, add `start` and `end` to the `cron` input (for example `start: "2026-09-21T00:00:00Z"`, `end: "2026-09-25T00:00:00Z"`) and run:
+
+```bash
+eventum generate --path generators/application-sharepoint-server-uls/generator.yml --id sharepoint-uls --live-mode false
+```
+
+The file output is overwritten when a run starts.
 
 ## Sample output
 
 The grant request of the first episode, `xmnv Name=Request` row, from the default 96-hour capture:
 
 ```json
-{"@timestamp": "2026-09-21T08:50:23.880Z", "ecs": {"version": "8.17.0"}, "event": {"action": "correlation-data", "category": ["web"], "code": "xmnv", "dataset": "sharepoint.uls", "kind": "event", "module": "sharepoint", "original": "09/21/2026 08:50:23.88\tw3wp.exe (0x7F1C)\t0x1AE8\tSharePoint Foundation\tLogging Correlation Data\txmnv\tMedium\tName=Request (POST:https://portal.contoso.test:443/sites/hr/_layouts/15/aclinv.aspx)\tda1c0771-4409-3b8d-774b-6a417e11d05d", "type": ["info"]}, "host": {"name": "sp-wfe-01"}, "http": {"request": {"method": "POST"}}, "log": {"level": "medium"}, "message": "Name=Request (POST:https://portal.contoso.test:443/sites/hr/_layouts/15/aclinv.aspx)", "process": {"name": "w3wp.exe", "pid": 32540, "thread": {"id": 6888}}, "related": {"hosts": ["sp-wfe-01"], "user": ["n.sokolova"]}, "service": {"name": "SharePoint Server", "version": "16.0.10390.20000"}, "sharepoint": {"site": {"url": "/sites/hr"}, "uls": {"area": "SharePoint Foundation", "category": "Logging Correlation Data", "correlation_id": "da1c0771-4409-3b8d-774b-6a417e11d05d", "event_id": "xmnv", "level": "Medium", "message": "Name=Request (POST:https://portal.contoso.test:443/sites/hr/_layouts/15/aclinv.aspx)", "process": "w3wp.exe (0x7F1C)", "thread_id": "0x1AE8", "timestamp_local": "09/21/2026 08:50:23.88"}}, "url": {"domain": "portal.contoso.test", "original": "https://portal.contoso.test:443/sites/hr/_layouts/15/aclinv.aspx", "path": "/sites/hr/_layouts/15/aclinv.aspx", "port": 443, "scheme": "https"}, "user": {"domain": "contoso", "name": "n.sokolova"}}
+{"@timestamp": "2026-09-21T15:07:50.300Z", "ecs": {"version": "8.17.0"}, "event": {"action": "correlation-data", "category": ["web"], "code": "xmnv", "dataset": "sharepoint.uls", "kind": "event", "module": "sharepoint", "original": "09/21/2026 15:07:50.30\tw3wp.exe (0x40B4)\t0x52EC\tSharePoint Foundation\tLogging Correlation Data\txmnv\tMedium\tName=Request (POST:https://portal.contoso.test:443/sites/sales/_layouts/15/aclinv.aspx)\t8fa1f421-f79a-ceed-f2ad-cb626390d8b7", "type": ["info"]}, "host": {"name": "sp-wfe-01"}, "http": {"request": {"method": "POST"}}, "log": {"level": "medium"}, "message": "Name=Request (POST:https://portal.contoso.test:443/sites/sales/_layouts/15/aclinv.aspx)", "process": {"name": "w3wp.exe", "pid": 16564, "thread": {"id": 21228}}, "related": {"hosts": ["sp-wfe-01"], "user": ["o.lebedeva"]}, "service": {"name": "SharePoint Server", "version": "16.0.10390.20000"}, "sharepoint": {"site": {"url": "/sites/sales"}, "uls": {"area": "SharePoint Foundation", "category": "Logging Correlation Data", "correlation_id": "8fa1f421-f79a-ceed-f2ad-cb626390d8b7", "event_id": "xmnv", "level": "Medium", "message": "Name=Request (POST:https://portal.contoso.test:443/sites/sales/_layouts/15/aclinv.aspx)", "process": "w3wp.exe (0x40B4)", "thread_id": "0x52EC", "timestamp_local": "09/21/2026 15:07:50.30"}}, "url": {"domain": "portal.contoso.test", "original": "https://portal.contoso.test:443/sites/sales/_layouts/15/aclinv.aspx", "path": "/sites/sales/_layouts/15/aclinv.aspx", "port": 443, "scheme": "https"}, "user": {"domain": "contoso", "name": "o.lebedeva"}}
 ```
 
 ## Format and coverage
@@ -107,6 +113,7 @@ ECS enrichment: `user.name`, `url.*`, `http.request.method` and `sharepoint.site
 - Rows are written unpadded, as in Microsoft's Tx sample; column padding of files written directly by the ULS service is not verified. Correlation IDs follow the shape of Microsoft's samples (a slowly advancing first group, third and fourth groups fixed per process); the exact generation algorithm is undocumented.
 - `aoxsq` is written only for 302 responses, the codes shown in Microsoft's samples. Grant targets, permission levels and upload results are not visible in ULS and not modeled.
 - Volumes, cadences, session behaviour and the five-minute timer schedule are synthetic.
+- The removal guard sees every request that starts before the removal; a download by the same owner on the same site that is queued less than a millisecond before the removal but lands before it could escape it. No such case occurred in the verified captures.
 - KUMA 4.2 lists a SharePoint Server 2016 diagnostic-log normalizer; this pack has not been tested against it.
 
 ## References

@@ -10,10 +10,11 @@
 {%- set hq = module.heapq -%}
 {%- set sec = 1000000 -%}
 {%- set hour = 3600 * sec -%}
-{#- Guard window of the chain (grant, three or more downloads, revoke by
-    one account on one site); a little above the one-hour detection
-    window so row offsets inside a request cannot straddle it. -#}
-{%- set guard = 3720 * sec -%}
+{#- Chain window (grant, three or more downloads, revoke by one account
+    on one site), compared in centiseconds of the Name rows, the
+    resolution of the ULS timestamp. History is kept twice as long. -#}
+{%- set guard_cs = 360000 -%}
+{%- set keep_us = 7200 * sec -%}
 {%- set build = '16.0.10390.20000' -%}
 {%- macro ln(med, sig) -%}
   {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
@@ -33,6 +34,17 @@
   {%- elif 7 <= h < 8 or 18 <= h < 20 -%}{{- 0.35 -}}
   {%- else -%}{{- 0.05 -}}
   {%- endif -%}
+{%- endmacro -%}
+{%- macro ep_draw(lo, hi) -%}
+  {#- Episode start in [lo, hi), weighted by the square of the activity
+      curve plus a small floor, so starts sit in busy hours. -#}
+  {%- set c = namespace(t=lo, done=false) -%}
+  {%- for _ in range(2000) if not c.done -%}
+    {%- set c.t = module.rand.number.integer(lo, hi - 1) -%}
+    {%- set a = activity(c.t) | float -%}
+    {%- if module.rand.number.floating(0, 1.02) < a * a + 0.02 -%}{%- set c.done = true -%}{%- endif -%}
+  {%- endfor -%}
+  {{- c.t -}}
 {%- endmacro -%}
 {%- macro next_arrival(t, med) -%}
   {#- Thinned lognormal arrivals: the clock keeps advancing through
@@ -55,10 +67,11 @@
 {%- macro row(t, pi, tid, tag, msg, cid, ctx) -%}
   {{- push(t, {'k': 'row', 'p': pi, 'tid': tid, 'tag': tag, 'msg': msg, 'corr': cid, 'ctx': ctx}) -}}
 {%- endmacro -%}
-{%- macro request(t, user, method, path, site, status) -%}
+{%- macro request(t, user, method, path, site, status, o1=none) -%}
   {#- One request trace on a web front end, rows in the order of the
       Microsoft Q&A trace of SharePoint Server 2019. status 302 adds the
-      redirect row. Returns the end time. -#}
+      redirect row. o1 is the delay of the Name row (drawn when none);
+      its time is left in shared 'name_t'. Returns the end time. -#}
   {%- set pi = module.rand.choice([0, 1]) -%}
   {%- set p = shared.get('procs')[pi] -%}
   {%- set tid = module.rand.choice(p.threads) -%}
@@ -68,7 +81,8 @@
   {%- set ctx = {'user': user, 'method': method, 'url': url, 'path': path, 'site': site} -%}
   {%- set c = namespace(t=t) -%}
   {{- row(c.t, pi, tid, 'nasq', 'Entering monitored scope (' ~ name ~ ')', '', {}) -}}
-  {%- set c.t = c.t + (ln(0.0003, 0.6) | int) -%}
+  {%- set c.t = c.t + ((ln(0.0003, 0.6) | int) if o1 is none else o1) -%}
+  {%- do shared.set('name_t', c.t) -%}
   {{- row(c.t, pi, tid, 'xmnv', 'Name=' ~ name, cid, ctx) -}}
   {%- set c.t = c.t + (ln(0.0004, 0.6) | int) -%}
   {{- row(c.t, pi, tid, 'avwhz', "SPRequestModule.BeginRequestHandler End, SP Build Version: '" ~ build ~ "'", cid, ctx) -}}
@@ -116,23 +130,26 @@
 {%- endmacro -%}
 {%- macro base(site) -%}{{- '' if site == '/' else site -}}{%- endmacro -%}
 {%- macro doc_path(site, f) -%}{{- base(site) ~ '/Shared%20Documents/' ~ (f | replace(' ', '%20')) -}}{%- endmacro -%}
-{%- macro note(u, site, kind, t) -%}
-  {#- History of grants and downloads per (account, site), for the chain
-      guard; entries older than the guard window are dropped. -#}
+{%- macro note(u, site, kind) -%}
+  {#- History of grants and downloads per (account, site) at the time of
+      the Name row of the request just built, for the chain guard. -#}
+  {%- set t = shared.get('name_t') -%}
   {%- set key = u ~ '|' ~ site -%}
   {%- set hist = shared.get('hist') -%}
-  {%- set lst = hist.get(key, []) | selectattr(0, 'ge', t - guard) | list -%}
+  {%- set lst = hist.get(key, []) | selectattr(0, 'ge', t - keep_us) | list -%}
   {%- do lst.append([t, kind]) -%}
   {%- do hist.update({key: lst}) -%}
 {%- endmacro -%}
 {%- macro chain_ready(u, site, t) -%}
-  {#- True when a revoke by u on site at t would complete the chain: a
-      grant within the guard window followed by three or more downloads
-      of that site by u. -#}
-  {%- set lst = shared.get('hist').get(u ~ '|' ~ site, []) | selectattr(0, 'ge', t - guard) | list -%}
+  {#- True when a revoke by u on site whose Name row is at t would
+      complete the chain: a grant at most one hour (in centiseconds)
+      earlier, then three or more downloads of that site by u before t.
+      Called when the revoke is due, after every request due earlier has
+      been built, so all rows before t are already noted. -#}
+  {%- set lst = shared.get('hist').get(u ~ '|' ~ site, []) | selectattr(0, 'lt', t) | list -%}
   {%- set r = namespace(ok=false, g=none) -%}
   {%- for e in lst -%}
-    {%- if e[1] == 'g' and r.g is none -%}{%- set r.g = e[0] -%}{%- endif -%}
+    {%- if e[1] == 'g' and (r.g is none or e[0] < r.g) and t // 10000 - e[0] // 10000 <= guard_cs -%}{%- set r.g = e[0] -%}{%- endif -%}
   {%- endfor -%}
   {%- if r.g is not none and (lst | selectattr(1, 'equalto', 'd') | selectattr(0, 'gt', r.g) | list | length) >= 3 -%}{%- set r.ok = true -%}{%- endif -%}
   {{- 'yes' if r.ok else '' -}}
@@ -179,31 +196,31 @@
   {%- do shared.set('docs', samples.documents | map(attribute='name') | list) -%}
   {{- push(now + module.rand.number.integer(0, 300 * sec), {'k': 'tj', 'sch': now}) -}}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-  {%- do shared.update({'ep_owner': none, 'ep_site': none, 'ep_due': now + hour + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
+  {%- do shared.update({'ep_owner': none, 'ep_site': none, 'ep_due': ep_draw(now, now + ([interval, 24 * hour] | min)) | int}) -%}
 {%- endif -%}
 {%- set queue = shared.get('queue') -%}
 {%- set users = shared.get('users') -%}
 {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{#- Episode: once the due time plus its random delay has passed, the
-    start is thinned by the same activity curve as background sessions.
-    A site owner other than the previous episode's owner, on one of their
-    sites other than the previous episode's site, grants permissions,
-    downloads four to nine documents of that site and removes the
-    permission again within the hour. Every request uses the background
-    request builder and background delays. The next due time is one
-    interval after this start; missed episodes are not replayed. -#}
+{#- Episode: 'ep_due' holds the drawn start. The first start falls in
+    the first min(interval, 24 h); each later one in a window of width
+    min(interval / 4, 6 h) centred on the previous start plus the
+    interval, both weighted by ep_draw. A site owner other than the
+    previous episode's owner, on one of their sites other than the
+    previous episode's site, grants permissions, downloads four to nine
+    documents of that site and removes the permission again within the
+    hour. Every request uses the background request builder and
+    background delays; background sessions are not touched. Missed
+    episodes are not replayed. -#}
 {%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
-  {%- if module.rand.number.floating(0, 1) >= (activity(now) | float) -%}
-    {%- do shared.set('ep_due', now + (ln(900, 1.0) | int)) -%}
-  {%- else -%}
-    {%- set owners = [] -%}
-    {%- for u, st in users.items() if st.own and u != shared.get('ep_owner') and (st.own | reject('equalto', shared.get('ep_site')) | list) -%}{%- do owners.append(u) -%}{%- endfor -%}
-    {%- set u = module.rand.choice(owners) -%}
-    {%- set site = module.rand.choice(users[u].own | reject('equalto', shared.get('ep_site')) | list) -%}
-    {%- set start = now + module.rand.number.integer(0, sec - 1) -%}
-    {{- push(start, {'k': 'ep', 'u': u, 'site': site}) -}}
-    {%- do shared.update({'ep_owner': u, 'ep_site': site, 'ep_due': start + interval + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
-  {%- endif -%}
+  {%- set owners = [] -%}
+  {%- for u, st in users.items() if st.own and u != shared.get('ep_owner') and (st.own | reject('equalto', shared.get('ep_site')) | list) -%}{%- do owners.append(u) -%}{%- endfor -%}
+  {%- set u = module.rand.choice(owners) -%}
+  {%- set site = module.rand.choice(users[u].own | reject('equalto', shared.get('ep_site')) | list) -%}
+  {%- set start = shared.get('ep_due') -%}
+  {{- push(start, {'k': 'ep', 'u': u, 'site': site}) -}}
+  {%- set w = [interval // 4, 6 * hour] | min -%}
+  {%- set due = start + interval -%}
+  {%- do shared.update({'ep_owner': u, 'ep_site': site, 'ep_due': ep_draw(due - w // 2, due + w // 2) | int}) -%}
 {%- endif -%}
 {%- if now < queue[0][0] -%}
   {%- do shared.set('next_due', queue[0][0]) -%}
@@ -266,7 +283,7 @@
       {%- set _ = request(t.v, u, 'GET', base(site) ~ '/Shared%20Documents/Forms/AllItems.aspx', site, 200) -%}
     {%- elif op == 'download' -%}
       {%- set _ = request(t.v, u, 'GET', doc_path(site, samples.documents.pick().name), site, 200) -%}
-      {{- note(u, site, 'd', t.v) -}}
+      {{- note(u, site, 'd') -}}
     {%- elif op == 'upload' -%}
       {%- set _ = request(t.v, u, 'POST', base(site) ~ '/_layouts/15/Upload.aspx?List=%7B' ~ (shared.get('site_ids')[site][2] | upper) ~ '%7D', site, 200) -%}
       {%- if site in shared.get('wf_sites') and module.rand.chance(0.6) and shared.get('wf') | length < 200 -%}
@@ -280,7 +297,7 @@
           grant is planned for 75% of grants: 40% are quick reverts
           (median 15 minutes), the rest follow hours later. -#}
       {%- set _ = request(t.v, u, 'POST', base(site) ~ '/_layouts/15/aclinv.aspx', site, 200) -%}
-      {{- note(u, site, 'g', t.v) -}}
+      {{- note(u, site, 'g') -}}
       {%- if module.rand.chance(0.75) -%}
         {{- push(t.v + ((ln(900, 0.8) if module.rand.chance(0.4) else ln(10800, 1.0)) | int), {'k': 'rev', 'u': u, 'site': site}) -}}
       {%- endif -%}
@@ -299,28 +316,34 @@
       {%- endfor -%}
     {%- endif -%}
     {%- if item.left > 1 -%}
-      {%- set nsite = site if module.rand.chance(0.7) else module.rand.choice(st.member if module.rand.chance(0.95) else shared.get('site_ids').keys() | list) -%}
+      {#- Sessions tend to stay on one site; after an access-denied
+          page most users go back to a site they can open. -#}
+      {%- set nsite = site if module.rand.chance(0.25 if op == 'denied' else 0.7) else module.rand.choice(st.member if (op == 'denied' or module.rand.chance(0.95)) else shared.get('site_ids').keys() | list) -%}
       {{- push(t.v + (ln(40, 1.1) | int), {'k': 'op', 'u': u, 'site': nsite, 'left': item.left - 1, 'first': false}) -}}
     {%- else -%}
       {%- do st.update({'busy': false}) -%}
     {%- endif -%}
   {%- elif item.k == 'rev' -%}
     {#- Planned removal of a grant, in 45% of cases after the owner
-        first downloads one to six documents of the site. When the
-        removal would complete the chain it becomes a view of the
-        permissions page instead. -#}
+        first downloads one to six documents of the site. The removal
+        itself is queued at its own time and decided there ('revx'). -#}
     {%- set t = namespace(v=due) -%}
     {%- if module.rand.chance(0.45) -%}
       {%- for _ in range(module.rand.number.integer(1, 6)) -%}
-        {{- note(item.u, item.site, 'd', t.v) -}}
-        {%- set t.v = (request(t.v, item.u, 'GET', doc_path(item.site, samples.documents.pick().name), item.site, 200) | int) + (ln(40, 1.1) | int) -%}
+        {%- set t.v = (request(t.v, item.u, 'GET', doc_path(item.site, samples.documents.pick().name), item.site, 200) | int) -%}
+        {{- note(item.u, item.site, 'd') -}}
+        {%- set t.v = t.v + (ln(40, 1.1) | int) -%}
       {%- endfor -%}
     {%- endif -%}
-    {%- if chain_ready(item.u, item.site, t.v) -%}
-      {%- set _ = request(t.v, item.u, 'GET', base(item.site) ~ '/_layouts/15/user.aspx', item.site, 200) -%}
-    {%- else -%}
-      {%- set _ = request(t.v, item.u, 'POST', base(item.site) ~ '/_layouts/15/user.aspx', item.site, 200) -%}
-    {%- endif -%}
+    {{- push(t.v, {'k': 'revx', 'u': item.u, 'site': item.site}) -}}
+  {%- elif item.k == 'revx' -%}
+    {#- The removal, decided when it is due: every request due earlier
+        has been built by now, so the history is complete up to it. When
+        the removal would complete the chain it becomes a view of the
+        permissions page at the same time instead. -#}
+    {%- set o1 = ln(0.0003, 0.6) | int -%}
+    {%- set m = 'GET' if chain_ready(item.u, item.site, due + o1) else 'POST' -%}
+    {%- set _ = request(due, item.u, m, base(item.site) ~ '/_layouts/15/user.aspx', item.site, 200, o1) -%}
   {%- elif item.k == 'ep' -%}
     {%- set u = item.u -%}
     {%- set site = item.site -%}
@@ -333,13 +356,13 @@
     {%- endif -%}
     {%- set g = t.v -%}
     {%- set t.v = (request(t.v, u, 'POST', base(site) ~ '/_layouts/15/aclinv.aspx', site, 200) | int) + (ln(40, 1.1) | int) -%}
-    {{- note(u, site, 'g', g) -}}
+    {{- note(u, site, 'g') -}}
     {%- if module.rand.chance(0.6) -%}
       {%- set t.v = (request(t.v, u, 'GET', base(site) ~ '/Shared%20Documents/Forms/AllItems.aspx', site, 200) | int) + (ln(40, 1.1) | int) -%}
     {%- endif -%}
     {%- for f in module.random.sample(shared.get('docs'), module.rand.number.integer(4, 9)) -%}
-      {{- note(u, site, 'd', t.v) -}}
       {%- set t.v = (request(t.v, u, 'GET', doc_path(site, f), site, 200) | int) + (ln(40, 1.1) | int) -%}
+      {{- note(u, site, 'd') -}}
     {%- endfor -%}
     {%- set d = namespace(v=t.v + (ln(300, 1.1) | int)) -%}
     {%- for _ in range(40) if d.v - g > 3300 * sec -%}{%- set d.v = t.v + (ln(300, 1.1) | int) -%}{%- endfor -%}
