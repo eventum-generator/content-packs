@@ -6,14 +6,14 @@ Produces one native `enrichedEvent` item per JSON Line from the current [Yandex 
 
 | Native `event.type` | Category | Background share | Modeled operation |
 | --- | --- | ---: | --- |
-| `id_cookie.set` | authentication | 8.4% | Successful browser sign-in, service `ID` |
-| `disk_fs-view` | file | 44.1% | View an existing personal file, service `Web` |
-| `disk_fs-get-download-url` | file | 26.6% | Authenticated owner downloads a file, service `Web` |
-| `disk_fs-store` | file | 8.8% | Edit an existing file, service `Web` |
-| `disk_fs-set-public` | file | 6.0% | Publish a currently private file link |
-| `disk_fs-set-private` | file | 6.0% | Remove an existing owner/file link |
+| `id_cookie.set` | authentication | 8.6% | Successful browser sign-in, service `ID` |
+| `disk_fs-view` | file | 44.0% | View an existing personal file, service `Web` |
+| `disk_fs-get-download-url` | file | 27.5% | Authenticated owner downloads a file, service `Web` |
+| `disk_fs-store` | file | 9.1% | Edit an existing file, service `Web` |
+| `disk_fs-set-public` | file | 5.5% | Publish a currently private file link |
+| `disk_fs-set-private` | file | 5.5% | Remove an existing owner/file link |
 
-Shares are measured over an eight-day `anomaly_mode: false` run. One event is emitted per source minute, at a random second within that minute, about 1,440 per day. Rates, weights and timing describe a synthetic busy-browser organization, not measured production frequencies.
+Shares are measured over an eight-day `anomaly_mode: false` run. One event is emitted per source minute, at a random second within that minute, about 1,440 per day; about 0.4% of minutes stay empty where the chain rule below drops a download. Rates, weights and timing describe a synthetic busy-browser organization, not measured production frequencies.
 
 Six accounts own three or four personal files each; file sets differ per owner, so only some owners hold the payroll spreadsheet. Every owner works from a usual address and a shared alternate address. Traffic consists of short browser sessions from one owner and address: a single operation, sign-in followed by views, downloads or edits, view-then-download bursts, and sharing sessions. Up to three sessions interleave, and their operations are usually one to five minutes apart. A sharing session publishes a randomly chosen file of the owner that is currently private, with `employees` or `all` rights (both `read`, weighted 55/45); about 70% open the file first, and the session may end with a download, an edit or more browsing. Early in a run, sharing leans towards file/rights pairs a client has not published yet, so every pair appears; after that, choices are fully random.
 
@@ -23,7 +23,7 @@ Owner UID and file path identify a link. A successful publication precedes every
 
 `anomaly_mode` defaults to `true`, which adds recurring episodes to the background. `false` produces only background.
 
-An episode is four operations on adjacent minute slots from one account and the configured alternate address:
+An episode is four operations, usually one to three minutes apart, from one account and the configured alternate address:
 
 1. The account signs in through `id_cookie.set`.
 2. It views one of its files.
@@ -32,9 +32,9 @@ An episode is four operations on adjacent minute slots from one account and the 
 
 Correlate `event.org_id`, `event.uid`, `event.ip` and Disk `event.meta.tgt_rawaddress`. `request_id` and `idempotency_id` identify single operations, not a browser session, and every operation receives new IDs. Accounts rotate across the six owners, and target files advance through each owner's files after a complete owner rotation.
 
-The first episode is due after `anomaly_interval_hours` (24 by default). Each later one is due the configured interval after the previous actual start, with no catch-up bursts. A due account starts the way an idle client starts a session, once its current session has ended and the target file is private; measured starts come 0-37 minutes after the due time. Start delays accumulate, so episode clock times drift later: in the measured eight-day default run, starts moved from 00:09 to 01:06 UTC and the window held seven episodes, not eight. Episode links get the same removal-time draw as other links.
+The first episode is due at a uniformly drawn point within the first `anomaly_interval_hours` (at most 24 hours; the background has no daily curve). Each later one is due one interval after the previous actual start, at a uniformly drawn point within a window centred on that time, `w = min(interval / 4, 6 h)` wide, with no catch-up bursts. A due account starts the way an idle client starts a session (at most three sessions run at once), once its current session has ended and the target file is private. The episode is then an ordinary session plan of that client: its steps take minute slots when due, like any other session, and other clients keep working in between. Measured gaps between starts were 21.5-26.8 hours at the default interval and 11.1-13.3 hours at 12 hours. Episode links get the same removal-time draw as other links.
 
-Background contains every three-step part of the chain in both modes at comparable rates: sign-in, view and download of one file without a publication; sign-in, view and `all` publication of one file; view, `all` publication and download of one file without a sign-in; and sign-in, `all` publication and download of one file without a view. Sign-ins followed within minutes by views and downloads are common. Background never completes the full ordered sequence (sign-in, view of a file, `all` publication of that file, download of that file by the same UID and address) within 30 minutes. A detection therefore needs all four steps on one file, in order, within a few minutes.
+Background contains every three-step part of the chain in both modes at comparable rates: sign-in, view and download of one file without a publication; sign-in, view and `all` publication of one file; view, `all` publication and download of one file without a sign-in; and sign-in, `all` publication and download of one file without a view. Sign-ins followed within minutes by views and downloads are common. Background never completes the full ordered sequence (sign-in, view of a file, `all` publication of that file, download of that file by the same UID and address) within 15 minutes of the sign-in: such an ordinary download is not recorded, and its minute stays empty; nothing else moves. Past 15 minutes, ordinary sessions complete it at a natural rate. A detection therefore needs all four steps on one file, in order, within 15 minutes.
 
 The alternate address is ordinary traffic too. An account named `admin` does not establish organization-administrator privileges. Yandex calls `disk_fs-get-download-url` a file download, but this record contains neither a download URL nor a destination. The chain supports a rapid public-sharing detection; it does not prove anonymous retrieval, exfiltration or compromise.
 
@@ -47,7 +47,7 @@ Edit `event.template.params` in `generator.yml`:
 | Parameter | Default | Meaning |
 | --- | --- | --- |
 | `anomaly_mode` | `true` | Boolean: add recurring episodes; `false` produces only background |
-| `anomaly_interval_hours` | `24` | Finite number from 6 to 8,760; minimum delay before the first and between actual episode starts |
+| `anomaly_interval_hours` | `24` | Finite number from 6 to 8,760; average spacing between episode starts; the first falls within the first interval (at most 24 h), each later one in a window of a quarter of the interval (at most 6 h) centred on one interval after the previous actual start |
 | `org_id` | `1234567` | Positive integer organization ID |
 | `organization_domain` | `corp.example` | Domain for the five sampled employee logins |
 | `alternate_ip` | `2001:db8:8005:f00:61ce:682c:bca4:42e5/128` | Alternate client address shared by all owners in both modes |
@@ -102,14 +102,14 @@ end: '2026-10-03T03:20:00+00:00'
 eventum generate --path generators/cloud-yandex-360-audit/generator.batch.yml --id yandex-360-batch --live-mode false --keep-order true
 ```
 
-This window yields 3,081 events with two episodes at the default interval. Longer intervals need longer windows, and a live run shows only background until the first interval has passed. `--keep-order true` preserves source order through the asynchronous writer. Native timestamps are rendered in UTC whatever the CLI time zone.
+This window has 3,081 minute slots (a few stay empty) and usually two episodes at the default interval. Longer intervals need longer windows, and a live run shows only background until the first episode, which starts within the first interval (at most 24 hours). `--keep-order true` preserves source order through the asynchronous writer. Native timestamps are rendered in UTC whatever the CLI time zone.
 
 ## Sample Output
 
 This complete `id_cookie.set` item opens the first episode of a generated default run:
 
 ```json
-{"event": {"idempotency_id": "b08ccdbe-814b-4160-b672-88ac806ba8f1", "ip": "2001:db8:8005:f00:61ce:682c:bca4:42e5/128", "is_system": false, "meta": {"device_id": "", "revision": "1"}, "occurred_at": "2026-10-02T00:09:21+00:00", "org_id": 1234567, "request_id": "@924773,1790899761.9207088,8545715301411949,7b310dc385f968bcb9bb5d6f05354041a6,1130000000123456,admin@corp.example", "service": "ID", "status": "Success", "type": "id_cookie.set", "uid": 1130000000123456}, "user_login": "admin@corp.example", "user_name": "\u0421\u043e\u043a\u043e\u043b\u043e\u0432 \u0410\u043b\u0435\u043a\u0441\u0435\u0439"}
+{"event": {"idempotency_id": "89dca6bd-1afa-41b6-8015-a9e07870fab1", "ip": "2001:db8:8005:f00:61ce:682c:bca4:42e5/128", "is_system": false, "meta": {"device_id": "", "revision": "1"}, "occurred_at": "2026-10-01T13:52:21+00:00", "org_id": 1234567, "request_id": "@970887,1790862740.9596545,6795679673396694,33935ab262612f9cf66d8deab9a29836a8,1130000000123456,admin@corp.example", "service": "ID", "status": "Success", "type": "id_cookie.set", "uid": 1130000000123456}, "user_login": "admin@corp.example", "user_name": "\u0421\u043e\u043a\u043e\u043b\u043e\u0432 \u0410\u043b\u0435\u043a\u0441\u0435\u0439"}
 ```
 
 ## Source Fidelity and Limits

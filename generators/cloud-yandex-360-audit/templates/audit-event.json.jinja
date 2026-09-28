@@ -1,6 +1,7 @@
 {# One organization, personal Disk owners; synthetic cadence/sessions/maintenance, native API keys only. #}
 {%- set tick = timestamp.timestamp() | int -%}
-{%- set window = 1800 -%}
+{%- set window = 900 -%}
+{%- set interval = params.anomaly_interval_hours * 3600 if params.anomaly_interval_hours is number else 0 -%}
 {%- if shared.get('last_source_time') is not none and tick-shared.get('last_source_time') != 60 -%}
   {%- do module.builtins.exec('raise ValueError("selected profile requires exactly one timestamp per source minute")') -%}
 {%- endif -%}
@@ -57,32 +58,35 @@
       {%- endif -%}
       {%- set debt = [] -%}
       {%- for file in owner.files -%}{%- do debt.extend([[file[0],'employees'],[file[0],'all']]) -%}{%- endfor -%}
-      {%- do contexts.append({'owner':owner,'ip':address | string,'signin':none,'viewed':{},'published':{},'plan':[],'pace':[50,25,15,10],'next_at':tick,'debt':debt}) -%}
+      {%- do contexts.append({'owner':owner,'ip':address | string,'plan':[],'pace':[50,25,15,10],'next_at':tick,'debt':debt,'parts':[],'ep':none}) -%}
     {%- endfor -%}
     {%- do owner.update({'ips':[usual | string,alternate | string]}) -%}
   {%- endfor -%}
-  {%- do shared.update({'inventory':owners,'contexts':contexts,'links':{},'episode':none,'pending':none,'cursor':0,'due':now+params.anomaly_interval_hours*3600}) -%}
+  {%- do shared.update({'inventory':owners,'contexts':contexts,'links':{},'pending':none,'lock':none,'cursor':0,'due':now+module.rand.number.floating(0,[interval,86400] | min)}) -%}
 {%- endif -%}
 {%- set owners = shared.get('inventory') -%}
 {%- set contexts = shared.get('contexts') -%}
 {%- set links = shared.get('links') -%}
-{%- set episode = shared.get('episode') -%}
 {%- set pending = shared.get('pending') -%}
-{# Chain-guard memory: per client, sign-in time and the sign-in behind each viewed/`all`-published file, kept for 30 minutes. #}
+{%- set lock = shared.get('lock') -%}
+{# Chain-guard memory: per client (UID and address), the partial sign-in -> view F -> `all` publication of F sequences of its records,
+   as a sequence matcher sees them: [next step, sign-in time, F], kept for 15 minutes after the sign-in. #}
 {%- for context in contexts -%}
-  {%- if context.signin is not none and now-context.signin > window -%}{%- do context.update({'signin':none}) -%}{%- endif -%}
-  {%- for memory in [context.viewed,context.published] -%}
-    {%- for path,at in memory.items() | list -%}{%- if now-at > window -%}{%- do memory.pop(path) -%}{%- endif -%}{%- endfor -%}
-  {%- endfor -%}
+  {%- if context.parts -%}{%- do context.update({'parts':context.parts | selectattr(1,'ge',now-window) | list}) -%}{%- endif -%}
 {%- endfor -%}
-{%- if params.anomaly_mode and not episode and not pending and now >= shared.get('due') -%}
+{%- set running = contexts | selectattr('ep') | first -%}
+{%- if params.anomaly_mode and not running and not pending and now >= shared.get('due') -%}
   {%- set cursor = shared.get('cursor') -%}
   {%- set owner = owners[cursor % 6] -%}
   {%- set pending = {'owner':owner,'file':owner.files[(cursor // 6) % (owner.files | length)],'ip':owner.ips[1]} -%}
   {%- do shared.set('pending',pending) -%}
 {%- endif -%}
 {%- set choice = namespace(kind=none, owner=none, ip=none, file=none, rights=none, context=none) -%}
-{%- if not episode -%}
+{# A running episode is one more session plan; it takes a tick only when its next step is due, like any session.
+   It never waits more than eight minutes for its next step, so it ends within the 15-minute window. #}
+{%- if running and running.next_at <= tick and now-running.ep > 480 -%}
+  {%- set choice.context = running -%}
+{%- else -%}
   {# Each link gets its own removal time (30-50 minutes after publication); the owner acts on the earliest due link with probability 0.5 per minute, so removals drift a few minutes in both modes. #}
   {%- set cleanup = namespace(key=none,until=none) -%}
   {%- for key,link in links.items() -%}
@@ -95,31 +99,28 @@
     {%- set choice.kind = 'disk_fs-set-private' -%}{%- set choice.owner = link.owner -%}{%- set choice.file = link.file -%}
     {%- set choice.ip = link.ip if module.rand.chance(0.7) else (link.owner.ips | reject('equalto',link.ip) | first) -%}
   {%- elif pending -%}
-    {# A due client starts like any idle client starting a session, once its target is private: causal consistency only. #}
+    {# A due client starts like any idle client starting a session (at most three run at once), once its target is private. #}
     {%- set reserved = contexts | selectattr('ip','equalto',pending.ip) | selectattr('owner.uid','equalto',pending.owner.uid) | first -%}
-    {%- if not reserved.plan and (pending.owner.uid,pending.file[0]) not in links and module.rand.chance(0.25) -%}
-      {%- set episode = {'owner':pending.owner,'file':pending.file,'ip':pending.ip,'step':0} -%}
-      {%- do shared.update({'episode':episode,'pending':none,'due':now+params.anomaly_interval_hours*3600,'cursor':shared.get('cursor')+1}) -%}
+    {%- if not reserved.plan and (contexts | selectattr('plan') | list | length) < 3 and (pending.owner.uid,pending.file[0]) not in links and module.rand.chance(0.25) -%}
+      {# The episode is a sharing-session plan of that client. The next start is drawn uniformly within +/- w/2 of one interval
+         after this actual start, w = min(interval / 4, 6 h); the target stays reserved until the episode publishes it. #}
+      {%- set f = pending.file -%}
+      {%- do reserved.update({'plan':[['id_cookie.set',none],['disk_fs-view',f],['disk_fs-set-public',f,'all'],['disk_fs-get-download-url',f]],'pace':[80,15,5,0],'ep':now}) -%}
+      {%- set half = ([interval / 4, 21600] | min) / 2 -%}
+      {%- do shared.update({'pending':none,'lock':pending,'due':now+interval+module.rand.number.floating(-half,half),'cursor':shared.get('cursor')+1}) -%}
+      {%- set lock = pending -%}
       {%- set pending = none -%}
+      {%- set choice.context = reserved -%}
     {%- endif -%}
   {%- endif -%}
 {%- endif -%}
-{%- if episode -%}
-  {%- set choice.owner = episode.owner -%}{%- set choice.ip = episode.ip -%}{%- set choice.file = episode.file -%}
-  {%- set choice.context = contexts | selectattr('ip','equalto',episode.ip) | selectattr('owner.uid','equalto',episode.owner.uid) | first -%}
-  {%- set choice.kind = ['id_cookie.set','disk_fs-view','disk_fs-set-public','disk_fs-get-download-url'][episode.step] -%}
-  {%- if episode.step == 2 -%}
-    {%- set choice.rights = {'macros':'all','rights':'read'} -%}
-    {%- do links.update({(choice.owner.uid,choice.file[0]):{'owner':choice.owner,'file':choice.file,'ip':choice.ip,'until':now + 60*(module.rand.number.triangular(30,50,33) | round | int)}}) -%}
-  {%- endif -%}
-  {%- if episode.step == 3 -%}{%- do shared.set('episode',none) -%}
-  {%- else -%}{%- do episode.update({'step':episode.step+1}) -%}{%- endif -%}
-{%- elif choice.kind is none -%}
+{%- if choice.kind is none -%}
   {# Ordinary browser sessions: up to three interleaved per-client plans of one to five operations minutes apart. #}
   {%- set active = contexts | selectattr('plan') | list -%}
   {%- set due = active | selectattr('next_at','le',tick) | sort(attribute='next_at') | list -%}
   {%- set idle = contexts | rejectattr('plan') | list -%}
-  {%- if due and (active | length >= 3 or module.rand.chance(0.7)) -%}
+  {%- if choice.context is not none -%}
+  {%- elif due and (active | length >= 3 or module.rand.chance(0.7)) -%}
     {%- set choice.context = due | first -%}
   {%- elif active | length < 3 -%}
     {%- set context = module.rand.choice(idle) -%}
@@ -140,7 +141,7 @@
          Until every file/rights pair of this client has occurred once (a startup transient, never refilled), picks lean towards a missing pair. #}
       {%- set candidates = [] -%}
       {%- for file in files -%}
-        {%- if (context.owner.uid,file[0]) not in links and not (pending and context.owner.uid == pending.owner.uid and file[0] == pending.file[0]) -%}{%- do candidates.append(file) -%}{%- endif -%}
+        {%- if (context.owner.uid,file[0]) not in links and not (pending and context.owner.uid == pending.owner.uid and file[0] == pending.file[0]) and not (lock and context.owner.uid == lock.owner.uid and file[0] == lock.file[0]) -%}{%- do candidates.append(file) -%}{%- endif -%}
       {%- endfor -%}
       {%- set a = module.rand.choice(candidates) if candidates else a -%}
       {%- set macro = module.rand.weighted_choice(['employees','all'],[55,45]) -%}
@@ -170,22 +171,47 @@
   {%- set choice.owner = context.owner -%}{%- set choice.ip = context.ip -%}
   {%- set choice.kind = step[0] -%}{%- set choice.file = step[1] if step[1] is not none else module.rand.choice(context.owner.files) -%}
   {%- if choice.kind == 'disk_fs-set-public' -%}
-    {%- if (choice.owner.uid,choice.file[0]) not in links and not (pending and choice.owner.uid == pending.owner.uid and choice.file[0] == pending.file[0]) -%}
+    {%- if context.ep and lock -%}{%- do shared.set('lock',none) -%}{%- endif -%}
+    {%- if (choice.owner.uid,choice.file[0]) not in links and (context.ep or not (pending and choice.owner.uid == pending.owner.uid and choice.file[0] == pending.file[0]) and not (lock and choice.owner.uid == lock.owner.uid and choice.file[0] == lock.file[0])) -%}
       {%- set choice.rights = {'macros':step[2],'rights':'read'} -%}
       {%- if [choice.file[0],step[2]] in context.debt -%}{%- do context.debt.remove([choice.file[0],step[2]]) -%}{%- endif -%}
       {%- do links.update({(choice.owner.uid,choice.file[0]):{'owner':choice.owner,'file':choice.file,'ip':choice.ip,'until':now + 60*(module.rand.number.triangular(30,50,33) | round | int)}}) -%}
     {%- else -%}{%- set choice.kind = 'disk_fs-view' -%}{%- endif -%}
   {%- endif -%}
-  {# Ordinary traffic never completes sign-in -> view F -> `all` publication of F -> download of F within 30 minutes. #}
-  {%- if choice.kind == 'disk_fs-get-download-url' and choice.file[0] in context.published -%}
-    {%- set choice.kind = 'disk_fs-view' -%}
+  {# Ordinary traffic never completes sign-in -> view F -> `all` publication of F -> download of F within 15 minutes of the
+     sign-in: such a download is not recorded, and its minute slot stays empty. The episode's own download completes its chain. #}
+  {%- if choice.kind == 'disk_fs-get-download-url' and not context.ep and context.parts | selectattr(0,'equalto',3) | selectattr(2,'equalto',choice.file[0]) | list -%}
+    {%- do dispatch.drop() -%}
   {%- endif -%}
+  {%- if context.ep and not context.plan -%}{%- do context.update({'ep':none}) -%}{%- endif -%}
 {%- endif -%}
 {%- if choice.context is not none -%}
   {%- set context = choice.context -%}
-  {%- if choice.kind == 'id_cookie.set' -%}{%- do context.update({'signin':now}) -%}
-  {%- elif choice.kind == 'disk_fs-view' and context.signin is not none -%}{%- do context.viewed.update({choice.file[0]:context.signin}) -%}
-  {%- elif choice.kind == 'disk_fs-set-public' and choice.rights.macros == 'all' and choice.file[0] in context.viewed -%}{%- do context.published.update({choice.file[0]:context.viewed[choice.file[0]]}) -%}
+  {%- if choice.kind == 'id_cookie.set' -%}
+    {%- set step = 0 -%}
+  {%- elif choice.kind == 'disk_fs-view' -%}
+    {%- set step = 1 -%}
+  {%- elif choice.kind == 'disk_fs-set-public' and choice.rights.macros == 'all' -%}
+    {%- set step = 2 -%}
+  {%- elif choice.kind == 'disk_fs-get-download-url' -%}
+    {%- set step = 3 -%}
+  {%- else -%}
+    {%- set step = none -%}
+  {%- endif -%}
+  {%- if step is not none -%}
+    {%- set m = namespace(new=[], done=false) -%}
+    {%- for p in context.parts -%}
+      {%- if not m.done -%}
+        {%- if p[0] == step and (step == 1 or p[2] == choice.file[0]) -%}
+          {%- if step == 3 -%}{%- set m.done = true -%}
+          {%- else -%}{%- do m.new.append([step + 1, p[1], choice.file[0] if step == 1 else p[2]]) -%}{%- endif -%}
+        {%- else -%}
+          {%- do m.new.append(p) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if step == 0 -%}{%- do m.new.append([1, now, none]) -%}{%- endif -%}
+    {%- do context.update({'parts':[] if m.done else m.new[-8:]}) -%}
   {%- endif -%}
 {%- endif -%}
 {%- if choice.kind == 'id_cookie.set' -%}
