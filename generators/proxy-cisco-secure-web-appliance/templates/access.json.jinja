@@ -16,7 +16,26 @@
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set within = 1800 -%}
-{%- set guard = 3600 -%}
+
+{#- Draw an episode start in [a, b): 10-minute slots weighted by the
+    background hour curve (sq: curve^2 + 0.05), uniform within a slot. -#}
+{%- macro draw_start(a, b, sq) -%}
+  {%- set curve = shared.get('curve') -%}
+  {%- set base = (a // 600) * 600 -%}
+  {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
+  {%- for i in range((b - base) // 600 + 1) -%}
+    {%- set lo = [a, base + i * 600] | max -%}
+    {%- set hi = [b, base + (i + 1) * 600] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = curve[((base + i * 600) % 86400) // 600] -%}
+      {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
+      {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set j = module.rand.weighted_choice(range(ws | length) | list, ws) -%}
+  {%- do shared.set('start_at',
+      module.rand.number.integer(lows[j], highs[j] - 1)) -%}
+{%- endmacro -%}
 
 {%- if not shared.get('initialized', false) -%}
   {%- if not (1 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
@@ -31,9 +50,15 @@
     {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
     {%- set checked = module.ipaddress.IPv4Address(ip) -%}
     {%- do clients.append(ip) -%}
-    {%- do weights.append(module.rand.number.lognormal(0, 0.9)) -%}
+    {#- Skewed but bounded activity weight: no single client carries a
+        quarter of the traffic. -#}
+    {%- do weights.append(module.rand.number.clamp(module.rand.number.lognormal(0, 0.9), 0.2, 3.5)) -%}
     {#- Own working hours (UTC start, length) per client. -#}
-    {%- do shifts.update({ip: [module.rand.number.floating(5.0, 10.0), module.rand.number.floating(7.0, 10.5)]}) -%}
+    {#- Own working hours (UTC start, length), plus a per-day start
+        jitter and a day off (about 1 day in 10), redrawn when the UTC
+        day changes. -#}
+    {%- do shifts.update({ip: [module.rand.number.floating(4.0, 11.0), module.rand.number.floating(7.0, 10.5),
+        -1, 0.0, false]}) -%}
     {%- do groups.update({ip: module.rand.weighted_choice(params.access_policies, [70, 30])}) -%}
   {%- endfor -%}
   {#- Web reputation score per domain, fixed for the run. -#}
@@ -54,23 +79,37 @@
         'sha': module.rand.crypto.sha256(),
         'size': (module.rand.number.lognormal(module.math.log(6000000), 0.9)) | int}) -%}
   {%- endfor -%}
+  {#- Background hour curve per 10-minute slot of the UTC day: the
+      weighted sum of every client's working-hours factor, max 1. -#}
+  {%- set wsum = weights | sum -%}
+  {%- set curve = [] -%}
+  {%- for k in range(144) -%}
+    {%- set acc = namespace(v=0) -%}
+    {%- for ip in clients -%}
+      {%- set into = ((k + 0.5) / 6 - shifts[ip][0]) % 24 -%}
+      {%- set acc.v = acc.v + weights[loop.index0] * (1.0 if into < shifts[ip][1]
+          else (0.45 if into < shifts[ip][1] + 4 else 0.12)) -%}
+    {%- endfor -%}
+    {%- do curve.append(acc.v / wsum) -%}
+  {%- endfor -%}
+  {%- set cmax = curve | max -%}
+  {%- set norm = [] -%}
+  {%- for v in curve -%}{%- do norm.append(v / cmax) -%}{%- endfor -%}
   {%- do shared.update({'initialized': true, 'clients': clients,
       'weights': weights, 'groups': groups, 'shifts': shifts, 'wbrs': wbrs, 'files': files,
-      'q': [], 'hist': {},
-      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'q': [], 'm': {}, 'curve': norm, 'start_at': none,
       'last_client': none, 'last_path': none}) -%}
+  {#- First episode inside the first min(interval, 24 h), its time of
+      day drawn from the background hour curve. -#}
+  {%- if params.anomaly_mode -%}
+    {{- draw_start(now, now + ([interval, 24] | min * 3600) | int, false) -}}
+  {%- endif -%}
 {%- endif -%}
 
 {%- set clients = shared.get('clients') -%}
 {%- set files = shared.get('files') -%}
 {%- set q = shared.get('q') -%}
-{%- set hist = shared.get('hist') -%}
-{%- if now % 600 == 0 -%}
-  {%- for k in hist | list -%}
-    {%- set keep = hist[k] | selectattr('t', 'gt', now - 2 * guard) | list -%}
-    {%- if keep -%}{%- do hist.update({k: keep}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
-  {%- endfor -%}
-{%- endif -%}
+{%- set mstate = shared.get('m') -%}
 {%- set hod = (now % 86400) / 3600 -%}
 
 {%- macro gap(median, sigma) -%}
@@ -78,27 +117,9 @@
 {%- endmacro -%}
 
 {#- Queue one request. kind: page, asset, post, deny, wbrs, get (file). -#}
-{%- macro enq(client, kind, domain, path, cat, at, file=none) -%}
+{%- macro enq(client, kind, domain, path, cat, at, file=none, ep=false) -%}
   {%- do q.append({'due': at, 'client': client, 'kind': kind, 'domain': domain,
-      'path': path, 'cat': cat, 'file': file}) -%}
-{%- endmacro -%}
-
-{#- Chain guard on the final step only: for one client and one file path,
-    no window of `guard` seconds holds both two or more denials and an
-    allowed download. Anything else (single denial then a mirror
-    download, repeated denials without a download) stays in background. -#}
-{%- macro guard_ok(client, path, kind, at) -%}
-  {%- set rows = hist.get(client ~ '|' ~ path, []) | selectattr('t', 'gt', at - guard) | selectattr('t', 'lt', at + guard) | list -%}
-  {%- set nd = rows | selectattr('k', 'equalto', 'd') | list | length -%}
-  {%- set ng = rows | selectattr('k', 'equalto', 'g') | list | length -%}
-  {{- 'yes' if (kind == 'd' and (ng == 0 or nd == 0)) or (kind == 'g' and nd < 2) else 'no' -}}
-{%- endmacro -%}
-{%- macro mark(client, path, kind, at) -%}
-  {%- set k = client ~ '|' ~ path -%}
-  {%- set rows = hist.get(k, []) -%}
-  {%- do rows.append({'t': at, 'k': kind}) -%}
-  {%- if rows | length > 40 -%}{%- do rows.pop(0) -%}{%- endif -%}
-  {%- do hist.update({k: rows}) -%}
+      'path': path, 'cat': cat, 'file': file, 'ep': ep}) -%}
 {%- endmacro -%}
 
 {#- A browsing page view: the page and a few embedded objects. -#}
@@ -116,8 +137,12 @@
     each thinned by its own working hours. -#}
 {%- set c = module.rand.weighted_choice(clients, shared.get('weights')) -%}
 {%- set sh = shared.get('shifts')[c] -%}
-{%- set into = (hod - sh[0]) % 24 -%}
-{%- set active = 1.0 if into < sh[1] else (0.45 if into < sh[1] + 4 else 0.12) -%}
+{%- if sh[2] != now // 86400 -%}
+  {%- set sh = [sh[0], sh[1], now // 86400, module.rand.number.gauss(0, 0.6), module.rand.chance(0.1)] -%}
+  {%- do shared.get('shifts').update({c: sh}) -%}
+{%- endif -%}
+{%- set into = (hod - sh[0] - sh[3]) % 24 -%}
+{%- set active = 0.12 if sh[4] else (1.0 if into < sh[1] else (0.45 if into < sh[1] + 4 else 0.12)) -%}
 {%- if module.rand.chance(0.15 * active) -%}
   {%- set profile = module.rand.weighted_choice(
       ['browse', 'post', 'blocked', 'wbrs', 'mirror', 'sharing'],
@@ -150,10 +175,7 @@
     {%- set m = module.rand.choice(params.mirrors) -%}
     {%- set t = namespace(v=now) -%}
     {%- for i in range(module.rand.weighted_choice([1, 2, 3], [82, 14, 4])) -%}
-      {%- if guard_ok(c, f.path, 'g', t.v) == 'yes' -%}
-        {{- mark(c, f.path, 'g', t.v) -}}
-        {{- enq(c, 'get', m.domain, f.path, m.cat, t.v, f) -}}
-      {%- endif -%}
+      {{- enq(c, 'get', m.domain, f.path, m.cat, t.v, f) -}}
       {%- set t.v = t.v + gap(90, 1.2) | int -%}
     {%- endfor -%}
   {%- else -%}
@@ -163,35 +185,28 @@
     {%- set f = module.rand.choice(files) -%}
     {%- set s = module.rand.choice(params.sharing_sites) -%}
     {%- set n = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
-    {%- set t = namespace(v=now, d=0) -%}
+    {%- set t = namespace(v=now) -%}
     {%- for i in range([n, 10] | min) -%}
-      {%- if guard_ok(c, f.path, 'd', t.v) == 'yes' -%}
-        {{- mark(c, f.path, 'd', t.v) -}}
-        {{- enq(c, 'deny', s.domain, f.path, s.cat, t.v) -}}
-        {%- set t.d = t.d + 1 -%}
-      {%- endif -%}
+      {{- enq(c, 'deny', s.domain, f.path, s.cat, t.v) -}}
       {%- set t.v = t.v + gap(25, 0.9) | int -%}
     {%- endfor -%}
     {%- set after = module.rand.weighted_choice(['none', 'other', 'same'], [55, 25, 20]) -%}
     {%- set at = t.v + gap(180, 0.8) | int -%}
     {%- set m = module.rand.choice(params.mirrors) -%}
     {%- set g = f if after == 'same' else module.rand.choice(files | rejectattr('path', 'equalto', f.path) | list) -%}
-    {%- if after != 'none' and guard_ok(c, g.path, 'g', at) == 'yes' -%}
-      {{- mark(c, g.path, 'g', at) -}}
+    {%- if after != 'none' -%}
       {{- enq(c, 'get', m.domain, g.path, m.cat, at, g) -}}
     {%- endif -%}
   {%- endif -%}
 {%- endif -%}
 
-{#- 2. Episode: due by source time, random start delay, next due from
-    the actual start, no catch-up. A rotated client is denied a rotated
-    file on a blocked file-sharing site two or more times, then fetches
-    the same path from an allowed mirror. -#}
+{#- 2. Episode: a rotated client is denied a rotated file on a blocked
+    file-sharing site two or more times, then fetches the same path from
+    an allowed mirror. The next start is drawn in a window of
+    w = min(interval / 4, 6 h) centred on due = this start + interval,
+    weighted by the hour curve squared plus a floor. -#}
 {%- if params.anomaly_mode -%}
-  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
-    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
-  {%- endif -%}
-  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {%- if now >= shared.get('start_at') -%}
     {%- set c = module.rand.choice(clients | reject('equalto', shared.get('last_client')) | list) -%}
     {%- set f = module.rand.choice(files | rejectattr('path', 'equalto', shared.get('last_path')) | list) -%}
     {%- set s = module.rand.choice(params.sharing_sites) -%}
@@ -204,15 +219,15 @@
     {%- endfor -%}
     {%- set t = namespace(v=now) -%}
     {%- for i in range([[n.v, 2] | max, 10] | min) -%}
-      {{- mark(c, f.path, 'd', t.v) -}}
-      {{- enq(c, 'deny', s.domain, f.path, s.cat, t.v) -}}
+      {{- enq(c, 'deny', s.domain, f.path, s.cat, t.v, none, true) -}}
       {%- set t.v = t.v + gap(25, 0.9) | int -%}
     {%- endfor -%}
     {%- set at = t.v + [gap(180, 0.8) | int, 1200] | min -%}
-    {{- mark(c, f.path, 'g', at) -}}
-    {{- enq(c, 'get', m.domain, f.path, m.cat, at, f) -}}
-    {%- do shared.update({'start_at': none, 'last_client': c, 'last_path': f.path,
-        'next_due': now + (interval * 3600) | int}) -%}
+    {{- enq(c, 'get', m.domain, f.path, m.cat, at, f, true) -}}
+    {%- do shared.update({'last_client': c, 'last_path': f.path}) -%}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+    {{- draw_start(due - half, due + half, true) -}}
   {%- endif -%}
 {%- endif -%}
 
@@ -225,6 +240,28 @@
 {%- endfor -%}
 {%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
 {%- set e = q.pop(pick.i) -%}
+{%- set ms = module.rand.number.integer(0, 999) -%}
+
+{#- Guard on the final chain step over every binding: a 200 download
+    of a /pub/ path completes a chain when its client was denied that
+    path twice or more in the preceding `within` s (the first denial on
+    another domain, which a mirror always is; no cap, no reset). A
+    background download that would complete one is dropped; episode
+    rows never are. -#}
+{%- if e.path.startswith('/pub/') -%}
+  {%- set tt = now + ms / 1000 -%}
+  {%- set hk = e.client ~ '|' ~ e.path -%}
+  {%- set recent = mstate.get(hk, []) | selectattr('0', 'ge', tt - within) | list -%}
+  {%- if e.kind == 'get' -%}
+    {%- if not e.ep and recent | rejectattr('1', 'equalto', e.domain) | list
+        and recent | length >= 2 -%}
+      {{ dispatch.drop() }}
+    {%- endif -%}
+  {%- else -%}
+    {%- do recent.append([tt, e.domain]) -%}
+  {%- endif -%}
+  {%- do mstate.update({hk: recent}) -%}
+{%- endif -%}
 
 {#- Transaction outcome. -#}
 {%- set url = 'http://' ~ e.domain ~ e.path -%}
@@ -286,7 +323,6 @@
     ~ ',-,"-","-","-","Unknown","Unknown","-","-",' ~ bw ~ ',0,-,"-","-",' ~ amp.v ~ ',"-",-,0,"'
     ~ amp.name ~ '","' ~ amp.sha ~ '">' -%}
 
-{%- set ms = module.rand.number.integer(0, 999) -%}
 {%- set iso = module.datetime.datetime.fromtimestamp(now, utc) + module.datetime.timedelta(milliseconds=ms) -%}
 {%- set epoch = now ~ '.' ~ '%03d' | format(ms) -%}
 {%- set raw = epoch ~ ' ' ~ elapsed ~ ' ' ~ e.client ~ ' ' ~ code ~ '/' ~ status ~ ' ' ~ size ~ ' '
