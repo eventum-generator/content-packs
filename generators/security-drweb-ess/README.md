@@ -18,25 +18,25 @@ Station agents reconnect after network interruptions, so connection notification
 
 ## Event Types
 
-The single `spin` dispatcher selects workflows and seven schema-specific body templates. There are nine physical Jinja files including the dispatcher and shared envelope macro. All seven notification classes occur ordinarily in both modes. Shares are measured in the final 194-hour default captures (3568 background-mode and 3669 anomaly-mode records).
+The single `spin` dispatcher selects workflows and seven schema-specific body templates. There are nine physical Jinja files including the dispatcher and shared envelope macro. All seven notification classes occur ordinarily in both modes. Shares are measured in the final 156-hour default captures (3100 background-mode and 3083 anomaly-mode records).
 
 | Action | Notification | Share off / on | Category |
 |---|---|---:|---|
-| `scan-completed` | Scan statistics | 39.0% / 38.2% | malware |
-| `application-control-blocked` | Application Control blocked the process | 18.2% / 18.6% | process |
-| `station-authorization-failed` | Station authorization failed | 11.7% / 12.2% | authentication |
-| `preventive-protection-allowed` | Report of Preventive protection | 10.3% / 9.6% | process |
-| `security-threat-detected` | Security threat detected | 7.8% / 7.4% | malware |
-| `station-update-error` | Critical error of station update | 7.0% / 6.3% | package |
-| `station-id-duplicate` | Station already logged in | 6.1% / 7.7% | authentication |
+| `scan-completed` | Scan statistics | 36.0% / 37.5% | malware |
+| `application-control-blocked` | Application Control blocked the process | 17.9% / 18.1% | process |
+| `station-authorization-failed` | Station authorization failed | 14.8% / 13.2% | authentication |
+| `preventive-protection-allowed` | Report of Preventive protection | 10.1% / 10.2% | process |
+| `security-threat-detected` | Security threat detected | 7.4% / 7.8% | malware |
+| `station-update-error` | Critical error of station update | 5.7% / 5.9% | package |
+| `station-id-duplicate` | Station already logged in | 8.0% / 7.2% | authentication |
 
-Ordinary activity mixes independent workflows: clean scans, launch blocks with retries, infected scans (detection then completion), user-allowed HOSTS edits, update failures with retries, connection failures (retried, sometimes followed by a session collision) and standalone collisions. Stations are chosen at random with unequal activity weights drawn per run; there is no rotation or schedule. About 20 times a day an ordinary workflow reproduces a contiguous part of the anomaly chain, mostly one of its two five-step parts, on one station with the chain's own timing (for example block, allowed HOSTS edit, detection of the blocked copy, scan completion and an authorization failure, without the collision). A guard keeps background from completing the full chain by coincidence. When an ordinary part starts with a block and reaches the detection of that copy, it starts only on a station with no connection notification already scheduled. For 96 minutes after its last block of that copy (longer than the 95-minute detection window), no new connection-failure or collision workflow starts on that station. The guard has a residual effect, identical in both modes: after such an ordinary four-step prefix, a collision never follows on that station within the window, whereas without the guard about two coincidental chains per eight days would occur.
+Ordinary activity mixes independent workflows: clean scans, launch blocks with retries, infected scans (detection then completion), user-allowed HOSTS edits, update failures with retries, connection failures (retried, sometimes followed by a session collision) and standalone collisions. Stations are chosen at random with unequal activity weights drawn per run; there is no rotation or schedule. About 20 times a day an ordinary workflow reproduces a contiguous part of the anomaly chain, mostly one of its two five-step parts, on one station with the chain's own timing (for example block, allowed HOSTS edit, detection of the blocked copy, scan completion and an authorization failure, without the collision). A guard keeps background from completing the full chain by coincidence, and it acts only on the chain's last step: an ordinary duplicate-ID collision that would complete the chain on its station (block of a copy, allowed HOSTS edit, detection of that copy, infected scan completion and an authorization failure, the block at most 95 minutes earlier) is not emitted. Nothing else on the station changes: connection failures, other collisions and every other workflow start and run as usual. The check stays active after an episode completes: its own sequence keeps blocking such collisions on that station until its 95-minute window ends, so neither an ordinary collision nor a retry of the episode's own collision completes it a second time.
 
 ## Anomaly Chain
 
-`anomaly_mode: true` is the default; `false` produces only background. The first episode becomes eligible `anomaly_interval_hours` (default 24) after the start of generation and starts at a random moment after that, on average about 7 minutes later. The next episode becomes eligible one interval after the previous actual start, so start delays accumulate and episode clock times drift later: default episodes started 24.02-24.32 hours apart and drifted from 00:01 to 01:03 UTC over eight days. There are no catch-up bursts. The supported interval is 6 to 8760 finite hours.
+`anomaly_mode: true` is the default; `false` produces only background. The first episode starts at a uniformly random moment within the first `anomaly_interval_hours` or 24 hours of generation, whichever is shorter. Each later episode is due one interval after the previous actual start and starts at a uniformly random moment in a window centred on that due time, a quarter of the interval wide but at most 6 hours (default: 21 to 27 hours after the previous start); it takes the first free 10-second render from then on. The background has no daily cycle, so start times are uniform over the day. There are no catch-up bursts. The supported interval is 6 to 8760 finite hours.
 
-An episode picks a station at random, independent of its current load, among stations that are not running a Scanner job, have a free quarantine slot, are not under the guard described above and were not among the three previous episode stations. It picks an executable different from the previous episode's.
+An episode picks a station at random, independent of its current load, among stations that are not running a Scanner job, have a free quarantine slot, are not in the middle of an ordinary chain part whose detection of the blocked copy has been reported or is scheduled (the episode's collision would otherwise complete that older part instead of its own) and were not among the three previous episode stations. It picks an executable different from the previous episode's.
 
 1. Application Control prevents launch of a new executable copy (the user may retry, as in ordinary traffic).
 2. 1-20 minutes later, the same station/user allows a separate PowerShell HOSTS modification.
@@ -45,7 +45,7 @@ An episode picks a station at random, independent of its current load, among sta
 5. 1-20 minutes later, a connection attempt claiming the same registered station UUID fails credentials (and may be retried).
 6. 0.3-10 minutes later, another attempt collides with that station's existing connected identity.
 
-Measured spans were 21-42 minutes (default), 31-54 minutes (12-hour interval) and 22-53 minutes (6-hour interval). Other stations' notifications interleave with the episode. The step gaps, retries and every step type are the same as in ordinary traffic. Only the complete ordered sequence on one station within 95 minutes, with the blocked path equal to the detected path, is specific to episodes; background cannot produce it because of the guard. The Server registration ID in the duplicate report is `MSG.Server`. These are related training correlations, not proof that malware executed, changed HOSTS, cloned an Agent or corrected a password. Authorization hooks describe duplicate checking after valid ID/password checking, but this notification pair does not identify the attempting peer or prove it was the same process. Inventory IP/hostname context on those reports denotes the registered asset, not an observed request source.
+Measured spans were 27-50 minutes (default) and 26-55 minutes (12-hour interval). Other stations' notifications interleave with the episode. The step gaps, retries and every step type are the same as in ordinary traffic. Only the complete ordered sequence on one station within 95 minutes, with the blocked path equal to the detected path, is specific to episodes; background cannot produce it because of the guard. The Server registration ID in the duplicate report is `MSG.Server`. These are related training correlations, not proof that malware executed, changed HOSTS, cloned an Agent or corrected a password. Authorization hooks describe duplicate checking after valid ID/password checking, but this notification pair does not identify the attempting peer or prove it was the same process. Inventory IP/hostname context on those reports denotes the registered asset, not an observed request source.
 
 Detection idea: per station, block of file F, then an allowed protected-object operation, then detection and quarantine of F with its completion, then a failed authorization and a duplicate-ID collision for the same station UUID, all within about 1.5 hours. Any shorter part of this sequence also occurs in ordinary traffic.
 
@@ -66,7 +66,9 @@ This is **49/54 (90.7%) variable-name coverage**, not native-byte or realism cer
 
 The vendor publishes editable text templates and variable meanings, not a fixed serialization. Notification names, English action/type labels, message text, severity, ECS outcomes, `file.*` enrichment and inventory enrichment are collector choices. The shown Action/HipsType/IsShellGuard strings are descriptive normalized values, not proved installed-build enum bytes. Normal Security threat detected has no published SHA256 variable, so its join to an application block uses station/path. SHA256 appears only in the Application Control message. Threat names use published Dr.Web labels, while filenames, hashes and their association with those labels are entirely synthetic, not genuine malware fixtures. A named threat does not prove its behavior occurred.
 
-Synthetic timing limits: the input ticks every 10 seconds and each tick carries at most one notification at a whole-second receipt time; the rate (427-479 notifications per day in the final captures) has no daily cycle; the workflow mix, retry probabilities, gaps, scan counter/speed distributions and delivery delays are selected training assumptions. Primary sources give no rates. Ordinary chain parts are deliberately frequent so that no part of the chain identifies an episode; as a result, the detection rate (about 35 per day) and the duplicate-ID collision rate (about 27 per day) far exceed a typical 48-station fleet and are set by this separability design, not by any source.
+Synthetic timing limits: the input ticks every 10 seconds and each tick carries at most one notification at a whole-second receipt time; the rate (435-478 notifications per day in the final captures) has no daily cycle; the workflow mix, retry probabilities, gaps, scan counter/speed distributions and delivery delays are selected training assumptions. Primary sources give no rates. Ordinary chain parts are deliberately frequent so that no part of the chain identifies an episode; as a result, the detection rate (about 35 per day) and the duplicate-ID collision rate (about 38 per day) far exceed a typical 48-station fleet and are set by this separability design, not by any source.
+
+Episode stations are chosen among stations the scheduler can use at that moment (no scan running, quarantine below its cap, no unfinished ordinary chain part), which favours quieter stations: across 45 episodes the ordinary activity in the 2 h and 6 h before an episode ran at about 0.6-0.7 of matched background times, with wide run-to-run spread (one fresh pair measured 1.5). No single capture separates episode stations by activity alone.
 
 No complete native delivery capture, maintained Elastic sample or live SIEM-parser round trip was established in the bounded search. **BLOCKED_RAW_EVIDENCE** remains. No claim extends to another product version or complete ESS telemetry.
 
@@ -99,7 +101,7 @@ From the content-packs checkout, live mode:
 eventum generate --path generators/security-drweb-ess/generator.yml --id drweb --live-mode true
 ```
 
-For a finite sample, copy `generator.yml` to `generator.finite.yml` beside it and set `input[0].cron.start: "2026-09-26T00:00:00+00:00"` and `end: "2026-09-28T02:00:00+00:00"`. At the default interval this covers two episodes. Run:
+For a finite sample, copy `generator.yml` to `generator.finite.yml` beside it and set `input[0].cron.start: "2026-09-26T00:00:00+00:00"` and `end: "2026-09-28T02:00:00+00:00"`. At the default interval this covers one or, usually, two episodes. Run:
 
 ```bash
 eventum generate --path generators/security-drweb-ess/generator.finite.yml --id drweb --live-mode false --keep-order true
@@ -109,24 +111,22 @@ eventum generate --path generators/security-drweb-ess/generator.finite.yml --id 
 
 | Finite input | Records | Complete episodes | Episode intervals (h) | Maximum quarantine per station |
 |---|---:|---:|---|---:|
-| Default, 24 h interval, 194 h, anomaly | 3669 | 8 | 24.02-24.32 | 4 |
-| Default, 24 h interval, 194 h, background | 3568 | 0 | - | 4 |
-| Custom profile, 12 h interval, 98 h, anomaly | 1842 | 8 | 12.01-12.14 | 4 |
-| Custom profile, 12 h interval, 98 h, background | 1739 | 0 | - | 4 |
-| Minimum 6 h interval, 98 h, anomaly | 1956 | 15 | 6.01-6.46 | 4 |
-| Minimum 6 h interval, 98 h, background | 1866 | 0 | - | 4 |
+| Default, 24 h interval, 156 h, anomaly (two runs) | 3083 / 2963 | 6 / 6 | 22.43-26.50 | 4 |
+| Default, 24 h interval, 156 h, background (six runs) | 2825-3100 | 0 | - | 4 |
+| 12 h interval, 156 h, anomaly (two runs) | 3020 / 2974 | 13 / 13 | 10.51-13.36 | 4 |
+| 12 h interval, 156 h, background | 2944 | 0 | - | 4 |
 
-All runs exited 0 with complete JSON output to the configured end and no log output. None of the 25 background-mode and 8 anomaly-mode captures generated for this version contains a chain produced by background (background mode has zero chains; anomaly-mode chains are exactly the scheduled episodes, one per interval). Checks covered the seven exact selected field sets, UTC receipt/occurrence clocks, strictly increasing receipt times, registered identity roles, new-file/quarantine/run counters and bounds, recurrence (first start after one interval, later starts at least one interval and at most three hours late, rotating stations and executables), zero complete chains in background mode, ordinary coverage of every class, all 48 stations, four executable hashes, six threat labels and every contiguous chain part. The custom profile changed Server UUID/name/IP, quoted Unicode group, ECS version and input timezone.
+All runs exited 0 with complete JSON output to the configured end and no log output. None of the seven background-mode captures contains a complete chain, and the anomaly-mode chains are exactly the scheduled episodes, also when every candidate binding is kept and completions reset nothing (6, 6, 13 and 13 chains). Checks covered the seven exact selected field sets, UTC receipt/occurrence clocks, strictly increasing receipt times, registered identity roles, new-file/quarantine/run counters and bounds, recurrence (first start within min(interval, 24 h), later starts within the centred window, rotating stations and executables), zero complete chains in background mode, ordinary coverage of every class, all 48 stations, four executable hashes, six threat labels and every contiguous chain part.
 
-Background decisions were compared between modes against six further independent background captures per profile: class volumes, same-station repeats within 1-60 minutes, bursts, retry shares, inter-class transitions, chain-part counts, station gaps, scan run durations, copy ages, station delays and scan counters, including their lowest quantiles and extremes; neither mode shows a feature the other lacks. Ordinary rows of an episode's station within two hours of the episode are compared with that station's own rate: 102 observed against 119.6 expected over 8 anomaly-mode captures (ratio 0.85). The shortfall (z = -1.6, not significant) comes from the eligibility filters above, which skip stations that are under the guard, running a Scanner job or holding a full quarantine. Mutations are rejected: a chain step moved to another station, infected statistics without detection, re-quarantine of a removed copy, a different UUID in the final collision, a complete chain in background mode, a collision appended to an ordinary five-step part, background suspended around episodes, background without short same-station repeats, a fixed station rotation, a fixed cadence, a constant station delay, incrementing PIDs and duplicated captures.
+Background decisions were compared between modes against five further independent background captures: class volumes, same-station repeats within 1-60 minutes, bursts, retry shares, inter-class transitions, chain-part counts, station gaps, scan run durations, copy ages, station delays and scan counters, including their lowest quantiles and extremes; neither mode shows a feature the other lacks. Ordinary rows of an episode's station within two hours of the episode are compared with that station's own rate: 40 observed against 60.5 expected over 4 anomaly-mode captures (ratio 0.67, z = -2.6; per capture z -2.3 to -0.2) and 102 against 134 over the eight captures of this and the previous build (0.76); the shortfall comes from the eligibility filters above, which prefer stations without a running Scanner job or an ordinary chain part in progress. Around a background chain prefix (block through authorization failure on one station), authorization failures of that station decay smoothly from the prefix's own retries into the background rate across the 95-minute boundary (0.13 and 0.07 per prefix-hour in the last two 16-minute bins inside, 0-0.04 outside), and collisions on other stations stay at 1.3-1.6 per prefix-hour on both sides.
 
 ## Sample Output
 
-Actual default-mode episode block, copied from the finite capture:
+Actual default-mode episode block, copied from the final default anomaly-mode capture (row 251), pretty-printed:
 
 ```json
 {
-  "@timestamp": "2026-09-27T00:01:14+00:00",
+  "@timestamp": "2026-09-26T10:52:26+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -144,7 +144,7 @@ Actual default-mode episode block, copied from the finite capture:
     "outcome": "success",
     "severity": 5
   },
-  "message": "Application Control prevented launch of C:\\Users\\Public\\Downloads\\updater_20260926_234019.exe on WS-HR-07.",
+  "message": "Application Control prevented launch of C:\\Users\\Public\\Downloads\\invoice.pdf_20260926_104640.exe on WS-IT-03.",
   "observer": {
     "vendor": "Doctor Web",
     "product": "Enterprise Security Suite",
@@ -155,53 +155,53 @@ Actual default-mode episode block, copied from the finite capture:
     ]
   },
   "host": {
-    "id": "10a56af1-2be3-4381-927f-4d7b1e02c023",
-    "name": "WS-HR-07",
-    "hostname": "WS-HR-07",
+    "id": "10a56af1-2be3-4381-927f-4d7b1e02c043",
+    "name": "WS-IT-03",
+    "hostname": "WS-IT-03",
     "ip": [
-      "10.20.11.107"
+      "10.20.15.103"
     ]
   },
   "user": {
-    "name": "user23"
+    "name": "user43"
   },
   "file": {
-    "path": "C:\\Users\\Public\\Downloads\\updater_20260926_234019.exe",
-    "name": "updater_20260926_234019.exe"
+    "path": "C:\\Users\\Public\\Downloads\\invoice.pdf_20260926_104640.exe",
+    "name": "invoice.pdf_20260926_104640.exe"
   },
   "related": {
     "hosts": [
-      "WS-HR-07"
+      "WS-IT-03"
     ],
     "ip": [
-      "10.20.11.107"
+      "10.20.15.103"
     ],
     "user": [
-      "user23"
+      "user43"
     ],
     "hash": [
-      "775d486ec80d5cd7b615d573ac891579e3a2b518373804134121855cdd5d4ee8"
+      "57a04e9de7e32d301ddbf6b93359a45f1c17f24e8a45b5e4d79ed28533e3b221"
     ]
   },
   "drweb": {
     "ess": {
       "notification": "Application Control blocked the process",
       "station": {
-        "id": "10a56af1-2be3-4381-927f-4d7b1e02c023",
-        "name": "WS-HR-07",
-        "ip": "10.20.11.107",
+        "id": "10a56af1-2be3-4381-927f-4d7b1e02c043",
+        "name": "WS-IT-03",
+        "ip": "10.20.15.103",
         "primary_group": "Workstations"
       },
       "variables": {
         "MSG.AppCtlAction": 5,
         "MSG.AppCtlType": 1,
-        "MSG.Path": "C:\\Users\\Public\\Downloads\\updater_20260926_234019.exe",
+        "MSG.Path": "C:\\Users\\Public\\Downloads\\invoice.pdf_20260926_104640.exe",
         "MSG.Profile": "Default deny executables",
         "MSG.Rule": "Block untrusted application",
-        "MSG.SHA256": "775d486ec80d5cd7b615d573ac891579e3a2b518373804134121855cdd5d4ee8",
-        "MSG.StationTime": "2026-09-27T00:01:00+00:00",
+        "MSG.SHA256": "57a04e9de7e32d301ddbf6b93359a45f1c17f24e8a45b5e4d79ed28533e3b221",
+        "MSG.StationTime": "2026-09-26T10:52:19+00:00",
         "MSG.TestMode": 0,
-        "MSG.User": "user23"
+        "MSG.User": "user43"
       }
     }
   }

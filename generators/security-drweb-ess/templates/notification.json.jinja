@@ -11,15 +11,14 @@
 {%- set chain = ['block', 'preventive', 'threat', 'scan', 'auth', 'duplicate'] -%}
 {%- set executables = [0, 1, 3, 4] -%}
 {%- set retention = 72 * 3600 -%}
-{#- Longer than the 5700 s chain detection window, re-armed by every
-    block of a guarded copy, so ordinary traffic cannot complete a chain. -#}
-{%- set guard_window = 5760 -%}
 {%- if not shared.get('stations') -%}
   {%- set fleet = [] -%}
   {%- for row in samples.stations -%}
-    {%- do fleet.append(dict(station=dict(id=row.id, name=row.name, ip=row.ip, user=row.user), weight=module.rand.number.lognormal(0, 0.4), quarantine=[], reserved=0, scanning=false, guard_until=0)) -%}
+    {%- do fleet.append(dict(station=dict(id=row.id, name=row.name, ip=row.ip, user=row.user), weight=module.rand.number.lognormal(0, 0.4), quarantine=[], reserved=0, scanning=false)) -%}
   {%- endfor -%}
-  {%- do shared.update(dict(stations=fleet, pending=[], backlog=0, expiry=none, next_episode=clock + interval * 3600, recent=[], last_object=-1)) -%}
+  {#- The first episode starts at a uniform time within the first
+      min(interval, 24 h). -#}
+  {%- do shared.update(dict(stations=fleet, pending=[], backlog=0, expiry=none, next_episode=clock + module.rand.number.floating(0, 1) * ([interval, 24] | min) * 3600, recent=[], last_object=-1, parts={})) -%}
 {%- endif -%}
 {%- set fleet = shared.get('stations') -%}
 {%- set pending = shared.get('pending') -%}
@@ -75,25 +74,11 @@
     {%- set steps = [workflow] -%}
   {%- endif -%}
   {%- set later_threat = 'threat' in steps and steps[0] != 'threat' -%}
-  {%- set auth_like = 'auth' in steps or 'duplicate' in steps -%}
-  {%- set guarded_part = workflow == 'near' and steps[0] == 'block' and 'scan' in steps -%}
-  {%- set noisy = [] -%}
-  {%- if guarded_part -%}
-    {#- A block-started part that reaches the detection must not meet a
-        connection notification already scheduled on its station. -#}
-    {%- for entry in pending -%}
-      {%- if entry.kind in ['auth', 'duplicate'] or 'auth' in entry.rest or 'duplicate' in entry.rest -%}
-        {%- do noisy.append(entry.context.index) -%}
-      {%- endif -%}
-    {%- endfor -%}
-  {%- endif -%}
   {%- set candidates = [] -%}
   {%- set weights = [] -%}
   {%- for state in fleet -%}
     {%- if not (steps[0] in ['scan', 'threat'] and state.scanning)
-          and not ('threat' in steps and (state.quarantine | length) + state.reserved >= 4)
-          and not (auth_like and state.guard_until > clock)
-          and not (guarded_part and loop.index0 in noisy) -%}
+          and not ('threat' in steps and (state.quarantine | length) + state.reserved >= 4) -%}
       {%- do candidates.append(loop.index0) -%}
       {%- do weights.append(state.weight) -%}
     {%- endif -%}
@@ -121,19 +106,33 @@
       {%- do state.update(dict(reserved=state.reserved + 1)) -%}
       {%- do context.update(dict(reserved=true)) -%}
     {%- endif -%}
-    {%- if guarded_part -%}
-      {#- An unrelated connection pair on this station would complete the
-          chain; ordinary connection noise avoids it for the chain window. -#}
-      {%- do context.update(dict(guard=true)) -%}
-    {%- endif -%}
     {%- set sel.item = dict(kind=steps[0], rest=steps[1:], context=context) -%}
   {%- endif -%}
-{%- elif params.anomaly_mode and clock >= shared.get('next_episode') and module.rand.chance(0.025) -%}
+{%- elif params.anomaly_mode and clock >= shared.get('next_episode') -%}
+  {#- A station whose earlier block can still become a chain (the
+      detection of that copy was reported or is scheduled) is skipped: its
+      collision would otherwise complete that older partial instead of
+      the episode's own. -#}
+  {%- set busy = [] -%}
+  {%- for index, held in shared.get('parts').items() -%}
+    {%- for q in held -%}
+      {%- if clock - q[1] <= 5700 -%}
+        {%- if q[0] >= 3 -%}{%- do busy.append(index) -%}{%- endif -%}
+        {%- for entry in pending -%}
+          {%- if entry.context.index == index and entry.context.get('obj')
+              and entry.context.obj.path == q[2]
+              and (entry.kind == 'threat' or 'threat' in entry.rest) -%}
+            {%- do busy.append(index) -%}
+          {%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
   {%- set candidates = [] -%}
   {%- for state in fleet -%}
     {%- set index = loop.index0 -%}
     {%- if not state.scanning and (state.quarantine | length) + state.reserved < 4
-          and state.guard_until <= clock
+          and index not in busy
           and state.station.id not in shared.get('recent') -%}
       {%- do candidates.append(index) -%}
     {%- endif -%}
@@ -148,8 +147,12 @@
     {%- set context = dict(index=index, infected=1, reserved=true, obj=dict(path=(path.parent / (path.stem ~ '_' ~ introduced.strftime('%Y%m%d_%H%M%S') ~ path.suffix)) | string, threat=source.threat, kind=source.kind, sha256=source.sha256)) -%}
     {%- do state.update(dict(reserved=state.reserved + 1)) -%}
     {%- set recent = (shared.get('recent') + [state.station.id])[-3:] -%}
-    {%- do shared.update(dict(recent=recent, last_object=object_index, next_episode=clock + interval * 3600)) -%}
-    {%- set sel.item = dict(kind='block', rest=chain[1:], context=context) -%}
+    {#- The next episode is due one interval after this actual start and
+        starts at a uniform time in a window of min(interval / 4, 6 h)
+        centred on that due time. -#}
+    {%- set half = ([interval / 4, 6] | min) * 1800 -%}
+    {%- do shared.update(dict(recent=recent, last_object=object_index, next_episode=clock + interval * 3600 - half + module.rand.number.floating(0, 1) * 2 * half)) -%}
+    {%- set sel.item = dict(kind='block', rest=chain[1:], context=context, episode=true) -%}
   {%- endif -%}
 {%- endif -%}
 {%- if sel.item is none -%}
@@ -165,9 +168,38 @@
   {%- do pending.append(item) -%}
   {{- dispatch.drop() -}}
 {%- endif -%}
-{%- if item.kind == 'block' and ctx.guard -%}
-  {%- do state.update(dict(guard_until=[state.guard_until, clock + guard_window] | max)) -%}
+{#- Partial chains of this station under every binding a detector could
+    choose (block binds the file; then any Preventive report, detection of
+    that file, infected scan, authorization failure, duplicate), each at
+    most 5700 s after its block: a matching notification adds the advanced
+    copy and the partial keeps waiting; a completion resets nothing. A
+    duplicate that would complete one is not emitted unless it is the
+    episode's own; retries of episode notifications count as ordinary. -#}
+{%- set parts = shared.get('parts') -%}
+{%- set live = [] -%}
+{%- for q in parts.get(ctx.index, []) -%}
+  {%- if clock - q[1] <= 5700 -%}{%- do live.append(q) -%}{%- endif -%}
+{%- endfor -%}
+{%- if item.kind == 'duplicate' and not item.get('episode') -%}
+  {%- for q in live -%}
+    {%- if q[0] == 5 -%}{{- dispatch.drop() -}}{%- endif -%}
+  {%- endfor -%}
 {%- endif -%}
+{%- set advanced = [] -%}
+{%- for q in live -%}
+  {%- if q not in advanced -%}{%- do advanced.append(q) -%}{%- endif -%}
+  {%- set ok = (q[0] == 1 and item.kind == 'preventive')
+      or (q[0] == 2 and item.kind == 'threat' and ctx.obj.path == q[2])
+      or (q[0] == 3 and item.kind == 'scan' and ctx.infected == 1)
+      or (q[0] == 4 and item.kind == 'auth') -%}
+  {%- if ok and [q[0] + 1, q[1], q[2]] not in advanced -%}
+    {%- do advanced.append([q[0] + 1, q[1], q[2]]) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if item.kind == 'block' -%}
+  {%- do advanced.append([1, clock, ctx.obj.path]) -%}
+{%- endif -%}
+{%- do parts.update({ctx.index: advanced}) -%}
 {%- if item.kind == 'threat' -%}
   {#- The targeted Scanner response removes this file copy from its
       original path; its completion accounts for this one move. -#}
@@ -199,7 +231,7 @@
 {%- endif -%}
 {%- if item.rest -%}
   {%- set gap = {'block': [60, 1200, 300], 'preventive': [120, 1500, 480], 'threat': [30, 720, 120], 'scan': [60, 1200, 360], 'auth': [18, 600, 120]}[item.kind] -%}
-  {%- do pending.append(dict(kind=item.rest[0], rest=item.rest[1:], context=ctx, due=clock + module.rand.number.triangular(gap[0], gap[1], gap[2]))) -%}
+  {%- do pending.append(dict(kind=item.rest[0], rest=item.rest[1:], context=ctx, due=clock + module.rand.number.triangular(gap[0], gap[1], gap[2]), episode=item.get('episode', false))) -%}
 {%- endif -%}
 {%- if item.kind in ['block', 'preventive'] -%}
   {%- set station_delay = module.rand.number.triangular(1, 25, 2) | int -%}
