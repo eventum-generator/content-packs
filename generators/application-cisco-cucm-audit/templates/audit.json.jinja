@@ -7,6 +7,7 @@
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
 {%- set guard_ms = 10800000 -%}
+{%- set chain_ms = 7200000 -%}
 {%- macro d(lo, med, sig, hi) -%}
   {#- Offset lognormal in seconds, upper tail redrawn; returns ms. -#}
   {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
@@ -33,7 +34,7 @@
   {%- set nodes = {} -%}
   {%- for row in samples.processnodes -%}{%- do nodes.update({row.name: row.present}) -%}{%- endfor -%}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
-  {%- do shared.update({'admins': admins, 'nodes': nodes, 'touched': {}, 'reserved': none, 'last_ms': now - 1, 'next_due': admins | map(attribute='due') | min, 'ep_active': false, 'ep_last_admin': none, 'ep_last_key': none, 'ep_start': now + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min))}) -%}
+  {%- do shared.update({'admins': admins, 'nodes': nodes, 'touched': {}, 'reserved': none, 'last_ms': now - 1, 'next_due': admins | map(attribute='due') | min, 'ep_active': false, 'ep_last_admin': none, 'ep_last_key': none, 'ep_start': now + module.rand.number.integer(0, [interval, 86400000] | min)}) -%}
 {%- endif -%}
 {%- set admins = shared.get('admins') -%}
 {%- set nodes = shared.get('nodes') -%}
@@ -44,8 +45,10 @@
     previous episode's, no own session due within 3 h, no add in the
     last 3 h) and an absent processnode key untouched for 3 h (not the
     previous episode's). The episode is an extra session: the
-    administrator's own schedule resumes unchanged afterwards. The next
-    due is one interval after this start. -#}
+    administrator's own schedule resumes unchanged afterwards. The first
+    start is uniform over the first min(interval, 24 h); each next one is
+    uniform in a window of width min(interval / 4, 6 h) centred on this
+    start plus the interval. -#}
 {%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') -%}
   {%- set ca = [] -%}
   {%- for a in admins -%}
@@ -62,6 +65,7 @@
     {%- set key = module.rand.choice(ck) -%}
     {%- set a = admins[ai] -%}
     {%- set start = now + module.rand.number.integer(0, 999) -%}
+    {%- set half = module.builtins.int([interval / 4, 21600000] | min / 2) -%}
     {%- set ops = [['add', key, false], ['upd', key, true]] -%}
     {%- set more = namespace(go=module.rand.chance(0.45)) -%}
     {%- for _ in range(6) if more.go -%}
@@ -70,15 +74,15 @@
     {%- endfor -%}
     {%- do ops.append(['del', key, false]) -%}
     {%- do a.update({'episode': true, 'resume': a.due, 'due': start, 'pending_ops': ops}) -%}
-    {%- do shared.update({'ep_active': true, 'reserved': key, 'ep_last_admin': ai, 'ep_last_key': key, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(0, [1800000, interval / 8] | min)), 'next_due': [shared.get('next_due'), start] | min}) -%}
+    {%- do shared.update({'ep_active': true, 'reserved': key, 'ep_last_admin': ai, 'ep_last_key': key, 'ep_start': start + interval + module.rand.number.integer(-half, half), 'next_due': [shared.get('next_due'), start] | min}) -%}
   {%- endif -%}
 {%- endif -%}
 {%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- macro chain_done(a, key, t) -%}
-  {#- True when this administrator added and then updated the key within
-      the guard window, so deleting it now would complete the chain. -#}
+  {#- True when this administrator added the key at most chain_ms before t
+      and updated it since, so deleting it now would complete the chain. -#}
   {%- set ns = namespace(add=none, hit=false) -%}
-  {%- for h in a.hist if t - h[0] <= guard_ms and h[2] == key -%}
+  {%- for h in a.hist if t - h[0] <= chain_ms and h[2] == key -%}
     {%- if h[1] == 'add' -%}{%- set ns.add = h[0] -%}
     {%- elif h[1] == 'upd' and ns.add is not none -%}{%- set ns.hit = true -%}{%- endif -%}
   {%- endfor -%}
