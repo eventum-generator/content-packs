@@ -1,51 +1,435 @@
-{%- set previous_time = shared.get('previous_time') -%}
-{%- set event_time = timestamp if previous_time is none or timestamp > previous_time else previous_time + module.datetime.timedelta(seconds=1) -%}
-{%- do shared.set('previous_time', event_time) -%}
-{%- set interval = params.anomaly_interval_events | int -%}
-{%- set tick = (shared.get('tick', -1) + 1) % (interval + 7) -%}
-{%- do shared.set('tick', tick) -%}
-{%- set chain = params.anomaly_mode and tick >= interval -%}
-{%- set step = tick - interval if chain else tick % 4 -%}
-{%- if chain -%}
-  {%- set common_name = params.suspicious_common_name -%}
-  {%- set source_ip = params.first_public_ip if step <= 2 else params.second_public_ip -%}
-  {%- set source_port = 52144 if step <= 2 else 59021 -%}
-  {%- set tunnel_ip = params.tunnel_ip -%}
-{%- else -%}
-  {%- if step == 0 -%}
-    {%- set routine_id = (shared.get('routine_id', 0) % 1000000) + 1 -%}
-    {%- do shared.set('routine_id', routine_id) -%}
-    {%- do shared.set('routine_cn', module.rand.choice(['anna-laptop', 'pavel-phone', 'ops-workstation', 'svc-backup'])) -%}
-    {%- do shared.set('routine_ip', module.rand.choice(['198.51.100.41', '198.51.100.42', '203.0.113.21'])) -%}
-    {%- do shared.set('routine_port', 41000 + routine_id % 20000) -%}
+{#- OpenVPN 2.6.14 server file log (--log-append, --verb 3, UDP,
+    --ifconfig-pool-persist) of one multi-client server. Each tick emits
+    at most one line: the earliest due one. Every user is an independent
+    random process (idle gap, connection, session segments that end by
+    exit notification, ping timeout or a reconnect from the same or
+    another network); the anomaly episode only queues its own lines for
+    one idle user and never touches the background. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 600 -%}
+{%- set ping_restart = 240 -%}
+
+{%- macro hload(t) -%}
+  {%- set h = ((t | int) // 3600) % 24 -%}
+  {{- 1.0 if 8 <= h < 18 else (0.55 if 7 <= h < 8 or 18 <= h < 21 else (0.3 if 21 <= h < 23 else 0.08)) -}}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma, lo, hi) -%}
+  {{- [[module.random.lognormvariate(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
+{%- endmacro -%}
+
+{#- Next connection of an idle user: lognormal idle gaps thinned by the
+    hour-of-day load. -#}
+{%- macro next_wake(t0, w) -%}
+  {%- set s = namespace(t=t0) -%}
+  {%- for i in range(80) -%}
+    {%- set s.t = s.t + gap(6000 / w, 1.0, 60, 400000) | int -%}
+    {%- if module.random.random() < hload(s.t) | float -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {{- s.t -}}
+{%- endmacro -%}
+
+{#- Session segment length: short on an unstable network (more likely
+    right after a reconnect), long otherwise. -#}
+{%- macro seg_len(short_p) -%}
+  {{- gap(150, 0.9, 15, 3600) if module.random.random() < short_p else gap(5400, 0.9, 120, 43200) -}}
+{%- endmacro -%}
+
+{#- Time from a client's network change to its new Initial packet: an
+    immediate reconnect on an OS network event, or detection by the
+    client's pushed ping-restart 120 (last ping 0-10 s before) plus the
+    connect retry. -#}
+{%- macro detect_gap(ping_only) -%}
+  {{- (120 - module.random.randint(0, 10) + module.random.randint(1, 6)) if ping_only or module.random.random() < 0.45 else gap(8, 0.8, 1, 60) -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 720) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- One fixed site: per-user activity and network instability come
+      from a fixed seed; only behaviour is random. -#}
+  {%- set rnd = module.random.Random(2614) -%}
+  {%- set users = [] -%}
+  {%- set heap = [] -%}
+  {%- for i in range(samples.clients | length) -%}
+    {%- set row = samples.clients[i] -%}
+    {%- set w = rnd.lognormvariate(0, 0.6) -%}
+    {%- set wake = next_wake(now, w) | int -%}
+    {%- do users.append({'cn': row.cn, 'vip': row.vip, 'addrs': row.addresses | list,
+        'aw': row.address_weights | list, 'seen': [], 'w': w, 'flaky': rnd.lognormvariate(0, 0.7),
+        'wake': wake, 'active': none, 'busy': false}) -%}
+    {%- do module.heapq.heappush(heap, [wake, i, {'k': 'wake', 'u': i}]) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'heap': heap,
+      'seq': users | length, 'peers': [], 'partials': {},
+      'start_at': none, 'last_user': none}) -%}
+{%- endif -%}
+{%- set users = shared.get('users') -%}
+{%- set heap = shared.get('heap') -%}
+{%- set peers = shared.get('peers') -%}
+{%- set partials = shared.get('partials') -%}
+
+{%- macro push(at, item) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(heap, [at | int, n, item]) -%}
+{%- endmacro -%}
+
+{%- macro idle(u, t0) -%}
+  {%- set user = users[u] -%}
+  {%- set wake = next_wake(t0, user.w) | int -%}
+  {%- do user.update({'busy': false, 'wake': wake}) -%}
+  {{- push(wake, {'k': 'wake', 'u': u}) -}}
+{%- endmacro -%}
+
+{#- Detector replica of the chain on one CN: session replacements
+    (duplicate-cn drops) alternating X, Y, X, Y between two source
+    addresses within `window` seconds of the first. Returns 1 when a
+    drop from `ip` at `t` would complete it. -#}
+{%- macro completes(cn, ip, t) -%}
+  {%- set r = namespace(hit=0) -%}
+  {%- for p in partials.get(cn, []) if t - p[1] <= window and p[0] == 3 and p[2][1] == ip -%}
+    {%- set r.hit = 1 -%}
+  {%- endfor -%}
+  {{- r.hit -}}
+{%- endmacro -%}
+
+{%- macro feed(cn, ip, t) -%}
+  {%- set st = namespace(new=[], done=false) -%}
+  {%- for p in partials.get(cn, []) if t - p[1] <= window -%}
+    {%- if not st.done -%}
+      {%- if p[0] == 1 and ip != p[2][0] -%}
+        {%- set st.new = st.new + [[2, p[1], [p[2][0], ip]]] -%}
+      {%- elif p[0] == 2 and ip == p[2][0] -%}
+        {%- set st.new = st.new + [[3, p[1], p[2]]] -%}
+      {%- elif p[0] == 3 and ip == p[2][1] -%}
+        {%- set st.done = true -%}
+      {%- else -%}
+        {%- set st.new = st.new + [p] -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if st.done -%}
+    {%- do partials.pop(cn, none) -%}
+  {%- else -%}
+    {%- do partials.update({cn: (st.new + [[1, t, [ip]]])[-8:]}) -%}
   {%- endif -%}
-  {%- set common_name = shared.get('routine_cn') -%}
-  {%- set source_ip = shared.get('routine_ip') -%}
-  {%- set source_port = shared.get('routine_port') -%}
-  {%- set tunnel_ip = '10.8.0.' ~ (20 + shared.get('routine_id') % 150) -%}
+{%- endmacro -%}
+
+{#- A new connection of user u from `ip`. `old` is the session it may
+    replace. -#}
+{%- macro connect(u, ip, t, ep, short_p) -%}
+  {%- set s = {'u': u, 'ip': ip, 'port': module.random.randint(1025, 65535),
+      'sid': '%08x %08x' | format(module.random.getrandbits(32), module.random.getrandbits(32)),
+      'ep': ep, 'alive': false, 'peer': none, 'short_p': short_p} -%}
+  {{- push(t, {'k': 'initial', 's': s}) -}}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first tick, its hour drawn from the
+    background hour-of-day curve. Each later start is due one interval
+    after the actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and not shared.get('scheduled', false) -%}
+  {%- do shared.update({'scheduled': true, 'start_at':
+      pick_start(now, now + ([interval, 24] | min * 3600) | int, false) | int}) -%}
 {%- endif -%}
-{%- set endpoint = source_ip ~ ':' ~ source_port -%}
-{%- if chain and step == 5 -%}
-  {%- set action = 'duplicate-cn-drop' -%}
-  {%- set message = "MULTI: new connection by client '" ~ common_name ~ "' will cause previous active sessions by this client to be dropped. Remember to use the --duplicate-cn option if you want multiple clients using the same certificate or username to concurrently connect." -%}
-  {%- set event_type = 'info' -%}
-{%- elif (step == 0 or (chain and step == 3)) -%}
-  {%- set action = 'verify' -%}
-  {%- set message = endpoint ~ ' VERIFY OK: depth=0, CN=' ~ common_name -%}
-  {%- set event_type = 'info' -%}
-{%- elif (step == 1 or (chain and step == 4)) -%}
-  {%- set action = 'peer-connection' -%}
-  {%- set message = endpoint ~ ' [' ~ common_name ~ '] Peer Connection Initiated with [AF_INET]' ~ endpoint -%}
-  {%- set event_type = 'start' -%}
-{%- elif not chain and step == 3 -%}
-  {%- set action = 'data-channel' -%}
-  {%- set message = common_name ~ '/' ~ endpoint ~ " Data Channel: using negotiated cipher 'AES-256-GCM'" -%}
-  {%- set event_type = 'info' -%}
-{%- else -%}
-  {%- set action = 'pool-assignment' -%}
-  {%- set message = 'MULTI_sva: pool returned IPv4=' ~ tunnel_ip ~ ', IPv6=(Not enabled)' -%}
-  {%- set event_type = 'info' -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {#- One client certificate used from two places at once: the user's
+      device connects from one of the user's usual networks, a second
+      device with the same certificate connects from another of them,
+      and each kicked device reconnects when its ping-restart fires,
+      replacing the other: k = 4-6 alternating replacements. The user
+      is drawn with background activity weights among idle users whose
+      own next connection comes after the episode and who have no
+      replacement within the chain window; the previous episode's user
+      sits this one out. -#}
+  {%- if shared.get('ep_plan') is none -%}
+    {%- set k = module.rand.weighted_choice([4, 5, 6], [6, 3, 1]) -%}
+    {%- set first = gap(900, 0.8, 60, 3600) | int -%}
+    {%- set gaps = [] -%}
+    {%- for i in range(k - 1) -%}{%- do gaps.append(detect_gap(true) | int) -%}{%- endfor -%}
+    {%- do shared.set('ep_plan', {'k': k, 'first': first, 'gaps': gaps,
+        'tail': gap(5400, 0.9, 120, 43200) | int,
+        'exit': module.rand.chance(0.75)}) -%}
+  {%- endif -%}
+  {%- set p = shared.get('ep_plan') -%}
+  {%- set end = now + p.first + p.gaps | sum + p.tail + ping_restart + 600 -%}
+  {%- set ep = namespace(c=[], w=[]) -%}
+  {%- for i in range(users | length) -%}
+    {%- set user = users[i] -%}
+    {%- set recent = namespace(n=0) -%}
+    {%- for q in partials.get(user.cn, []) if now - q[1] <= window -%}{%- set recent.n = 1 -%}{%- endfor -%}
+    {%- if not user.busy and user.active is none and user.wake > end
+        and user.cn != shared.get('last_user') and recent.n == 0
+        and user.seen | length >= 2 -%}
+      {%- set ep.c = ep.c + [i] -%}{%- set ep.w = ep.w + [user.w] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ep.c -%}
+    {%- set u = module.rand.weighted_choice(ep.c, ep.w) -%}
+    {%- set user = users[u] -%}
+    {%- set own = namespace(a=[], w=[]) -%}
+    {%- for j in range(user.addrs | length) if user.addrs[j] in user.seen -%}
+      {%- set own.a = own.a + [user.addrs[j]] -%}{%- set own.w = own.w + [user.aw[j]] -%}
+    {%- endfor -%}
+    {%- set a1 = module.rand.weighted_choice(own.a, own.w) -%}
+    {%- set rest = namespace(a=[], w=[]) -%}
+    {%- for j in range(user.addrs | length) if user.addrs[j] != a1 and user.addrs[j] in user.seen -%}
+      {%- set rest.a = rest.a + [user.addrs[j]] -%}{%- set rest.w = rest.w + [user.aw[j]] -%}
+    {%- endfor -%}
+    {%- set a2 = module.rand.weighted_choice(rest.a, rest.w) -%}
+    {%- do p.update({'u': u, 'addrs': [a1, a2], 'i': 0}) -%}
+    {%- do shared.set('ep_plan', none) -%}
+    {{- connect(u, a1, now, p, 0) -}}
+    {{- connect(u, a2, now + p.first, p, 0) -}}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
+    {%- do shared.update({'last_user': user.cn,
+        'start_at': pick_start(due - half, due + half, true) | int}) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set prefix = event_time.strftime('%a %b ') ~ event_time.day ~ event_time.strftime(' %H:%M:%S %Y ') -%}
-{%- set raw = prefix ~ message -%}
-{"@timestamp":{{ event_time.isoformat() | tojson }},"ecs":{"version":"8.17.0"},"event":{"kind":"event","module":"openvpn","dataset":"openvpn.server","action":{{ action | tojson }},"category":["network"],"type":[{{ event_type | tojson }}],"original":{{ raw | tojson }}},"host":{"name":{{ params.vpn_host | tojson }}},"source":{"ip":{{ source_ip | tojson }},"port":{{ source_port }}},"user":{"name":{{ common_name | tojson }}},"openvpn":{"common_name":{{ common_name | tojson }},"source_address":{{ endpoint | tojson }},"tunnel_ip":{{ tunnel_ip | tojson }}},"message":{{ message | tojson }}}
+
+{#- 2. Pop the earliest due item. A wake starts a background connection
+    of an idle user; a segment end decides how the session goes on. -#}
+{%- set ns = namespace(item=none) -%}
+{%- for i in range(60) -%}
+  {%- if not heap or heap[0][0] > now -%}{%- break -%}{%- endif -%}
+  {%- set entry = module.heapq.heappop(heap) -%}
+  {%- set item = entry[2] -%}
+  {%- if item.k == 'wake' -%}
+    {%- set user = users[item.u] -%}
+    {%- do user.update({'busy': true}) -%}
+    {{- connect(item.u, module.rand.weighted_choice(user.addrs, user.aw), now, none,
+        [0.5, 0.1 * user.flaky] | min) -}}
+  {%- elif item.k == 'segend' -%}
+    {%- set s = item.s -%}
+    {%- set user = users[s.u] -%}
+    {%- if s.alive and not s.ep -%}
+      {%- set short = item.short -%}
+      {%- set r = module.random.random() -%}
+      {%- set roam_p = 0.8 if short else 0.08 -%}
+      {%- set timeout_at = now - module.random.randint(0, 10) + ping_restart -%}
+      {%- if r < roam_p -%}
+        {#- Reconnect from the same or another network; the server
+            drops the old instance only if it has not timed out. -#}
+        {%- set g = detect_gap(false) | int -%}
+        {%- do s.update({'roam': true}) -%}
+        {%- if now + g + 3 >= timeout_at -%}
+          {{- push(timeout_at, {'k': 'timeout', 's': s}) -}}
+        {%- endif -%}
+        {%- if module.random.random() < 0.4 -%}
+          {%- set ip = s.ip -%}
+        {%- else -%}
+          {%- set rest = namespace(a=[], w=[]) -%}
+          {%- for j in range(user.addrs | length) if user.addrs[j] != s.ip -%}
+            {%- set rest.a = rest.a + [user.addrs[j]] -%}{%- set rest.w = rest.w + [user.aw[j]] -%}
+          {%- endfor -%}
+          {%- set ip = module.rand.weighted_choice(rest.a, rest.w) -%}
+        {%- endif -%}
+        {{- connect(s.u, ip, now + g, none, [0.7, 0.45 * user.flaky] | min) -}}
+      {%- elif r < roam_p + (1 - roam_p) * 0.78 -%}
+        {{- push(now, {'k': 'delayed', 's': s}) -}}
+      {%- else -%}
+        {{- push(timeout_at, {'k': 'timeout', 's': s}) -}}
+      {%- endif -%}
+    {%- elif s.alive and s.ep -%}
+      {{- push(now if item.exit else now - module.random.randint(0, 10) + ping_restart,
+          {'k': 'delayed' if item.exit else 'timeout', 's': s}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'timeout' and not item.s.alive -%}
+    {#- Already replaced by a reconnect: nothing to log. -#}
+  {%- else -%}
+    {%- set ns.item = item -%}{%- break -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if ns.item is none -%}{%- do dispatch.drop() -%}{%- endif -%}
+
+{%- set item = ns.item -%}
+{%- set s = item.s -%}
+{%- set user = users[s.u] -%}
+{%- set cn = user.cn -%}
+{%- set action = item.k -%}
+{%- set addr = s.ip ~ ':' ~ s.port -%}
+{%- set inst = cn ~ '/' ~ addr -%}
+{%- set with_cn = true -%}
+{%- set vip = none -%}
+
+{#- 3. Emit and queue the next line. -#}
+{%- if action == 'initial' -%}
+  {%- set old = user.active -%}
+  {%- if old is not none and not s.ep -%}
+    {#- Guard, background only: a reconnect whose replacement line
+        would complete the chain on this CN comes from the address of
+        the session it replaces instead (a client restart on the same
+        network). Times are unchanged. -#}
+    {%- if completes(cn, s.ip, now) | int -%}
+      {%- set alt = [old.ip] + user.addrs -%}
+      {%- for a in alt if not completes(cn, a, now) | int -%}
+        {%- if loop.first -%}{%- do s.update({'ip': a}) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set addr = s.ip ~ ':' ~ s.port -%}
+      {%- set inst = cn ~ '/' ~ addr -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set message = addr ~ ' TLS: Initial packet from [AF_INET]' ~ addr ~ ', sid=' ~ s.sid -%}
+  {%- set with_cn = false -%}
+  {{- push(now + module.rand.weighted_choice([0, 1], [3, 1]), {'k': 'verify_ca', 's': s}) -}}
+{%- elif action == 'verify_ca' -%}
+  {%- set message = addr ~ ' VERIFY OK: depth=1, CN=' ~ params.ca_common_name -%}
+  {%- set with_cn = false -%}
+  {{- push(now, {'k': 'verify', 's': s}) -}}
+{%- elif action == 'verify' -%}
+  {%- set message = addr ~ ' VERIFY OK: depth=0, CN=' ~ cn -%}
+  {{- push(now, {'k': 'control', 's': s}) -}}
+{%- elif action == 'control' -%}
+  {%- set message = addr ~ ' Control Channel: TLSv1.3, cipher TLSv1.3 TLS_AES_256_GCM_SHA384, peer certificate: 2048 bits RSA, signature: RSA-SHA256, peer temporary key: 253 bits X25519' -%}
+  {%- set with_cn = false -%}
+  {{- push(now + module.rand.weighted_choice([0, 1], [1, 2]), {'k': 'peer', 's': s}) -}}
+{%- elif action == 'peer' -%}
+  {%- set message = addr ~ ' [' ~ cn ~ '] Peer Connection Initiated with [AF_INET]' ~ addr -%}
+  {%- if not s.ep and s.ip not in user.seen -%}{%- do user.seen.append(s.ip) -%}{%- endif -%}
+  {%- set old = user.active -%}
+  {%- if old is not none and old.alive -%}
+    {{- push(now, {'k': 'dup', 's': s}) -}}
+  {%- else -%}
+    {{- push(now, {'k': 'sva', 's': s}) -}}
+  {%- endif -%}
+{%- elif action == 'dup' -%}
+  {%- set old = user.active -%}
+  {%- do old.update({'alive': false}) -%}
+  {%- do peers.remove(old.peer) if old.peer in peers -%}
+  {%- set message = inst ~ " MULTI: new connection by client '" ~ cn ~ "' will cause previous active sessions by this client to be dropped.  Remember to use the --duplicate-cn option if you want multiple clients using the same certificate or username to concurrently connect." -%}
+  {{- feed(cn, s.ip, now) -}}
+  {{- push(now, {'k': 'sva', 's': s}) -}}
+{%- elif action == 'sva' -%}
+  {%- set pid = namespace(v=0) -%}
+  {%- for i in range(peers | length + 1) if i not in peers -%}
+    {%- if loop.first -%}{%- set pid.v = i -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do peers.append(pid.v) -%}
+  {%- do s.update({'alive': true, 'peer': pid.v}) -%}
+  {%- do user.update({'active': s}) -%}
+  {%- set vip = user.vip -%}
+  {%- set message = inst ~ ' MULTI_sva: pool returned IPv4=' ~ vip ~ ', IPv6=(Not enabled)' -%}
+  {{- push(now, {'k': 'learn', 's': s}) -}}
+{%- elif action == 'learn' -%}
+  {%- set vip = user.vip -%}
+  {%- set message = inst ~ ' MULTI: Learn: ' ~ vip ~ ' -> ' ~ inst -%}
+  {{- push(now, {'k': 'primary', 's': s}) -}}
+{%- elif action == 'primary' -%}
+  {%- set vip = user.vip -%}
+  {%- set message = inst ~ ' MULTI: primary virtual IP for ' ~ inst ~ ': ' ~ vip -%}
+  {{- push(now + module.rand.weighted_choice([0, 1], [1, 1]), {'k': 'push', 's': s}) -}}
+{%- elif action == 'push' -%}
+  {%- set message = inst ~ " PUSH: Received control message: 'PUSH_REQUEST'" -%}
+  {{- push(now, {'k': 'data', 's': s}) -}}
+{%- elif action == 'data' -%}
+  {%- set message = inst ~ " Data Channel: cipher 'AES-256-GCM', peer-id: " ~ s.peer -%}
+  {{- push(now, {'k': 'timers', 's': s}) -}}
+{%- elif action == 'timers' -%}
+  {%- set message = inst ~ ' Timers: ping 10, ping-restart ' ~ ping_restart -%}
+  {{- push(now, {'k': 'protocol', 's': s}) -}}
+{%- elif action == 'protocol' -%}
+  {%- set message = inst ~ ' Protocol options: protocol-flags cc-exit tls-ekm dyn-tls-crypt' -%}
+  {#- Plan how this session goes on. -#}
+  {%- set p = s.ep -%}
+  {%- if p -%}
+    {%- do p.update({'i': p.i + 1}) -%}
+    {%- if p.i >= 2 -%}
+      {#- The device this connection kicked reconnects when its own
+          ping-restart fires, until k replacements happened. -#}
+      {%- if p.i <= p.k -%}
+        {{- connect(s.u, p.addrs[p.i % 2], now + p.gaps[p.i - 2], p, 0) -}}
+      {%- else -%}
+        {{- push(now + p.tail, {'k': 'segend', 's': s, 'short': false, 'exit': p.exit}) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set short = module.random.random() < s.short_p -%}
+    {{- push(now + seg_len(1 if short else 0) | int, {'k': 'segend', 's': s, 'short': short}) -}}
+  {%- endif -%}
+{%- elif action == 'delayed' -%}
+  {%- set message = inst ~ ' Delayed exit in 5 seconds' -%}
+  {{- push(now + 5, {'k': 'exit', 's': s}) -}}
+{%- elif action == 'exit' -%}
+  {%- set message = inst ~ ' SIGTERM[soft,delayed-exit] received, client-instance exiting' -%}
+{%- elif action == 'timeout' -%}
+  {%- set message = inst ~ ' [' ~ cn ~ '] Inactivity timeout (--ping-restart), restarting' -%}
+  {{- push(now, {'k': 'restart', 's': s}) -}}
+{%- elif action == 'restart' -%}
+  {%- set message = inst ~ ' SIGUSR1[soft,ping-restart] received, client-instance restarting' -%}
+{%- endif -%}
+{%- if action in ['exit', 'restart'] and s.alive -%}
+  {%- do s.update({'alive': false}) -%}
+  {%- do peers.remove(s.peer) if s.peer in peers -%}
+  {%- if user.active is not none and user.active.sid == s.sid -%}{%- do user.update({'active': none}) -%}{%- endif -%}
+  {%- if not s.ep and not s.get('roam') -%}{{- idle(s.u, now) -}}{%- endif -%}
+{%- endif -%}
+
+{%- set categories = {
+    'initial': (['network'], ['connection', 'start']),
+    'verify_ca': (['authentication'], ['info']),
+    'verify': (['authentication'], ['info']),
+    'control': (['network'], ['protocol']),
+    'peer': (['session'], ['start']),
+    'dup': (['session'], ['end']),
+    'sva': (['network'], ['info']),
+    'learn': (['network'], ['info']),
+    'primary': (['network'], ['info']),
+    'push': (['network'], ['protocol']),
+    'data': (['network'], ['protocol']),
+    'timers': (['network'], ['info']),
+    'protocol': (['network'], ['protocol']),
+    'delayed': (['session'], ['info']),
+    'exit': (['session'], ['end']),
+    'timeout': (['session'], ['end']),
+    'restart': (['session'], ['end'])} -%}
+{%- set actions = {
+    'initial': 'tls-initial-packet', 'verify_ca': 'certificate-verified',
+    'verify': 'certificate-verified', 'control': 'control-channel-established',
+    'peer': 'peer-connection-initiated', 'dup': 'duplicate-cn-replaced',
+    'sva': 'virtual-address-assigned', 'learn': 'route-learned',
+    'primary': 'primary-virtual-address', 'push': 'push-request',
+    'data': 'data-channel-established', 'timers': 'timers',
+    'protocol': 'protocol-options', 'delayed': 'exit-scheduled',
+    'exit': 'client-exited', 'timeout': 'inactivity-timeout',
+    'restart': 'client-restarted'} -%}
+{%- set clock = timestamp.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set event = {'kind': 'event', 'module': 'openvpn', 'dataset': 'openvpn.server',
+    'action': actions[action], 'category': categories[action][0],
+    'type': categories[action][1], 'original': clock ~ ' ' ~ message} -%}
+{%- if action == 'timeout' -%}{%- do event.update({'outcome': 'failure'}) -%}
+{%- elif action in ['verify_ca', 'verify', 'peer'] -%}{%- do event.update({'outcome': 'success'}) -%}{%- endif -%}
+{%- set related = {'ip': [s.ip] + ([vip] if vip else [])} -%}
+{%- set doc = {'@timestamp': timestamp.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
+    'ecs': {'version': '8.17.0'},
+    'event': event,
+    'message': message,
+    'host': {'name': params.vpn_host},
+    'process': {'name': 'openvpn'},
+    'source': {'ip': s.ip, 'port': s.port},
+    'related': related} -%}
+{%- if with_cn -%}
+  {%- do doc.update({'user': {'name': cn}}) -%}
+  {%- do related.update({'user': [cn]}) -%}
+{%- endif -%}
+{%- if vip -%}{%- do doc.update({'openvpn': {'virtual_ip': vip}}) -%}{%- endif -%}
+{%- if action == 'data' -%}{%- do doc.update({'openvpn': {'peer_id': s.peer}}) -%}{%- endif -%}
+{{ doc | tojson }}
