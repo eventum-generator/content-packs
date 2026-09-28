@@ -11,10 +11,11 @@
 {%- set hq = module.heapq -%}
 {%- set sec = 1000000 -%}
 {%- set hour = 3600 * sec -%}
-{#- Guard window: a background URL match is renamed when the same
-    endpoint and user matched that URL and then a file hash within this
-    window, so the URL -> hash -> same URL sequence stays episode-only. -#}
-{%- set guard = 2 * hour -%}
+{#- Chain window: URL match, file hash, the same URL again for one
+    endpoint and user, counted from the first URL match. -#}
+{%- set within = hour -%}
+{#- Recent URLs of an endpoint that a new episode avoids. -#}
+{%- set recent_window = 2 * hour -%}
 {#- Incident opportunities per day over all endpoints; user endpoints
     take up an opportunity with an hour-of-day probability (UTC business
     hours), service accounts always. -#}
@@ -96,14 +97,18 @@
     {%- endfor -%}
   {%- endif -%}
 {%- endmacro -%}
-{%- macro armed(hist) -%}
-  {#- URLs of this history that were followed by a hash match. -#}
-  {%- set st = namespace(pending=[], armed=[]) -%}
-  {%- for e in hist -%}
-    {%- if e[1] == 'H' -%}{%- set st.armed = st.armed + st.pending -%}{%- set st.pending = [] -%}
-    {%- else -%}{%- do st.pending.append(e[2]) -%}{%- endif -%}
+{%- macro pick_start(lo, hi, sq, floor) -%}
+  {#- Uniform time in [lo, hi) accepted with the relative incident rate
+      of its UTC hour (squared plus floor when sq), by rejection. -#}
+  {%- set r = namespace(t=lo + module.builtins.int(module.rand.number.floating(0, 1) * (hi - lo)), done=false) -%}
+  {%- set cmax = shared.get('curve') | max -%}
+  {%- for _ in range(200) if not r.done -%}
+    {%- set r.t = lo + module.builtins.int(module.rand.number.floating(0, 1) * (hi - lo)) -%}
+    {%- set c = shared.get('curve')[module.datetime.datetime.fromtimestamp(r.t / 1000000, module.datetime.timezone.utc).hour] / cmax -%}
+    {%- set acc = (c * c + floor) / (1 + floor) if sq else c -%}
+    {%- if module.rand.number.floating(0, 1) < acc -%}{%- set r.done = true -%}{%- endif -%}
   {%- endfor -%}
-  {{- st.armed | join('\n') -}}
+  {{- r.t -}}
 {%- endmacro -%}
 {%- if shared.get('queue') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
@@ -114,7 +119,7 @@
   {%- do shared.update({'queue': [], 'seq': 0}) -%}
   {%- set eps = [] -%}
   {%- for r in samples.endpoints -%}
-    {%- do eps.append({'ip': r.ip, 'users': r.users.split(' '), 'w': r.weight | float, 'eid': module.rand.number.integer(100000, 9000000), 'hist': [], 'remap': {}}) -%}
+    {%- do eps.append({'ip': r.ip, 'users': r.users.split(' '), 'w': r.weight | float, 'eid': module.rand.number.integer(100000, 9000000), 'hist': [], 'remap': {}, 'seqm': {}}) -%}
   {%- endfor -%}
   {%- set lists = {} -%}
   {%- set fields = {
@@ -140,9 +145,17 @@
     {%- do eps[a].update({'med': mean_s * module.math.exp(-0.605), 'svc': eps[a].users[0].startswith('svc-')}) -%}
     {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(eps[a].med * module.math.exp(1.21), 1.1) | int)), {'k': 'inc', 'a': a}) -}}
   {%- endfor -%}
-  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {#- Relative incident rate per UTC hour: service accounts flat, user
+      endpoints thinned by the diurnal factor. -#}
+  {%- set svc_w = eps | selectattr('svc') | sum(attribute='w') -%}
+  {%- set curve = [] -%}
+  {%- for h in range(24) -%}{%- do curve.append(svc_w + (total_w - svc_w) * diurnal[h]) -%}{%- endfor -%}
+  {%- do shared.set('curve', curve) -%}
   {%- if params.anomaly_mode -%}
-    {{- push(now + hour + module.rand.number.integer(0, [hour, interval // 8] | min), {'k': 'ep'}) -}}
+    {#- First episode within the first min(interval, 24 h), its hour
+        following the incident rate. -#}
+    {%- set first_w = module.builtins.int([params.anomaly_interval_hours, 24] | min * hour) -%}
+    {{- push(pick_start(now, now + first_w, false, 0) | int, {'k': 'ep'}) -}}
   {%- endif -%}
 {%- endif -%}
 {%- set q = shared.get('queue') -%}
@@ -158,7 +171,10 @@
     {{- push(top[0] + (ln(eps[it.a].med, 1.1) | int), it) -}}
   {%- elif it.k == 'ep' -%}
     {#- Episode: URL match, a file hash from the same endpoint and user,
-        then the same URL again. Actor and objects rotate. -#}
+        then the same URL again. Actor and objects rotate. The next
+        start is drawn in a window of width w = min(interval / 4, 6 h)
+        centred one interval after this start, weighted by the squared
+        incident rate of the hour plus a floor. -#}
     {%- set start = top[0] -%}
     {%- set a = namespace(v=shared.get('ep_last_a')) -%}
     {%- for _ in range(50) if a.v == shared.get('ep_last_a') -%}{%- set a.v = module.rand.number.integer(0, eps | length - 1) -%}{%- endfor -%}
@@ -170,15 +186,22 @@
     {%- for _ in range(50) if h.v == shared.get('ep_last_h') -%}{%- set h.v = pick('hash') | int -%}{%- endfor -%}
     {%- set u = module.rand.choice(ep.users) -%}
     {%- set t = hits(a.v, u, 'M', x.v, start, true) | int -%}
-    {%- set t = t + (ln(90, 0.9) | int) -%}
+    {#- Gaps from the ordinary distributions, redrawn in the rare case
+        that the repeated URL would fall outside the chain window. -#}
+    {%- set g = namespace(d=[within, 0]) -%}
+    {%- for _ in range(50) if t - start + g.d | sum >= within -%}
+      {%- set g.d = [ln(90, 0.9) | int, ln(300, 0.8) | int] -%}
+    {%- endfor -%}
+    {%- set t = t + g.d[0] -%}
     {%- set _ = hits(a.v, u, 'H', h.v, t, true) -%}
-    {%- set t = t + (ln(300, 0.8) | int) -%}
+    {%- set t = t + g.d[1] -%}
     {{- push(t, {'k': 'row', 'a': a.v, 'u': u, 'c': 'M', 'i': x.v, 'ep': true}) -}}
     {%- if module.rand.chance(0.5) -%}
       {%- set _ = hits(a.v, u, 'M', other_mal(x.v) | int, t + (ln(400, 0.8) | int), false) -%}
     {%- endif -%}
     {%- do shared.update({'ep_last_a': a.v, 'ep_last_x': x.v, 'ep_last_h': h.v}) -%}
-    {{- push(start + interval + module.rand.number.integer(0, [hour, interval // 8] | min), {'k': 'ep'}) -}}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {{- push(pick_start(start + interval - w // 2, start + interval + w // 2, true, 0.05) | int, {'k': 'ep'}) -}}
   {%- else -%}
     {%- set out.due = top[0] -%}
     {%- set out.item = it -%}
@@ -187,7 +210,7 @@
 {%- if out.item is none -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set it = out.item -%}
 {%- set ep = eps[it.a] -%}
-{%- set keep = ep.hist | selectattr(0, 'ge', out.due - guard) | list -%}
+{%- set keep = ep.hist | selectattr(0, 'ge', out.due - recent_window) | list -%}
 {%- if keep | length > 200 -%}{%- set keep = keep[-200:] -%}{%- endif -%}
 {%- do ep.update({'hist': keep}) -%}
 {%- if it.c == 'H' -%}
@@ -196,9 +219,17 @@
 {%- else -%}
   {%- set pool = 'mal' if it.c == 'M' else 'phi' -%}
   {%- set idx = namespace(v=it.i) -%}
+  {#- Mirror of the chain matcher per endpoint and user: partial matches
+      [next step, first URL time, bound URL] advance on every matching
+      row and expire one hour after their first URL. All live partial
+      matches are kept (no cap, no reset when a chain completes), so
+      every ordered URL, hash, same URL within the hour is covered and
+      no later match completes a chain with rows of a completed one. Guard (both modes): a
+      background URL match that would complete the chain (URL, hash,
+      the same URL) is reported for another URL of the same list. -#}
+  {%- set bad = [] -%}
+  {%- for p in ep.seqm.get(it.u, []) if p[0] == 2 and out.due - p[1] <= within -%}{%- do bad.append(p[2]) -%}{%- endfor -%}
   {%- if not it.ep -%}
-    {%- set hist_u = keep | selectattr(3, 'equalto', it.u) | list -%}
-    {%- set bad = (armed(hist_u) | string).split('\n') -%}
     {%- if shared.get(pool)[idx.v].url in bad -%}
       {%- set m = ep.remap.get(pool ~ idx.v) -%}
       {%- if m is none or shared.get(pool)[m].url in bad -%}
@@ -215,6 +246,20 @@
   {%- set ident = rec.url -%}
 {%- endif -%}
 {%- do ep.hist.append([out.due, it.c, ident, it.u]) -%}
+{%- set parts = [] -%}
+{%- for p in ep.seqm.get(it.u, []) if out.due - p[1] <= within -%}
+  {%- if it.c == 'H' and p[0] == 1 -%}
+    {%- do parts.append([2, p[1], p[2]]) -%}
+  {%- else -%}
+    {%- do parts.append(p) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if it.c != 'H' -%}{%- do parts.append([1, out.due, ident]) -%}{%- endif -%}
+{%- if not parts -%}
+  {%- do ep.seqm.pop(it.u, none) -%}
+{%- else -%}
+  {%- do ep.seqm.update({it.u: parts}) -%}
+{%- endif -%}
 {%- do ep.update({'eid': ep.eid + 1 + (module.rand.number.lognormal(module.math.log(150), 1.3) | int)}) -%}
 {%- set cats = {'M': 'KL_Malicious_URL', 'P': 'KL_Phishing_URL', 'H': 'KL_Malicious_Hash_MD5'} -%}
 {%- set cat = cats[it.c] -%}
