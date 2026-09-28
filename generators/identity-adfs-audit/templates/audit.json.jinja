@@ -1,0 +1,423 @@
+{#- AD FS (Windows Server 2016+, basic audit level) Security-log audit
+    events 1200/1201/1202/1203 of one federation server, as NXLog
+    im_msvistalog JSON records wrapped in ECS. Each one-second tick
+    emits at most one record: the earliest due one. Every user is an
+    independent random process (idle gap, fresh sign-in with occasional
+    wrong passwords, SSO token requests); the anomaly episode only
+    queues its own records for one idle user and never touches the
+    background. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 900 -%}
+{%- set min_fails = 5 -%}
+{#- Mistyped-password bursts: 1-8 failures, each extra failure about
+    a third as likely; the chance of finally getting the password right
+    falls by a quarter per failure, so bursts of five or more that end
+    in a sign-in are a thin tail. Episodes draw their count from the
+    same law's tail (k >= 5). A stale saved password retries 2-14
+    times, decaying by 0.8 per retry, minutes apart. -#}
+{%- set burst = [1, 2, 3, 4, 5, 6, 7, 8] -%}
+{%- set burst_w = [1000, 350, 122, 43, 15, 5, 2, 1] -%}
+{%- set stale = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] -%}
+{%- set stale_w = [1000, 800, 640, 512, 410, 328, 262, 210, 168, 134, 107, 86, 69] -%}
+{%- set agents = [
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36 Edg/124.0.2478.80',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0',
+    'Mozilla/4.0 (compatible; MSIE 7.0; Windows NT 10.0; WOW64; Trident/7.0; Touch; .NET4.0C; .NET4.0E)',
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; WebView/3.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/70.0.3538.102 Safari/537.36 Edge/18.19044',
+    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Safari/605.1.15',
+    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4 Mobile/15E148 Safari/604.1',
+    'Mozilla/5.0 (Linux; Android 11; SM-A217F Build/RP1A.200720.012; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/94.0.4606.85 Mobile Safari/537.36'
+] -%}
+{%- set desktop_w = [30, 20, 10, 8, 6, 6, 0, 0] -%}
+{%- set mobile_w = [0, 0, 0, 0, 0, 0, 55, 45] -%}
+
+{%- macro hload(t) -%}
+  {%- set h = ((t | int) // 3600) % 24 -%}
+  {{- 1.0 if 7 <= h < 17 else (0.5 if 6 <= h < 7 or 17 <= h < 19 else (0.3 if 19 <= h < 22 else 0.1)) -}}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma, lo, hi) -%}
+  {{- [[module.random.lognormvariate(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
+{%- endmacro -%}
+
+{#- Next fresh sign-in of an idle user: lognormal idle gaps thinned by
+    the hour-of-day load, so users mostly sign in during office hours. -#}
+{%- macro next_attempt(t0, w) -%}
+  {%- set s = namespace(t=t0) -%}
+  {%- for i in range(80) -%}
+    {%- set s.t = s.t + gap(8000 / w, 1.0, 60, 400000) | int -%}
+    {%- if module.random.random() < hload(s.t) | float -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {{- s.t -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 720) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- One fixed organisation: per-user activity, relying parties,
+      devices and remote-access habits come from a fixed seed, so every
+      run models the same users and only behaviour is random. -#}
+  {%- set rnd = module.random.Random(1200) -%}
+  {%- set rps = [] -%}{%- set rpw = [] -%}
+  {%- for i in range(samples.relying_parties | length) -%}
+    {%- do rps.append(samples.relying_parties[i].identifier) -%}
+    {%- do rpw.append(samples.relying_parties[i].weight) -%}
+  {%- endfor -%}
+  {%- set actors = [] -%}
+  {%- set heap = [] -%}
+  {%- for i in range(samples.users | length) -%}
+    {%- set row = samples.users[i] -%}
+    {%- set mine = [] -%}{%- set mw = [] -%}
+    {%- for j in range(rps | length) -%}
+      {%- if rnd.random() < ([rpw[j] / 20.0, 0.9] | min) -%}
+        {%- do mine.append(rps[j]) -%}{%- do mw.append(rpw[j] * rnd.lognormvariate(0, 0.8)) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if not mine -%}{%- do mine.append(rps[0]) -%}{%- do mw.append(1.0) -%}{%- endif -%}
+    {%- set homes = [] -%}{%- set hw = [] -%}
+    {%- for ip in row.home_ips -%}{%- do homes.append(ip) -%}{%- do hw.append(rnd.lognormvariate(0, 0.8)) -%}{%- endfor -%}
+    {%- set w = rnd.lognormvariate(0, 0.6) -%}
+    {%- set wake = next_attempt(now, w) | int -%}
+    {%- do actors.append({'sam': row.sam, 'upn': row.upn, 'ws': row.workstation_ip,
+        'homes': homes, 'hw': hw, 'rps': mine, 'rpw': mw, 'w': w,
+        'ext': rnd.choice([0.05, 0.15, 0.3, 0.5]),
+        'desk': rnd.choices(range(agents | length), desktop_w)[0],
+        'mob': rnd.choices(range(agents | length), mobile_w)[0],
+        'busy': false, 'wake': wake}) -%}
+    {%- do module.heapq.heappush(heap, [wake, i, {'k': 'wake', 'a': i}]) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'actors': actors,
+      'heap': heap, 'seq': actors | length, 'hist': {},
+      'record': module.random.randint(4000000, 90000000),
+      'start_at': none, 'last_user': none}) -%}
+{%- endif -%}
+{%- set actors = shared.get('actors') -%}
+{%- set heap = shared.get('heap') -%}
+{%- set hist = shared.get('hist') -%}
+
+{%- macro push(at, item) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(heap, [at | int, n, item]) -%}
+{%- endmacro -%}
+
+{%- macro idle(a, t0) -%}
+  {%- set actor = actors[a] -%}
+  {%- set wake = next_attempt(t0, actor.w) | int -%}
+  {%- do actor.update({'busy': false, 'wake': wake}) -%}
+  {{- push(wake, {'k': 'wake', 'a': a}) -}}
+{%- endmacro -%}
+
+{#- A sign-in plan: k credential failures (1203), then a validated
+    credential (1202) and its token (1200), or nothing when the user
+    gives up. The web SSO session then serves more tokens for the
+    user's relying parties at lognormal gaps. Burst gaps are seconds (a
+    mistyped password); a stale saved password retries every few tens
+    of minutes. Remote sign-ins come through the Web Application Proxy
+    from one of the user's home addresses, on a desktop or a phone. -#}
+{%- macro plan(a, k, final, is_stale, ep) -%}
+  {%- set actor = actors[a] -%}
+  {%- set gaps = [] -%}
+  {%- for i in range(k) -%}
+    {%- do gaps.append(gap(1200, 0.5, 60, 14400) | int if is_stale else gap(10, 0.7, 1, 75) | int) -%}
+  {%- endfor -%}
+  {%- set ext = module.random.random() < actor.ext -%}
+  {%- set ua = actor.desk -%}
+  {%- if ext and module.random.random() < 0.4 -%}{%- set ua = actor.mob -%}{%- endif -%}
+  {%- set tokens = [[module.rand.weighted_choice([0, 1, 2], [25, 55, 20]),
+      module.rand.weighted_choice(actor.rps, actor.rpw)]] -%}
+  {%- set tl = namespace(t=0) -%}
+  {%- for i in range(14) -%}
+    {%- if module.random.random() >= 0.6 -%}{%- break -%}{%- endif -%}
+    {%- set g = gap(900, 1.1, 5, 28800) | int -%}
+    {%- set tl.t = tl.t + g -%}
+    {%- if tl.t > 28800 -%}{%- break -%}{%- endif -%}
+    {%- do tokens.append([g, module.rand.weighted_choice(actor.rps, actor.rpw)]) -%}
+  {%- endfor -%}
+  {%- do shared.set('plan', {'a': a, 'k': k, 'i': 0, 'gaps': gaps,
+      'final': final, 'ep': ep, 'ext': ext, 'ua': ua,
+      'ip': module.rand.weighted_choice(actor.homes, actor.hw) if ext else actor.ws,
+      'tokens': tokens, 'ti': 0, 'aid': none}) -%}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first tick, its hour drawn from the
+    background hour-of-day curve. Each later start is due one interval
+    after the actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor, so start hours never drift. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and not shared.get('scheduled', false) -%}
+  {%- do shared.update({'scheduled': true, 'start_at':
+      pick_start(now, now + ([interval, 24] | min * 3600) | int, false) | int}) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {#- Password guessing that succeeds from one of a user's usual
+      addresses: at least five failures, a validated credential and
+      ordinary SSO token traffic. The user is drawn with the background
+      activity weights among idle users whose next own sign-in comes
+      after the episode and its window, so the episode never overlaps
+      or moves the user's own traffic; the previous episode's user sits
+      this one out. -#}
+  {%- if shared.get('ep_plan') is none -%}
+    {%- set k = module.rand.weighted_choice(burst[4:], burst_w[4:]) -%}
+    {{- plan(0, k, 'ok', false, true) -}}
+    {%- do shared.set('ep_plan', shared.get('plan')) -%}
+  {%- endif -%}
+  {%- set p = shared.get('ep_plan') -%}
+  {%- set tsum = namespace(t=0) -%}
+  {%- for tk in p.tokens -%}{%- set tsum.t = tsum.t + tk[0] -%}{%- endfor -%}
+  {%- set end = now + p.gaps | sum + tsum.t + 2 * window + 60 -%}
+  {%- set ep = namespace(c=[], w=[]) -%}
+  {%- for i in range(actors | length) -%}
+    {%- set actor = actors[i] -%}
+    {%- if not actor.busy and actor.wake > end and actor.sam != shared.get('last_user') -%}
+      {%- set ep.c = ep.c + [i] -%}{%- set ep.w = ep.w + [actor.w] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ep.c -%}
+    {%- set a = module.rand.weighted_choice(ep.c, ep.w) -%}
+    {%- set ep_p = shared.get('ep_plan') -%}
+    {{- plan(a, ep_p.k, 'ok', false, true) -}}
+    {%- set p = shared.get('plan') -%}
+    {%- set tokens = [] -%}
+    {%- for tk in ep_p.tokens -%}
+      {%- do tokens.append([tk[0], module.rand.weighted_choice(actors[a].rps, actors[a].rpw)]) -%}
+    {%- endfor -%}
+    {%- do p.update({'gaps': ep_p.gaps, 'tokens': tokens}) -%}
+    {%- do shared.set('ep_plan', none) -%}
+    {{- push(now, {'k': 'fail', 'p': p}) -}}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
+    {%- do shared.update({'last_user': actors[a].sam,
+        'start_at': pick_start(due - half, due + half, true) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Pop the earliest due item. A wake starts a background sign-in of
+    an idle user and queues its first record. -#}
+{%- set ns = namespace(item=none) -%}
+{%- for i in range(60) -%}
+  {%- if not heap or heap[0][0] > now -%}{%- break -%}{%- endif -%}
+  {%- set entry = module.heapq.heappop(heap) -%}
+  {%- set item = entry[2] -%}
+  {%- if item.k == 'wake' -%}
+    {%- set a = item.a -%}
+    {%- do actors[a].update({'busy': true}) -%}
+    {%- set r = module.random.random() -%}
+    {%- if r < 0.02 -%}
+      {{- plan(a, module.rand.weighted_choice(stale, stale_w), 'ok', true, false) -}}
+    {%- elif r < 0.14 -%}
+      {%- set k = module.rand.weighted_choice(burst, burst_w) -%}
+      {{- plan(a, k, 'ok' if module.random.random() < 0.92 * 0.75 ** (k - 1) else 'giveup', false, false) -}}
+    {%- else -%}
+      {{- plan(a, 0, 'ok', false, false) -}}
+    {%- endif -%}
+    {%- set p = shared.get('plan') -%}
+    {{- push(now, {'k': 'fail' if p.k > 0 else 'cred', 'p': p}) -}}
+  {%- else -%}
+    {%- set ns.item = item -%}{%- break -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if ns.item is none -%}{%- do dispatch.drop() -%}{%- endif -%}
+
+{%- set p = ns.item.p -%}
+{%- set actor = actors[p.a] -%}
+{%- set key = actor.sam ~ '|' ~ p.ip -%}
+{%- set step = ns.item.k -%}
+{%- set h = hist.get(key, {'f': [], 's': []}) -%}
+{%- set hf = [] -%}{%- set hs = [] -%}
+{%- for t in h.f if t >= now - window -%}{%- do hf.append(t) -%}{%- endfor -%}
+{%- for t in h.s if t >= now - window -%}{%- do hs.append(t) -%}{%- endfor -%}
+{%- set rp = none -%}
+{%- set outcome_ok = true -%}
+
+{#- 3. Emit and queue the next record of this sign-in. -#}
+{%- if step == 'fail' -%}
+  {%- do hf.append(now) -%}
+  {%- do p.update({'i': p.i + 1}) -%}
+  {%- set outcome_ok = false -%}
+  {%- if p.i < p.k -%}
+    {{- push(now + p.gaps[p.i - 1], {'k': 'fail', 'p': p}) -}}
+  {%- elif p.final == 'ok' -%}
+    {{- push(now + p.gaps[p.k - 1], {'k': 'cred', 'p': p}) -}}
+  {%- else -%}
+    {{- idle(p.a, now) -}}
+  {%- endif -%}
+{%- elif step == 'cred' -%}
+  {%- do hs.append(now) -%}
+  {%- do p.update({'aid': module.rand.crypto.uuid4()}) -%}
+  {{- push(now + p.tokens[0][0], {'k': 'token', 'p': p}) -}}
+{%- else -%}
+  {%- set rp = p.tokens[p.ti][1] -%}
+  {%- set aid = p.aid if p.ti == 0 else module.rand.crypto.uuid4() -%}
+  {#- The chain's own token is the step that completes it; ordinary
+      token failures apply to every other token. -#}
+  {%- set outcome_ok = (p.ep and p.ti == 0) or module.random.random() >= 0.02 -%}
+  {#- Background guard on the chain's final step, at its own time and
+      for its own relying party: a token that would complete five
+      failures, a validated credential and a token of one user|address
+      within the chain window (anchored at the first failure, as a
+      detector's) is denied (1201) instead. Outside the window nothing
+      changes. -#}
+  {%- if not p.ep and outcome_ok and hs -%}
+    {%- set g = namespace(i=none) -%}
+    {%- for i in range((hf | length) - 4) -%}
+      {%- if hf[i + 4] < hs[-1] -%}{%- set g.i = i -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if g.i is not none -%}
+      {%- if now - hf[g.i] <= window -%}{%- set outcome_ok = false -%}{%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if p.ep and p.ti == 0 -%}
+    {#- The chain consumed its failures (a detector resets on completion). -#}
+    {%- do hf.clear() -%}{%- do hs.clear() -%}
+  {%- endif -%}
+  {%- do p.update({'ti': p.ti + 1, 'cur_aid': aid}) -%}
+  {%- if p.ti < p.tokens | length -%}
+    {{- push(now + p.tokens[p.ti][0], {'k': 'token', 'p': p}) -}}
+  {%- elif not p.ep -%}
+    {{- idle(p.a, now) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- if hf or hs -%}{%- do hist.update({key: {'f': hf, 's': hs}}) -%}{%- else -%}{%- do hist.pop(key, none) -%}{%- endif -%}
+
+{#- 4. Render. Security-log record numbers advance by one plus the
+    other Security events written in between. -#}
+{%- set record = shared.get('record') + 1 + module.rand.weighted_choice([0, 1, 2, 3, 4, 6, 9], [30, 22, 16, 12, 9, 7, 4]) -%}
+{%- do shared.set('record', record) -%}
+{%- set fs = params.federation_service -%}
+{%- set trust = 'http://' ~ fs ~ '/adfs/services/trust' -%}
+{%- if step == 'fail' -%}
+  {%- set aid = module.rand.crypto.uuid4() -%}
+  {%- set code = 1203 -%}
+{%- elif step == 'cred' -%}
+  {%- set aid = p.aid -%}
+  {%- set code = 1202 -%}
+{%- else -%}
+  {%- set aid = p.cur_aid -%}
+  {%- set code = 1200 if outcome_ok else 1201 -%}
+{%- endif -%}
+{%- set success = code in [1200, 1202] -%}
+{%- set fresh = code in [1202, 1203] -%}
+{%- set ua = agents[p.ua] -%}
+{%- set bound = code == 1200 and p.ua == 3 -%}
+{#- As in the fixtures, failure records (1201, 1203) and fresh-credential
+    records name the federation service and the typed UPN; a token issued
+    by the claims provider names the relying party and DOMAIN\\user. -#}
+{%- set by_fs = code != 1200 -%}
+{%- set user_id = actor.upn if by_fs else params.domain ~ '\\' ~ actor.sam -%}
+{%- set endpoint = '/adfs/ls/' -%}
+{%- set text = {1200: 'The Federation Service issued a valid token. See XML for details.',
+    1201: 'The Federation Service failed to issue a valid token. See XML for failure details.',
+    1202: 'The Federation Service validated a new credential. See XML for details.',
+    1203: 'The Federation Service failed to validate a new credential. See XML for failure details.'}[code] -%}
+{%- set a = {'type': 'FreshCredentialAudit' if fresh else 'AppTokenAudit',
+    'audit_type': 'FreshCredentials' if fresh else 'AppToken',
+    'result': 'Success' if success else 'Failure',
+    'failure': 'None' if success else ('CredentialValidationError' if fresh else 'GenericError'),
+    'rp': trust if by_fs else rp,
+    'cp': 'AD AUTHORITY' if success else 'N/A',
+    'primary': 'urn:oasis:names:tc:SAML:2.0:ac:classes:PasswordProtectedTransport' if success else 'N/A',
+    'tbp': 'true' if bound else 'false',
+    'sso': 'TokenBoundAndValid' if bound else 'NotSet',
+    'location': 'Extranet' if p.ext else 'Intranet',
+    'fwd': p.ip if p.ext else none,
+    'proxy': params.proxy_server if p.ext else 'N/A'} -%}
+{%- set nl = '\r\n' -%}
+{%- set xml = '<?xml version="1.0" encoding="utf-16"?>' ~ nl
+    ~ '<AuditBase xmlns:xsd="http://www.w3.org/2001/XMLSchema" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:type="' ~ a.type ~ '">' ~ nl
+    ~ '  <AuditType>' ~ a.audit_type ~ '</AuditType>' ~ nl
+    ~ '  <AuditResult>' ~ a.result ~ '</AuditResult>' ~ nl
+    ~ '  <FailureType>' ~ a.failure ~ '</FailureType>' ~ nl
+    ~ '  <ErrorCode>N/A</ErrorCode>' ~ nl
+    ~ '  <ContextComponents>' ~ nl
+    ~ '    <Component xsi:type="ResourceAuditComponent">' ~ nl
+    ~ '      <RelyingParty>' ~ (a.rp | e) ~ '</RelyingParty>' ~ nl
+    ~ '      <ClaimsProvider>' ~ a.cp ~ '</ClaimsProvider>' ~ nl
+    ~ '      <UserId>' ~ (user_id | e) ~ '</UserId>' ~ nl
+    ~ '    </Component>' ~ nl
+    ~ '    <Component xsi:type="AuthNAuditComponent">' ~ nl
+    ~ '      <PrimaryAuth>' ~ a.primary ~ '</PrimaryAuth>' ~ nl
+    ~ '      <DeviceAuth>false</DeviceAuth>' ~ nl
+    ~ '      <DeviceId>N/A</DeviceId>' ~ nl
+    ~ '      <MfaPerformed>false</MfaPerformed>' ~ nl
+    ~ '      <MfaMethod>N/A</MfaMethod>' ~ nl
+    ~ '      <TokenBindingProvidedId>' ~ a.tbp ~ '</TokenBindingProvidedId>' ~ nl
+    ~ '      <TokenBindingReferredId>false</TokenBindingReferredId>' ~ nl
+    ~ '      <SsoBindingValidationLevel>' ~ a.sso ~ '</SsoBindingValidationLevel>' ~ nl
+    ~ '    </Component>' ~ nl
+    ~ '    <Component xsi:type="ProtocolAuditComponent">' ~ nl
+    ~ '      <OAuthClientId>N/A</OAuthClientId>' ~ nl
+    ~ '      <OAuthGrant>N/A</OAuthGrant>' ~ nl
+    ~ '    </Component>' ~ nl
+    ~ '    <Component xsi:type="RequestAuditComponent">' ~ nl
+    ~ '      <Server>' ~ trust ~ '</Server>' ~ nl
+    ~ '      <AuthProtocol>WSFederation</AuthProtocol>' ~ nl
+    ~ '      <NetworkLocation>' ~ a.location ~ '</NetworkLocation>' ~ nl
+    ~ '      <IpAddress>' ~ p.ip ~ '</IpAddress>' ~ nl
+    ~ ('      <ForwardedIpAddress>' ~ a.fwd ~ '</ForwardedIpAddress>' if a.fwd else '      <ForwardedIpAddress />') ~ nl
+    ~ '      <ProxyIpAddress>N/A</ProxyIpAddress>' ~ nl
+    ~ '      <NetworkIpAddress>N/A</NetworkIpAddress>' ~ nl
+    ~ '      <ProxyServer>' ~ a.proxy ~ '</ProxyServer>' ~ nl
+    ~ '      <UserAgentString>' ~ (ua | e) ~ '</UserAgentString>' ~ nl
+    ~ '      <Endpoint>' ~ endpoint ~ '</Endpoint>' ~ nl
+    ~ '    </Component>' ~ nl
+    ~ '  </ContextComponents>' ~ nl
+    ~ '</AuditBase>' -%}
+{%- set message = text ~ ' ' ~ nl ~ nl ~ 'Activity ID: ' ~ aid ~ ' ' ~ nl ~ nl ~ 'Additional Data ' ~ nl ~ 'XML: ' ~ xml -%}
+{%- set event_time = timestamp.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set received = (timestamp + module.datetime.timedelta(seconds=module.rand.weighted_choice([0, 1, 2, 3], [20, 50, 25, 5]))).strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set native = {'EventTime': event_time, 'Hostname': params.host_name,
+    'Keywords': -9178336040581070848 if success else -9182839640208441344,
+    'EventType': 'AUDIT_SUCCESS' if success else 'AUDIT_FAILURE',
+    'SeverityValue': 2 if success else 4, 'Severity': 'INFO' if success else 'ERROR',
+    'EventID': code, 'SourceName': 'AD FS Auditing', 'Task': 3, 'RecordNumber': record,
+    'ProcessID': 0, 'ThreadID': 0, 'Channel': 'Security',
+    'Domain': params.domain, 'AccountName': params.service_account,
+    'UserID': params.service_account_sid, 'AccountType': 'User',
+    'Message': message, 'Opcode': 'Info', 'EventReceivedTime': received,
+    'SourceModuleName': 'in', 'SourceModuleType': 'im_msvistalog'} -%}
+{%- set audit = {'audit_type': a.audit_type, 'audit_result': a.result,
+    'failure_type': a.failure, 'error_code': 'N/A', 'relying_party': a.rp,
+    'claims_provider': a.cp, 'user_id': user_id, 'primary_auth': a.primary,
+    'mfa_performed': false, 'server': trust, 'auth_protocol': 'WSFederation',
+    'network_location': a.location, 'ip_address': p.ip,
+    'proxy_server': a.proxy, 'endpoint': endpoint} -%}
+{%- if a.fwd -%}{%- do audit.update({'forwarded_ip_address': a.fwd}) -%}{%- endif -%}
+{%- set action = {1200: 'token-issued', 1201: 'token-issue-failed',
+    1202: 'credential-validated', 1203: 'credential-validation-failed'}[code] -%}
+{{ module.json.dumps({'@timestamp': timestamp.isoformat(),
+    'ecs': {'version': '8.17.0'},
+    'event': {'kind': 'event', 'module': 'adfs', 'dataset': 'adfs.audit',
+        'code': code | string, 'action': action, 'category': ['authentication'],
+        'type': ['start'] if fresh else ['info'],
+        'outcome': 'success' if success else 'failure',
+        'original': module.json.dumps(native, ensure_ascii=False, separators=(',', ':'))},
+    'message': text,
+    'host': {'name': params.host_name},
+    'winlog': {'channel': 'Security', 'provider_name': 'AD FS Auditing',
+        'event_id': code | string, 'record_id': record, 'activity_id': aid,
+        'computer_name': params.host_name,
+        'keywords': ['Audit Success', 'Classic'] if success else ['Audit Failure', 'Classic']},
+    'user': {'name': actor.sam, 'domain': params.domain},
+    'source': {'ip': p.ip},
+    'user_agent': {'original': ua},
+    'related': {'user': [actor.sam], 'ip': [p.ip]},
+    'adfs': {'audit': audit}
+}, ensure_ascii=False) }}
