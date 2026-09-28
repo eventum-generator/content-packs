@@ -3,7 +3,8 @@
 
     Each one-second tick emits at most one message, taken from a
     due-queue fed by independent per-user random processes (merged
-    Poisson with a diurnal load curve). The anomaly episode only adds
+    Poisson, each user thinned by its own working hours, shifted per
+    user and jittered per day). The anomaly episode only adds
     its own requests to the queue; it never suspends, delays or
     reshapes background traffic.
 
@@ -16,7 +17,34 @@
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
-{%- set guard = 3600 -%}
+{%- set within = 1800 -%}
+
+{#- Activity factor of one user at a local hour: busy inside its own
+    working hours (start, length), evening for 4 h after, night. -#}
+{%- macro factor(start, length, local_hour) -%}
+{%- set into = (local_hour - start) % 24 -%}
+{{- (1.7 if into < length else (0.7 if into < length + 4 else 0.2)) / 0.9 -}}
+{%- endmacro -%}
+
+{#- Draw an episode start in [a, b): 10-minute slots weighted by the
+    background hour curve (sq: curve^2 + 0.05, curve max 1), uniform
+    within a slot. -#}
+{%- macro draw_start(a, b, sq) -%}
+  {%- set base = (a // 600) * 600 -%}
+  {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
+  {%- for i in range((b - base) // 600 + 1) -%}
+    {%- set lo = [a, base + i * 600] | max -%}
+    {%- set hi = [b, base + (i + 1) * 600] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = shared.get('curve')[((base + i * 600) % 86400) // 600] -%}
+      {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
+      {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set j = module.rand.weighted_choice(range(ws | length) | list, ws) -%}
+  {%- do shared.set('start_at',
+      module.rand.number.integer(lows[j], highs[j] - 1)) -%}
+{%- endmacro -%}
 
 {%- if not shared.get('initialized', false) -%}
   {%- if not (1 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
@@ -36,26 +64,47 @@
     {%- do users.append({'name': name, 'ip': ip,
         'group': module.rand.weighted_choice(params.groups, range(params.groups | length, 0, -1) | list),
         'ua': module.rand.weighted_choice(agents, [46, 30, 16, 8])}) -%}
-    {%- do weights.append(module.rand.number.lognormal(0, 0.6)) -%}
+    {%- do weights.append(module.rand.number.lognormal(0, 1.0)) -%}
   {%- endfor -%}
+  {#- Own working hours per user (local start, length), a per-day
+      jitter of the start and a day off (about 1 day in 10), redrawn
+      when the user's local day changes. -#}
+  {%- set shifts = {} -%}
+  {%- for u in users -%}
+    {%- do shifts.update({u.name: [module.rand.number.floating(6.0, 11.5),
+        module.rand.number.floating(7.0, 10.5), -1, 0.0, false]}) -%}
+  {%- endfor -%}
+  {#- Background hour curve per 10-minute UTC slot: weighted sum of the
+      users' factors, max 1 (for episode start times only). -#}
+  {%- set wsum = weights | sum -%}
+  {%- set curve = [] -%}
+  {%- for k in range(144) -%}
+    {%- set lh = ((k + 0.5) / 6 + params.syslog_utc_offset_hours) % 24 -%}
+    {%- set acc = namespace(v=0) -%}
+    {%- for u in users -%}
+      {%- set sh = shifts[u.name] -%}
+      {%- set acc.v = acc.v + weights[loop.index0] * (factor(sh[0], sh[1], lh) | float) -%}
+    {%- endfor -%}
+    {%- do curve.append(acc.v / wsum) -%}
+  {%- endfor -%}
+  {%- set cmax = curve | max -%}
+  {%- set norm = [] -%}
+  {%- for v in curve -%}{%- do norm.append(v / cmax) -%}{%- endfor -%}
   {%- do shared.update({'initialized': true, 'users': users, 'weights': weights,
-      'q': [], 'hist': {},
-      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'shifts': shifts, 'curve': norm, 'q': [], 'm': {}, 'start_at': none,
       'last_user': none, 'last_share': none}) -%}
+  {#- First episode inside the first min(interval, 24 h), its time of
+      day drawn from the background hour curve. -#}
+  {%- if params.anomaly_mode -%}
+    {{- draw_start(now, now + ([interval, 24] | min * 3600) | int, false) -}}
+  {%- endif -%}
 {%- endif -%}
 
 {%- set users = shared.get('users') -%}
 {%- set q = shared.get('q') -%}
-{%- set hist = shared.get('hist') -%}
-{%- if now % 600 == 0 -%}
-  {%- for k in hist | list -%}
-    {%- set keep = hist[k] | selectattr('t', 'gt', now - 2 * guard) | list -%}
-    {%- if keep -%}{%- do hist.update({k: keep}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
-  {%- endfor -%}
-{%- endif -%}
-{%- set hour = timestamp.astimezone(utc).hour -%}
-{%- set local_hour = (hour + params.syslog_utc_offset_hours) % 24 -%}
-{%- set load = (1.7 if 8 <= local_hour < 18 else (0.7 if 18 <= local_hour < 22 else 0.2)) / 0.9 -%}
+{%- set mstate = shared.get('m') -%}
+{%- set local_hour = ((now % 86400) / 3600 + params.syslog_utc_offset_hours) % 24 -%}
+{%- set day_no = ((now + params.syslog_utc_offset_hours * 3600) // 86400) | int -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
@@ -63,27 +112,9 @@
 
 {#- Queue one request. kind: page, asset, api, deny, upload, share,
     download. -#}
-{%- macro enq(u, kind, site, path, at, referer='') -%}
+{%- macro enq(u, kind, site, path, at, referer='', ep=false) -%}
   {%- do q.append({'due': at, 'u': u, 'kind': kind, 'site': site,
-      'path': path, 'referer': referer}) -%}
-{%- endmacro -%}
-
-{#- Chain guard on the final step only: for one user, no window of
-    `guard` seconds holds both two or more denied uploads to a blocked
-    file-sharing site and an allowed upload to cloud storage. A single
-    denial followed by an upload, and repeated denials without an
-    upload, stay in background. -#}
-{%- macro guard_ok(u, kind, at) -%}
-  {%- set rows = hist.get(u.name, []) | selectattr('t', 'gt', at - guard) | selectattr('t', 'lt', at + guard) | list -%}
-  {%- set nd = rows | selectattr('k', 'equalto', 'd') | list | length -%}
-  {%- set ng = rows | selectattr('k', 'equalto', 'g') | list | length -%}
-  {{- 'yes' if (kind == 'd' and (ng == 0 or nd == 0)) or (kind == 'g' and nd < 2) else 'no' -}}
-{%- endmacro -%}
-{%- macro mark(u, kind, at) -%}
-  {%- set rows = hist.get(u.name, []) -%}
-  {%- do rows.append({'t': at, 'k': kind}) -%}
-  {%- if rows | length > 40 -%}{%- do rows.pop(0) -%}{%- endif -%}
-  {%- do hist.update({u.name: rows}) -%}
+      'path': path, 'referer': referer, 'ep': ep}) -%}
 {%- endmacro -%}
 
 {%- set assets = ['/static/app.js', '/static/vendor.js', '/static/site.css',
@@ -103,19 +134,23 @@
 
 {#- Denied upload attempts, retried by the user; t.v advances to the
     time after the last attempt. -#}
-{%- macro share_attempt(u, s, t, n, forced) -%}
+{%- macro share_attempt(u, s, t, n, ep) -%}
   {%- for i in range(n) -%}
-    {%- if forced or guard_ok(u, 'd', t.v) == 'yes' -%}
-      {{- mark(u, 'd', t.v) -}}
-      {{- enq(u, 'share', s, s.path, t.v, 'https://' ~ s.host ~ '/') -}}
-    {%- endif -%}
+    {{- enq(u, 'share', s, s.path, t.v, 'https://' ~ s.host ~ '/', ep) -}}
     {%- set t.v = t.v + gap(25, 0.9) | int -%}
   {%- endfor -%}
 {%- endmacro -%}
 
 {#- 1. Background: one merged Poisson stream of independent users. -#}
-{%- if module.rand.chance(0.06 * load) -%}
-  {%- set u = module.rand.weighted_choice(users, shared.get('weights')) -%}
+{%- set u = module.rand.weighted_choice(users, shared.get('weights')) -%}
+{%- set sh = shared.get('shifts')[u.name] -%}
+{%- if sh[2] != day_no -%}
+  {%- set sh = [sh[0], sh[1], day_no, module.rand.number.gauss(0, 0.6),
+      module.rand.chance(0.1)] -%}
+  {%- do shared.get('shifts').update({u.name: sh}) -%}
+{%- endif -%}
+{%- set f = 0.2 / 0.9 if sh[4] else factor(sh[0] + sh[3], sh[1], local_hour) | float -%}
+{%- if module.rand.chance(0.06 * f) -%}
   {%- set profile = module.rand.weighted_choice(
       ['browse', 'api', 'blocked', 'upload', 'share', 'download'],
       [63, 9, 8, 8, 6, 6]) -%}
@@ -143,10 +178,7 @@
     {%- set s = module.rand.choice(params.storage_sites) -%}
     {%- set t = namespace(v=now) -%}
     {%- for i in range(module.rand.weighted_choice([1, 2, 3], [78, 16, 6])) -%}
-      {%- if guard_ok(u, 'g', t.v) == 'yes' -%}
-        {{- mark(u, 'g', t.v) -}}
-        {{- enq(u, 'upload', s, s.path, t.v, 'https://' ~ s.host ~ '/') -}}
-      {%- endif -%}
+      {{- enq(u, 'upload', s, s.path, t.v, 'https://' ~ s.host ~ '/') -}}
       {%- set t.v = t.v + gap(90, 1.2) | int -%}
     {%- endfor -%}
   {%- elif profile == 'share' -%}
@@ -159,10 +191,7 @@
     {%- if module.rand.chance(0.45) -%}
       {%- set at = t.v + gap(180, 0.8) | int -%}
       {%- set g = module.rand.choice(params.storage_sites) -%}
-      {%- if guard_ok(u, 'g', at) == 'yes' -%}
-        {{- mark(u, 'g', at) -}}
-        {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/') -}}
-      {%- endif -%}
+      {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/') -}}
     {%- endif -%}
   {%- else -%}
     {%- set s = module.rand.choice(params.storage_sites) -%}
@@ -170,15 +199,13 @@
   {%- endif -%}
 {%- endif -%}
 
-{#- 2. Episode: due by source time, random start delay, next due from
-    the actual start, no catch-up. A rotated user is denied two or more
-    uploads to a rotated blocked file-sharing site, then uploads to
-    sanctioned cloud storage. -#}
+{#- 2. Episode: a rotated user is denied two or more uploads to a
+    rotated blocked file-sharing site, then uploads to sanctioned cloud
+    storage. The next start is drawn in a window of
+    w = min(interval / 4, 6 h) centred on due = this start + interval,
+    weighted by the hour curve squared plus a floor. -#}
 {%- if params.anomaly_mode -%}
-  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
-    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 1200)) | int) -%}
-  {%- endif -%}
-  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {%- if now >= shared.get('start_at') -%}
     {%- set u = module.rand.choice(users | rejectattr('name', 'equalto', shared.get('last_user')) | list) -%}
     {%- set s = module.rand.choice(params.sharing_sites | rejectattr('host', 'equalto', shared.get('last_share')) | list) -%}
     {%- set g = module.rand.choice(params.storage_sites) -%}
@@ -192,10 +219,11 @@
     {%- set t = namespace(v=now) -%}
     {{- share_attempt(u, s, t, n, true) -}}
     {%- set at = t.v + [gap(180, 0.8) | int, 1200] | min -%}
-    {{- mark(u, 'g', at) -}}
-    {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/') -}}
-    {%- do shared.update({'start_at': none, 'last_user': u.name, 'last_share': s.host,
-        'next_due': now + (interval * 3600) | int}) -%}
+    {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/', true) -}}
+    {%- do shared.update({'last_user': u.name, 'last_share': s.host}) -%}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+    {{- draw_start(due - half, due + half, true) -}}
   {%- endif -%}
 {%- endif -%}
 
@@ -208,6 +236,28 @@
 {%- endfor -%}
 {%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
 {%- set e = q.pop(pick.i) -%}
+{%- set ms = module.rand.number.integer(0, 999) -%}
+
+{#- Guard on the final chain step over every binding: an allowed
+    upload completes a chain when its user had two or more denied POSTs
+    to one other host in the preceding `within` s (no cap, no reset). A
+    background upload that would complete one is dropped; episode rows
+    never are. -#}
+{%- if e.kind in ['share', 'upload'] -%}
+  {%- set tt = now + ms / 1000 -%}
+  {%- set recent = mstate.get(e.u.name, []) | selectattr('0', 'ge', tt - within) | list -%}
+  {%- if e.kind == 'upload' -%}
+    {%- if not e.ep -%}
+      {%- set hosts = recent | map(attribute='1') | reject('equalto', e.site.host) | list -%}
+      {%- for h in hosts | unique -%}
+        {%- if hosts | select('equalto', h) | list | length >= 2 -%}{{ dispatch.drop() }}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do recent.append([tt, e.site.host]) -%}
+  {%- endif -%}
+  {%- do mstate.update({e.u.name: recent}) -%}
+{%- endif -%}
 
 {#- Request outcome. -#}
 {%- set u = e.u -%}
@@ -283,7 +333,6 @@
 {%- set port = 443 if proto == 'https' else 80 -%}
 {%- set acc_port = module.rand.number.integer(49152, 65535) -%}
 
-{%- set ms = module.rand.number.integer(0, 999) -%}
 {%- set req_dt = module.datetime.datetime.fromtimestamp(now, utc) + module.datetime.timedelta(milliseconds=ms) -%}
 {%- set req_time = req_dt.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d' | format(ms) ~ 'Z' -%}
 {%- set log_dt = req_dt + module.datetime.timedelta(milliseconds=ftime, hours=params.syslog_utc_offset_hours) -%}
