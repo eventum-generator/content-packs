@@ -1,16 +1,22 @@
 {#- pfSense RFC 5424 records wrapped in ECS JSON: filterlog packet records
     and IPsec charon records of eight site-to-site IKEv1 PSK tunnels.
-    One input tick per second; each tick emits the earliest due record
-    (with a random microsecond fraction inside that second) or drops.
-    Independent background processes: LAN passes, WAN default-deny
-    blocks, and per site a tunnel lifecycle (negotiation attempts with
-    occasional wrong Phase 1 identities, IKE/CHILD establishment, enc0
-    traffic while the CHILD_SA is up, closure and deletion). Times are
-    epoch seconds. -#}
+    Every input timestamp yields exactly one record at that time. A
+    small queue holds scheduled records - charon records of the per-site
+    tunnel lifecycles (negotiation attempts with occasional wrong Phase 1
+    identities, IKE/CHILD establishment, closure and deletion), follow-up
+    administrative connections and episode steps; once due, a queued
+    record takes over the next timestamp of any input. Otherwise an
+    `office` timestamp becomes an enc0 pass of a site whose CHILD_SA is
+    up (probability proportional to site weight) or a LAN pass, and a
+    `wan` timestamp a WAN default-deny block. Times are epoch seconds. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set now = module.builtins.int(ts.timestamp()) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set tf = ts.timestamp() -%}
+{%- set now = module.builtins.int(tf) -%}
 {%- set hq = module.heapq -%}
+{#- Probability, per unit of site weight, that an office timestamp is an
+    enc0 pass of an up site (about a quarter of office traffic with the
+    usual number of tunnels up). -#}
+{%- set enc_share = 0.0545 -%}
 {#- Chain window: three wrong-identity lookups of one peer, its IKE_SA
     and an administrative-port enc0 pass from its subnet, all within
     this many seconds of the first lookup. -#}
@@ -37,7 +43,7 @@
   {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
   {%- for _ in range(500) if not r.ok -%}
     {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
-    {%- if module.rand.number.floating(0, top) < curve[(c // hour) % 24] ** 2 + 0.02 -%}
+    {%- if module.rand.number.floating(0, top) < curve[((c + shared.get('tzoff')) // hour) % 24] ** 2 + 0.02 -%}
       {%- set r.v = c -%}
       {%- set r.ok = true -%}
     {%- endif -%}
@@ -56,6 +62,18 @@
   {%- endfor -%}
   {{- module.rand.weighted_choice(idx, wts) -}}
 {%- endmacro -%}
+{%- macro follow_ups(si, host, srv, t0) -%}
+  {#- An administrator often opens further management sessions from the
+      same host to the same server shortly after the first one; they are
+      queued as background passes. -#}
+  {%- if module.rand.chance(0.4) -%}
+    {%- set t = namespace(v=t0) -%}
+    {%- for _ in range(module.rand.weighted_choice([1, 2], [65, 35])) -%}
+      {%- set t.v = t.v + (ln(40, 0.9) | int) -%}
+      {{- push(t.v, {'k': 'row', 'kind': 'enc', 's': si, 'host': host, 'dst': srv.ip, 'port': module.rand.choice(srv.ports | select('in', admin_ports) | list)}) -}}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endmacro -%}
 {%- if shared.get('queue') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
@@ -65,23 +83,21 @@
     'ipsec_pass_rule_tracker': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 1}}
   }} -%}
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
-  {#- Office activity by UTC hour (relative rate, peak 1): LAN and enc0
-      traffic and wrong-identity attempts are thinned by it; episode
-      starts are weighted by its square. -#}
-  {%- do shared.update({'queue': [], 'seq': 0, 'curve': [0.08, 0.06, 0.06, 0.08, 0.15, 0.35, 0.7, 0.95, 1.0, 1.0, 0.95, 0.9, 0.95, 1.0, 0.9, 0.7, 0.45, 0.3, 0.22, 0.18, 0.14, 0.12, 0.1, 0.09]}) -%}
+  {#- Office activity by hour of the generator timezone (relative rate,
+      peak 1): the hourly office input rate of patterns/office-*.yml.
+      Wrong-identity attempts follow it; episode starts are weighted by
+      its square. -#}
+  {%- do shared.update({'queue': [], 'seq': 0, 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()), 'wan_src': none, 'wan_left': 0, 'curve': [0.178, 0.188, 0.223, 0.289, 0.385, 0.504, 0.633, 0.759, 0.868, 0.949, 0.994, 1.0, 0.967, 0.898, 0.802, 0.689, 0.57, 0.456, 0.356, 0.278, 0.224, 0.193, 0.18, 0.177]}) -%}
   {%- set sites = [] -%}
   {%- for row in samples.sites -%}
     {%- do sites.append({'conn': row.conn, 'peer': row.peer, 'subnet': row.subnet, 'hosts': row.hosts | list, 'w': row.weight, 'alt': row.alt_id, 'state': 'down', 'gen': 0, 'att_at': none, 'cur': none, 'thr': 1, 'ike': none, 'child': none, 'parts': []}) -%}
     {%- do sites[-1].update({'att_at': now + module.rand.number.integer(1, hour)}) -%}
     {{- push(sites[-1].att_at, {'k': 'att', 's': loop.index0, 'g': 0, 'id': none}) -}}
-    {{- push(now + ex(100 / row.weight) | int, {'k': 'tr', 's': loop.index0}) -}}
   {%- endfor -%}
   {%- set servers = [] -%}
   {%- for row in samples.servers -%}
     {%- do servers.append({'ip': row.ip, 'ports': row.ports | list, 'w': row.weight}) -%}
   {%- endfor -%}
-  {{- push(now + ex(7) | int, {'k': 'lan'}) -}}
-  {{- push(now + ex(40) | int, {'k': 'wan'}) -}}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
   {%- do shared.update({'sites': sites, 'servers': servers, 'ike_seq': module.rand.number.integer(20, 900), 'child_seq': module.rand.number.integer(5, 400), 'ep_last': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
 {%- endif -%}
@@ -89,22 +105,25 @@
 {%- set sites = shared.get('sites') -%}
 {%- set curve = shared.get('curve') -%}
 {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{#- Episode: at the first tick at or after its drawn start, a site
+{#- Episode: at the first timestamp at or after its drawn start, a site
     other than the previous episode's whose tunnel is down and whose next
-    negotiation is due within 30 minutes of that tick (weighted like
+    negotiation is due within 30 minutes of that timestamp (weighted like
     background traffic; after 20 minutes without one, the down site that
     reconnects first, within a few minutes) has that negotiation
     replaced at its own time: its peer offers a wrong Phase 1 identity
     3-5 times with background retry gaps, then its configured identity;
-    the IKE_SA and CHILD_SA come up and one remote host opens SMB, RDP and
-    WinRM to one internal server over enc0. The tunnel then lives and
+    the IKE_SA and CHILD_SA come up and one remote host opens an SMB, RDP
+    or WinRM session to an internal server over enc0. Its records are
+    queued and take over timestamps like background lifecycle records.
+    The tunnel then lives and
     closes like any background tunnel. The first start falls within the
     first min(interval, 24 h); each later start within a window of
     min(interval / 4, 6 h) centred one interval after the actual start,
     both weighted by the activity curve squared. Missed episodes are not
     replayed. -#}
 {%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
-  {#- Waiting starts at the first due tick; retries do not re-arm it. -#}
+  {#- Waiting starts at the first due timestamp; retries do not re-arm
+      it. -#}
   {%- if shared.get('ep_wait') is none -%}{%- do shared.set('ep_wait', now) -%}{%- endif -%}
   {%- set late = now - shared.get('ep_wait') > 1200 -%}
   {%- set cand = [] -%}
@@ -152,37 +171,28 @@
     {{- push(t.v, {'k': 'row', 'kind': 'child', 's': si, 'ep': true}) -}}
     {{- push(t.v + (ln(2.5 * hour, 0.7) | int), {'k': 'down', 's': si, 'g': st.gen}) -}}
     {%- set t.v = t.v + g.v[nf] -%}
+    {#- One administrative pass drawn like a background one: port by
+        background weight, a server offering it, a host of the site; it
+        may be followed by background follow-up sessions. -#}
+    {%- set port = module.rand.weighted_choice(admin_ports, [14, 7, 3]) -%}
+    {%- set srv = shared.get('servers')[pick_server(port) | int] -%}
     {%- set host = module.rand.choice(st.hosts) -%}
-    {#- A server offering every administrative port, by server weight. -#}
-    {%- set idx = [] -%}
-    {%- set wts = [] -%}
-    {%- for srv in shared.get('servers') -%}
-      {%- if admin_ports | reject('in', srv.ports) | list | length == 0 -%}
-        {%- do idx.append(loop.index0) -%}
-        {%- do wts.append(srv.w) -%}
-      {%- endif -%}
-    {%- endfor -%}
-    {%- set srv = shared.get('servers')[module.rand.weighted_choice(idx, wts)] -%}
-    {%- for port in module.rand.shuffle(admin_ports) -%}
-      {{- push(t.v, {'k': 'row', 'kind': 'enc', 's': si, 'host': host, 'dst': srv.ip, 'port': port, 'ep': true}) -}}
-      {%- set t.v = t.v + (ln(40, 0.9) | int) -%}
-    {%- endfor -%}
+    {{- push(t.v, {'k': 'row', 'kind': 'enc', 's': si, 'host': host, 'dst': srv.ip, 'port': port, 'ep': true}) -}}
+    {{- follow_ups(si, host, srv, t.v) -}}
     {%- set w = [interval // 4, 6 * hour] | min -%}
     {%- do shared.update({'ep_last': si, 'ep_wait': none, 'ep_due': pick_start(start + interval - w // 2, w) | int}) -%}
   {%- else -%}
     {%- do shared.set('ep_due', now + 60) -%}
   {%- endif -%}
 {%- endif -%}
-{%- if now < queue[0][0] -%}
-  {%- do shared.set('next_due', queue[0][0]) -%}
-  {{- dispatch.drop() -}}
-{%- endif -%}
+{#- The earliest due queued record takes this timestamp; lifecycle
+    control items popped on the way schedule further records. -#}
 {%- set out = namespace(row=none) -%}
 {%- for _ in range(40) if out.row is none and queue and queue[0][0] <= now -%}
   {%- set top = hq.heappop(queue) -%}
   {%- set due = top[0] -%}
   {%- set item = top[2] -%}
-  {%- set h = (due // hour) % 24 -%}
+  {%- set h = ((due + shared.get('tzoff')) // hour) % 24 -%}
   {%- if item.k == 'row' -%}
     {%- set st = sites[item.s] if item.s is defined else none -%}
     {%- if item.kind == 'enc' and st.state != 'up' -%}
@@ -229,52 +239,48 @@
       {%- do st.update({'att_at': due + (ln(hour, 1.0) | int)}) -%}
       {{- push(st.att_at, {'k': 'att', 's': item.s, 'g': st.gen, 'id': none}) -}}
     {%- endif -%}
-  {%- elif item.k == 'tr' -%}
-    {%- set st = sites[item.s] -%}
-    {{- push(due + ex(100 / st.w) | int, item) -}}
-    {%- if st.state == 'up' and module.rand.chance(0.1 + 0.9 * curve[h]) -%}
-      {#- Port by background weight, then a server offering it and a
-          host of the site. -#}
-      {%- set port = module.rand.weighted_choice([443, 53, 389, 88, 135, 445, 3389, 5985], [30, 22, 10, 8, 6, 14, 7, 3]) -%}
-      {%- set srv = shared.get('servers')[pick_server(port) | int] -%}
-      {%- set host = module.rand.choice(st.hosts) -%}
-      {{- push(due, {'k': 'row', 'kind': 'enc', 's': item.s, 'host': host, 'dst': srv.ip, 'port': port}) -}}
-      {#- An administrator often opens further management sessions to
-          the same server shortly after the first one. -#}
-      {%- if port in admin_ports and module.rand.chance(0.4) -%}
-        {%- set t = namespace(v=due) -%}
-        {%- for _ in range(module.rand.weighted_choice([1, 2], [65, 35])) -%}
-          {%- set t.v = t.v + (ln(40, 0.9) | int) -%}
-          {{- push(t.v, {'k': 'row', 'kind': 'enc', 's': item.s, 'host': host, 'dst': srv.ip, 'port': module.rand.choice(srv.ports | select('in', admin_ports) | list)}) -}}
-        {%- endfor -%}
-      {%- endif -%}
-    {%- endif -%}
-  {%- elif item.k == 'lan' -%}
-    {{- push(due + ex(7) | int, item) -}}
-    {%- if module.rand.chance(0.15 + 0.85 * curve[h]) -%}
-      {%- set prof = module.rand.weighted_choice(['dns', 'int', 'web'], [40, 25, 35]) -%}
-      {%- set dst = '10.20.0.10' if prof == 'dns' else module.rand.choice(['10.20.1.15', '10.20.1.30']) if prof == 'int' else module.rand.choice(['192.0.2.44', '192.0.2.71', '192.0.2.130', '192.0.2.201']) -%}
-      {{- push(due, {'k': 'row', 'kind': 'lan', 'src': '10.20.' ~ module.rand.choice([7, 8]) ~ '.' ~ module.rand.number.integer(10, 250), 'dst': dst, 'port': 53 if prof == 'dns' else 443, 'out': prof == 'web'}) -}}
-    {%- endif -%}
-  {%- elif item.k == 'wan' -%}
-    {#- Unsolicited internet probes hitting the default deny rule;
-        scanners send short bursts. -#}
-    {{- push(due + ex(40) | int, item) -}}
-    {%- set src = '198.51.100.' ~ module.rand.number.integer(100, 254) -%}
-    {%- set t = namespace(v=due) -%}
-    {%- for _ in range(module.rand.weighted_choice([1, 2, 3, 4], [65, 18, 10, 7])) -%}
-      {{- push(t.v, {'k': 'row', 'kind': 'wan', 'src': src, 'port': module.rand.weighted_choice([443, 22, 3389, 445, 23, 8080], [30, 25, 15, 10, 12, 8])}) -}}
-      {%- set t.v = t.v + (ln(3, 1.0) | int) -%}
-    {%- endfor -%}
   {%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', queue[0][0] if queue else now + 1) -%}
-{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- if out.row is none and 'wan' in tags -%}
+  {#- Unsolicited internet probe hitting the default deny rule. A scanner
+      sends one to four probes; consecutive WAN timestamps continue the
+      current scanner until its count is used up. -#}
+  {%- if shared.get('wan_left') > 0 -%}
+    {%- do shared.set('wan_left', shared.get('wan_left') - 1) -%}
+  {%- else -%}
+    {%- do shared.update({'wan_src': '198.51.100.' ~ module.rand.number.integer(100, 254), 'wan_left': module.rand.weighted_choice([0, 1, 2, 3], [65, 18, 10, 7])}) -%}
+  {%- endif -%}
+  {%- set out.row = {'kind': 'wan', 'src': shared.get('wan_src'), 'port': module.rand.weighted_choice([443, 22, 3389, 445, 23, 8080], [30, 25, 15, 10, 12, 8])} -%}
+{%- elif out.row is none -%}
+  {#- Office traffic: an enc0 pass of site k with probability
+      enc_share * weight_k while its CHILD_SA is up, otherwise a LAN
+      pass. -#}
+  {%- set pick = namespace(s=none, acc=0) -%}
+  {%- set r = module.rand.number.floating(0, 1) -%}
+  {%- for st in sites if pick.s is none -%}
+    {%- if st.state == 'up' -%}
+      {%- set pick.acc = pick.acc + enc_share * st.w -%}
+      {%- if r < pick.acc -%}{%- set pick.s = loop.index0 -%}{%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if pick.s is not none -%}
+    {#- Port by background weight, then a server offering it and a host
+        of the site. -#}
+    {%- set st = sites[pick.s] -%}
+    {%- set port = module.rand.weighted_choice([443, 53, 389, 88, 135, 445, 3389, 5985], [30, 22, 10, 8, 6, 14, 7, 3]) -%}
+    {%- set srv = shared.get('servers')[pick_server(port) | int] -%}
+    {%- set host = module.rand.choice(st.hosts) -%}
+    {%- set out.row = {'kind': 'enc', 's': pick.s, 'host': host, 'dst': srv.ip, 'port': port} -%}
+    {%- if port in admin_ports -%}{{- follow_ups(pick.s, host, srv, now) -}}{%- endif -%}
+  {%- else -%}
+    {%- set prof = module.rand.weighted_choice(['dns', 'int', 'web'], [40, 25, 35]) -%}
+    {%- set dst = '10.20.0.10' if prof == 'dns' else module.rand.choice(['10.20.1.15', '10.20.1.30']) if prof == 'int' else module.rand.choice(['192.0.2.44', '192.0.2.71', '192.0.2.130', '192.0.2.201']) -%}
+    {%- set out.row = {'kind': 'lan', 'src': '10.20.' ~ module.rand.choice([7, 8]) ~ '.' ~ module.rand.number.integer(10, 250), 'dst': dst, 'port': 53 if prof == 'dns' else 443, 'out': prof == 'web'} -%}
+  {%- endif -%}
+{%- endif -%}
 {%- set row = out.row -%}
 {%- set kind = row.kind -%}
-{%- set us = module.rand.number.integer(0, 999999) -%}
-{%- set event_time = ts + module.datetime.timedelta(microseconds=us) -%}
-{%- set tf = now + us / 1000000 -%}
+{%- set event_time = ts -%}
 {%- set is_firewall = kind in ['enc', 'lan', 'wan'] -%}
 {%- set thread = '%02d' % module.rand.number.integer(1, 16) -%}
 {%- if is_firewall -%}
@@ -298,18 +304,16 @@
         the window. A background administrative-port pass that would
         complete one keeps its time and host; its service port and server
         are redrawn from the background non-administrative flow weights.
-        An episode pass completes and resets. -#}
+        An episode pass completes one. Partials are kept until they expire,
+        so every later background administrative pass of the site inside
+        the window is redirected too. -#}
     {%- set live = st.parts | selectattr('t', 'ge', tf - window) | list -%}
     {%- set dst_ip = row.dst -%}
     {%- if not row.get('ep') and dst_port in admin_ports and live | selectattr('i', 'equalto', 4) | list -%}
       {%- set dst_port = module.rand.weighted_choice([443, 53, 389, 88, 135], [30, 22, 10, 8, 6]) -%}
       {%- set dst_ip = shared.get('servers')[pick_server(dst_port) | int].ip -%}
     {%- endif -%}
-    {%- if dst_port in admin_ports and live | selectattr('i', 'equalto', 4) | list -%}
-      {%- do st.update({'parts': []}) -%}
-    {%- else -%}
-      {%- do st.update({'parts': live}) -%}
-    {%- endif -%}
+    {%- do st.update({'parts': live}) -%}
     {%- set src_ip = row.host -%}
     {%- set interface = 'enc0' -%}
     {%- set action = 'pass' -%}

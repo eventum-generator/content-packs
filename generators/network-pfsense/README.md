@@ -4,48 +4,61 @@ Produces the remote syslog stream of one pfSense CE 2.9.0 firewall with eight si
 
 ## Event Types
 
-Shares measured over the five 73-hour `anomaly_mode: false` calibration captures (203,012 records).
+Shares measured over the five 150-hour `anomaly_mode: false` calibration captures (403,440 records).
 
 | Action | Native record | Share | Category |
 | --- | --- | ---: | --- |
-| `pass` | `filterlog` LAN pass, rule 115 | 53.46% | Network |
-| `block` | `filterlog` WAN default deny, rule 5 | 26.49% | Network |
-| `pass` | `filterlog` IPsec (`enc0`) pass, rule 146 | 18.02% | Network |
-| `ipsec-peer-lookup` | `charon` `looking for pre-shared key peer configs matching ...` | 0.56% | Network |
-| `ipsec-ike-established` | `charon` `IKE_SA ... established between ...` | 0.31% | Network |
-| `ipsec-child-established` | `charon` `CHILD_SA ... established with SPIs ...` | 0.31% | Network |
-| `ipsec-child-closed` | `charon` `closing CHILD_SA ... with SPIs ...` | 0.30% | Network |
-| `ipsec-ike-deleting` | `charon` `deleting IKE_SA ... between ...` | 0.30% | Network |
-| `ipsec-peer-not-found` | `charon` `no peer config found` | 0.24% | Network |
+| `pass` | `filterlog` LAN pass, rule 115 | 52.34% | Network |
+| `block` | `filterlog` WAN default deny, rule 5 | 25.44% | Network |
+| `pass` | `filterlog` IPsec (`enc0`) pass, rule 146 | 20.27% | Network |
+| `ipsec-peer-lookup` | `charon` `looking for pre-shared key peer configs matching ...` | 0.53% | Network |
+| `ipsec-ike-established` | `charon` `IKE_SA ... established between ...` | 0.30% | Network |
+| `ipsec-child-established` | `charon` `CHILD_SA ... established with SPIs ...` | 0.30% | Network |
+| `ipsec-child-closed` | `charon` `closing CHILD_SA ... with SPIs ...` | 0.29% | Network |
+| `ipsec-ike-deleting` | `charon` `deleting IKE_SA ... between ...` | 0.29% | Network |
+| `ipsec-peer-not-found` | `charon` `no peer config found` | 0.23% | Network |
 
-About 13,000 records per day. Rates are synthetic workload choices, not measured production frequencies:
+About 12,900 records per day. Rates are synthetic workload choices, not measured production frequencies:
 
-- **LAN** - workstation DNS and HTTPS passes (`igb1.12`, rule tracker `1690001001`), thinned by an office-hours curve.
-- **WAN** - unsolicited internet connection attempts to the WAN address hitting the default deny rule (`igb0`, tracker `1000000103`, rule 5 / subrule 16777216), exponential gaps with short scanner bursts.
+- **LAN** - workstation DNS and HTTPS passes (`igb1.12`, rule tracker `1690001001`).
+- **WAN** - unsolicited internet connection attempts to the WAN address hitting the default deny rule (`igb0`, tracker `1000000103`, rule 5 / subrule 16777216). A scanner sends one to four probes (65/18/10/7%), which occupy consecutive WAN probe times.
 - **Tunnels** - per site an independent lifecycle: a negotiation attempt, IKE_SA and CHILD_SA establishment, a lognormal lifetime (median 2.5 h), closure and deletion (idle, DPD or reauthentication), and a lognormal pause (median 1 h) before the next attempt. Some attempts offer a wrong Phase 1 identity (`vpn-ext` or the branch firewall FQDN, more often in office hours, when peers are being reconfigured); each fails with `no peer config found` and is retried within seconds to minutes with the same identity until it is corrected or the peer gives up. Repeated failures of one peer and failures followed by a successful negotiation are ordinary.
-- **enc0 traffic** - while a site's CHILD_SA is up, hosts of its subnet (`10.200.<k>.0/24`) reach internal servers on DNS, Kerberos, LDAP, RPC, HTTPS, SMB, RDP and WinRM (IPsec tab rule tracker `ipsec_pass_rule_tracker`). Administrative ports carry about a quarter of that traffic, from every site host to every server offering them; an administrative connection is often followed within a minute or two by further management sessions from the same host to the same server.
+- **enc0 traffic** - while a site's CHILD_SA is up, hosts of its subnet (`10.200.<k>.0/24`) reach internal servers on DNS, Kerberos, LDAP, RPC, HTTPS, SMB, RDP and WinRM (IPsec tab rule tracker `ipsec_pass_rule_tracker`), at a rate proportional to the site weight. Administrative ports carry about a quarter of that traffic, from every site host to every server offering them; an administrative connection is followed in 40% of cases by one or two further management sessions from the same host to the same server within a minute or two.
 
-Every `enc0` pass requires an active CHILD_SA of its site; closing and deleting records carry the native IDs, SPIs and selectors of the established SA. No tunnel is assumed to be up at the start of a run. A pass record means that a packet matched a pass rule, not that a connection or authentication succeeded.
+Every `enc0` pass requires an active CHILD_SA of its site; closing and deleting records carry the native IDs, SPIs and selectors of the established SA. No tunnel is assumed to be up at the start of a run; each site first negotiates within the first hour. A pass record means that a packet matched a pass rule, not that a connection or authentication succeeded.
+
+## Input Design
+
+The inputs set the rate: every input timestamp becomes exactly one record at that time, and nothing is dropped.
+
+- **`office`** (`patterns/office-floor.yml`, `patterns/office-peak.yml`) - LAN and `enc0` traffic: 3,200 timestamps a day spread uniformly plus 6,400 on a beta curve (a = 4.25, b = 4.75) peaking at 10:00-12:00 of the generator timezone (UTC by default), each day's counts varying by up to 10%. The resulting hourly rate runs from about 133 at night to 750 at the peak.
+- **`wan`** (`patterns/wan.yml`) - WAN probes: 143 an hour around the clock, each hour's count varying by up to 20%.
+
+An `office` timestamp becomes an `enc0` pass of site k with probability 0.0545 × weight_k while that site's CHILD_SA is up, otherwise a LAN pass; LAN traffic absorbs the variation in the number of tunnels up. A `wan` timestamp becomes a WAN probe.
+
+Records whose time follows from a lifecycle - `charon` records of negotiations, establishment, closure and deletion, the follow-up management sessions, and the episode steps below - wait in a small queue with a due time. Once due, a queued record takes over the next timestamp of either input in place of the record that timestamp would have produced. Records scheduled for the same moment therefore come out on consecutive timestamps: a lookup and its `no peer config found`, or IKE_SA and CHILD_SA, are 4-5 s apart in median and at most about a minute apart at night (measured over the calibration captures).
 
 ## Anomaly Chain
 
 `anomaly_mode: true` is the default; `anomaly_mode: false` produces only the background above.
 
-A branch peer repeatedly offers a wrong Phase 1 identity, then the configured one; the tunnel comes up and a host behind it opens SMB, RDP and WinRM sessions to one internal server - a peer being reconfigured until it connects, immediately followed by administrative access through the new tunnel.
+A branch peer repeatedly offers a wrong Phase 1 identity, then the configured one; the tunnel comes up and a host behind it opens an SMB, RDP or WinRM session to an internal server - a peer being reconfigured until it connects, immediately followed by administrative access through the new tunnel.
 
 1. `charon` - `<N> looking for pre-shared key peer configs matching <WAN>...<peer>[<wrong ID>]`, then `<N> no peer config found` - three to five times with background retry gaps
 2. `charon` - `<N> looking for ... <peer>[<peer>]`, `<conK|N> IKE_SA conK[N] established between ...`, `<conK|N> CHILD_SA conK{M} established with SPIs ... and TS 10.20.0.0/16|/0 === 10.200.K.0/24|/0`
-3. `filterlog` - `enc0` passes from one host `10.200.K.x` to one server offering all three ports (`dc01` or `fs01` in `samples/servers.json`) on 445, 3389 and 5985 in random order
+3. `filterlog` - an `enc0` pass from a host `10.200.K.x` to a server on 445, 3389 or 5985
 
-The tunnel then lives and closes like any background tunnel (CHILD_SA closure and IKE_SA deletion with the same IDs and SPIs).
+The tunnel then lives and closes like any background tunnel (CHILD_SA closure and IKE_SA deletion with the same IDs and SPIs), and the administrative pass may be followed by background management sessions like any other.
+
+**Timestamps.** Episode records are queued like background lifecycle records: each takes over the next input timestamp once due, so the inputs produce the same number of timestamps in both modes, and an episode replaces about ten records of whatever kind those timestamps would have carried. Background schedules are not paused or shifted.
 
 **Linking fields.** The peer address (`source.ip` of lookups and IKE_SA, `...<peer>[` in the message) identifies the site. A failure line carries only the IKE_SA unique ID `<N>` of its lookup. IKE and CHILD lines carry `<conK|N>`; the CHILD_SA traffic selector names the site subnet, which joins the `enc0` source address. The mapping peer - connection - subnet is tunnel configuration, not part of any single record.
 
-**Recurrence.** `anomaly_interval_hours` (default `24`, minimum `4`) is measured in event time. The first episode starts within the first min(interval, 24 h) of the run, its hour drawn from the office-hours curve squared; each later start is drawn in a window of min(interval / 4, 6 h) centred one interval after the previous actual start, with the same weighting, so episodes stay in busy hours. At intervals up to 8 h the window covers much of the clock. The episode then replaces the next scheduled reconnection of a site whose tunnel is down, so it starts when that site would have reconnected anyway: a random delay after the drawn start. Sites due to reconnect within 30 minutes of the start are candidates; after 20 minutes without one, the down site that reconnects first is taken and reconnects within a few minutes, earlier than it otherwise would. Measured over 102 episodes (4 h interval, three 146-hour runs): delay median 23 min, 90% under 28 min, longest measured 34 min (the wait has no hard upper bound); 44% took the 20-minute fallback. Missed episodes are not replayed.
+**Recurrence.** `anomaly_interval_hours` (default `24`, minimum `4`) is measured in event time. The first episode starts within the first min(interval, 24 h) of the run, its hour weighted by the hourly `office` input rate squared (relative to the peak, plus a floor of 0.02); each later start is drawn in a window of min(interval / 4, 6 h) centred one interval after the previous actual start, with the same weighting, so episodes stay in busy hours. At intervals up to 8 h the window covers much of the clock. The episode then replaces the next scheduled reconnection of a site whose tunnel is down, so it starts when that site would have reconnected anyway: a random delay after the drawn start. Sites due to reconnect within 30 minutes of the start are candidates; after 20 minutes without one, the down site that reconnects first is taken and reconnects within a few minutes, earlier than it otherwise would. Measured over 104 episodes (4 h interval, three 146-hour runs): delay median 22 min, 90% under 28 min, longest measured 45 min (the wait has no hard upper bound); 49% took the 20-minute fallback. Missed episodes are not replayed.
 
-**Variation.** Each episode picks a site other than the previous episode's among those whose tunnel is down and due to reconnect within 30 minutes of the start, weighted like background traffic (after 20 minutes without one, the down site that reconnects first); the wrong identity is one the site offers in background; the server is one that offers SMB, RDP and WinRM, every server and port of an episode also occurs in background traffic, and so does its host - server administrative pair. Failure count, retry gaps and traffic gaps follow the background distributions; the chain spans 98 to 123 s from the first lookup to the first administrative pass in the default-on capture (65 to 206 s at 8 h).
+**Variation.** Each episode picks a site other than the previous episode's among those whose tunnel is down and due to reconnect within 30 minutes of the start, weighted like background traffic (after 20 minutes without one, the down site that reconnects first); the wrong identity is one the site offers in background; the port, server and host are drawn like a background administrative pass (port by background weight, a server offering it, a host of the site), so every server, port and host - server pair of an episode also occurs in background traffic. Failure count, retry gaps and traffic gaps follow the background distributions; the chain spans 71 to 211 s from the first lookup to the administrative pass in the default-on capture (57 to 273 s at 8 h).
 
-**Background guard.** Background never completes the chain: when a background administrative-port pass would finish three wrong-identity lookups and an IKE_SA of the same site inside the 15-minute chain window, it is logged at the same time from the same host, with its service port and server redrawn from the background non-administrative flow weights, so non-administrative traffic keeps its usual mix around chain prefixes. Wrong-identity failure runs, failures followed by an established tunnel, and administrative traffic after an established tunnel remain in both modes.
+**Background guard.** Background never completes the chain: when a background administrative-port pass would finish three wrong-identity lookups and an IKE_SA of the same site inside the 15-minute chain window, it is logged at the same time from the same host, with its service port and server redrawn from the background non-administrative flow weights, so non-administrative traffic keeps its usual mix around chain prefixes. The guard stays on for the whole window, also after an episode's own pass, so each episode completes the chain exactly once; no record is dropped or delayed. Wrong-identity failure runs, failures followed by an established tunnel, and administrative traffic after an established tunnel remain in both modes.
 
 **Detection idea.** Per site, at least three `no peer config found` failures after lookups with a non-configured identity, then an established IKE_SA and an administrative-port pass through `enc0` from the site subnet, all within 15 minutes.
 
@@ -88,7 +101,7 @@ From the content-packs repository root, live:
 eventum generate --path generators/network-pfsense/generator.yml --id network-pfsense --live-mode true
 ```
 
-As a batch (add `start`/`end` to the `cron` input for a finite window; the second episode can start up to 51 hours after the run start plus its start delay, so use at least 52 hours to see two at the default interval):
+The patterns start at midnight of the current day and never end. For a finite batch, set `start` and `end` in the three files under `patterns/` (for example `start: "2026-09-01T00:00:00Z"`, `end: "+7d"`); the second episode can start up to 51 hours after the run start plus its start delay, so use at least 52 hours to see two at the default interval:
 
 ```bash
 eventum generate --path generators/network-pfsense/generator.yml --id network-pfsense --live-mode false --keep-order true
@@ -96,10 +109,10 @@ eventum generate --path generators/network-pfsense/generator.yml --id network-pf
 
 ## Sample Output
 
-A chain step from the final default-on capture:
+A chain step (the IKE_SA of the first episode) from the final default-on capture:
 
 ```json
-{"@timestamp": "2026-09-01T05:35:26.565138+00:00", "data_stream": {"dataset": "pfsense.log", "namespace": "default", "type": "logs"}, "destination": {"ip": "203.0.113.1"}, "ecs": {"version": "8.17.0"}, "event": {"action": "ipsec-ike-established", "category": ["network"], "dataset": "pfsense.log", "kind": "event", "original": "\u003c30\u003e1 2026-09-01T05:35:26.565138+00:00 fw01.corp.example charon 18610 - - 06[IKE] \u003ccon2|139\u003e IKE_SA con2[139] established between 203.0.113.1[203.0.113.1]...198.51.100.2[198.51.100.2]", "type": ["info"]}, "host": {"name": "fw01.corp.example"}, "log": {"syslog": {"priority": 30}}, "message": "06[IKE] \u003ccon2|139\u003e IKE_SA con2[139] established between 203.0.113.1[203.0.113.1]...198.51.100.2[198.51.100.2]", "observer": {"name": "fw01.corp.example", "product": "pfSense", "type": "firewall", "vendor": "Netgate", "version": "2.9.0"}, "process": {"name": "charon", "pid": 18610}, "related": {"ip": ["198.51.100.2", "203.0.113.1"]}, "source": {"ip": "198.51.100.2"}, "syslog": {"facility": {"code": 3}, "priority": 30, "severity": {"code": 6}}}
+{"@timestamp": "2026-09-01T10:19:59.653536+00:00", "data_stream": {"dataset": "pfsense.log", "namespace": "default", "type": "logs"}, "destination": {"ip": "203.0.113.1"}, "ecs": {"version": "8.17.0"}, "event": {"action": "ipsec-ike-established", "category": ["network"], "dataset": "pfsense.log", "kind": "event", "original": "\u003c30\u003e1 2026-09-01T10:19:59.653536+00:00 fw01.corp.example charon 18610 - - 10[IKE] \u003ccon2|803\u003e IKE_SA con2[803] established between 203.0.113.1[203.0.113.1]...198.51.100.2[198.51.100.2]", "type": ["info"]}, "host": {"name": "fw01.corp.example"}, "log": {"syslog": {"priority": 30}}, "message": "10[IKE] \u003ccon2|803\u003e IKE_SA con2[803] established between 203.0.113.1[203.0.113.1]...198.51.100.2[198.51.100.2]", "observer": {"name": "fw01.corp.example", "product": "pfSense", "type": "firewall", "vendor": "Netgate", "version": "2.9.0"}, "process": {"name": "charon", "pid": 18610}, "related": {"ip": ["198.51.100.2", "203.0.113.1"]}, "source": {"ip": "198.51.100.2"}, "syslog": {"facility": {"code": 3}, "priority": 30, "severity": {"code": 6}}}
 ```
 
 ## Limitations
@@ -108,9 +121,14 @@ A chain step from the final default-on capture:
 - **No complete CE 2.9.0 capture.** The `filterlog` grammar and log settings come from current Netgate documentation; the `charon` bodies from Netgate's IPsec troubleshooting examples (edited for brevity by Netgate) and older real pfSense `charon` records with `<conn|id>` context. Close and delete bodies follow upstream strongSwan 5.9.14 source, not the exact library build bundled with CE 2.9.0. Live SIEM/parser compatibility is not verified.
 - **Synthetic counters.** CHILD_SA byte counters include traffic and replies that `filterlog` does not log, so they cannot be derived from the logged packets.
 - **Tunnel churn.** Real site-to-site tunnels usually rekey without going down; the down periods here stand for idle, DPD and reauthentication teardowns and give the negotiation records a realistic volume.
-- **Episode site choice** is limited to sites whose tunnel is down and about to reconnect, which the per-site lifecycles make roughly independent of site weight. The episode takes over that reconnection; in the fallback case (about 44% of episodes) it brings the reconnection forward, shortening that site's pause by up to its remaining length.
+- **Episode site choice** is limited to sites whose tunnel is down and about to reconnect, which the per-site lifecycles make roughly independent of site weight. The episode takes over that reconnection; in the fallback case (about half of the episodes) it brings the reconnection forward, shortening that site's pause by up to its remaining length.
 - **ECS mapping** of `charon` records (`source.ip` / `destination.ip` on lookup and IKE_SA lines) is derived from the message text; Elastic's pfSense IPsec pipeline does not extract these fields.
+- **Record spacing.** Records written for the same moment (a lookup and its failure, IKE_SA and CHILD_SA, CHILD_SA closure and IKE_SA deletion) ride on consecutive input timestamps: median 4-5 s apart, 90% within 20 s, at most about 70 s at night, where real `charon` writes them within milliseconds. Probes of one WAN scanner are spread over consecutive WAN timestamps, about 25 s apart on average.
 - **Rates** are synthetic.
+
+## Performance
+
+About 4,700 records per second on one core: a 14-day default run (182,844 records) takes 39 s.
 
 ## References
 
