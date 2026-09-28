@@ -1,7 +1,14 @@
 {%- set ticks = module.rand.number.integer(0, 9999999) -%}
 {%- set utc_timestamp = timestamp.astimezone(module.datetime.timezone.utc).replace(microsecond=ticks // 10) -%}
 {%- for key in ['to_auth_failures', 'to_auth_success', 'to_routine'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
+{%- set now_s = utc_timestamp.timestamp() -%}
+{#- Retry step law, shared by background bursts and episode steps. -#}
+{%- set step_s = [30, 60, 90, 120] -%}
+{%- set step_w = [45, 30, 15, 10] -%}
+{#- An episode step waits for its due time; ticks before it carry
+    ordinary decisions. -#}
+{%- set episode = shared.get('episode', none) -%}
+{%- set stage = vars.stage if vars.stage == 'routine' or (episode is not none and now_s >= episode.due) else 'routine' -%}
 {%- set stations = {
   'anna': 'DA-7A-11-31-8C-42',
   'boris': 'DA-7A-11-4D-2E-91',
@@ -24,7 +31,6 @@
   'anton': 'DA-7A-11-91-3D-A4'
 } -%}
 {%- set users = (stations.keys()|list) + [params.target_user] -%}
-{%- set now_s = utc_timestamp.timestamp() -%}
 {%- set interval_s = params.anomaly_interval_seconds | float -%}
 {%- set chain_window_s = 300 -%}
 {%- set denials = shared.get('denials', {}) -%}
@@ -41,7 +47,7 @@
     {%- set station = retry.station -%}
     {%- if retry.left > 0 -%}
       {%- set code = 6273 -%}
-      {%- do retry.update({'left': retry.left - 1, 'due': now_s + module.rand.weighted_choice([30, 60, 90, 120], [45, 30, 15, 10]) - 1}) -%}
+      {%- do retry.update({'left': retry.left - 1, 'due': now_s + module.rand.weighted_choice(step_s, step_w) - 1}) -%}
       {%- if retry.left == 0 and not retry.ok -%}{%- set retry = none -%}{%- endif -%}
     {%- else -%}
       {%- set code = 6272 -%}
@@ -50,7 +56,7 @@
   {%- else -%}
     {%- set code = module.rand.weighted_choice([6272, 6273, 6274], [91.8, 8, 0.2]) -%}
     {%- if code == 6273 and retry is none and module.rand.chance(0.3) -%}
-      {%- set retry = {'user': user, 'station': station, 'left': module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [40, 25, 15, 10, 6, 4]), 'ok': module.rand.chance(0.8), 'due': now_s + module.rand.weighted_choice([30, 60, 90, 120], [45, 30, 15, 10]) - 1} -%}
+      {%- set retry = {'user': user, 'station': station, 'left': module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [40, 25, 15, 10, 6, 4]), 'ok': module.rand.chance(0.8), 'due': now_s + module.rand.weighted_choice(step_s, step_w) - 1} -%}
     {%- endif -%}
   {%- endif -%}
   {%- do shared.set('retry', retry) -%}
@@ -61,16 +67,25 @@
   {%- if shared.get('next_anomaly_at') is none -%}
     {%- do shared.set('next_anomaly_at', now_s + module.rand.number.floating(0, [interval_s, 86400] | min)) -%}
   {%- endif -%}
-  {%- if params.anomaly_mode and now_s >= shared.get('next_anomaly_at') -%}
+  {%- if params.anomaly_mode and vars.stage == 'routine' and now_s >= shared.get('next_anomaly_at') -%}
     {%- set half = ([interval_s / 4, 21600] | min) / 2 -%}
+    {#- Episode steps follow the retry step law, redrawn until the grant
+        falls at most 270 s (nine ticks) after the first denial, so the
+        whole chain stays inside the 300 s window. -#}
+    {%- set ep = namespace(gaps=[30, 30, 30, 30]) -%}
+    {%- for _ in range(100) -%}
+      {%- set draw = module.rand.weighted_choices(step_s, step_w, 4) -%}
+      {%- if draw | sum <= 270 -%}{%- set ep.gaps = draw -%}{%- break -%}{%- endif -%}
+    {%- endfor -%}
+    {%- do shared.set('episode', {'due': now_s, 'gaps': ep.gaps}) -%}
     {%- do shared.set('fail_count', 0) -%}
     {%- do shared.set('to_auth_failures', true) -%}
     {%- do shared.set('next_anomaly_at', now_s + interval_s + module.rand.number.floating(-half, half)) -%}
   {%- endif -%}
-  {#- Guard: a grant that would complete four denials of the same
-      account and station, the first at most chain_window_s earlier,
-      does not happen (the retrying user gives up); the tick stays
-      empty. -#}
+  {#- Guard: an ordinary grant that would complete four denials of the
+      same account and station (an episode's denials included), the
+      first at most chain_window_s earlier, does not happen (the
+      retrying user gives up); the tick stays empty. -#}
   {%- if code == 6272 and (denials.get(user ~ '|' ~ station, []) | select('ge', now_s - chain_window_s) | list | length) >= 4 -%}
     {{- dispatch.drop() -}}
   {%- endif -%}
@@ -80,22 +95,26 @@
   {%- set code = 6273 -%}
   {%- set count = shared.get('fail_count', 0) + 1 -%}
   {%- do shared.set('fail_count', count) -%}
+  {%- do episode.update({'due': now_s + episode.gaps[count - 1] - 1}) -%}
+  {%- do shared.set('episode', episode) -%}
   {%- if count >= 4 -%}{%- do shared.set('to_auth_success', true) -%}{%- endif -%}
 {%- else -%}
   {%- set user = params.target_user -%}
   {%- set station = params.suspicious_station -%}
   {%- set code = 6272 -%}
   {%- do shared.set('fail_count', 0) -%}
+  {%- do shared.set('episode', none) -%}
   {%- do shared.set('to_routine', true) -%}
 {%- endif -%}
-{#- Denial history per account and station for the guard; the episode's
-    own grant completes the chain and clears the history of its key. -#}
+{#- Denial history per account and station for the guard, the episode's
+    own denials included: after the episode's grant completes the chain,
+    a later ordinary grant within the window would complete it again. -#}
 {%- set key = user ~ '|' ~ station -%}
 {%- set recent = denials.get(key, []) | select('ge', now_s - chain_window_s) | list -%}
 {%- if code == 6273 -%}
   {%- do recent.append(now_s) -%}
 {%- endif -%}
-{%- if stage == 'auth_success' or not recent -%}
+{%- if not recent -%}
   {%- do denials.pop(key, none) -%}
 {%- else -%}
   {%- do denials.update({key: recent}) -%}
