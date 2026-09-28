@@ -2,15 +2,23 @@
 {%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set interval = module.datetime.timedelta(hours=[params.anomaly_interval_hours|float, 0.5]|max) -%}
 {%- set export_path = module.urllib.parse.quote(params.anomaly_path, safe='/-._~') -%}
+{%- set now_s = utc.timestamp() -%}
+{%- set interval_s = interval.total_seconds() -%}
+{%- set chain_window_s = 300 -%}
 {%- if step == 'routine' -%}
   {%- do shared.pop('to_attack', none) -%}
   {%- if params.anomaly_mode -%}
+    {#- Recurrence: the first start is uniform over the first
+        min(interval, 24 h) of the run; each next one is uniform in a
+        window of width min(interval / 4, 6 h) centred on the actual
+        start plus the interval. -#}
     {%- set due = shared.get('next_episode_at', none) -%}
     {%- if due is none -%}
-      {%- do shared.set('next_episode_at', utc + interval) -%}
-    {%- elif utc >= due -%}
+      {%- do shared.set('next_episode_at', now_s + module.rand.number.floating(0, [interval_s, 86400] | min)) -%}
+    {%- elif now_s >= due -%}
+      {%- set half = ([interval_s / 4, 21600] | min) / 2 -%}
       {%- do shared.set('to_attack', true) -%}
-      {%- do shared.set('next_episode_at', utc + interval) -%}
+      {%- do shared.set('next_episode_at', now_s + interval_s + module.rand.number.floating(-half, half)) -%}
       {%- set ports = module.random.sample(range(40000, 62001), 6) -%}
       {%- if ports[0] == shared.get('last_first_port', none) -%}
         {%- do ports.reverse() -%}
@@ -27,6 +35,31 @@
 {%- set bytes = req.bytes -%}
 {%- set server = req.backend -%}
 {%- set src = params.anomaly_ip if module.rand.number.integer(1, 50) == 1 else samples.clients.pick().ip -%}
+{#- Background retry bursts: an ordinary 401 login starts, with a small
+    probability, one to six more 401 logins from the same client on the
+    next ticks, followed by a 302 login in 70% of bursts. -#}
+{%- if step == 'routine' -%}
+  {%- set burst = shared.get('burst', none) -%}
+  {%- if burst is not none -%}
+    {%- set src = burst.ip -%}
+    {%- set method = 'POST' -%}
+    {%- set path = '/login' -%}
+    {%- set server = 'app1' -%}
+    {%- if burst.fails > 0 -%}
+      {%- set status = 401 -%}
+      {%- set bytes = 310 -%}
+      {%- do burst.update({'fails': burst.fails - 1}) -%}
+      {%- if burst.fails == 0 and not burst.ok -%}{%- set burst = none -%}{%- endif -%}
+    {%- else -%}
+      {%- set status = 302 -%}
+      {%- set bytes = 196 -%}
+      {%- set burst = none -%}
+    {%- endif -%}
+  {%- elif path == '/login' and status == 401 and module.rand.chance(0.02) -%}
+    {%- set burst = {'ip': src, 'fails': module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [45, 25, 14, 8, 5, 3]), 'ok': module.rand.chance(0.7)} -%}
+  {%- endif -%}
+  {%- do shared.set('burst', burst) -%}
+{%- endif -%}
 {%- if step.startswith('fail_') -%}
   {%- set method = 'POST' -%}
   {%- set path = '/login' -%}
@@ -57,6 +90,29 @@
     {%- do shared.pop('episode_ports', none) -%}
   {%- endif -%}
 {%- endif -%}
+{#- Guard: an ordinary export that would complete four 401 logins, a
+    302 login and the export from one client, the first 401 at most
+    chain_window_s before the export request, is replaced by another
+    request from the pool (any class but the export). The export's
+    timers are drawn first, only to place its request time; they are
+    kept when it is not replaced, and a replacement gets its own
+    timers, bytes and status below. The history is kept after an
+    episode, so a later ordinary export cannot complete a chain with
+    the episode's own logins either. -#}
+{%- set history = shared.get('login_history', {}) -%}
+{%- set pre = none -%}
+{%- if step == 'routine' and path == export_path and history.get(src, {}).get('armed') is not none -%}
+  {%- set pre = {'tr_request': module.rand.number.integer(0, 2), 'tc_connect': module.rand.number.integer(0, 4), 'tr_response': module.rand.number.integer(80, 240), 'transfer': module.rand.number.integer(300, 700)} -%}
+  {%- set pre_request_s = now_s - (pre.tr_request + pre.tc_connect + pre.tr_response + pre.transfer) / 1000 -%}
+  {%- if history[src].armed >= pre_request_s - chain_window_s -%}
+    {%- set other = [] -%}
+    {%- for i in range(samples.requests | length) if samples.requests[i].path != '/admin/export' -%}{%- do other.append(samples.requests[i]) -%}{%- endfor -%}
+    {%- set req = module.rand.choice(other) -%}
+    {%- set method = req.method -%}{%- set path = req.path -%}{%- set status = req.status -%}
+    {%- set bytes = req.bytes -%}{%- set server = req.backend -%}
+    {%- set pre = none -%}
+  {%- endif -%}
+{%- endif -%}
 {%- set no_server = server == '<NOSRV>' -%}
 {%- if no_server -%}
   {%- set tr_request = 0 -%}
@@ -70,12 +126,12 @@
   {%- set beconn = 0 -%}
   {%- set srvconn = 0 -%}
 {%- else -%}
-  {%- set tr_request = module.rand.number.integer(0, 2) -%}
+  {%- set tr_request = module.rand.number.integer(0, 2) if pre is none else pre.tr_request -%}
   {%- set tw_queue = 0 -%}
-  {%- set tc_connect = module.rand.number.integer(0, 4) -%}
+  {%- set tc_connect = module.rand.number.integer(0, 4) if pre is none else pre.tc_connect -%}
   {%- if path == export_path -%}
-    {%- set tr_response = module.rand.number.integer(80, 240) -%}
-    {%- set transfer = module.rand.number.integer(300, 700) -%}
+    {%- set tr_response = module.rand.number.integer(80, 240) if pre is none else pre.tr_response -%}
+    {%- set transfer = module.rand.number.integer(300, 700) if pre is none else pre.transfer -%}
   {%- elif status == 401 -%}
     {%- set tr_response = module.rand.number.integer(8, 35) -%}
     {%- set transfer = module.rand.number.integer(0, 10) -%}
@@ -96,6 +152,23 @@
   {%- set beconn = module.rand.number.integer(0, feconn) -%}
   {%- set srvconn = module.rand.number.integer(0, beconn) -%}
 {%- endif -%}
+{%- set request_s = now_s - ta_active / 1000 -%}
+{#- Guard history: per client, the 401 request times of the last
+    chain_window_s and the latest anchor that a 302 has armed. -#}
+{%- set h = history.get(src, {'fails': [], 'armed': none}) -%}
+{%- set fails = h.fails | select('ge', request_s - chain_window_s) | list -%}
+{%- set armed = h.armed if h.armed is not none and h.armed >= request_s - chain_window_s else none -%}
+{%- if path == '/login' and status == 401 -%}
+  {%- do fails.append(request_s) -%}
+{%- elif path == '/login' and status == 302 and fails | length >= 4 -%}
+  {%- set armed = [armed if armed is not none else fails[-4], fails[-4]] | max -%}
+{%- endif -%}
+{%- if not fails and armed is none -%}
+  {%- do history.pop(src, none) -%}
+{%- else -%}
+  {%- do history.update({src: {'fails': fails[-8:], 'armed': armed}}) -%}
+{%- endif -%}
+{%- do shared.set('login_history', history) -%}
 {%- set timers = tr_request ~ '/' ~ tw_queue ~ '/' ~ tc_connect ~ '/' ~ tr_response ~ '/' ~ ta_active -%}
 {%- set connections = actconn ~ '/' ~ feconn ~ '/' ~ beconn ~ '/' ~ srvconn ~ '/0' -%}
 {%- set reqline = method ~ ' ' ~ path ~ ' HTTP/1.1' -%}
