@@ -8,11 +8,36 @@
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
-{%- set guard_s = 5400 -%}
+{%- set within = 3600 -%}
 {%- set dos_names = ['TCP SYN Flood', 'UDP Flood', 'ICMPv4 Flood', 'Bad TCP checksum',
     'TCP RST Flood', 'Single Endpoint Flood', 'Single Endpoint Sweep', 'IP Fragment Overlap',
     'DNS Response Flood', 'LAND Attack'] -%}
 {%- set dos_weights = [26, 18, 14, 10, 8, 7, 6, 5, 4, 2] -%}
+
+{#- Background load by UTC hour (7-19 busy, 19-23 evening, night). -#}
+{%- macro load_at(h) -%}
+{{- (1.35 if 7 <= h < 19 else (0.9 if 19 <= h < 23 else 0.45)) / 0.975 -}}
+{%- endmacro -%}
+
+{#- Draw an episode start in [a, b): 10-minute slots weighted by the
+    background load curve (sq: curve^2 + 0.05, curve max 1), uniform
+    within a slot. -#}
+{%- macro draw_start(a, b, sq) -%}
+  {%- set base = (a // 600) * 600 -%}
+  {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
+  {%- for i in range((b - base) // 600 + 1) -%}
+    {%- set lo = [a, base + i * 600] | max -%}
+    {%- set hi = [b, base + (i + 1) * 600] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = (load_at(((base + i * 600) % 86400) // 3600) | float) * 0.975 / 1.35 -%}
+      {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
+      {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set j = module.rand.weighted_choice(range(ws | length) | list, ws) -%}
+  {%- do shared.set('start_at',
+      module.rand.number.integer(lows[j], highs[j] - 1)) -%}
+{%- endmacro -%}
 
 {%- if not shared.get('initialized', false) -%}
   {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
@@ -50,15 +75,19 @@
   {%- do shared.update({'initialized': true, 'clients': clients, 'weights': weights,
       'addresses': addresses, 'addr_weights': addr_weights,
       'vs_weights': servers | map(attribute='weight') | list,
-      'q': [], 'hist': {},
-      'next_due': now + (interval * 3600) | int, 'armed': false,
+      'q': [], 'm': {}, 'start_at': none,
       'last_client': none, 'last_address': none}) -%}
+  {#- First episode inside the first min(interval, 24 h), its time of
+      day drawn from the background load curve. -#}
+  {%- if params.anomaly_mode -%}
+    {{- draw_start(now, now + ([interval, 24] | min * 3600) | int, false) -}}
+  {%- endif -%}
 {%- endif -%}
 {%- set q = shared.get('q') -%}
-{%- set hist = shared.get('hist') -%}
+{%- set mstate = shared.get('m') -%}
 {%- set servers = params.virtual_servers -%}
 {%- set hour = timestamp.astimezone(utc).hour -%}
-{%- set load = (1.35 if 7 <= hour < 19 else (0.9 if 19 <= hour < 23 else 0.45)) / 0.975 -%}
+{%- set load = load_at(hour) | float -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
@@ -145,10 +174,10 @@
       's': {'status': 'Attack Stopped', 'id': aid, 'name': name}}) -%}
 {%- endif -%}
 
-{#- 2. Episode: due by source time, exponential start delay (mean
-    20 min, the same flat hour weighting as background probes), next
-    due from the actual start, never catching up. -#}
-{%- if params.anomaly_mode and now >= shared.get('next_due') and module.rand.chance(1 / 1200) -%}
+{#- 2. Episode: the next start is drawn in a window of
+    w = min(interval / 4, 6 h) centred on due = this start + interval,
+    weighted by the load curve squared plus a floor. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
   {%- set pool = namespace(c=[], w=[]) -%}
   {%- for ip in clients -%}
     {%- if ip != shared.get('last_client') -%}
@@ -165,8 +194,10 @@
   {%- set a = module.rand.weighted_choice(apool.a, apool.w) -%}
   {%- set k = module.rand.weighted_choice([3, 4, 5], [58, 28, 14]) -%}
   {{- probe_burst(c, a, module.rand.shuffle(params.closed_ports | list)[:k], true, true) -}}
-  {%- do shared.update({'last_client': c, 'last_address': a,
-      'next_due': now + (interval * 3600) | int}) -%}
+  {%- do shared.update({'last_client': c, 'last_address': a}) -%}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+  {{- draw_start(due - half, due + half, true) -}}
 {%- endif -%}
 
 {#- 3. Emit the earliest due record, otherwise nothing. -#}
@@ -181,23 +212,33 @@
 {%- set s = e.s -%}
 {%- set kind = e.kind -%}
 
-{%- for k in hist | list -%}
-  {%- set kept = hist[k] | selectattr('0', 'ge', now - guard_s) | list -%}
-  {%- if kept -%}{%- do hist.update({k: kept}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
-{%- endfor -%}
-
+{#- Guard on the final chain step over every binding: an Accept/Open
+    completes a chain when its client was dropped on three or more
+    distinct ports of that address in the preceding `within` s (no cap,
+    no reset). A background allowed connection that would complete one
+    is not made; episode records never are dropped. -#}
 {%- if kind == 'deny' -%}
-  {%- set key = s.client ~ '>' ~ s.address -%}
-  {%- do hist.update({key: (hist.get(key, []) + [[now, s.port]])[-16:]}) -%}
+  {%- set hk = s.client ~ '>' ~ s.address -%}
+  {%- set recent = mstate.get(hk, []) | selectattr('0', 'ge', now - within) | list -%}
+  {%- do recent.append([now, s.port]) -%}
+  {%- do mstate.update({hk: recent}) -%}
 {%- elif kind == 'start' -%}
-  {#- Guard on the final chain step only: an ordinary allowed
-      connection that would follow drops on three or more distinct
-      closed ports of the same address is not made. -#}
-  {%- if not e.episode -%}
-    {%- set ports = hist.get(s.client ~ '>' ~ s.vs.address, []) | map(attribute='1') | unique | list -%}
-    {%- if ports | length >= 3 -%}{{ dispatch.drop() }}{%- endif -%}
+  {%- set hk = s.client ~ '>' ~ s.vs.address -%}
+  {%- set recent = mstate.get(hk, []) | selectattr('0', 'ge', now - within) | list -%}
+  {%- do mstate.update({hk: recent}) -%}
+  {%- if not e.episode and recent | map(attribute='1') | unique | list | length >= 3 -%}
+    {{ dispatch.drop() }}
   {%- endif -%}
-  {%- do s.update({'spt': module.rand.number.integer(1024, 65535)}) -%}
+  {#- Source port not in use by an open flow of the same client to the
+      same virtual server (a live 4-tuple is never reused). -#}
+  {%- set busy = q | selectattr('kind', 'equalto', 'close')
+      | map(attribute='s') | selectattr('client', 'equalto', s.client)
+      | map(attribute='spt') | list -%}
+  {%- set sp = namespace(v=module.rand.number.integer(1024, 65535)) -%}
+  {%- for i in range(8) -%}
+    {%- if sp.v in busy -%}{%- set sp.v = module.rand.number.integer(1024, 65535) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do s.update({'spt': sp.v}) -%}
   {%- if s.vs.logging == 'flow' -%}
     {%- do q.append({'due': now + s.dur, 'kind': 'close', 'episode': e.episode, 's': s}) -%}
   {%- endif -%}
