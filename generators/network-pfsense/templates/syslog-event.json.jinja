@@ -1,89 +1,316 @@
-{%- for key in ['to_peer_lookup', 'to_peer_failure', 'to_peer_lookup_valid', 'to_ike_established', 'to_child_established', 'to_vpn_traffic', 'to_routine', 'to_child_close', 'to_ike_delete'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- set kind = stage -%}
-{%- set admin_port = none -%}
-{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- if stage == 'routine' -%}
-  {%- set count = shared.get('routine_phase', 0) + 1 -%}
-  {%- do shared.set('routine_phase', count % 720) -%}
-  {%- if count == 20 -%}{%- set kind = 'peer_lookup' -%}
-  {%- elif count == 21 -%}{%- set kind = 'peer_failure' -%}
-  {%- elif count == 99 and not shared.get('active_ike', false) -%}
-    {%- set kind = 'peer_lookup_valid' -%}
-    {%- do shared.set('normal_negotiation', true) -%}
-  {%- elif count == 100 and shared.get('normal_negotiation', false) -%}{%- set kind = 'ike_established' -%}
-  {%- elif count == 101 and shared.pop('normal_negotiation', false) -%}{%- set kind = 'child_established' -%}
-  {%- elif count in [300,450,600] and shared.get('active_child', false) -%}
-    {%- set admin_port = {300:445,450:3389,600:5985}[count] -%}
-  {%- elif count == 650 and shared.get('active_child', false) -%}{%- set kind = 'child_close' -%}
-  {%- elif count == 651 and shared.get('active_ike', false) -%}{%- set kind = 'ike_delete' -%}
-  {%- endif -%}
-  {%- set interval = [params.anomaly_interval_hours|float,1]|max * 3600 -%}
-  {%- set due = shared.get('next_episode_at', utc.timestamp() + interval) -%}
-  {%- do shared.set('next_episode_at', due) -%}
-  {%- if params.anomaly_mode and utc.timestamp() >= due and kind == 'routine' -%}
-    {%- do shared.set('failure_count', 0) -%}
-    {%- do shared.set('next_episode_at', utc.timestamp() + interval) -%}
-    {%- do shared.set('to_child_close' if shared.get('active_child', false) else 'to_ike_delete' if shared.get('active_ike', false) else 'to_peer_lookup', true) -%}
-  {%- endif -%}
-{%- elif stage == 'peer_lookup' -%}
-  {%- if shared.get('failure_count',0) == 0 -%}{%- do shared.set('next_episode_at', utc.timestamp() + [params.anomaly_interval_hours|float,1]|max * 3600) -%}{%- endif -%}
-  {%- do shared.set('to_peer_failure', true) -%}
-{%- elif stage == 'peer_failure' -%}
-  {%- set count = shared.get('failure_count', 0) + 1 -%}
-  {%- do shared.set('failure_count', count) -%}
-  {%- if count == 3 -%}{%- do shared.set('to_peer_lookup_valid', true) -%}
-  {%- else -%}{%- do shared.set('to_peer_lookup', true) -%}{%- endif -%}
-{%- elif stage == 'peer_lookup_valid' -%}
-  {%- do shared.set('to_ike_established', true) -%}
-{%- elif stage == 'ike_established' -%}
-  {%- do shared.set('to_child_established', true) -%}
-{%- elif stage == 'child_established' -%}
-  {%- do shared.set('traffic_count', 0) -%}
-  {%- do shared.set('to_vpn_traffic', true) -%}
-{%- elif stage == 'vpn_traffic' -%}
-  {%- set admin_port = [445, 3389, 5985][shared.get('traffic_count', 0)] -%}
-  {%- set count = shared.get('traffic_count', 0) + 1 -%}
-  {%- do shared.set('traffic_count', count) -%}
-  {%- if count == 3 -%}{%- do shared.set('to_routine', true) -%}{%- endif -%}
+{#- pfSense RFC 5424 records wrapped in ECS JSON: filterlog packet records
+    and IPsec charon records of eight site-to-site IKEv1 PSK tunnels.
+    One input tick per second; each tick emits the earliest due record
+    (with a random microsecond fraction inside that second) or drops.
+    Independent background processes: LAN passes, WAN default-deny
+    blocks, and per site a tunnel lifecycle (negotiation attempts with
+    occasional wrong Phase 1 identities, IKE/CHILD establishment, enc0
+    traffic while the CHILD_SA is up, closure and deletion). Times are
+    epoch seconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp()) -%}
+{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set hq = module.heapq -%}
+{#- Chain window: three wrong-identity lookups of one peer, its IKE_SA
+    and an administrative-port enc0 pass from its subnet, all within
+    this many seconds of the first lookup. -#}
+{%- set window = 900 -%}
+{%- set hour = 3600 -%}
+{%- set admin_ports = [445, 3389, 5985] -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med, at least 1. -#}
+  {{- [module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig)), 1] | max -}}
+{%- endmacro -%}
+{%- macro ex(mean) -%}
+  {{- [module.builtins.int(module.rand.number.exponential(1.0 / mean)), 1] | max -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its UTC hour weighted by the activity
+      curve squared plus a small floor. -#}
+  {%- set curve = shared.get('curve') -%}
+  {%- set top = (curve | max) ** 2 + 0.02 -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, top) < curve[(c // hour) % 24] ** 2 + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro pick_server(port) -%}
+  {#- Index of a server offering the port, by server weight. -#}
+  {%- set idx = [] -%}
+  {%- set wts = [] -%}
+  {%- for srv in shared.get('servers') -%}
+    {%- if port in srv.ports -%}
+      {%- do idx.append(loop.index0) -%}
+      {%- do wts.append(srv.w) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- module.rand.weighted_choice(idx, wts) -}}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 4, 'le': 8760}},
+    'hostname': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[A-Za-z0-9.-]+$'}},
+    'wan_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^\\d+\\.\\d+\\.\\d+\\.\\d+$'}},
+    'ipsec_pass_rule_tracker': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 1}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {#- Office activity by UTC hour (relative rate, peak 1): LAN and enc0
+      traffic and wrong-identity attempts are thinned by it; episode
+      starts are weighted by its square. -#}
+  {%- do shared.update({'queue': [], 'seq': 0, 'curve': [0.08, 0.06, 0.06, 0.08, 0.15, 0.35, 0.7, 0.95, 1.0, 1.0, 0.95, 0.9, 0.95, 1.0, 0.9, 0.7, 0.45, 0.3, 0.22, 0.18, 0.14, 0.12, 0.1, 0.09]}) -%}
+  {%- set sites = [] -%}
+  {%- for row in samples.sites -%}
+    {%- do sites.append({'conn': row.conn, 'peer': row.peer, 'subnet': row.subnet, 'hosts': row.hosts | list, 'w': row.weight, 'alt': row.alt_id, 'state': 'down', 'gen': 0, 'att_at': none, 'cur': none, 'thr': 1, 'ike': none, 'child': none, 'parts': []}) -%}
+    {%- do sites[-1].update({'att_at': now + module.rand.number.integer(1, hour)}) -%}
+    {{- push(sites[-1].att_at, {'k': 'att', 's': loop.index0, 'g': 0, 'id': none}) -}}
+    {{- push(now + ex(100 / row.weight) | int, {'k': 'tr', 's': loop.index0}) -}}
+  {%- endfor -%}
+  {%- set servers = [] -%}
+  {%- for row in samples.servers -%}
+    {%- do servers.append({'ip': row.ip, 'ports': row.ports | list, 'w': row.weight}) -%}
+  {%- endfor -%}
+  {{- push(now + ex(7) | int, {'k': 'lan'}) -}}
+  {{- push(now + ex(40) | int, {'k': 'wan'}) -}}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'sites': sites, 'servers': servers, 'ike_seq': module.rand.number.integer(20, 900), 'child_seq': module.rand.number.integer(5, 400), 'ep_last': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
 {%- endif -%}
-{%- set is_firewall = kind in ['routine', 'vpn_traffic'] -%}
-{%- set process = 'filterlog' if is_firewall else 'charon' -%}
-{%- set pid = 72237 if is_firewall else 18610 -%}
-{%- set priority = 134 if is_firewall else 30 -%}
-{%- set src_ip = none -%}
-{%- set dst_ip = none -%}
-{%- set src_port = none -%}
-{%- set dst_port = none -%}
-{%- set interface = none -%}
-{%- set direction = none -%}
-{%- set tracker = none -%}
-{%- set action = none -%}
-{%- set transport = none -%}
-{%- set packet_length = none -%}
-{%- if is_firewall -%}
-  {%- if stage == 'vpn_traffic' or admin_port is not none -%}
-    {%- set profile = 'vpn_admin' -%}
-  {%- else -%}
-    {%- set profile = module.rand.weighted_choice(['lan_dns', 'lan_https', 'lan_web', 'wan_https', 'wan_ssh', 'vpn_service'], [30, 25, 20, 15, 5, 5]) -%}
+{%- set queue = shared.get('queue') -%}
+{%- set sites = shared.get('sites') -%}
+{%- set curve = shared.get('curve') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode: at the first tick at or after its drawn start, a site
+    other than the previous episode's whose tunnel is down and whose next
+    negotiation is due within 30 minutes of that tick (weighted like
+    background traffic; after 20 minutes without one, the down site that
+    reconnects first, within a few minutes) has that negotiation
+    replaced at its own time: its peer offers a wrong Phase 1 identity
+    3-5 times with background retry gaps, then its configured identity;
+    the IKE_SA and CHILD_SA come up and one remote host opens SMB, RDP and
+    WinRM to one internal server over enc0. The tunnel then lives and
+    closes like any background tunnel. The first start falls within the
+    first min(interval, 24 h); each later start within a window of
+    min(interval / 4, 6 h) centred one interval after the actual start,
+    both weighted by the activity curve squared. Missed episodes are not
+    replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {#- Waiting starts at the first due tick; retries do not re-arm it. -#}
+  {%- if shared.get('ep_wait') is none -%}{%- do shared.set('ep_wait', now) -%}{%- endif -%}
+  {%- set late = now - shared.get('ep_wait') > 1200 -%}
+  {%- set cand = [] -%}
+  {%- set wts = [] -%}
+  {%- set soon = namespace(i=none, at=none) -%}
+  {%- for st in sites -%}
+    {%- if st.state == 'down' and loop.index0 != shared.get('ep_last') and st.att_at > now -%}
+      {%- if st.att_at <= shared.get('ep_wait') + 1800 -%}
+        {%- do cand.append(loop.index0) -%}
+        {%- do wts.append(st.w) -%}
+      {%- endif -%}
+      {%- if soon.at is none or st.att_at < soon.at -%}
+        {%- set soon.i = loop.index0 -%}
+        {%- set soon.at = st.att_at -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- After 20 minutes without such a site, take the down site that
+      reconnects first, at the latest a few minutes from now. -#}
+  {%- if not cand and soon.i is not none and late -%}
+    {%- do cand.append(soon.i) -%}
+    {%- do wts.append(1) -%}
   {%- endif -%}
-  {%- if profile == 'vpn_service' and not shared.get('active_child', false) -%}{%- set profile = 'lan_https' -%}{%- endif -%}
+  {%- if cand -%}
+    {%- set si = module.rand.weighted_choice(cand, wts) -%}
+    {%- set st = sites[si] -%}
+    {%- do st.update({'gen': st.gen + 1, 'state': 'nego'}) -%}
+    {%- set start = [st.att_at, now + (ln(180, 0.6) | int)] | min if late else st.att_at -%}
+    {%- set nf = module.rand.weighted_choice([3, 4, 5], [60, 28, 12]) -%}
+    {%- set g = namespace(v=[], ok=false) -%}
+    {%- for _ in range(60) if not g.ok -%}
+      {%- set g.v = [] -%}
+      {%- for _ in range(nf + 1) -%}{%- do g.v.append(ln(25, 0.6) | int) -%}{%- endfor -%}
+      {%- set g.ok = (g.v | sum) <= window - 150 -%}
+    {%- endfor -%}
+    {%- set offered = module.rand.choice(['vpn-ext', st.alt]) -%}
+    {%- set t = namespace(v=start) -%}
+    {%- for i in range(nf) -%}
+      {{- push(t.v, {'k': 'row', 'kind': 'lookup', 's': si, 'id': offered, 'ep': true}) -}}
+      {{- push(t.v, {'k': 'row', 'kind': 'fail', 's': si, 'ep': true}) -}}
+      {%- set t.v = t.v + g.v[i] -%}
+    {%- endfor -%}
+    {{- push(t.v, {'k': 'row', 'kind': 'lookup', 's': si, 'id': none, 'ep': true}) -}}
+    {{- push(t.v, {'k': 'row', 'kind': 'ike', 's': si, 'ep': true}) -}}
+    {{- push(t.v, {'k': 'row', 'kind': 'child', 's': si, 'ep': true}) -}}
+    {{- push(t.v + (ln(2.5 * hour, 0.7) | int), {'k': 'down', 's': si, 'g': st.gen}) -}}
+    {%- set t.v = t.v + g.v[nf] -%}
+    {%- set host = module.rand.choice(st.hosts) -%}
+    {#- A server offering every administrative port, by server weight. -#}
+    {%- set idx = [] -%}
+    {%- set wts = [] -%}
+    {%- for srv in shared.get('servers') -%}
+      {%- if admin_ports | reject('in', srv.ports) | list | length == 0 -%}
+        {%- do idx.append(loop.index0) -%}
+        {%- do wts.append(srv.w) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set srv = shared.get('servers')[module.rand.weighted_choice(idx, wts)] -%}
+    {%- for port in module.rand.shuffle(admin_ports) -%}
+      {{- push(t.v, {'k': 'row', 'kind': 'enc', 's': si, 'host': host, 'dst': srv.ip, 'port': port, 'ep': true}) -}}
+      {%- set t.v = t.v + (ln(40, 0.9) | int) -%}
+    {%- endfor -%}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {%- do shared.update({'ep_last': si, 'ep_wait': none, 'ep_due': pick_start(start + interval - w // 2, w) | int}) -%}
+  {%- else -%}
+    {%- do shared.set('ep_due', now + 60) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if now < queue[0][0] -%}
+  {%- do shared.set('next_due', queue[0][0]) -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(40) if out.row is none and queue and queue[0][0] <= now -%}
+  {%- set top = hq.heappop(queue) -%}
+  {%- set due = top[0] -%}
+  {%- set item = top[2] -%}
+  {%- set h = (due // hour) % 24 -%}
+  {%- if item.k == 'row' -%}
+    {%- set st = sites[item.s] if item.s is defined else none -%}
+    {%- if item.kind == 'enc' and st.state != 'up' -%}
+    {%- elif item.kind == 'close' and st.child is none -%}
+    {%- elif item.kind == 'del' and st.ike is none -%}
+    {%- else -%}
+      {%- set out.row = item -%}
+    {%- endif -%}
+  {%- elif item.k == 'att' -%}
+    {#- One negotiation attempt of a site whose tunnel is down. A wrong
+        identity (more likely in office hours, when peers are being
+        reconfigured) fails and is retried with the same identity or
+        corrected; some peers give up and try again later. -#}
+    {%- set st = sites[item.s] -%}
+    {%- if item.g == st.gen -%}
+      {%- do st.update({'state': 'nego'}) -%}
+      {%- set wrong = module.rand.chance(0.62) if item.id else module.rand.chance(0.1 + 0.45 * curve[h]) -%}
+      {%- if wrong -%}
+        {%- set offered = item.id or module.rand.choice(['vpn-ext', st.alt]) -%}
+        {{- push(due, {'k': 'row', 'kind': 'lookup', 's': item.s, 'id': offered}) -}}
+        {{- push(due, {'k': 'row', 'kind': 'fail', 's': item.s}) -}}
+        {%- if module.rand.chance(0.15) -%}
+          {%- do st.update({'state': 'down'}) -%}
+          {%- do st.update({'att_at': due + (ln(1800, 1.0) | int)}) -%}
+          {{- push(st.att_at, {'k': 'att', 's': item.s, 'g': st.gen, 'id': none}) -}}
+        {%- else -%}
+          {{- push(due + (ln(25, 0.6) | int), {'k': 'att', 's': item.s, 'g': st.gen, 'id': offered}) -}}
+        {%- endif -%}
+      {%- else -%}
+        {{- push(due, {'k': 'row', 'kind': 'lookup', 's': item.s, 'id': none}) -}}
+        {{- push(due, {'k': 'row', 'kind': 'ike', 's': item.s}) -}}
+        {{- push(due, {'k': 'row', 'kind': 'child', 's': item.s}) -}}
+        {{- push(due + (ln(2.5 * hour, 0.7) | int), {'k': 'down', 's': item.s, 'g': st.gen}) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'down' -%}
+    {#- Tunnel teardown (idle, DPD or reauthentication): CHILD_SA closed,
+        IKE_SA deleted, the next negotiation after a lognormal pause. -#}
+    {%- set st = sites[item.s] -%}
+    {%- if item.g == st.gen -%}
+      {%- do st.update({'state': 'closing'}) -%}
+      {{- push(due, {'k': 'row', 'kind': 'close', 's': item.s}) -}}
+      {{- push(due + module.rand.number.integer(0, 1), {'k': 'row', 'kind': 'del', 's': item.s}) -}}
+      {%- do st.update({'att_at': due + (ln(hour, 1.0) | int)}) -%}
+      {{- push(st.att_at, {'k': 'att', 's': item.s, 'g': st.gen, 'id': none}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'tr' -%}
+    {%- set st = sites[item.s] -%}
+    {{- push(due + ex(100 / st.w) | int, item) -}}
+    {%- if st.state == 'up' and module.rand.chance(0.1 + 0.9 * curve[h]) -%}
+      {#- Port by background weight, then a server offering it and a
+          host of the site. -#}
+      {%- set port = module.rand.weighted_choice([443, 53, 389, 88, 135, 445, 3389, 5985], [30, 22, 10, 8, 6, 14, 7, 3]) -%}
+      {%- set srv = shared.get('servers')[pick_server(port) | int] -%}
+      {%- set host = module.rand.choice(st.hosts) -%}
+      {{- push(due, {'k': 'row', 'kind': 'enc', 's': item.s, 'host': host, 'dst': srv.ip, 'port': port}) -}}
+      {#- An administrator often opens further management sessions to
+          the same server shortly after the first one. -#}
+      {%- if port in admin_ports and module.rand.chance(0.4) -%}
+        {%- set t = namespace(v=due) -%}
+        {%- for _ in range(module.rand.weighted_choice([1, 2], [65, 35])) -%}
+          {%- set t.v = t.v + (ln(40, 0.9) | int) -%}
+          {{- push(t.v, {'k': 'row', 'kind': 'enc', 's': item.s, 'host': host, 'dst': srv.ip, 'port': module.rand.choice(srv.ports | select('in', admin_ports) | list)}) -}}
+        {%- endfor -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'lan' -%}
+    {{- push(due + ex(7) | int, item) -}}
+    {%- if module.rand.chance(0.15 + 0.85 * curve[h]) -%}
+      {%- set prof = module.rand.weighted_choice(['dns', 'int', 'web'], [40, 25, 35]) -%}
+      {%- set dst = '10.20.0.10' if prof == 'dns' else module.rand.choice(['10.20.1.15', '10.20.1.30']) if prof == 'int' else module.rand.choice(['192.0.2.44', '192.0.2.71', '192.0.2.130', '192.0.2.201']) -%}
+      {{- push(due, {'k': 'row', 'kind': 'lan', 'src': '10.20.' ~ module.rand.choice([7, 8]) ~ '.' ~ module.rand.number.integer(10, 250), 'dst': dst, 'port': 53 if prof == 'dns' else 443, 'out': prof == 'web'}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'wan' -%}
+    {#- Unsolicited internet probes hitting the default deny rule;
+        scanners send short bursts. -#}
+    {{- push(due + ex(40) | int, item) -}}
+    {%- set src = '198.51.100.' ~ module.rand.number.integer(100, 254) -%}
+    {%- set t = namespace(v=due) -%}
+    {%- for _ in range(module.rand.weighted_choice([1, 2, 3, 4], [65, 18, 10, 7])) -%}
+      {{- push(t.v, {'k': 'row', 'kind': 'wan', 'src': src, 'port': module.rand.weighted_choice([443, 22, 3389, 445, 23, 8080], [30, 25, 15, 10, 12, 8])}) -}}
+      {%- set t.v = t.v + (ln(3, 1.0) | int) -%}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- do shared.set('next_due', queue[0][0] if queue else now + 1) -%}
+{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set row = out.row -%}
+{%- set kind = row.kind -%}
+{%- set us = module.rand.number.integer(0, 999999) -%}
+{%- set event_time = ts + module.datetime.timedelta(microseconds=us) -%}
+{%- set tf = now + us / 1000000 -%}
+{%- set is_firewall = kind in ['enc', 'lan', 'wan'] -%}
+{%- set thread = '%02d' % module.rand.number.integer(1, 16) -%}
+{%- if is_firewall -%}
   {%- set src_port = module.rand.number.integer(49152, 65535) -%}
-  {%- set direction = 'in' -%}
-  {%- if profile in ['wan_https', 'wan_ssh'] -%}
-    {%- set src_ip = '198.51.100.' ~ module.rand.number.integer(80, 95) -%}
+  {%- if kind == 'wan' -%}
+    {%- set src_ip = row.src -%}
     {%- set dst_ip = params.wan_ip -%}
-    {%- set dst_port = 443 if profile == 'wan_https' else 22 -%}
+    {%- set dst_port = row.port -%}
     {%- set interface = 'igb0' -%}
     {%- set action = 'block' -%}
     {%- set tracker = 1000000103 -%}
     {%- set rule_number = 5 -%}
     {%- set subrule = 16777216 -%}
     {%- set network_direction = 'inbound' -%}
-  {%- elif profile in ['vpn_service', 'vpn_admin'] -%}
-    {%- set src_ip = params.remote_tunnel_ip -%}
-    {%- set dst_ip = params.internal_target_ip -%}
-    {%- set dst_port = admin_port if profile == 'vpn_admin' else module.rand.choice([53, 443]) -%}
+  {%- elif kind == 'enc' -%}
+    {%- set st = sites[row.s] -%}
+    {%- set dst_port = row.port -%}
+    {#- Chain tracker, same semantics as a streaming ordered matcher keyed
+        by site: partials that wait for the final step exist only after
+        three wrong-identity lookups and the IKE_SA of that peer within
+        the window. A background administrative-port pass that would
+        complete one keeps its time and host; its service port and server
+        are redrawn from the background non-administrative flow weights.
+        An episode pass completes and resets. -#}
+    {%- set live = st.parts | selectattr('t', 'ge', tf - window) | list -%}
+    {%- set dst_ip = row.dst -%}
+    {%- if not row.get('ep') and dst_port in admin_ports and live | selectattr('i', 'equalto', 4) | list -%}
+      {%- set dst_port = module.rand.weighted_choice([443, 53, 389, 88, 135], [30, 22, 10, 8, 6]) -%}
+      {%- set dst_ip = shared.get('servers')[pick_server(dst_port) | int].ip -%}
+    {%- endif -%}
+    {%- if dst_port in admin_ports and live | selectattr('i', 'equalto', 4) | list -%}
+      {%- do st.update({'parts': []}) -%}
+    {%- else -%}
+      {%- do st.update({'parts': live}) -%}
+    {%- endif -%}
+    {%- set src_ip = row.host -%}
     {%- set interface = 'enc0' -%}
     {%- set action = 'pass' -%}
     {%- set tracker = params.ipsec_pass_rule_tracker -%}
@@ -91,67 +318,77 @@
     {%- set subrule = '' -%}
     {%- set network_direction = 'inbound' -%}
   {%- else -%}
-    {%- set src_ip = module.rand.choice(['10.20.7.14', '10.20.7.32', '10.20.8.17']) -%}
-    {%- set dst_ip = '10.20.0.53' if profile == 'lan_dns' else '10.20.1.15' if profile == 'lan_https' else '192.0.2.44' -%}
-    {%- set dst_port = 53 if profile == 'lan_dns' else 443 -%}
+    {%- set src_ip = row.src -%}
+    {%- set dst_ip = row.dst -%}
+    {%- set dst_port = row.port -%}
     {%- set interface = 'igb1.12' -%}
     {%- set action = 'pass' -%}
     {%- set tracker = 1690001001 -%}
     {%- set rule_number = 115 -%}
     {%- set subrule = '' -%}
-    {%- set network_direction = 'outbound' if profile == 'lan_web' else 'internal' -%}
+    {%- set network_direction = 'outbound' if row.out else 'internal' -%}
   {%- endif -%}
-  {%- set ttl = module.rand.number.integer(47, 61) if profile in ['wan_https', 'wan_ssh'] else module.rand.number.integer(62, 64) -%}
+  {%- set ttl = module.rand.number.integer(47, 61) if kind == 'wan' else module.rand.number.integer(62, 64) -%}
   {%- set transport = 'udp' if dst_port == 53 else 'tcp' -%}
   {%- set packet_length = 69 if transport == 'udp' else 60 -%}
   {%- set ip_id = module.rand.number.integer(1, 65535) -%}
-  {%- set prefix = rule_number ~ ',' ~ subrule ~ ',,' ~ tracker ~ ',' ~ interface ~ ',match,' ~ action ~ ',' ~ direction ~ ',4,0x0,,' ~ ttl ~ ',' ~ ip_id ~ ',0,DF,' -%}
+  {%- set prefix = rule_number ~ ',' ~ subrule ~ ',,' ~ tracker ~ ',' ~ interface ~ ',match,' ~ action ~ ',in,4,0x0,,' ~ ttl ~ ',' ~ ip_id ~ ',0,DF,' -%}
   {%- if transport == 'udp' -%}
     {%- set payload = prefix ~ '17,udp,69,' ~ src_ip ~ ',' ~ dst_ip ~ ',' ~ src_port ~ ',' ~ dst_port ~ ',49' -%}
   {%- else -%}
     {%- set payload = prefix ~ '6,tcp,60,' ~ src_ip ~ ',' ~ dst_ip ~ ',' ~ src_port ~ ',' ~ dst_port ~ ',0,S,' ~ module.rand.number.integer(1, 4294967295) ~ ',,64240,,mss;sackOK;TS;nop;wscale' -%}
   {%- endif -%}
-{%- elif kind == 'peer_lookup' -%}
-  {%- set attempt_id = shared.get('ike_attempt_id', 17) % 2147483646 + 1 -%}
-  {%- do shared.set('ike_attempt_id', attempt_id) -%}
-  {%- set payload = '12[CFG] <' ~ attempt_id ~ '> looking for pre-shared key peer configs matching ' ~ params.wan_ip ~ '...' ~ params.remote_peer_ip ~ '[vpn-ext]' -%}
-{%- elif kind == 'peer_lookup_valid' -%}
-  {%- set attempt_id = shared.get('ike_attempt_id', 17) % 2147483646 + 1 -%}
-  {%- do shared.set('ike_attempt_id', attempt_id) -%}
-  {%- set payload = '12[CFG] <' ~ attempt_id ~ '> looking for pre-shared key peer configs matching ' ~ params.wan_ip ~ '...' ~ params.remote_peer_ip ~ '[' ~ params.remote_peer_ip ~ ']' -%}
-{%- elif kind == 'peer_failure' -%}
-  {%- set payload = '12[IKE] <' ~ shared.get('ike_attempt_id', 18) ~ '> no peer config found' -%}
-{%- elif kind == 'ike_established' -%}
-  {%- set success_id = shared.get('success_id', 0) % 2147483646 + 1 -%}
-  {%- do shared.set('success_id', success_id) -%}
-  {%- set attempt_id = shared.get('ike_attempt_id', 19) -%}
-  {%- do shared.set('active_ike', attempt_id) -%}
-  {%- set payload = '03[IKE] <' ~ params.tunnel_name ~ '|' ~ attempt_id ~ '> IKE_SA ' ~ params.tunnel_name ~ '[' ~ attempt_id ~ '] established between ' ~ params.wan_ip ~ '[' ~ params.wan_ip ~ ']...' ~ params.remote_peer_ip ~ '[' ~ params.remote_peer_ip ~ ']' -%}
-{%- elif kind == 'child_established' -%}
-  {%- set success_id = shared.get('success_id', 1) -%}
-  {%- set spi_in = '%08x' % module.rand.number.integer(256,4294967295) -%}
-  {%- set spi_out = '%08x' % module.rand.number.integer(256,4294967295) -%}
-  {%- set attempt_id = shared.get('active_ike') -%}
-  {%- do shared.update({'active_child':success_id,'spi_in':spi_in,'spi_out':spi_out,'sa_bytes_in':0,'sa_bytes_out':0}) -%}
-  {%- set payload = '16[IKE] <' ~ params.tunnel_name ~ '|' ~ attempt_id ~ '> CHILD_SA ' ~ params.tunnel_name ~ '{' ~ success_id ~ '} established with SPIs ' ~ spi_in ~ '_i ' ~ spi_out ~ '_o and TS ' ~ params.internal_target_ip.rsplit('.', 1)[0] ~ '.0/24|/0 === ' ~ params.remote_tunnel_ip.rsplit('.', 1)[0] ~ '.0/24|/0' -%}
-{%- elif kind == 'child_close' -%}
-  {%- set payload = '12[IKE] <' ~ params.tunnel_name ~ '|' ~ shared.get('active_ike') ~ '> closing CHILD_SA ' ~ params.tunnel_name ~ '{' ~ shared.get('active_child') ~ '} with SPIs ' ~ shared.get('spi_in') ~ '_i (' ~ shared.get('sa_bytes_in') ~ ' bytes) ' ~ shared.get('spi_out') ~ '_o (' ~ shared.get('sa_bytes_out') ~ ' bytes) and TS ' ~ params.internal_target_ip.rsplit('.', 1)[0] ~ '.0/24|/0 === ' ~ params.remote_tunnel_ip.rsplit('.', 1)[0] ~ '.0/24|/0' -%}
-  {%- for key in ['active_child','spi_in','spi_out','sa_bytes_in','sa_bytes_out'] -%}{%- do shared.pop(key) -%}{%- endfor -%}
+  {%- if kind == 'enc' -%}
+    {%- do st.update({'bin': st.bin + packet_length + module.rand.number.integer(100, 1500), 'bout': st.bout + module.rand.number.integer(60, 900)}) -%}
+  {%- endif -%}
 {%- else -%}
-  {%- set attempt_id = shared.pop('active_ike') -%}
-  {%- set payload = '12[IKE] <' ~ params.tunnel_name ~ '|' ~ attempt_id ~ '> deleting IKE_SA ' ~ params.tunnel_name ~ '[' ~ attempt_id ~ '] between ' ~ params.wan_ip ~ '[' ~ params.wan_ip ~ ']...' ~ params.remote_peer_ip ~ '[' ~ params.remote_peer_ip ~ ']' -%}
+  {%- set st = sites[row.s] -%}
+  {%- set ts_sel = '10.20.0.0/16|/0 === ' ~ st.subnet ~ '.0/24|/0' -%}
+  {%- set ends = params.wan_ip ~ '[' ~ params.wan_ip ~ ']...' ~ st.peer ~ '[' ~ st.peer ~ ']' -%}
+  {%- set live = st.parts | selectattr('t', 'ge', tf - window) | list -%}
+  {%- if kind == 'lookup' -%}
+    {#- A new IKE_SA per attempt: strongSwan unique IDs grow globally. -#}
+    {%- set ike_id = shared.get('ike_seq') + 1 -%}
+    {%- do shared.set('ike_seq', ike_id) -%}
+    {%- do st.update({'cur': ike_id, 'thr': thread}) -%}
+    {%- set payload = thread ~ '[CFG] <' ~ ike_id ~ '> looking for pre-shared key peer configs matching ' ~ params.wan_ip ~ '...' ~ st.peer ~ '[' ~ (row.id or st.peer) ~ ']' -%}
+    {%- if row.id -%}
+      {%- for p in live if p.i < 3 -%}{%- do p.update({'i': p.i + 1}) -%}{%- endfor -%}
+      {%- do live.append({'i': 1, 't': tf}) -%}
+    {%- endif -%}
+  {%- elif kind == 'fail' -%}
+    {%- set payload = st.thr ~ '[IKE] <' ~ st.cur ~ '> no peer config found' -%}
+  {%- elif kind == 'ike' -%}
+    {%- do st.update({'ike': st.cur}) -%}
+    {%- set payload = thread ~ '[IKE] <' ~ st.conn ~ '|' ~ st.ike ~ '> IKE_SA ' ~ st.conn ~ '[' ~ st.ike ~ '] established between ' ~ ends -%}
+    {%- for p in live if p.i == 3 -%}{%- do p.update({'i': 4}) -%}{%- endfor -%}
+  {%- elif kind == 'child' -%}
+    {%- set child_id = shared.get('child_seq') + 1 -%}
+    {%- do shared.set('child_seq', child_id) -%}
+    {%- do st.update({'child': child_id, 'state': 'up', 'spi_in': '%08x' % module.rand.number.integer(256, 4294967295), 'spi_out': '%08x' % module.rand.number.integer(256, 4294967295), 'bin': 0, 'bout': 0}) -%}
+    {%- set payload = thread ~ '[IKE] <' ~ st.conn ~ '|' ~ st.ike ~ '> CHILD_SA ' ~ st.conn ~ '{' ~ child_id ~ '} established with SPIs ' ~ st.spi_in ~ '_i ' ~ st.spi_out ~ '_o and TS ' ~ ts_sel -%}
+  {%- elif kind == 'close' -%}
+    {#- Counters include traffic and replies that filterlog does not log. -#}
+    {%- set bin = st.bin + (ln(400000, 1.3) | int) -%}
+    {%- set bout = st.bout + (ln(150000, 1.3) | int) -%}
+    {%- set payload = thread ~ '[IKE] <' ~ st.conn ~ '|' ~ st.ike ~ '> closing CHILD_SA ' ~ st.conn ~ '{' ~ st.child ~ '} with SPIs ' ~ st.spi_in ~ '_i (' ~ bin ~ ' bytes) ' ~ st.spi_out ~ '_o (' ~ bout ~ ' bytes) and TS ' ~ ts_sel -%}
+    {%- do st.update({'child': none, 'state': 'closing', 'spi_in': none, 'spi_out': none, 'bin': 0, 'bout': 0}) -%}
+  {%- else -%}
+    {%- set payload = thread ~ '[IKE] <' ~ st.conn ~ '|' ~ st.ike ~ '> deleting IKE_SA ' ~ st.conn ~ '[' ~ st.ike ~ '] between ' ~ ends -%}
+    {%- do st.update({'ike': none, 'state': 'down' if st.state == 'closing' else st.state}) -%}
+  {%- endif -%}
+  {%- do st.update({'parts': live[-8:]}) -%}
 {%- endif -%}
-{%- if is_firewall and interface == 'enc0' -%}
-  {%- do shared.set('sa_bytes_in', shared.get('sa_bytes_in',0) + packet_length + module.rand.number.integer(100,1500)) -%}
-  {%- do shared.set('sa_bytes_out', shared.get('sa_bytes_out',0) + module.rand.number.integer(60,900)) -%}
-{%- endif -%}
-{%- set event_time = utc + module.datetime.timedelta(microseconds=module.rand.number.integer(0, 999999)) -%}
+{%- set process = 'filterlog' if is_firewall else 'charon' -%}
+{%- set pid = 72237 if is_firewall else 18610 -%}
+{%- set priority = 134 if is_firewall else 30 -%}
 {%- set syslog_time = event_time.isoformat(timespec='microseconds') -%}
 {%- set original = '<' ~ priority ~ '>1 ' ~ syslog_time ~ ' ' ~ params.hostname ~ ' ' ~ process ~ ' ' ~ pid ~ ' - - ' ~ payload -%}
+{%- set charon_action = {'lookup': 'ipsec-peer-lookup', 'fail': 'ipsec-peer-not-found', 'ike': 'ipsec-ike-established', 'child': 'ipsec-child-established', 'close': 'ipsec-child-closed', 'del': 'ipsec-ike-deleting'} -%}
 {%- set event = {
   '@timestamp': syslog_time,
   'ecs': {'version': '8.17.0'},
-  'event': {'kind': 'event', 'category': ['network'], 'type': ['connection'] if is_firewall else ['info'], 'action': action if is_firewall else ('ipsec-peer-lookup' if kind in ['peer_lookup', 'peer_lookup_valid'] else 'ipsec-peer-not-found' if kind == 'peer_failure' else 'ipsec-ike-established' if kind == 'ike_established' else 'ipsec-child-established' if kind == 'child_established' else 'ipsec-child-closed' if kind == 'child_close' else 'ipsec-ike-deleting'), 'original': original, 'dataset': 'pfsense.log'},
+  'event': {'kind': 'event', 'category': ['network'], 'type': ['connection'] if is_firewall else ['info'], 'action': action if is_firewall else charon_action[kind], 'original': original, 'dataset': 'pfsense.log'},
   'data_stream': {'dataset': 'pfsense.log', 'type': 'logs', 'namespace': 'default'},
   'host': {'name': params.hostname},
   'observer': {'name': params.hostname, 'product': 'pfSense', 'vendor': 'Netgate', 'type': 'firewall', 'version': '2.9.0'},
@@ -161,9 +398,9 @@
   'log': {'syslog': {'priority': priority}}
 } -%}
 {%- if is_firewall -%}
-  {%- do event.update({'source': {'ip': src_ip, 'port': src_port}, 'destination': {'ip': dst_ip, 'port': dst_port}, 'related': {'ip': [src_ip, dst_ip]}, 'network': {'transport': transport, 'direction': network_direction}, 'rule': {'id': tracker|string}, 'pfsense': {'interface': interface, 'direction': direction, 'ip': {'tos': '0x0', 'ttl': ttl, 'id': ip_id, 'offset': 0, 'flags': 'DF', 'length': packet_length}}}) -%}
+  {%- do event.update({'source': {'ip': src_ip, 'port': src_port}, 'destination': {'ip': dst_ip, 'port': dst_port}, 'related': {'ip': [src_ip, dst_ip]}, 'network': {'transport': transport, 'direction': network_direction}, 'rule': {'id': tracker | string}, 'pfsense': {'interface': interface, 'direction': 'in', 'ip': {'tos': '0x0', 'ttl': ttl, 'id': ip_id, 'offset': 0, 'flags': 'DF', 'length': packet_length}}}) -%}
   {%- if transport == 'udp' -%}{%- do event.pfsense.update({'udp': {'length': 49}}) -%}{%- else -%}{%- do event.pfsense.update({'tcp': {'flags': 'S', 'window': 64240, 'length': 0}}) -%}{%- endif -%}
-{%- elif kind in ['peer_lookup', 'peer_lookup_valid', 'ike_established'] -%}
-  {%- do event.update({'source': {'ip': params.remote_peer_ip}, 'destination': {'ip': params.wan_ip}, 'related': {'ip': [params.remote_peer_ip, params.wan_ip]}}) -%}
+{%- elif kind in ['lookup', 'ike'] -%}
+  {%- do event.update({'source': {'ip': sites[row.s].peer}, 'destination': {'ip': params.wan_ip}, 'related': {'ip': [sites[row.s].peer, params.wan_ip]}}) -%}
 {%- endif -%}
 {{- event | tojson -}}
