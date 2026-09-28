@@ -21,7 +21,7 @@
 {%- set keys = {'orders': 'order_id', 'invoices': 'invoice_id', 'ledger': 'entry_id', 'payroll': 'employee_id'} -%}
 {%- set services = ['orders_svc', 'billing_svc', 'hr_portal', 'reporting_etl'] -%}
 {%- set pool = ['audit_reader', 'support_ro', 'bi_extract', 'recon_job', 'dq_check', 'migration_ro', 'finance_audit', 'ext_auditor', 'report_tmp', 'svc_backfill'] -%}
-{%- set guard_ms = 10800000 -%}
+{%- set chain_ms = 7200000 -%}
 {%- if shared.get('actors') is none -%}
   {%- if params.anomaly_mode is not boolean -%}
     {{- invalid('anomaly_mode must be a boolean') -}}
@@ -82,15 +82,21 @@
   {%- for r in pool -%}
     {%- do roles.update({r: none}) -%}
   {%- endfor -%}
-  {%- do shared.update({'actors': actors, 'roles': roles, 'ep': none, 'last_admin': none, 'last_role': none,
-      'next_due': now + (params.anomaly_interval_hours * 3600000) | int, 'delay': expo(1200) | int}) -%}
+  {#- First start: uniform over the first min(interval, 24 h). -#}
+  {%- do shared.update({'actors': actors, 'roles': roles, 'ep': none, 'last_admin': none, 'last_role': none, 'chains': {},
+      'next_start': now + num.integer(0, ([params.anomaly_interval_hours, 24] | min * 3600000) | int)}) -%}
 {%- endif -%}
 {%- set actors = shared.get('actors') -%}
 {%- set roles = shared.get('roles') -%}
 {%- set admins = actors | selectattr('kind', 'equalto', 'admin') | list -%}
-{%- set o = namespace(a=none, t=none, user=none, ip=none, port=0, type=none, ks=none, scope=none, op=none, target=none, attempted=none, auth=false) -%}
-{#- Episode start: due from the previous actual start, plus a random delay. -#}
-{%- if params.anomaly_mode and shared.get('ep') is none and now >= shared.get('next_due') + shared.get('delay') -%}
+{%- set o = namespace(a=none, t=none, user=none, ip=none, port=0, type=none, ks=none, scope=none, op=none, target=none, attempted=none, auth=false, skip=false) -%}
+{#- Chain prefixes per source IP, as the detector matches them: CREATE r at t0
+    -> GRANT payroll to r -> LOGIN as r -> SELECT payroll as r, all within
+    chain_ms of t0. The guard only stops the final DROP ROLE r of a prefix. -#}
+{%- set chains = shared.get('chains') -%}
+{#- Episode start: uniform in a window centred on the due time (previous
+    actual start + interval), width min(interval / 4, 6 h). -#}
+{%- if params.anomaly_mode and shared.get('ep') is none and now >= shared.get('next_start') -%}
   {%- set free = roles | dictsort | selectattr(1, 'none') | map(attribute=0) | reject('equalto', shared.get('last_role')) | list -%}
   {%- set cand = admins | rejectattr('name', 'equalto', shared.get('last_admin')) | list -%}
   {%- if free -%}
@@ -99,7 +105,9 @@
     {%- do roles.update({role: {'episode': true}}) -%}
     {%- do shared.update({'ep': {'step': 'a_login', 'due': now + num.integer(0, 999), 'admin': admin.name, 'role': role, 'ip': rand.choice(admin.ips),
         'table': 'payroll', 'selects': rand.weighted_choice([1, 2, 3, 4], [35, 30, 20, 15]), 'use': rand.chance(0.25), 'relogin': rand.chance(0.5), 'revoke': rand.chance(0.4), 'aport': 0, 'xport': 0},
-        'last_admin': admin.name, 'last_role': role, 'next_due': now + (params.anomaly_interval_hours * 3600000) | int, 'delay': expo(1200) | int}) -%}
+        'last_admin': admin.name, 'last_role': role}) -%}
+    {%- set half = ([params.anomaly_interval_hours / 4, 6] | min * 1800000) | int -%}
+    {%- do shared.update({'next_start': now + (params.anomaly_interval_hours * 3600000) | int + num.integer(-half, half)}) -%}
   {%- endif -%}
 {%- endif -%}
 {#- Pick the earliest due item in this tick. -#}
@@ -277,21 +285,19 @@
         {%- set active = roles.values() | reject('none') | rejectattr('episode') | list -%}
         {%- set idle_roles = active | selectattr('phase', 'equalto', 'idle') | list -%}
         {%- set granted = active | selectattr('grants') | list -%}
+        {#- Fewer new roles as the name pool fills; two names always stay
+            free, so an episode never waits for one. -#}
+        {%- set create_w = [22, 22 * (absent | length - 2) / 4] | min if absent | length > 2 else 0 -%}
         {%- set choice = rand.weighted_choice(['list_roles', 'list_perms', 'select', 'alter_role', 'create', 'grant', 'revoke', 'drop', 'alter_table'],
-            [22, 18, 16, 6, 7 if absent else 0, 6 if active else 0, 4 if granted else 0, 7 if idle_roles else 0, 3]) -%}
+            [22, 18, 16, 6, create_w, 6 if active else 0, 4 if granted else 0, 7 if idle_roles else 0, 3]) -%}
         {%- if choice == 'drop' -%}
           {%- set victim = rand.choice(idle_roles) -%}
-          {%- if victim.read_payroll and o.t - victim.created < guard_ms -%}
-            {%- set choice = 'list_perms_victim' -%}
-          {%- endif -%}
         {%- endif -%}
         {%- if choice == 'list_roles' -%}
           {%- set item = ['LIST_ROLES', none, 'LIST ROLES;'] -%}
         {%- elif choice == 'list_perms' -%}
           {%- set who = rand.choice(services + (active | map(attribute='name') | list)) -%}
           {%- set item = ['LIST_PERMISSIONS', none, 'LIST ALL PERMISSIONS OF ' ~ who ~ ';'] -%}
-        {%- elif choice == 'list_perms_victim' -%}
-          {%- set item = ['LIST_PERMISSIONS', none, 'LIST ALL PERMISSIONS OF ' ~ victim.name ~ ';'] -%}
         {%- elif choice == 'select' -%}
           {%- set t = rand.weighted_choice(ctables, cweights) -%}
           {%- set item = ['SELECT', t, q(role_query(t))] -%}
@@ -302,12 +308,15 @@
           {%- set item = ['ALTER_TABLE', t, 'ALTER TABLE finance.' ~ t ~ ' WITH gc_grace_seconds = ' ~ rand.choice(['86400', '172800', '432000', '864000']) ~ ';'] -%}
         {%- elif choice == 'create' -%}
           {%- set r = rand.choice(absent) -%}
-          {%- do roles.update({r: {'kind': 'role', 'name': r, 'episode': false, 'created': o.t, 'grants': [], 'last_table': 'payroll', 'read_payroll': false,
+          {%- do roles.update({r: {'kind': 'role', 'name': r, 'episode': false, 'created': o.t, 'grants': [], 'last_table': 'payroll',
               'phase': 'idle', 'next': none, 'ips': [rand.choice(['10.20.50.61', '10.20.50.62', '10.20.50.63', '10.20.50.64', '10.20.40.51'])], 'ip': none, 'port': 0,
               'spd': 3, 'ops_med': 3, 'gap_med': 35, 'fail': 0.04, 'fails': 0, 'ops_left': 0, 'queue': [], 'ks': none, 'test_ip': none, 'test': false, 'pending': none, 'menu': []}}) -%}
           {%- set item = ['CREATE_ROLE', none, 'CREATE ROLE ' ~ r ~ " WITH PASSWORD = '*******' AND LOGIN = true;", r] -%}
           {%- if rand.chance(0.75) -%}
             {%- do a.update({'pending': ['GRANT_NEW', r, none], 'ops_left': [a.ops_left, 1] | max}) -%}
+          {%- elif rand.chance(0.8) -%}
+            {#- A scratch role, removed again in a later session. -#}
+            {%- do a.update({'followup': ['DROP_NEW', r, o.t], 'followup_due': o.t + (lgn(900, 0.8, 5400) | int)}) -%}
           {%- endif -%}
         {%- elif choice == 'grant' -%}
           {%- set who = rand.choice(active) -%}
@@ -336,17 +345,22 @@
       {%- if who is none -%}
         {%- set item = ['LIST_ROLES', none, 'LIST ROLES;'] -%}
       {%- else -%}
-        {%- set t = rand.weighted_choice(ctables, cweights) -%}
+        {#- Most new roles are tested from the DBA's own host, payroll access
+            first of all; many are short-lived and dropped again soon. -#}
+        {%- set tested = rand.chance(0.75) -%}
+        {%- set t = rand.weighted_choice(ctables, [60, 14, 13, 13] if tested else cweights) -%}
         {%- set item = ['GRANT', none, 'GRANT SELECT ON TABLE finance.' ~ t ~ ' TO ' ~ who.name ~ ';', who.name] -%}
         {%- do who.grants.append(t) -%}
-        {%- if rand.chance(0.45) -%}
+        {%- if tested -%}
           {%- do who.update({'test_ip': a.ip, 'next': o.t + (lgn(90, 0.7, 900) | int)}) -%}
-          {#- Sometimes the tested role is dropped again in a later session. -#}
-          {%- if rand.chance(0.4) -%}
-            {%- do a.update({'followup': ['DROP_NEW', who.name, who.created], 'followup_due': o.t + (lgn(1200, 0.7, 5400) | int)}) -%}
+          {%- if rand.chance(0.7) -%}
+            {%- do a.update({'followup': ['DROP_NEW', who.name, who.created], 'followup_due': o.t + (lgn(900, 0.7, 5400) | int)}) -%}
           {%- endif -%}
         {%- else -%}
           {%- do who.update({'next': o.t + (expo(86400 / who.spd) | int)}) -%}
+          {%- if rand.chance(0.6) -%}
+            {%- do a.update({'followup': ['DROP_NEW', who.name, who.created], 'followup_due': o.t + (lgn(900, 0.8, 5400) | int)}) -%}
+          {%- endif -%}
         {%- endif -%}
       {%- endif -%}
     {%- endif -%}
@@ -354,7 +368,7 @@
       {%- set who = roles.get(item[1]) -%}
       {%- if who is none or who.episode or who.created != item[2] -%}
         {%- set item = ['LIST_ROLES', none, 'LIST ROLES;'] -%}
-      {%- elif who.phase != 'idle' or (who.read_payroll and o.t - who.created < guard_ms) -%}
+      {%- elif who.phase != 'idle' -%}
         {%- set item = ['LIST_PERMISSIONS', none, 'LIST ALL PERMISSIONS OF ' ~ who.name ~ ';'] -%}
       {%- elif who.grants and not who.get('revoked') and rand.chance(0.4) -%}
         {#- Revoke first, then drop in the next statement. -#}
@@ -365,7 +379,13 @@
         {%- do a.update({'pending': ['DROP_NEW', who.name, who.created], 'ops_left': [a.ops_left, 1] | max}) -%}
       {%- else -%}
         {%- set item = ['DROP_ROLE', none, 'DROP ROLE ' ~ who.name ~ ';', who.name] -%}
-        {%- do roles.update({who.name: none}) -%}
+        {%- set done = chains.get(a.ip, []) | selectattr(0, 'equalto', 4) | selectattr(2, 'equalto', who.name) | selectattr(1, 'ge', o.t - chain_ms) | list -%}
+        {%- if done -%}
+          {#- Guard: this drop would complete the chain; it is not issued. -#}
+          {%- set o.skip = true -%}
+        {%- else -%}
+          {%- do roles.update({who.name: none}) -%}
+        {%- endif -%}
       {%- endif -%}
     {%- endif -%}
     {%- set o.type = item[0] -%}
@@ -386,9 +406,6 @@
     {%- else -%}
       {%- set o.ks = a.ks -%}
     {%- endif -%}
-    {%- if a.kind == 'role' and o.type == 'SELECT' and o.scope == 'payroll' -%}
-      {%- do a.update({'read_payroll': true}) -%}
-    {%- endif -%}
     {%- if a.queue or a.ops_left > 0 or a.pending is not none -%}
       {%- do a.update({'next': o.t + (lgn(a.gap_med, 0.9, 20 * a.gap_med) | int)}) -%}
     {%- else -%}
@@ -399,6 +416,9 @@
       {%- do a.update({'phase': 'idle', 'next': nxt}) -%}
     {%- endif -%}
   {%- endif -%}
+{%- endif -%}
+{%- if o.skip -%}
+  {%- do dispatch.drop() -%}
 {%- endif -%}
 {%- set categories = {'SELECT': 'QUERY', 'UPDATE': 'DML', 'DELETE': 'DML', 'PREPARE_STATEMENT': 'PREPARE', 'USE_KEYSPACE': 'OTHER', 'ALTER_TABLE': 'DDL',
     'LIST_ROLES': 'DCL', 'LIST_PERMISSIONS': 'DCL', 'CREATE_ROLE': 'DCL', 'ALTER_ROLE': 'DCL', 'DROP_ROLE': 'DCL', 'GRANT': 'DCL', 'REVOKE': 'DCL',
@@ -420,6 +440,20 @@
 {%- set thread = 'Native-Transport-Requests-' ~ ([1, num.lognormal(module.math.log(6), 0.8) | round | int] | max) -%}
 {%- set original = 'INFO  [' ~ thread ~ '] ' ~ lw.strftime('%Y-%m-%d %H:%M:%S,') ~ ('%03d' | format(logged % 1000)) ~ ' FileAuditLogger.java:51 - ' ~ message -%}
 {%- set actor = o.attempted if o.attempted else o.user -%}
+{%- set kept = [] -%}
+{%- for p in chains.get(o.ip, []) if o.t - p[1] <= chain_ms -%}
+  {%- if (p[0] == 1 and o.type == 'GRANT' and o.target == p[2] and ' ON TABLE finance.payroll TO ' in o.op)
+      or (p[0] == 2 and o.type == 'LOGIN_SUCCESS' and actor == p[2])
+      or (p[0] == 3 and o.type == 'SELECT' and o.scope == 'payroll' and actor == p[2]) -%}
+    {%- do kept.append([p[0] + 1, p[1], p[2]]) -%}
+  {%- elif not (p[0] == 4 and o.type == 'DROP_ROLE' and o.target == p[2]) -%}
+    {%- do kept.append(p) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if o.type == 'CREATE_ROLE' -%}
+  {%- do kept.append([1, o.t, o.target]) -%}
+{%- endif -%}
+{%- do chains.update({o.ip: kept}) -%}
 {%- set audit = {'user': o.user, 'host': host, 'source': '/' ~ o.ip, 'port': o.port, 'timestamp': o.t, 'type': o.type, 'category': category, 'operation': o.op} -%}
 {%- if o.ks -%}{%- do audit.update({'keyspace': o.ks}) -%}{%- endif -%}
 {%- if o.scope -%}{%- do audit.update({'scope': o.scope}) -%}{%- endif -%}

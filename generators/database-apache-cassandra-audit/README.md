@@ -6,27 +6,27 @@ Traffic comes from four application roles using prepared statements, four analys
 
 ## Event Types
 
-Shares are measured on the final default `anomaly_mode: true` capture (52 h, 4989 records).
+Shares are measured on the final default `anomaly_mode: true` capture (144 h, 14594 records).
 
 | Audit type | Category | Share | Produced by |
 | --- | --- | ---: | --- |
-| `SELECT` | QUERY | 58.25% | Applications, analysts, temporary roles, DBA checks |
-| `UPDATE` | DML | 23.93% | Applications and analysts (CQL `INSERT` is also logged as `UPDATE`) |
-| `LOGIN_SUCCESS` | AUTH | 5.17% | Every connection |
-| `PREPARE_STATEMENT` | PREPARE | 4.25% | Applications after reconnecting |
-| `USE_KEYSPACE` | OTHER | 3.89% | Drivers (`USE "finance"`) and some `cqlsh` sessions |
-| `DELETE` | DML | 1.48% | `billing_svc` |
-| `LIST_PERMISSIONS` | DCL | 0.64% | DBAs |
-| `LIST_ROLES` | DCL | 0.62% | DBAs |
-| `CREATE_ROLE` | DCL | 0.28% | DBAs |
-| `GRANT` | DCL | 0.28% | DBAs |
-| `ALTER_ROLE` | DCL | 0.26% | DBA password rotation for service roles |
-| `DROP_ROLE` | DCL | 0.26% | DBAs |
-| `ALTER_TABLE` | DDL | 0.24% | DBAs |
-| `LOGIN_ERROR` | AUTH | 0.20% | Mistyped passwords |
-| `REVOKE` | DCL | 0.10% | DBAs |
-| `REQUEST_FAILURE` | ERROR | 0.08% | Queries against a misspelled table |
-| `UNAUTHORIZED_ATTEMPT` | AUTH | 0.06% | Analysts reading `finance.payroll`, roles after a revoke |
+| `SELECT` | QUERY | 60.63% | Applications, analysts, temporary roles, DBA checks |
+| `UPDATE` | DML | 21.43% | Applications and analysts (CQL `INSERT` is also logged as `UPDATE`) |
+| `LOGIN_SUCCESS` | AUTH | 5.68% | Every connection |
+| `PREPARE_STATEMENT` | PREPARE | 4.18% | Applications after reconnecting |
+| `USE_KEYSPACE` | OTHER | 3.80% | Drivers (`USE "finance"`) and some `cqlsh` sessions |
+| `DELETE` | DML | 1.08% | `billing_svc` |
+| `LIST_ROLES` | DCL | 0.57% | DBAs |
+| `GRANT` | DCL | 0.47% | DBAs |
+| `LIST_PERMISSIONS` | DCL | 0.46% | DBAs |
+| `CREATE_ROLE` | DCL | 0.39% | DBAs |
+| `DROP_ROLE` | DCL | 0.35% | DBAs |
+| `LOGIN_ERROR` | AUTH | 0.28% | Mistyped passwords |
+| `ALTER_ROLE` | DCL | 0.21% | DBA password rotation for service roles |
+| `REVOKE` | DCL | 0.20% | DBAs |
+| `UNAUTHORIZED_ATTEMPT` | AUTH | 0.15% | Analysts reading `finance.payroll`, roles after a revoke |
+| `REQUEST_FAILURE` | ERROR | 0.07% | Queries against a misspelled table |
+| `ALTER_TABLE` | DDL | 0.05% | DBAs |
 
 The mix is a synthetic training profile, not a measured production ratio.
 
@@ -44,11 +44,11 @@ A DBA account creates a login role, grants it `SELECT` on `finance.payroll`, log
 
 **Linking fields:** `source.ip`, the role name in `user.target.name` (DCL) and `user.name` (login, select), `cassandra.audit.scope` = `payroll`, the port shared by the DBA connection.
 
-**Recurrence:** the first episode is due `anomaly_interval_hours` after generation start, each next one `anomaly_interval_hours` after the actual start of the previous one, with no catch-up. The start is delayed after the due time by an exponential random delay (mean 20 minutes). The default interval is 24 h; the minimum accepted value is 6 h. Measured: default interval, 2 episodes in 52 h, 24.16 h apart, spans 642 and 1047 s; 8 h interval, 6 episodes, gaps 8.08-8.58 h, spans 575-934 s. Intervals below 6 h are rejected: at 2 h the episodes become frequent enough that per-role timing stands out from ordinary role management.
+**Recurrence:** the first episode starts at a uniformly random moment within the first `anomaly_interval_hours` after generation start (at most 24 h); each next one starts one interval after the actual start of the previous one, shifted by a uniformly random offset within a window of a quarter of the interval (at most 6 h) centred on that point, with no catch-up. The default interval is 24 h; the minimum accepted value is 6 h. Measured over 144 h: default interval, two captures with 6 episodes each, gaps 21.04-25.83 h; 8 h interval, 18 episodes, gaps 7.09-8.99 h. Intervals below 6 h are rejected: at 2 h the episodes become frequent enough that per-role timing stands out from ordinary role management.
 
 **Variation:** the DBA differs from the previous episode's DBA and the role name from the previous role name; both come from the same pools as ordinary traffic. The source address is one of that DBA's usual addresses. Read count, query text, `LIMIT`, re-login, revoke and all gaps are random.
 
-**Ordinary look-alikes (both modes):** DBAs create the same role names, grant `finance.payroll` or other tables, test new roles from their own workstation, read payroll themselves, revoke and drop roles, sometimes within minutes of creating them. `hr_portal`, `reporting_etl` and `hr_lead_mora` read payroll all day. Only the complete ordered sequence above within two hours is absent from ordinary traffic: a role that has read payroll is never dropped by ordinary administration in its first 3 hours.
+**Ordinary look-alikes (both modes):** DBAs create the same role names, grant `finance.payroll` or other tables, test most new roles from their own workstation (payroll access first of all), read payroll themselves, revoke and drop roles, often within minutes of creating them. Per day of background: about 3-7 roles dropped within 37 minutes of creation and about 3-4 connections of a new role reading payroll from a DBA address (up to about 4 in a busy capture). `hr_portal`, `reporting_etl` and `hr_lead_mora` read payroll all day. Only the complete ordered sequence above within two hours is absent from ordinary traffic: ordinary administration leaves out a `DROP ROLE r` only when it would complete it, that is when the same source IP created `r`, granted it payroll, logged in as `r` and read payroll, starting at most two hours earlier. The same drop after two hours or from another address is written as usual. DBAs create fewer roles as the ten-name pool fills and always leave two names free.
 
 **Detection idea:** per source IP and role name, `CREATE_ROLE` then a `GRANT` on a sensitive table, a login and a read of that table by the new role, then `DROP_ROLE` of the same role within 2 hours. Sort by `@timestamp` before sequence matching.
 
@@ -86,7 +86,7 @@ eventum generate --path generators/database-apache-cassandra-audit/generator.yml
 The `GRANT` step of the first episode in the final default capture:
 
 ```json
-{"@timestamp": "2026-09-02T00:14:30.049Z", "cassandra": {"audit": {"category": "DCL", "host": "/10.20.30.10:7000", "operation": "GRANT SELECT ON TABLE finance.payroll TO svc_backfill;", "port": 42919, "source": "/10.20.10.5", "timestamp": 1788308070049, "type": "GRANT", "user": "dba_okafor"}}, "ecs": {"version": "8.17.0"}, "event": {"action": "grant", "category": ["iam"], "created": "2026-09-02T00:14:30.050Z", "kind": "event", "original": "INFO  [Native-Transport-Requests-4] 2026-09-02 00:14:30,050 FileAuditLogger.java:51 - user:dba_okafor|host:/10.20.30.10:7000|source:/10.20.10.5|port:42919|timestamp:1788308070049|type:GRANT|category:DCL|operation:GRANT SELECT ON TABLE finance.payroll TO svc_backfill;", "outcome": "success", "type": ["user", "change"]}, "host": {"ip": ["10.20.30.10"], "name": "cassandra-01.example.test"}, "log": {"level": "INFO", "logger": "org.apache.cassandra.audit.FileAuditLogger", "origin": {"file": {"line": 51, "name": "FileAuditLogger.java"}}}, "message": "user:dba_okafor|host:/10.20.30.10:7000|source:/10.20.10.5|port:42919|timestamp:1788308070049|type:GRANT|category:DCL|operation:GRANT SELECT ON TABLE finance.payroll TO svc_backfill;", "process": {"thread": {"name": "Native-Transport-Requests-4"}}, "related": {"ip": ["10.20.10.5", "10.20.30.10"], "user": ["dba_okafor", "svc_backfill"]}, "source": {"ip": "10.20.10.5", "port": 42919}, "user": {"name": "dba_okafor", "target": {"name": "svc_backfill"}}}
+{"@timestamp": "2026-09-01T09:17:42.900Z", "cassandra": {"audit": {"category": "DCL", "host": "/10.20.30.10:7000", "operation": "GRANT SELECT ON TABLE finance.payroll TO migration_ro;", "port": 42642, "source": "/10.20.10.5", "timestamp": 1788254262900, "type": "GRANT", "user": "ops_admin"}}, "ecs": {"version": "8.17.0"}, "event": {"action": "grant", "category": ["iam"], "created": "2026-09-01T09:17:42.902Z", "kind": "event", "original": "INFO  [Native-Transport-Requests-5] 2026-09-01 09:17:42,902 FileAuditLogger.java:51 - user:ops_admin|host:/10.20.30.10:7000|source:/10.20.10.5|port:42642|timestamp:1788254262900|type:GRANT|category:DCL|operation:GRANT SELECT ON TABLE finance.payroll TO migration_ro;", "outcome": "success", "type": ["user", "change"]}, "host": {"ip": ["10.20.30.10"], "name": "cassandra-01.example.test"}, "log": {"level": "INFO", "logger": "org.apache.cassandra.audit.FileAuditLogger", "origin": {"file": {"line": 51, "name": "FileAuditLogger.java"}}}, "message": "user:ops_admin|host:/10.20.30.10:7000|source:/10.20.10.5|port:42642|timestamp:1788254262900|type:GRANT|category:DCL|operation:GRANT SELECT ON TABLE finance.payroll TO migration_ro;", "process": {"thread": {"name": "Native-Transport-Requests-5"}}, "related": {"ip": ["10.20.10.5", "10.20.30.10"], "user": ["ops_admin", "migration_ro"]}, "source": {"ip": "10.20.10.5", "port": 42642}, "user": {"name": "ops_admin", "target": {"name": "migration_ro"}}}
 ```
 
 ## Limitations
