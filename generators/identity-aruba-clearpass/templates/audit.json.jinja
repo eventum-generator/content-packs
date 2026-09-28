@@ -1,55 +1,279 @@
-{%- set stage = vars.stage -%}
-{%- set target = {'user': params.admin_user,
-    'client_ip': params.suspicious_client_ip} -%}
-{%- if stage == 'routine' -%}
-  {%- do shared.pop('start_anomaly', none) -%}
-  {%- set routine_count = shared.get('routine_count', 0) + 1 -%}
-  {%- do shared.set('routine_count', routine_count) -%}
-  {%- set choice = module.rand.number.integer(0, samples.admins | length) -%}
-  {%- if choice == 0 -%}
-    {%- set actor = target -%}
+{#- ClearPass 6.11 Policy Manager Audit Records (RFC 5424 export) from
+    one node. Input ticks every second; a tick renders at most one audit
+    record and is dropped when nothing is due. All activity comes from a
+    time-ordered queue of independent processes: WebUI sessions of each
+    administrator (logins with occasional mistyped passwords, then
+    configuration changes), clients retrying a stale password, login
+    guesses from outside and, when anomaly_mode is true, the recurring
+    anomaly episode. -#}
+{#- Jinja has no raise statement: a missing-key lookup aborts the render
+    with the message as the key. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{#- UTC working-hours curve of administrator activity; also weights
+    episode start times. -#}
+{%- macro curve(t) -%}
+  {%- set h = (t % 86400) / 3600 -%}
+  {{- 0.15 + 0.85 * module.math.sin(module.math.pi * (h - 6) / 13) if 6 < h < 19 else 0.15 -}}
+{%- endmacro -%}
+{#- A start time in [lo, lo + width): drawn by rejection with weight
+    curve (first episode) or curve^2 + 0.05 (later episodes). -#}
+{%- macro draw_start(lo, width, squared) -%}
+  {%- set pick = namespace(t=lo + (module.rand.number.floating(0, width) | int)) -%}
+  {%- for _ in range(500) -%}
+    {%- set c = curve(pick.t) | float -%}
+    {%- set w = (c * c + 0.05) / 1.05 if squared else c -%}
+    {%- if module.rand.number.floating(0, 1) < w -%}{%- break -%}{%- endif -%}
+    {%- set pick.t = lo + (module.rand.number.floating(0, width) | int) -%}
+  {%- endfor -%}
+  {{- pick.t -}}
+{%- endmacro -%}
+{%- set num = module.rand.number -%}
+{%- set rand = module.rand -%}
+{%- set hq = module.heapq -%}
+{%- set ln = module.math.log -%}
+{%- set now = timestamp.timestamp() | int -%}
+{#- Chain window, counted from the first failed login. -#}
+{%- set window = 1800 -%}
+{%- set jump_host = '10.20.5.10' -%}
+{#- Human retries after a mistyped password; the same draws serve
+    ordinary logins and the anomaly episode. -#}
+{%- set tries = [1, 2, 3, 4, 5] -%}
+{%- set try_weights = [50, 25, 13, 7, 5] -%}
+{%- if shared.get('heap') is none -%}
+  {%- set ipv4 = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}' -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean
+      or not 3 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- invalid('anomaly_interval_hours must be a number in 3..8760') -}}
+  {%- endif -%}
+  {%- if params.node_ip is not string or not module.re.fullmatch(ipv4, params.node_ip) -%}
+    {{- invalid('node_ip must be a dotted-quad IPv4 address') -}}
+  {%- endif -%}
+  {%- if params.admin_user is not string or not module.re.fullmatch('[A-Za-z0-9][A-Za-z0-9._@-]{0,63}', params.admin_user) -%}
+    {{- invalid('admin_user must be an account name') -}}
+  {%- endif -%}
+  {#- The organisation (administrators, their desks, VPN addresses and
+      activity rates) is fixed for a node; all activity on top of it is
+      random in every run. -#}
+  {%- set org = module.random.Random('clearpass-org:' ~ params.node_ip) -%}
+  {%- set admins = [{'user': params.admin_user, 'desk': '10.20.10.10'}] -%}
+  {%- for row in samples.admins -%}
+    {%- if row.user == params.admin_user -%}
+      {{- invalid('admin_user must differ from the sample administrators') -}}
+    {%- endif -%}
+    {%- do admins.append({'user': row.user, 'desk': row.client_ip}) -%}
+  {%- endfor -%}
+  {%- set heap = [] -%}
+  {%- for a in admins -%}
+    {#- Sessions per day, and two VPN addresses of the administrator. -#}
+    {%- do a.update({'rate': org.lognormvariate(ln(6), 0.5),
+        'vpn': ['10.8.' ~ org.randint(0, 3) ~ '.' ~ org.randint(2, 254),
+                '10.8.' ~ org.randint(0, 3) ~ '.' ~ org.randint(2, 254)]}) -%}
+    {%- do hq.heappush(heap, [now + (num.exponential(a.rate / 0.443 / 86400) | int), num.floating(0, 1), {'k': 'sess', 'a': a}]) -%}
+  {%- endfor -%}
+  {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
+  {%- do shared.update({'heap': heap, 'admins': admins, 'chains': {},
+      'clock': {'stale': now + (num.exponential(1.5 / 0.443 / 86400) | int),
+                'guess': now + (num.exponential(8 / 86400) | int),
+                'cleanup': now + 600,
+                'ep_start': draw_start(now, [interval, 86400] | min, false) | int},
+      'last_ep': {'u': none, 'ip': none}}) -%}
+{%- endif -%}
+{%- set heap = shared.get('heap') -%}
+{%- set clock = shared.get('clock') -%}
+{%- set admins = shared.get('admins') -%}
+{#- Per account: its failed and successful logins [time, 'F' or 'S',
+    client IP] and log service changes [time, 'L', none] of the last
+    chain window, every record kept. -#}
+{%- set chains = shared.get('chains') -%}
+{%- set weights = [] -%}
+{%- for a in admins -%}{%- do weights.append(a.rate) -%}{%- endfor -%}
+{#- Process clocks: each is an independent Poisson process; none waits
+    for, or is moved by, another process or an episode. -#}
+{%- if clock.stale <= now -%}
+  {%- if num.floating(0, 1) < curve(now) | float -%}
+    {#- A browser tab or script keeps the old password after a change and
+        retries until its owner notices. -#}
+    {%- set a = rand.weighted_choice(admins, weights) -%}
+    {%- set ip = a.desk if rand.chance(0.6) else rand.choice(a.vpn) if rand.chance(0.75) else jump_host -%}
+    {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'login', 'a': a, 'ip': ip,
+        'f': num.integer(3, 8), 'gap': 40, 'give_up': rand.chance(0.5), 'cfg': num.integer(0, 3)}]) -%}
+  {%- endif -%}
+  {%- do clock.update({'stale': now + 1 + (num.exponential(1.5 / 0.443 / 86400) | int)}) -%}
+{%- endif -%}
+{%- if clock.guess <= now -%}
+  {#- Password guesses against the WebUI from outside addresses. -#}
+  {%- set a = rand.choice(admins) if rand.chance(0.4) else admins[0] -%}
+  {%- set ip = rand.choice(['198.51.100.', '203.0.113.', '192.0.2.']) ~ num.integer(1, 254) -%}
+  {%- set n = [[num.lognormal(ln(2), 0.8) | round | int, 1] | max, 10] | min -%}
+  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'login', 'a': a, 'ip': ip,
+      'f': n, 'gap': 8, 'give_up': true, 'cfg': 0}]) -%}
+  {%- do clock.update({'guess': now + 1 + (num.exponential(8 / 86400) | int)}) -%}
+{%- endif -%}
+{%- if clock.cleanup <= now -%}
+  {%- for key in chains | list -%}
+    {%- if chains[key][-1][0] < now - window -%}{%- do chains.pop(key) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do clock.update({'cleanup': now + 600}) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and clock.ep_start <= now -%}
+  {#- Episode: an administrator (weighted by activity, not the previous
+      episode's) from a VPN or jump-host address that administrator has
+      already logged in from earlier in the run (not the previous
+      episode's address). The next start is drawn in a window of
+      min(interval / 4, 6 h) centred one interval after this actual
+      start, weighted towards busy hours. -#}
+  {%- set last = shared.get('last_ep') -%}
+  {%- set seen = shared.get('seen', {}) -%}
+  {%- set cands = [] -%}
+  {%- set cand_weights = [] -%}
+  {%- for a in admins if a.user != last.u -%}
+    {%- if seen.get(a.user, []) | reject('equalto', last.ip) | list -%}
+      {%- do cands.append(a) -%}{%- do cand_weights.append(a.rate) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if cands -%}
+    {%- set pick = namespace(a=rand.weighted_choice(cands, cand_weights)) -%}
+    {%- set addrs = seen[pick.a.user] | reject('equalto', last.ip) | list -%}
   {%- else -%}
-    {%- set row = samples.admins[choice - 1] -%}
-    {%- set actor = {'user': row.user, 'client_ip': row.client_ip} -%}
+    {#- Early in a run: any administrator and own remote address. -#}
+    {%- set pick = namespace(a=rand.weighted_choice(admins, weights)) -%}
+    {%- for _ in range(50) -%}
+      {%- if pick.a.user != last.u -%}{%- break -%}{%- endif -%}
+      {%- set pick.a = rand.weighted_choice(admins, weights) -%}
+    {%- endfor -%}
+    {%- set addrs = (pick.a.vpn + [jump_host]) | reject('equalto', last.ip) | list -%}
   {%- endif -%}
-  {%- set kind = module.rand.weighted_choice(
-      ['login_success', 'login_failure', 'account_settings',
-       'cluster_parameter', 'log_change', 'key_add'],
-      [45, 10, 20, 15, 7, 3]) -%}
-  {%- if routine_count in [12, 27, 43, 58] -%}
-    {%- set actor = target -%}
-    {%- set kind = {12: 'login_success', 27: 'login_failure',
-        43: 'log_change', 58: 'key_add'}[routine_count] -%}
-  {%- endif -%}
-  {%- if actor.user == target.user and kind == 'login_failure' -%}
-    {%- set last_failure = shared.get('last_target_failure') -%}
-    {%- if routine_count != 27 and last_failure is not none and
-        (timestamp - last_failure).total_seconds() < 1800 -%}
-      {%- set kind = 'login_success' -%}
+  {%- set ip = rand.choice(addrs) -%}
+  {%- do last.update({'u': pick.a.user, 'ip': ip}) -%}
+  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'ep', 'a': pick.a, 'ip': ip, 's': 0}]) -%}
+  {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
+  {%- set width = [interval // 4, 21600] | min -%}
+  {%- do clock.update({'ep_start': draw_start(now + interval - width // 2, width, true) | int}) -%}
+{%- endif -%}
+{#- Configuration categories of ordinary changes (synthetic weights). -#}
+{%- set cfg_kinds = ['account_settings', 'cluster_parameter', 'log_change', 'key_add'] -%}
+{%- set cfg_weights = [37, 30, 22, 11] -%}
+{#- Pop due work until one record is produced. -#}
+{%- set out = namespace(done=false, a=none, ip=none, kind=none, ep=false) -%}
+{%- for _ in range(16) -%}
+  {%- if out.done or not heap or heap[0][0] > now -%}{%- break -%}{%- endif -%}
+  {%- set item = hq.heappop(heap)[2] -%}
+  {%- if item.k == 'sess' -%}
+    {%- set a = item.a -%}
+    {%- do hq.heappush(heap, [now + 1 + (num.exponential(a.rate / 0.443 / 86400) | int), num.floating(0, 1), item]) -%}
+    {%- if num.floating(0, 1) < curve(now) | float -%}
+      {#- A WebUI session: desk, VPN or jump host; sometimes mistyped
+          passwords first (rarely given up), then changes. -#}
+      {%- set ip = a.desk if rand.chance(0.6) else rand.choice(a.vpn) if rand.chance(0.75) else jump_host -%}
+      {%- set f = rand.weighted_choice(tries, try_weights) if rand.chance(0.15) else 0 -%}
+      {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'login', 'a': a, 'ip': ip, 'f': f, 'gap': 12,
+          'give_up': f > 0 and rand.chance(0.1),
+          'cfg': rand.weighted_choice([0, 1, 2, 3, 4, 5, 6, 8], [18, 20, 18, 14, 10, 8, 7, 5])}]) -%}
+    {%- endif -%}
+  {%- elif item.k == 'login' -%}
+    {%- set out.a = item.a -%}{%- set out.ip = item.ip -%}{%- set out.done = true -%}
+    {%- if item.f > 0 -%}
+      {%- set out.kind = 'login_failure' -%}
+      {%- do item.update({'f': item.f - 1}) -%}
+      {%- if item.f > 0 or not item.give_up -%}
+        {%- set wait = [num.lognormal(ln(item.gap), 0.7), item.gap * 10] | min -%}
+        {%- do hq.heappush(heap, [now + 1 + (wait | int), num.floating(0, 1), item]) -%}
+      {%- endif -%}
     {%- else -%}
-      {%- do shared.set('last_target_failure', timestamp) -%}
+      {%- set out.kind = 'login_success' -%}
+      {%- if item.cfg > 0 -%}
+        {%- do hq.heappush(heap, [now + 5 + ([num.lognormal(ln(150), 1.0), 3600] | min | int), num.floating(0, 1),
+            {'k': 'cfg', 'a': item.a, 'n': item.cfg}]) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'cfg' -%}
+    {%- set kind = rand.weighted_choice(cfg_kinds, cfg_weights) -%}
+    {%- if item.n > 1 -%}
+      {%- do hq.heappush(heap, [now + 5 + ([num.lognormal(ln(150), 1.0), 3600] | min | int), num.floating(0, 1),
+          {'k': 'cfg', 'a': item.a, 'n': item.n - 1}]) -%}
+    {%- endif -%}
+    {#- Guard: an SSH key addition that would complete the chain for this
+        account with any combination of its records of the last window
+        (four failures from one client, a success from that client, a log
+        service change, in this order) is dropped; its time and the
+        session's other changes stay as they are. Scanning from the
+        earliest failure of each client finds any such combination. -#}
+    {%- set open = namespace(v=false) -%}
+    {%- if kind == 'key_add' -%}
+      {%- set recent = chains.get(item.a.user, []) | selectattr(0, 'ge', now - window) | list -%}
+      {%- for ip in recent | selectattr(1, 'equalto', 'F') | map(attribute=2) | unique -%}
+        {%- set g = namespace(n=0, t0=none) -%}
+        {%- for r in recent -%}
+          {%- if g.n < 4 and r[1] == 'F' and r[2] == ip -%}
+            {%- if g.n == 0 -%}{%- set g.t0 = r[0] -%}{%- endif -%}
+            {%- set g.n = g.n + 1 -%}
+          {%- elif g.n == 4 and r[1] == 'S' and r[2] == ip -%}
+            {%- set g.n = 5 -%}
+          {%- elif g.n == 5 and r[1] == 'L' -%}
+            {%- set g.n = 6 -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if g.n == 6 -%}{%- set open.v = true -%}{%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- if not open.v -%}
+      {%- set out.a = item.a -%}{%- set out.ip = none -%}{%- set out.kind = kind -%}{%- set out.done = true -%}
+    {%- endif -%}
+  {%- elif item.k == 'ep' -%}
+    {#- Four failed logins, the successful login from the same client,
+        a log service change and an SSH key addition: the same retry
+        delays as ordinary logins; the two change delays come from the
+        ordinary change-delay distribution, drawn again until the
+        episode fits the chain window. -#}
+    {%- set out.a = item.a -%}{%- set out.done = true -%}{%- set out.ep = true -%}
+    {%- set out.ip = item.ip if item.s <= 4 else none -%}
+    {%- set out.kind = ['login_failure'] * 4 + ['login_success', 'log_change', 'key_add'] -%}
+    {%- set out.kind = out.kind[item.s] -%}
+    {%- if item.s == 0 -%}{%- do item.update({'t0': now}) -%}{%- endif -%}
+    {%- if item.s < 4 -%}
+      {%- set wait = 1 + ([num.lognormal(ln(12), 0.7), 120] | min | int) -%}
+    {%- elif item.s == 4 -%}
+      {%- set d = namespace(a=0, b=0) -%}
+      {%- for _ in range(1000) -%}
+        {%- set d.a = 5 + ([num.lognormal(ln(150), 1.0), 3600] | min | int) -%}
+        {%- set d.b = 5 + ([num.lognormal(ln(150), 1.0), 3600] | min | int) -%}
+        {%- if now - item.t0 + d.a + d.b <= window - 60 -%}{%- break -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set wait = d.a -%}
+      {%- do item.update({'d2': d.b}) -%}
+    {%- else -%}
+      {%- set wait = item.get('d2', 0) -%}
+    {%- endif -%}
+    {%- if item.s < 6 -%}
+      {%- do hq.heappush(heap, [now + wait, num.floating(0, 1), {'k': 'ep', 'a': item.a, 'ip': item.ip,
+          's': item.s + 1, 't0': item.t0, 'd2': item.get('d2', 0)}]) -%}
     {%- endif -%}
   {%- endif -%}
-  {%- if params.anomaly_mode and routine_count >=
-      shared.get('next_anomaly_at', params.anomaly_after_events) -%}
-    {%- do shared.set('next_anomaly_at',
-        routine_count + params.anomaly_interval_events) -%}
-    {%- do shared.set('start_anomaly', true) -%}
+{%- endfor -%}
+{%- if not out.done -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set kind = out.kind -%}
+{%- set actor = {'user': out.a.user, 'client_ip': out.ip} -%}
+{#- Remote addresses each administrator has logged in from. -#}
+{%- if params.anomaly_mode and kind == 'login_success' and not out.ep and out.ip != out.a.desk -%}
+  {%- set seen = shared.get('seen', {}) -%}
+  {%- if out.ip not in seen.get(out.a.user, []) -%}
+    {%- do seen.update({out.a.user: seen.get(out.a.user, []) + [out.ip]}) -%}
   {%- endif -%}
-{%- else -%}
-  {%- set actor = target -%}
-  {%- if stage.startswith('reject_') -%}
-    {%- set kind = 'login_failure' -%}
-    {%- if stage == 'reject_4' -%}
-      {%- do shared.set('last_target_failure', timestamp) -%}
-    {%- endif -%}
-  {%- elif stage == 'accept' -%}
-    {%- set kind = 'login_success' -%}
-  {%- elif stage == 'log_change' -%}
-    {%- set kind = 'log_change' -%}
-  {%- else -%}
-    {%- set kind = 'key_add' -%}
-  {%- endif -%}
+  {%- do shared.set('seen', seen) -%}
+{%- endif -%}
+{#- Chain-relevant history of the account, fed with every record. -#}
+{%- set step = {'login_failure': 'F', 'login_success': 'S', 'log_change': 'L'}.get(kind) -%}
+{%- if step -%}
+  {%- set kept = chains.get(actor.user, []) | selectattr(0, 'ge', now - window) | list -%}
+  {%- do kept.append([now, step, actor.client_ip]) -%}
+  {%- do chains.update({actor.user: kept}) -%}
 {%- endif -%}
 {%- set audit_dt = timestamp.replace(
     microsecond=module.rand.number.integer(0, 999) * 1000) -%}
