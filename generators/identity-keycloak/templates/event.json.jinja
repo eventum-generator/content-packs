@@ -1,300 +1,454 @@
-{%- for key in ['to_spray', 'to_breach', 'to_token', 'to_role_grant', 'to_audit_change', 'to_routine'] -%}
-  {%- do shared.pop(key, none) -%}
-{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- set event_time = timestamp + module.datetime.timedelta(
-    seconds=module.rand.number.integer(0, 2),
-    milliseconds=module.rand.number.integer(0, 999)) -%}
-{%- set ingest_time = event_time + module.datetime.timedelta(
-    seconds=module.rand.number.integer(1, 4)) -%}
-{%- set users = [
-    {'name': 'alice', 'id': '364ba1fb-f8c5-45ac-a57c-a39f3bd4b3a0', 'ip': '10.20.8.12', 'client': 'portal'},
-    {'name': 'bob', 'id': '08558a58-3690-4ee3-bdcc-4df76d84c23b', 'ip': '10.20.8.31', 'client': 'hr-app'},
-    {'name': 'carol', 'id': '81515fb3-c87c-4768-9607-d0d4543a5d33', 'ip': '10.20.9.18', 'client': 'mail-ui'},
-    {'name': 'dmitry', 'id': '06d6371d-36ad-4c74-ad71-92c418d6b6ca', 'ip': '10.20.8.52', 'client': 'portal'},
-    {'name': 'irina', 'id': 'e32ea9c9-eef4-4472-8d1c-431cbf9f065b', 'ip': '10.20.9.43', 'client': 'hr-app'},
-    {'name': params.compromised_user, 'id': params.compromised_user_id,
-     'ip': params.suspicious_ip, 'client': 'security-admin-console'}
-] -%}
-{%- set actor = module.rand.choice(users) -%}
-{%- set name = actor.name -%}
-{%- set uid = actor.id -%}
-{%- set ip = actor.ip -%}
-{%- set client = actor.client -%}
-{%- set kind = 'LOGIN' -%}
-{%- set op = none -%}
-{%- set resource_type = none -%}
-{%- set resource_path = none -%}
-{%- set representation = none -%}
-{%- set target_id = params.target_user_id -%}
-{%- set error = none -%}
-{%- set session_id = none -%}
-{%- set code_id = none -%}
-{%- set token_id = none -%}
-{%- set refresh_token_id = none -%}
-{%- set n = shared.get('routine_count', 0) -%}
-{%- if stage == 'routine' -%}
-  {%- set n = (n % 1000000) + 1 -%}
-  {%- do shared.set('routine_count', n) -%}
-  {%- set active_session = shared.get('active_session') -%}
-  {%- if active_session is not none and not active_session.tokenized
-      and event_time.timestamp() - active_session.login_epoch >= 60 -%}
-    {%- do shared.pop('active_session') -%}
-  {%- endif -%}
-  {%- if n % 107 == 22 and shared.get('role_assigned', true) -%}
-    {%- set kind = 'ADMIN_EVENT' -%}
-    {%- set op = 'DELETE' -%}
-    {%- set delete_count = shared.get('delete_count', 0) -%}
-    {%- set target_id = params.target_user_id if delete_count == 0
-        else module.rand.crypto.uuid4() -%}
-    {%- do shared.set('delete_count', (delete_count % 1000000) + 1) -%}
-    {%- do shared.set('current_target_id', target_id) -%}
-  {%- elif n % 107 == 0 and not shared.get('role_assigned', true) -%}
-    {%- set kind = 'ADMIN_EVENT' -%}
-    {%- set op = 'CREATE' -%}
-    {%- set target_id = shared.get('current_target_id') -%}
-  {%- elif n % 119 == 0 -%}
-    {%- set kind = 'ADMIN_EVENT' -%}
-    {%- set op = 'UPDATE' -%}
-  {%- elif n % 29 == 0 -%}
-    {%- set kind = 'LOGIN_ERROR' -%}
-  {%- elif shared.get('active_session') is not none and n % 3 == 0 and not shared.get('active_session').tokenized -%}
-    {%- set kind = 'CODE_TO_TOKEN' -%}
-  {%- elif shared.get('active_session') is not none and n % 5 == 0 and shared.get('active_session').tokenized -%}
-    {%- set kind = 'LOGOUT' -%}
-  {%- else -%}
-    {%- set kind = module.rand.weighted_choice(['LOGIN', 'LOGIN_ERROR'], [85, 15]) -%}
-  {%- endif -%}
-  {%- if n % 29 == 0 and kind == 'LOGIN_ERROR' -%}
-    {%- set actor = users[5] -%}
-  {%- elif n % 41 == 0 and kind == 'LOGIN' -%}
-    {%- set actor = users[5] -%}
-  {%- endif -%}
-  {%- if kind == 'ADMIN_EVENT' -%}
-    {%- set actor = users[5] -%}
-  {%- endif -%}
-  {%- set name = actor.name -%}
-  {%- set uid = actor.id -%}
-  {%- set ip = actor.ip -%}
-  {%- set client = actor.client -%}
-  {%- if kind == 'LOGIN_ERROR' -%}
-    {%- set error = 'invalid_user_credentials' -%}
-    {%- set code_id = module.rand.crypto.uuid4() -%}
-  {%- elif kind == 'LOGIN' -%}
-    {%- set session_id = module.rand.crypto.uuid4() -%}
-    {%- set code_id = session_id -%}
-    {%- do shared.set('active_session', {'name': name, 'id': uid, 'ip': ip,
-          'client': client, 'session_id': session_id, 'tokenized': false,
-          'login_epoch': event_time.timestamp()}) -%}
-  {%- elif kind == 'CODE_TO_TOKEN' or kind == 'LOGOUT' -%}
-    {%- set active = shared.get('active_session') -%}
-    {%- set name = active.name -%}
-    {%- set uid = active.id -%}
-    {%- set ip = active.ip -%}
-    {%- set client = active.client -%}
-    {%- set session_id = active.session_id -%}
-    {%- if kind == 'CODE_TO_TOKEN' -%}
-      {%- set code_id = session_id -%}
-      {%- set token_id = 'onrtac:' ~ module.rand.crypto.uuid4() -%}
-      {%- set refresh_token_id = module.rand.crypto.uuid4() -%}
-      {%- do shared.set('active_session', {'name': name, 'id': uid, 'ip': ip,
-            'client': client, 'session_id': session_id, 'tokenized': true}) -%}
+{#- Keycloak 26.7.4 jboss-logging event listener lines of one realm,
+    as Elastic Agent ships them from the Keycloak log file. Each
+    one-second tick emits at most one line: the earliest due one.
+    Every account is an independent random process (idle gap, login
+    attempt with occasional wrong passwords, token exchange, optional
+    logout; administrators also change realm role mappings); the
+    anomaly episode only queues its own lines for one idle
+    administrator and never touches the background. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 900 -%}
+{%- set min_fails = 5 -%}
+{%- set priv = params.privileged_role_name -%}
+{#- Wrong-password bursts: 1-8 failures, halving per extra failure.
+    Episodes draw from the same law's tail (k >= 5). -#}
+{%- set burst = [1, 2, 3, 4, 5, 6, 7, 8] -%}
+{%- set burst_w = [128, 64, 32, 16, 8, 4, 2, 1] -%}
+{%- set nops = [0, 1, 2, 3, 4, 5, 6] -%}
+{%- set nops_w = [10, 30, 25, 15, 10, 6, 4] -%}
+{%- set base = params.sso_base_url -%}
+{%- set clients = {
+    'account-console': [base ~ '/realms/' ~ params.realm ~ '/account/', 'openid email profile'],
+    'portal': ['https://portal.corp.example/oauth2/callback', 'openid profile email'],
+    'hr-app': ['https://hr.corp.example/login/oauth2/code/keycloak', 'openid profile'],
+    'mail-ui': ['https://mail.corp.example/sso/callback', 'openid email profile'],
+    'security-admin-console': [base ~ '/admin/' ~ params.realm ~ '/console/', 'openid profile email']} -%}
+{%- set people = ['anna.ivanova', 'pavel.smirnov', 'olga.kim', 'dmitry.orlov',
+    'maria.petrova', 'sergey.volkov', 'elena.sokolova', 'ivan.popov',
+    'natalia.lebedeva', 'alexey.kozlov', 'irina.novikova', 'mikhail.morozov',
+    'tatiana.egorova', 'andrey.pavlov', 'yulia.fedorova', 'nikolai.stepanov',
+    'ksenia.nikolaeva', 'roman.makarov', 'svetlana.zakharova', 'artem.zaitsev',
+    'daria.solovyova', 'kirill.borisov', 'ekaterina.romanova', 'maxim.vasiliev',
+    'polina.guseva', 'denis.titov', 'victoria.kuzmina', 'oleg.belov',
+    'anastasia.komarova', 'vladimir.orlov', 'john.miller', 'sarah.jones',
+    'david.clark', 'emma.wilson', 'lucas.martin', 'sofia.garcia'] -%}
+{%- set admin_names = ['adm.kuznetsov', 'adm.sidorova', 'adm.frolov', 'adm.egorova', 'adm.volkova'] -%}
+{%- set role_names = ['portal-editor', 'hr-viewer', 'mail-archive', 'finance-reader', 'project-lead', priv] -%}
+{%- set role_w = [22, 18, 14, 16, 14, 16] -%}
+{%- set vpn_ips = params.vpn_nat_ips -%}
+
+{%- macro hload(t) -%}
+  {%- set h = ((t | int) // 3600) % 24 -%}
+  {{- 1.0 if 8 <= h < 18 else (0.5 if 7 <= h < 8 or 18 <= h < 20 else (0.25 if 20 <= h < 23 else 0.06)) -}}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma, lo, hi) -%}
+  {{- [[module.random.lognormvariate(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
+{%- endmacro -%}
+
+{#- Keycloak 26 session, code and token ids: 128 random bits. -#}
+{%- macro rid() -%}
+  {%- set h = '%032x' | format(module.random.getrandbits(128)) -%}
+  {{- h[:8] ~ '-' ~ h[8:12] ~ '-' ~ h[12:16] ~ '-' ~ h[16:20] ~ '-' ~ h[20:] -}}
+{%- endmacro -%}
+
+{#- Next attempt of an idle account: lognormal idle gaps thinned by the
+    hour-of-day load, so accounts are mostly active in office hours. -#}
+{%- macro next_attempt(t0, med) -%}
+  {%- set s = namespace(t=t0) -%}
+  {%- for i in range(120) -%}
+    {%- set s.t = s.t + gap(med, 1.0, 5, 400000) | int -%}
+    {%- if module.random.random() < hload(s.t) | float -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {{- s.t -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (6 <= interval <= 720) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- One fixed organisation: identities, home addresses, preferred
+      applications and activity come from a fixed seed, so every run
+      models the same realm and only behaviour is random. -#}
+  {%- set rnd = module.random.Random(2674) -%}
+  {%- set actors = [] -%}
+  {%- set heap = [] -%}
+  {%- set app_names = ['account-console', 'portal', 'hr-app', 'mail-ui'] -%}
+  {%- for p in people + admin_names -%}
+    {%- set adm = p in admin_names -%}
+    {%- if adm -%}
+      {%- set apps = ['security-admin-console', 'account-console'] -%}
+      {%- set aw = [0.85, 0.15] -%}
     {%- else -%}
-      {%- do shared.pop('active_session') -%}
+      {%- set apps = rnd.sample(app_names, rnd.choice([1, 2, 2, 3])) -%}
+      {%- set aw = [] -%}
+      {%- for a in apps -%}{%- do aw.append(rnd.lognormvariate(0, 0.8)) -%}{%- endfor -%}
+    {%- endif -%}
+    {%- set w = rnd.lognormvariate(0, 0.6) -%}
+    {%- set med = (9000 if adm else 3600) / w -%}
+    {%- set i = actors | length -%}
+    {%- set wake = next_attempt(now, med) | int -%}
+    {%- do actors.append({'name': p, 'id': module.uuid.UUID(int=rnd.getrandbits(128), version=4) | string, 'admin': adm,
+        'ip': ('10.20.5.' if adm else '10.20.' ~ rnd.choice([8, 9]) ~ '.') ~ rnd.randint(10, 250),
+        'remote': rnd.uniform(0.15, 0.45), 'apps': apps, 'aw': aw, 'w': w, 'med': med,
+        'busy': false, 'wake': wake}) -%}
+    {%- do module.heapq.heappush(heap, [wake, i, {'k': 'wake', 'a': i}]) -%}
+  {%- endfor -%}
+  {%- set roles = {} -%}
+  {%- for r in role_names -%}
+    {%- do roles.update({r: params.privileged_role_id if r == priv else module.uuid.UUID(int=rnd.getrandbits(128), version=4) | string}) -%}
+  {%- endfor -%}
+  {#- Standing role assignments; the privileged role starts with two
+      holders whose grants are permanent. -#}
+  {%- set held = {} -%}
+  {%- for i in range(people | length) -%}
+    {%- do held.update({i: rnd.sample(role_names[:-1], rnd.choice([0, 1, 1, 2]))}) -%}
+  {%- endfor -%}
+  {%- for i in rnd.sample(range(people | length) | list, 2) -%}
+    {%- do held[i].append(priv) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'actors': actors, 'heap': heap,
+      'seq': actors | length, 'roles': roles, 'held': held, 'revoke': [],
+      'recent': {}, 'offset': module.random.randint(200000, 9000000),
+      'start_at': none, 'scheduled': false, 'last_admin': none, 'last_target': none}) -%}
+{%- endif -%}
+{%- set actors = shared.get('actors') -%}
+{%- set heap = shared.get('heap') -%}
+{%- set held = shared.get('held') -%}
+{%- set recent = shared.get('recent') -%}
+
+{%- macro push(at, item) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(heap, [at | int, n, item]) -%}
+{%- endmacro -%}
+
+{%- macro idle(a, t0) -%}
+  {%- set actor = actors[a] -%}
+  {%- set wake = next_attempt(t0, actor.med) | int -%}
+  {%- do actor.update({'busy': false, 'wake': wake}) -%}
+  {{- push(wake, {'k': 'wake', 'a': a}) -}}
+{%- endmacro -%}
+
+{#- One login attempt in one browser authentication session: k wrong
+    passwords, then LOGIN (or nothing, when the user gives up), the
+    authorization-code exchange, admin operations for the admin
+    console, and an optional logout. All gaps are drawn up front. -#}
+{%- macro plan(a, k, final, ep, ip, client) -%}
+  {%- set actor = actors[a] -%}
+  {%- set fg = [] -%}
+  {%- for i in range(k) -%}{%- do fg.append(gap(8, 0.6, 2, 40) | int) -%}{%- endfor -%}
+  {%- set n_ops = 0 -%}
+  {%- if client == 'security-admin-console' -%}
+    {%- set n_ops = module.rand.weighted_choice(nops[1:] if ep else nops, nops_w[1:] if ep else nops_w) -%}
+  {%- endif -%}
+  {%- set og = [] -%}
+  {%- for i in range(n_ops) -%}
+    {%- do og.append(gap(45, 0.9, 3, 300) | int if i == 0 else gap(70, 1.0, 3, 900) | int) -%}
+  {%- endfor -%}
+  {%- set lo = module.rand.chance(0.5 if actor.admin else 0.3) -%}
+  {%- set tail = (gap(300, 1.0, 10, 7200) if actor.admin else gap(2700, 1.0, 30, 28800)) | int -%}
+  {%- do shared.set('plan', {'a': a, 'k': k, 'i': 0, 'fg': fg, 'final': final, 'ep': ep,
+      'ip': ip, 'client': client, 'asid': rid(), 'tab': module.secrets.token_urlsafe(8),
+      'ops': og, 'op_i': 0, 'logout': lo, 'tail': tail,
+      'cd': module.rand.weighted_choice([1, 2], [3, 1]),
+      'span': fg | sum + 2 + og | sum + tail + 60}) -%}
+{%- endmacro -%}
+
+{%- macro pick_ip(actor) -%}
+  {{- module.rand.choice(vpn_ips) if module.rand.chance(actor.remote) else actor.ip -}}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first tick, its hour drawn from the
+    background hour-of-day curve. Each later start is due one interval
+    after the actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor, so start hours never drift. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and not shared.get('scheduled') -%}
+  {%- do shared.update({'scheduled': true, 'start_at':
+      pick_start(now, now + ([interval, 24] | min * 3600) | int, false) | int}) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {#- Password guessing against an administrator from a VPN egress
+      address, then LOGIN, the code exchange and a grant of the
+      privileged role. The administrator is drawn with the background
+      activity weights among idle administrators whose own next attempt
+      comes after the episode, so the episode never overlaps or moves
+      their traffic; the previous episode's administrator sits out. -#}
+  {%- set ep = namespace(c=[], w=[]) -%}
+  {%- for i in range(actors | length) -%}
+    {%- set actor = actors[i] -%}
+    {%- if actor.admin and not actor.busy and actor.wake > now + 7200
+        and actor.name != shared.get('last_admin') -%}
+      {%- set ep.c = ep.c + [i] -%}{%- set ep.w = ep.w + [actor.w] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ep.c -%}
+    {%- set a = module.rand.weighted_choice(ep.c, ep.w) -%}
+    {{- plan(a, module.rand.weighted_choice(burst[4:], burst_w[4:]), 'accept', true,
+        module.rand.choice(vpn_ips), 'security-admin-console') -}}
+    {%- set p = shared.get('plan') -%}
+    {%- if actors[a].wake > now + p.span -%}
+      {{- push(now, {'k': 'fail', 'p': p}) -}}
+      {%- set due = now + (interval * 3600) | int -%}
+      {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
+      {%- do shared.update({'last_admin': actors[a].name,
+          'start_at': pick_start(due - half, due + half, true) | int}) -%}
     {%- endif -%}
   {%- endif -%}
-  {%- set interval = [params.anomaly_interval_events, 1] | max -%}
-  {%- if params.anomaly_mode and n >= params.anomaly_after_events
-      and (n - params.anomaly_after_events) % interval == 0 -%}
-    {%- do shared.set('episode_due', true) -%}
-  {%- endif -%}
-  {%- if params.anomaly_mode and shared.get('episode_due', false)
-      and not shared.get('role_assigned', true) -%}
-    {%- do shared.pop('episode_due') -%}
-    {%- do shared.set('episode_target_id', shared.get('current_target_id')) -%}
-    {%- do shared.set('spray_count', 0) -%}
-    {%- do shared.set('to_spray', true) -%}
-  {%- endif -%}
-{%- elif stage == 'spray' -%}
-  {%- set spray_count = shared.get('spray_count', 0) + 1 -%}
-  {%- do shared.set('spray_count', spray_count) -%}
-  {%- set actor = users[5] if spray_count == 5 else users[spray_count - 1] -%}
-  {%- set kind = 'LOGIN_ERROR' -%}
-  {%- set name = actor.name -%}
-  {%- set uid = actor.id -%}
-  {%- set ip = params.suspicious_ip -%}
-  {%- set client = 'security-admin-console' -%}
-  {%- set error = 'invalid_user_credentials' -%}
-  {%- set code_id = module.rand.crypto.uuid4() -%}
-  {%- if spray_count == 5 -%}
-    {%- do shared.set('to_breach', true) -%}
-  {%- endif -%}
-{%- elif stage == 'breach' -%}
-  {%- set actor = users[5] -%}
-  {%- set name = actor.name -%}
-  {%- set uid = actor.id -%}
-  {%- set ip = actor.ip -%}
-  {%- set client = actor.client -%}
-  {%- set session_id = module.rand.crypto.uuid4() -%}
-  {%- set code_id = session_id -%}
-  {%- do shared.set('anomaly_session', session_id) -%}
-  {%- do shared.set('to_token', true) -%}
-{%- elif stage == 'token' -%}
-  {%- set kind = 'CODE_TO_TOKEN' -%}
-  {%- set actor = users[5] -%}
-  {%- set name = actor.name -%}
-  {%- set uid = actor.id -%}
-  {%- set ip = actor.ip -%}
-  {%- set client = actor.client -%}
-  {%- set session_id = shared.pop('anomaly_session') -%}
-  {%- set code_id = session_id -%}
-  {%- set token_id = 'onrtac:' ~ module.rand.crypto.uuid4() -%}
-  {%- set refresh_token_id = module.rand.crypto.uuid4() -%}
-  {%- do shared.set('to_role_grant', true) -%}
-{%- elif stage == 'role_grant' -%}
-  {%- set kind = 'ADMIN_EVENT' -%}
-  {%- set op = 'CREATE' -%}
-  {%- set target_id = shared.get('episode_target_id') -%}
-  {%- do shared.set('to_audit_change', true) -%}
-{%- else -%}
-  {%- set kind = 'ADMIN_EVENT' -%}
-  {%- set op = 'UPDATE' -%}
-  {%- do shared.pop('episode_target_id', none) -%}
-  {%- do shared.set('to_routine', true) -%}
 {%- endif -%}
-{%- if op is not none -%}
-  {%- if op == 'CREATE' or op == 'DELETE' -%}
-    {%- do shared.set('role_assigned', op == 'CREATE') -%}
-  {%- endif -%}
-  {%- set name = params.compromised_user -%}
-  {%- set uid = params.compromised_user_id -%}
-  {%- set ip = params.suspicious_ip -%}
-  {%- set client = 'security-admin-console' -%}
-  {%- set resource_type = 'REALM' if op == 'UPDATE' else 'REALM_ROLE_MAPPING' -%}
-  {%- set resource_path = 'events/config' if op == 'UPDATE' else 'users/' ~ target_id ~ '/role-mappings/realm' -%}
-  {%- if op == 'UPDATE' -%}
-    {%- set representation = ({'eventsEnabled': true, 'adminEventsEnabled': true,
-          'adminEventsDetailsEnabled': true, 'eventsListeners': ['jboss-logging'],
-          'eventsExpiration': 604800}|tojson) -%}
+
+{#- 2. Pop the earliest due item. A wake starts a background attempt of
+    an idle account and queues its first line. -#}
+{%- set ns = namespace(item=none) -%}
+{%- for i in range(80) -%}
+  {%- if not heap or heap[0][0] > now -%}{%- break -%}{%- endif -%}
+  {%- set entry = module.heapq.heappop(heap) -%}
+  {%- set item = entry[2] -%}
+  {%- if item.k == 'wake' -%}
+    {%- set a = item.a -%}
+    {%- set actor = actors[a] -%}
+    {%- do actor.update({'busy': true}) -%}
+    {%- set client = module.rand.weighted_choice(actor.apps, actor.aw) -%}
+    {%- if module.rand.chance(0.12) -%}
+      {%- set k = module.rand.weighted_choice(burst, burst_w) -%}
+      {{- plan(a, k, 'accept' if module.rand.chance(0.85) else 'giveup', false, pick_ip(actor), client) -}}
+    {%- else -%}
+      {{- plan(a, 0, 'accept', false, pick_ip(actor), client) -}}
+    {%- endif -%}
+    {%- set p = shared.get('plan') -%}
+    {{- push(now, {'k': 'fail' if p.k > 0 else 'login', 'p': p}) -}}
   {%- else -%}
-    {%- set representation = ([{'id': params.privileged_role_id,
-                               'name': params.privileged_role_name}]|tojson) -%}
+    {%- set ns.item = item -%}{%- break -%}
   {%- endif -%}
-{%- endif -%}
-{%- set level = 'WARN' if error else 'INFO' -%}
-{%- if op is not none -%}
-  {%- set message = 'operationType=' ~ (op|tojson)
-      ~ ', realmId=' ~ (params.realm_id|tojson)
-      ~ ', realmName=' ~ (params.realm|tojson)
-      ~ ', clientId=' ~ (client|tojson)
-      ~ ', userId=' ~ (uid|tojson)
-      ~ ', ipAddress=' ~ (ip|tojson)
-      ~ ', resourceType=' ~ (resource_type|tojson)
-      ~ ', resourcePath=' ~ (resource_path|tojson) -%}
-  {%- if representation is not none -%}
-    {%- set message = message ~ ', representation=' ~ (representation|tojson) -%}
+{%- endfor -%}
+{%- if ns.item is none -%}{%- do dispatch.drop() -%}{%- endif -%}
+
+{%- set p = ns.item.p -%}
+{%- set kind = ns.item.k -%}
+{%- set actor = actors[p.a] -%}
+{%- set key = actor.id ~ '|' ~ p.ip -%}
+{%- set hist = [] -%}
+{%- for r in recent.get(key, []) if r[0] >= now - window -%}{%- do hist.append(r) -%}{%- endfor -%}
+{%- set op = none -%}
+
+{#- 3. Advance this attempt and queue its next line. -#}
+{%- if kind == 'fail' -%}
+  {%- do p.update({'i': p.i + 1}) -%}
+  {%- if p.i < p.k -%}
+    {{- push(now + p.fg[p.i - 1], {'k': 'fail', 'p': p}) -}}
+  {%- elif p.final == 'accept' -%}
+    {{- push(now + p.fg[p.k - 1], {'k': 'login', 'p': p}) -}}
+  {%- else -%}
+    {{- idle(p.a, now) -}}
+  {%- endif -%}
+{%- elif kind == 'login' -%}
+  {{- push(now + p.cd, {'k': 'token', 'p': p}) -}}
+{%- elif kind == 'token' or kind == 'op' -%}
+  {%- if kind == 'op' -%}
+    {%- set op = namespace(type='CREATE', target=none, role=none) -%}
+    {%- set revoke = shared.get('revoke') -%}
+    {%- if p.ep and p.op_i == 0 -%}
+      {#- The episode's grant: a user without the role, not the previous
+          episode's target. -#}
+      {%- set c = [] -%}
+      {%- for i in range(people | length) if priv not in held[i] and i != shared.get('last_target') -%}{%- do c.append(i) -%}{%- endfor -%}
+      {%- set op.target = module.rand.choice(c) -%}
+      {%- set op.role = priv -%}
+      {%- do shared.set('last_target', op.target) -%}
+    {%- else -%}
+      {%- set due = [] -%}
+      {%- for r in revoke if r[0] <= now and priv in held[r[1]] -%}{%- do due.append(r) -%}{%- endfor -%}
+      {%- if due and module.rand.chance(0.7) -%}
+        {#- Time-bound privileged access expires: an administrator
+            removes it in the next console session. -#}
+        {%- set op.type = 'DELETE' -%}{%- set op.target = due[0][1] -%}{%- set op.role = priv -%}
+      {%- elif module.rand.chance(0.6) -%}
+        {%- set op.role = module.rand.weighted_choice(role_names, role_w) -%}
+        {%- set c = [] -%}
+        {%- for i in range(people | length) if op.role not in held[i] -%}{%- do c.append(i) -%}{%- endfor -%}
+        {%- set op.target = module.rand.choice(c) -%}
+        {#- Guard on the chain's final step only: a background grant of
+            the privileged role that would complete five failures,
+            LOGIN and the code exchange by the same account and address
+            within the chain window grants another role instead. -#}
+        {%- set g = namespace(n=0, st=0) -%}
+        {%- for r in hist -%}
+          {%- if g.st == 0 and r[1] == 'fail' -%}
+            {%- set g.n = g.n + 1 -%}{%- if g.n >= min_fails -%}{%- set g.st = 1 -%}{%- endif -%}
+          {%- elif g.st == 1 and r[1] == 'login' -%}{%- set g.st = 2 -%}
+          {%- elif g.st == 2 and r[1] == 'token' -%}{%- set g.st = 3 -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if op.role == priv and g.st == 3 -%}
+          {%- set alt = [] -%}
+          {%- for r in role_names[:-1] if r not in held[op.target] -%}{%- do alt.append(r) -%}{%- endfor -%}
+          {%- set op.role = module.rand.choice(alt) if alt else role_names[0] -%}
+          {%- if op.role in held[op.target] -%}{%- set op.type = 'DELETE' -%}{%- endif -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- set op.type = 'DELETE' -%}
+        {%- set c = [] -%}
+        {%- for i in range(people | length) -%}
+          {%- for r in held[i] if r != priv -%}{%- do c.append([i, r]) -%}{%- endfor -%}
+        {%- endfor -%}
+        {%- set m = module.rand.choice(c) -%}
+        {%- set op.target = m[0] -%}{%- set op.role = m[1] -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if op.type == 'CREATE' -%}
+      {%- do held[op.target].append(op.role) -%}
+      {%- if op.role == priv -%}
+        {%- do revoke.append([now + gap(28800, 0.6, 3600, 172800) | int, op.target]) -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- do held[op.target].remove(op.role) -%}
+      {%- set keep = [] -%}
+      {%- for r in revoke if r[1] != op.target or op.role != priv -%}{%- do keep.append(r) -%}{%- endfor -%}
+      {%- do shared.set('revoke', keep) -%}
+    {%- endif -%}
+    {%- do p.update({'op_i': p.op_i + 1}) -%}
+  {%- endif -%}
+  {%- if p.op_i < p.ops | length -%}
+    {{- push(now + p.ops[p.op_i], {'k': 'op', 'p': p}) -}}
+  {%- elif p.logout -%}
+    {{- push(now + p.tail, {'k': 'logout', 'p': p}) -}}
+  {%- elif not p.ep -%}
+    {{- idle(p.a, now) -}}
   {%- endif -%}
 {%- else -%}
-  {%- set message = 'type=' ~ (kind|tojson)
-      ~ ', realmId=' ~ (params.realm_id|tojson)
-      ~ ', realmName=' ~ (params.realm|tojson)
-      ~ ', clientId=' ~ (client|tojson)
-      ~ ', userId=' ~ (uid|tojson) -%}
-  {%- if session_id is not none -%}
-    {%- set message = message ~ ', sessionId=' ~ (session_id|tojson) -%}
-  {%- endif -%}
-  {%- set message = message ~ ', ipAddress=' ~ (ip|tojson) -%}
-  {%- if error is not none -%}
-    {%- set message = message ~ ', error=' ~ (error|tojson) -%}
-  {%- endif -%}
-  {%- if kind == 'LOGIN' or kind == 'LOGIN_ERROR' -%}
-    {%- set message = message ~ ', auth_method=' ~ ('openid-connect'|tojson)
-        ~ ', auth_type=' ~ ('code'|tojson)
-        ~ ', response_type=' ~ ('code'|tojson)
-        ~ ', redirect_uri=' ~ (params.redirect_uri|tojson)
-        ~ ', consent=' ~ ('no_consent_required'|tojson)
-        ~ ', code_id=' ~ (code_id|tojson)
-        ~ ', username=' ~ (name|tojson)
-        ~ ', response_mode=' ~ ('query'|tojson) -%}
-  {%- elif kind == 'CODE_TO_TOKEN' -%}
-    {%- set message = message ~ ', token_id=' ~ (token_id|tojson)
-        ~ ', grant_type=' ~ ('authorization_code'|tojson)
-        ~ ', refresh_token_type=' ~ ('Refresh'|tojson)
-        ~ ', scope=' ~ ('openid profile email'|tojson)
-        ~ ', refresh_token_id=' ~ (refresh_token_id|tojson)
-        ~ ', code_id=' ~ (code_id|tojson)
-        ~ ', client_auth_method=' ~ ('client-secret'|tojson) -%}
-  {%- endif -%}
+  {%- if not p.ep -%}{{- idle(p.a, now) -}}{%- endif -%}
 {%- endif -%}
-{%- set full_line = event_time.strftime('%Y-%m-%d %H:%M:%S,%f')[:23] ~ ' ' ~ level ~ '  [org.keycloak.events] (executor-thread-1) ' ~ message -%}
-{%- set offset = shared.get('log_offset', 0) -%}
-{%- do shared.set('log_offset', offset + (full_line|length) + 1) -%}
-{%- set event = {
-    'agent_id_status': 'verified', 'dataset': 'keycloak.log',
-    'ingested': ingest_time.isoformat(), 'original': full_line,
-    'timezone': '+00:00', 'kind': 'event',
-    'action': (op ~ '-' ~ resource_type) if op else kind,
-    'outcome': 'failure' if error else ('success' if kind == 'LOGIN' else 'unknown'),
-    'category': ['iam'] if op else ['authentication'],
-    'type': (['info', 'admin', 'creation' if op == 'CREATE' else 'deletion' if op == 'DELETE' else 'change'] if op else
-             ['info', 'start'] if kind == 'LOGIN' else
-             ['info', 'end'] if kind == 'LOGOUT' else ['info'])
-} -%}
+{%- if kind in ['fail', 'login', 'token'] -%}{%- do hist.append([now, kind]) -%}{%- endif -%}
+{%- if hist -%}{%- do recent.update({key: hist[-40:]}) -%}{%- else -%}{%- do recent.pop(key, none) -%}{%- endif -%}
+
+{#- 4. Render the listener line (quotes '"', sanitize on) and the
+    document Elastic's Keycloak integration makes of it. -#}
+{%- macro q(v) -%}{{ '"' ~ (v | string | replace('"', '\\"')) ~ '"' }}{%- endmacro -%}
+{%- set cl = clients[p.client] -%}
+{%- set event_time = timestamp + module.datetime.timedelta(milliseconds=module.random.randint(0, 999)) -%}
+{%- set thread = 'executor-thread-' ~ gap(24, 0.7, 1, 200) -%}
+{%- set url = none -%}
 {%- if op is not none -%}
-  {%- do event.update({'code': op ~ '-' ~ resource_type}) -%}
-{%- elif error is not none -%}
-  {%- do event.update({'code': error}) -%}
-{%- endif -%}
-{%- set kc = {'realm': {'id': params.realm_id}, 'client': {'id': client},
-             'event_type': 'admin' if op else 'login'} -%}
-{%- if op is not none -%}
-  {%- do kc.update({'admin': {'operation': op,
-      'resource': {'type': resource_type, 'path': resource_path}}}) -%}
+  {%- set target_id = actors[op.target].id -%}
+  {%- set rtype = 'REALM_ROLE_MAPPING' -%}
+  {%- set rpath = 'users/' ~ target_id ~ '/role-mappings/realm' -%}
+  {%- set rep = '[{"id":"' ~ shared.get('roles')[op.role] ~ '","name":"' ~ op.role
+      ~ '","composite":false,"clientRole":false,"containerId":"' ~ params.realm_id ~ '"}]' -%}
+  {%- set message = 'operationType=' ~ q(op.type) ~ ', realmId=' ~ q(params.realm_id)
+      ~ ', realmName=' ~ q(params.realm) ~ ', clientId=' ~ q(params.admin_console_client_uuid)
+      ~ ', userId=' ~ q(actor.id) ~ ', ipAddress=' ~ q(p.ip) ~ ', resourceType=' ~ q(rtype)
+      ~ ', resourcePath=' ~ q(rpath) ~ ', representation=' ~ q(rep) -%}
+  {%- set level = 'INFO' -%}
+  {%- set etype = 'ADMIN' -%}
 {%- else -%}
-  {%- set login = {'type': kind} -%}
-  {%- if kind == 'LOGIN' or kind == 'LOGIN_ERROR' -%}
-    {%- do login.update({'auth_method': 'openid-connect', 'auth_type': 'code',
-       'redirect_uri': params.redirect_uri}) -%}
-  {%- endif -%}
-  {%- if code_id is not none -%}
-    {%- do login.update({'code_id': code_id}) -%}
-  {%- endif -%}
-  {%- do kc.update({'login': login}) -%}
-  {%- if session_id is not none -%}
-    {%- do kc.update({'session': {'id': session_id}}) -%}
+  {%- set etype = {'fail': 'LOGIN_ERROR', 'login': 'LOGIN', 'token': 'CODE_TO_TOKEN', 'logout': 'LOGOUT'}[kind] -%}
+  {%- set level = 'WARN' if kind == 'fail' else 'INFO' -%}
+  {%- set message = 'type=' ~ q(etype) ~ ', realmId=' ~ q(params.realm_id) ~ ', realmName=' ~ q(params.realm)
+      ~ ', clientId=' ~ q(p.client) ~ ', userId=' ~ q(actor.id) -%}
+  {%- if kind != 'fail' -%}{%- set message = message ~ ', sessionId=' ~ q(p.asid) -%}{%- endif -%}
+  {%- set message = message ~ ', ipAddress=' ~ q(p.ip) -%}
+  {%- if kind == 'fail' -%}
+    {%- set message = message ~ ', error=' ~ q('invalid_user_credentials') ~ ', auth_method=' ~ q('openid-connect')
+        ~ ', auth_type=' ~ q('code') ~ ', redirect_uri=' ~ q(cl[0]) ~ ', code_id=' ~ q(p.asid)
+        ~ ', username=' ~ q(actor.name) ~ ', authSessionParentId=' ~ q(p.asid) ~ ', authSessionTabId=' ~ q(p.tab) -%}
+    {%- set url = cl[0] -%}
+  {%- elif kind == 'login' -%}
+    {%- set message = message ~ ', auth_method=' ~ q('openid-connect') ~ ', response_type=' ~ q('code')
+        ~ ', redirect_uri=' ~ q(cl[0]) ~ ', remember_me=' ~ q('false') ~ ', consent=' ~ q('no_consent_required')
+        ~ ', code_id=' ~ q(p.asid) ~ ', response_mode=' ~ q('query') ~ ', username=' ~ q(actor.name)
+        ~ ', authSessionParentId=' ~ q(p.asid) ~ ', authSessionTabId=' ~ q(p.tab) -%}
+    {%- set url = cl[0] -%}
+  {%- elif kind == 'token' -%}
+    {%- set message = message ~ ', token_id=' ~ q(('onltac:' if p.client == 'security-admin-console' else 'onrtac:') ~ rid())
+        ~ ', grant_type=' ~ q('authorization_code') ~ ', refresh_token_type=' ~ q('Refresh')
+        ~ ', scope=' ~ q(cl[1]) ~ ', refresh_token_id=' ~ q(rid()) ~ ', code_id=' ~ q(p.asid)
+        ~ ', client_auth_method=' ~ q('client-secret') -%}
+  {%- else -%}
+    {%- set message = message ~ ', redirect_uri=' ~ q(cl[0]) -%}
+    {%- set url = cl[0] -%}
   {%- endif -%}
 {%- endif -%}
-{%- set related_users = [uid, target_id] if op == 'CREATE' or op == 'DELETE' else [uid] -%}
+{%- set line = event_time.strftime('%Y-%m-%d %H:%M:%S,%f')[:23] ~ ' ' ~ level ~ '  [org.keycloak.events] ('
+    ~ thread ~ ') ' ~ message -%}
+{%- set offset = shared.get('offset') -%}
+{%- do shared.set('offset', offset + (line | length) + 1) -%}
+{%- set ingest_time = event_time + module.datetime.timedelta(milliseconds=gap(1800, 0.5, 300, 20000) | int) -%}
+
+{%- set event = {'original': line, 'kind': 'event', 'timezone': '+00:00',
+    'dataset': 'keycloak.log', 'agent_id_status': 'verified',
+    'ingested': ingest_time.strftime('%Y-%m-%dT%H:%M:%SZ')} -%}
+{%- set kc = {'realm': {'id': params.realm_id}} -%}
+{%- if op is not none -%}
+  {%- set code = op.type ~ '-' ~ rtype -%}
+  {%- do event.update({'code': code, 'action': code, 'outcome': 'unknown', 'category': ['iam'],
+      'type': ['info', 'admin', 'creation' if op.type == 'CREATE' else 'deletion']}) -%}
+  {%- do kc.update({'client': {'id': params.admin_console_client_uuid}, 'event_type': 'admin',
+      'admin': {'operation': op.type, 'resource': {'type': rtype, 'path': rpath}}}) -%}
+{%- else -%}
+  {%- do event.update({'action': etype,
+      'outcome': 'failure' if kind == 'fail' else ('success' if kind == 'login' else 'unknown'),
+      'category': ['authentication'],
+      'type': ['info', 'start'] if kind == 'login' else (['info', 'end'] if kind == 'logout' else ['info'])}) -%}
+  {%- if kind == 'fail' -%}{%- do event.update({'code': 'invalid_user_credentials'}) -%}{%- endif -%}
+  {%- set login = {'type': etype} -%}
+  {%- if kind in ['fail', 'login', 'logout'] -%}{%- do login.update({'redirect_uri': cl[0]}) -%}{%- endif -%}
+  {%- if kind in ['fail', 'login'] -%}
+    {%- do login.update({'auth_method': 'openid-connect', 'code_id': p.asid,
+        'auth_session_parent_id': p.asid, 'auth_session_tab_id': p.tab}) -%}
+  {%- endif -%}
+  {%- if kind == 'fail' -%}{%- do login.update({'auth_type': 'code'}) -%}{%- endif -%}
+  {%- if kind == 'token' -%}{%- do login.update({'code_id': p.asid}) -%}{%- endif -%}
+  {%- do kc.update({'client': {'id': p.client}, 'event_type': 'login', 'login': login}) -%}
+  {%- if kind != 'fail' -%}{%- do kc.update({'session': {'id': p.asid}}) -%}{%- endif -%}
+{%- endif -%}
+{%- set user = {'id': actor.id} -%}
+{%- if kind in ['fail', 'login'] -%}{%- do user.update({'name': actor.name}) -%}{%- endif -%}
+{%- set related = {'ip': [p.ip], 'user': [actor.id]} -%}
+{%- if op is not none -%}
+  {%- do user.update({'target': {'id': target_id}}) -%}
+  {%- do related.user.append(target_id) -%}
+{%- endif -%}
 {%- set doc = {
-    '@timestamp': event_time.isoformat(),
+    '@timestamp': event_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] ~ 'Z',
     'agent': {'ephemeral_id': params.collector_ephemeral_id, 'id': params.collector_id,
               'name': params.hostname, 'type': 'filebeat', 'version': params.collector_version},
     'data_stream': {'dataset': 'keycloak.log', 'namespace': 'default', 'type': 'logs'},
-    'ecs': {'version': '8.17.0'},
+    'ecs': {'version': '8.11.0'},
     'elastic_agent': {'id': params.collector_id, 'snapshot': false, 'version': params.collector_version},
     'event': event,
-    'host': {'architecture': 'x86_64', 'containerized': true,
-             'hostname': params.hostname, 'id': '5082ec46978249e68488c21de3f64030',
-             'ip': [params.host_ip], 'mac': ['02-42-0A-14-01-0F'],
-             'name': params.hostname,
-             'os': {'codename': 'bookworm', 'family': 'debian',
-                    'kernel': '6.1.0', 'name': 'Debian', 'platform': 'debian',
-                    'type': 'linux', 'version': '12'}},
+    'host': {'architecture': 'x86_64', 'containerized': true, 'hostname': params.hostname,
+             'ip': [params.host_ip], 'name': params.hostname,
+             'os': {'codename': 'bookworm', 'family': 'debian', 'kernel': '6.1.0-28-amd64',
+                    'name': 'Debian GNU/Linux', 'platform': 'debian', 'type': 'linux', 'version': '12'}},
     'input': {'type': 'filestream'},
     'keycloak': kc,
-    'log': {'file': {'device_id': '2049', 'inode': '537921',
-                      'path': '/opt/keycloak/data/log/keycloak.log'},
-            'level': level, 'logger': 'org.keycloak.events', 'offset': offset},
-    'message': message,
-    'process': {'thread': {'name': 'executor-thread-1'}},
-    'tags': ['keycloak-log'],
-    'source': {'address': ip, 'ip': ip}, 'related': {'ip': [ip], 'user': related_users},
-    'user': {'id': uid}
-} -%}
-{%- if op is none and kind != 'CODE_TO_TOKEN' and kind != 'LOGOUT' -%}
-  {%- do doc.user.update({'name': name}) -%}
+    'log': {'file': {'path': '/opt/keycloak/data/log/keycloak.log'}, 'level': level,
+            'logger': 'org.keycloak.events', 'offset': offset},
+    'process': {'thread': {'name': thread}},
+    'related': related,
+    'source': {'address': p.ip, 'ip': p.ip},
+    'tags': ['preserve_original_event', 'forwarded', 'keycloak-log'],
+    'user': user} -%}
+{%- if url is not none -%}
+  {%- set parts = url.split('/') -%}
+  {%- do doc.update({'url': {'original': url, 'scheme': parts[0][:-1], 'domain': parts[2],
+      'path': '/' ~ parts[3:] | join('/')}}) -%}
+  {%- do related.update({'hosts': [parts[2]]}) -%}
 {%- endif -%}
-{%- if op == 'CREATE' or op == 'DELETE' -%}
-  {%- do doc.update({'user': {'id': uid, 'target': {'id': target_id}}}) -%}
-{%- endif -%}
-{{- doc|tojson -}}
+{{- doc | tojson -}}
