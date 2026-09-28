@@ -12,11 +12,10 @@
 {%- set hq = module.heapq -%}
 {%- set sec = 1000000 -%}
 {%- set hour = 3600 * sec -%}
-{#- Guard window: a background CleanedUp is reported as CleanupFailed
-    when the same endpoint saw Detected -> CleanupFailed -> Detected for
-    the same threat and file within this window, so the full chain stays
-    episode-only. -#}
-{%- set guard = 3 * hour -%}
+{#- Chain window: Detected -> CleanupFailed -> Detected -> CleanedUp
+    for one endpoint, threat and file, counted from the first Detected
+    (millisecond event time, as written). -#}
+{%- set within_ms = 7200 * 1000 -%}
 {%- set incidents_per_day = 150 -%}
 {%- set diurnal = [0.25, 0.25, 0.25, 0.25, 0.25, 0.4, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.5, 0.4, 0.3, 0.25, 0.25, 0.25] -%}
 {%- set user_dirs = ['Downloads', 'Downloads', 'Downloads', 'Desktop', 'Documents', 'AppData\\Local\\Temp', 'AppData\\Local\\Temp', 'AppData\\Roaming\\Microsoft\\Windows\\Start Menu\\Programs\\Startup', 'AppData\\Local\\Microsoft\\Windows\\INetCache\\IE'] -%}
@@ -101,17 +100,18 @@
     {%- endif -%}
   {%- endif -%}
 {%- endmacro -%}
-{%- macro armed(hist, th, p) -%}
-  {#- 1 when hist holds Detected -> CleanupFailed -> Detected for the
-      threat and file, in order. -#}
-  {%- set st = namespace(s=0) -%}
-  {%- for e in hist if e[2] == th and e[3] == p -%}
-    {%- if st.s == 0 and e[1] == 'D' -%}{%- set st.s = 1 -%}
-    {%- elif st.s == 1 and e[1] == 'CF' -%}{%- set st.s = 2 -%}
-    {%- elif st.s == 2 and e[1] == 'D' -%}{%- set st.s = 3 -%}
-    {%- endif -%}
+{%- macro pick_start(lo, hi, sq, floor) -%}
+  {#- Uniform time in [lo, hi) accepted with the relative incident rate
+      of its UTC hour (squared plus floor when sq), by rejection. -#}
+  {%- set r = namespace(t=lo + module.builtins.int(module.rand.number.floating(0, 1) * (hi - lo)), done=false) -%}
+  {%- set cmax = shared.get('curve') | max -%}
+  {%- for _ in range(200) if not r.done -%}
+    {%- set r.t = lo + module.builtins.int(module.rand.number.floating(0, 1) * (hi - lo)) -%}
+    {%- set c = shared.get('curve')[module.datetime.datetime.fromtimestamp(r.t / 1000000, module.datetime.timezone.utc).hour] / cmax -%}
+    {%- set acc = (c * c + floor) / (1 + floor) if sq else c -%}
+    {%- if module.rand.number.floating(0, 1) < acc -%}{%- set r.done = true -%}{%- endif -%}
   {%- endfor -%}
-  {{- 1 if st.s == 3 else 0 -}}
+  {{- r.t -}}
 {%- endmacro -%}
 {%- if shared.get('queue') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
@@ -124,7 +124,7 @@
   {%- do shared.update({'queue': [], 'seq': 0}) -%}
   {%- set eps = [] -%}
   {%- for r in samples.endpoints -%}
-    {%- do eps.append({'host': r.hostname, 'ip': r.ip, 'eid': r.endpoint_id, 'etype': r.endpoint_type, 'user': r.user, 'uid': r.user_id, 'w': r.weight | float, 'hist': []}) -%}
+    {%- do eps.append({'host': r.hostname, 'ip': r.ip, 'eid': r.endpoint_id, 'etype': r.endpoint_type, 'user': r.user, 'uid': r.user_id, 'w': r.weight | float, 'seqm': {}}) -%}
   {%- endfor -%}
   {%- set threats = [] -%}
   {%- for r in samples.threats -%}
@@ -138,6 +138,12 @@
   {%- endfor -%}
   {%- do shared.update({'eps': eps, 'threats': threats, 'ep_idx': range(eps | length) | list, 'ep_w': eps | map(attribute='w') | list, 'ep_last_a': none, 'ep_last_t': none}) -%}
   {%- set total_w = eps | sum(attribute='w') -%}
+  {#- Relative incident rate per UTC hour: servers flat, computers
+      thinned by the diurnal factor. -#}
+  {%- set srv_w = eps | selectattr('etype', 'equalto', 'server') | sum(attribute='w') -%}
+  {%- set curve = [] -%}
+  {%- for h in range(24) -%}{%- do curve.append(srv_w + (total_w - srv_w) * diurnal[h]) -%}{%- endfor -%}
+  {%- do shared.set('curve', curve) -%}
   {%- for a in range(eps | length) -%}
     {#- Mean incident gap from the endpoint's weight; lognormal sigma
         1.1. First occurrences are a uniform point of a length-biased
@@ -152,7 +158,10 @@
     {%- endif -%}
   {%- endfor -%}
   {%- if params.anomaly_mode -%}
-    {{- push(now + hour, {'k': 'ep'}) -}}
+    {#- First episode within the first min(interval, 24 h), its hour
+        following the incident rate. -#}
+    {%- set first_w = module.builtins.int([params.anomaly_interval_hours, 24] | min * hour) -%}
+    {{- push(pick_start(now, now + first_w, false, 0) | int, {'k': 'ep'}) -}}
   {%- endif -%}
 {%- endif -%}
 {%- set q = shared.get('queue') -%}
@@ -175,25 +184,34 @@
     {{- push(top[0] + (ln(1296000, 1.0) | int), it) -}}
   {%- elif it.k == 'ep' -%}
     {#- Episode: Detected -> CleanupFailed -> Detected -> CleanedUp for
-        one threat and file on one endpoint. The start is a random
-        delay after the due time; the next due time counts from the
-        actual start. Endpoint and threat rotate. -#}
-    {%- set start = top[0] + module.rand.number.integer(0, [hour, interval // 8] | min) -%}
+        one threat and file on one endpoint, starting at the scheduled
+        time. The next start is drawn in a window of width
+        w = min(interval / 4, 6 h) centred one interval after this
+        start, weighted by the squared incident rate of the hour plus a
+        floor. Endpoint and threat rotate. -#}
+    {%- set start = top[0] -%}
     {%- set a = namespace(v=shared.get('ep_last_a')) -%}
     {%- for _ in range(50) if a.v == shared.get('ep_last_a') -%}{%- set a.v = module.rand.weighted_choice(shared.get('ep_idx'), shared.get('ep_w')) -%}{%- endfor -%}
     {%- set th = namespace(v=shared.get('ep_last_t')) -%}
     {%- for _ in range(50) if th.v == shared.get('ep_last_t') -%}{%- set th.v = pick_threat('malware') | int -%}{%- endfor -%}
     {%- set p = pick_path(a.v, th.v) -%}
+    {#- Step gaps from the ordinary distributions, redrawn in the rare
+        case that the episode would outlast the chain window. -#}
+    {%- set g = namespace(d=[within_ms * 1000, 0, 0]) -%}
+    {%- for _ in range(50) if g.d | sum >= within_ms * 1000 -%}
+      {%- set g.d = [ln(40, 0.9) | int, ln(600, 0.8) | int, ln(15, 1.0) | int] -%}
+    {%- endfor -%}
     {%- set t = start -%}
     {{- row(a.v, 'D', th.v, p, t, true) -}}
-    {%- set t = t + (ln(40, 0.9) | int) -%}
+    {%- set t = t + g.d[0] -%}
     {{- row(a.v, 'CF', th.v, p, t, true) -}}
-    {%- set t = t + (ln(600, 0.8) | int) -%}
+    {%- set t = t + g.d[1] -%}
     {{- row(a.v, 'D', th.v, p, t, true) -}}
-    {%- set t = t + (ln(15, 1.0) | int) -%}
+    {%- set t = t + g.d[2] -%}
     {{- row(a.v, 'CU', th.v, p, t, true) -}}
     {%- do shared.update({'ep_last_a': a.v, 'ep_last_t': th.v}) -%}
-    {{- push(start + interval, {'k': 'ep'}) -}}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {{- push(pick_start(start + interval - w // 2, start + interval + w // 2, true, 0.05) | int, {'k': 'ep'}) -}}
   {%- else -%}
     {%- set out.due = top[0] -%}
     {%- set out.item = it -%}
@@ -204,11 +222,41 @@
 {%- set ep = eps[it.a] -%}
 {%- set c = namespace(v=it.c) -%}
 {%- if it.t is not none -%}
-  {%- set keep = ep.hist | selectattr(0, 'ge', out.due - guard) | list -%}
-  {%- if keep | length > 200 -%}{%- set keep = keep[-200:] -%}{%- endif -%}
-  {%- do ep.update({'hist': keep}) -%}
-  {%- if c.v == 'CU' and not it.ep and (armed(keep, it.t, it.p) | int) == 1 -%}{%- set c.v = 'CF' -%}{%- endif -%}
-  {%- do ep.hist.append([out.due, c.v, it.t, it.p]) -%}
+  {#- Mirror of the chain matcher per endpoint, threat and file: partial
+      matches [next step, first Detected ms] advance on every matching
+      row and are all kept (no cap, no reset when a chain completes)
+      until 7200 s after their first Detected, so no later row
+      completes a chain with rows of a completed one; the chain binds no
+      values, so the most advanced partial per first Detected covers
+      every candidate run. Guard (both modes): a
+      background CleanedUp that would complete the chain is reported as
+      CleanupFailed at the same time. -#}
+  {%- set tms = out.due // 1000 -%}
+  {%- set sm = ep.seqm -%}
+  {%- for k in sm | list -%}
+    {%- set live = namespace(v=false) -%}
+    {%- for p in sm[k] if tms - p[1] <= within_ms -%}{%- set live.v = true -%}{%- endfor -%}
+    {%- if not live.v -%}{%- do sm.pop(k) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set sk = it.t ~ '|' ~ it.p -%}
+  {%- set steps = ['D', 'CF', 'D', 'CU'] -%}
+  {%- set st = namespace(armed=false) -%}
+  {%- for p in sm.get(sk, []) if p[0] == 3 and tms - p[1] <= within_ms -%}{%- set st.armed = true -%}{%- endfor -%}
+  {%- if c.v == 'CU' and not it.ep and st.armed -%}{%- set c.v = 'CF' -%}{%- endif -%}
+  {%- set parts = [] -%}
+  {%- for p in sm.get(sk, []) if tms - p[1] <= within_ms -%}
+    {%- if p[0] < 3 and c.v == steps[p[0]] -%}
+      {%- do parts.append([p[0] + 1, p[1]]) -%}
+    {%- else -%}
+      {%- do parts.append(p) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if c.v == 'D' -%}{%- do parts.append([1, tms]) -%}{%- endif -%}
+  {%- if not parts -%}
+    {%- do sm.pop(sk, none) -%}
+  {%- else -%}
+    {%- do sm.update({sk: parts}) -%}
+  {%- endif -%}
 {%- endif -%}
 {#- Event type, group, API severity and description per kind. Threat
     descriptions follow the "<text>: '<threat>' at '<path>'" form that
