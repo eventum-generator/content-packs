@@ -14,13 +14,28 @@
 {%- set hq = module.heapq -%}
 {%- set ln = module.math.log -%}
 {%- set now = timestamp.timestamp() | int -%}
-{#- Window after four failures of one mailbox and client IP in which
-    ordinary traffic never lets that pair's POP3 login through. -#}
-{%- set guard = 1200 -%}
-{%- set hour = (now % 86400) / 3600 -%}
-{%- set load = 0.25 + 0.75 * module.math.sin(module.math.pi * (hour - 5) / 15)
-    if 5 < hour < 20 else 0.25 -%}
-{%- set load = [load, 0.25] | max -%}
+{#- Chain window: four failures, an IMAP success and a POP3 success of
+    one mailbox and client IP, counted from the first failure. -#}
+{%- set window = 900 -%}
+{#- UTC daytime load curve of the background; also weights episode
+    start times. -#}
+{%- macro curve(t) -%}
+  {%- set h = (t % 86400) / 3600 -%}
+  {{- [0.25 + 0.75 * module.math.sin(module.math.pi * (h - 5) / 15) if 5 < h < 20 else 0.25, 0.25] | max -}}
+{%- endmacro -%}
+{#- A start time in [lo, lo + width): drawn by rejection with weight
+    curve (first episode) or curve^2 + 0.05 (later episodes). -#}
+{%- macro draw_start(lo, width, squared) -%}
+  {%- set pick = namespace(t=lo + (module.rand.number.floating(0, width) | int)) -%}
+  {%- for _ in range(500) -%}
+    {%- set c = curve(pick.t) | float -%}
+    {%- set w = (c * c + 0.05) / 1.05 if squared else c -%}
+    {%- if module.rand.number.floating(0, 1) < w -%}{%- break -%}{%- endif -%}
+    {%- set pick.t = lo + (module.rand.number.floating(0, width) | int) -%}
+  {%- endfor -%}
+  {{- pick.t -}}
+{%- endmacro -%}
+{%- set load = curve(now) | float -%}
 {%- if shared.get('heap') is none -%}
   {%- set ipv4 = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}' -%}
   {%- if params.anomaly_mode is not boolean -%}
@@ -122,9 +137,10 @@
     {%- do hq.heappush(heap, [now + (num.floating(0, 2 * gap) | int), num.floating(0, 1), {'k': 'dev', 'd': device}]) -%}
   {%- endfor -%}
   {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
+  {%- set first_start = draw_start(now, [interval, 86400] | min, false) | int -%}
   {%- do shared.update({'heap': heap, 'users': users, 'personal': personal, 'pool': pool,
       'hostile': hostile, 'repeat': org.sample(hostile, 24),
-      'fails': {}, 'public_seen': {}, 'pid': num.integer(2000, 400000),
+      'chains': {}, 'public_seen': {}, 'pid': num.integer(2000, 400000),
       'clock': {'web': now + (num.exponential(1 / 150) | int),
                 'brute': now + (num.exponential(1 / 6000) | int),
                 'spray': now + (num.exponential(1 / 3600) | int),
@@ -132,15 +148,18 @@
                 'pw': now + (num.exponential(1 / 18000) | int),
                 'setup': now + (num.exponential(1 / 36000) | int),
                 'cleanup': now + 600,
-                'ep_due': now + interval,
-                'ep_start': now + interval + num.integer(0, 900)},
+                'ep_start': first_start},
       'last_ep': {'u': none, 'ip': none}}) -%}
 {%- endif -%}
 {%- set heap = shared.get('heap') -%}
 {%- set clock = shared.get('clock') -%}
 {%- set pool = shared.get('pool') -%}
 {%- set users = shared.get('users') -%}
-{%- set fails = shared.get('fails') -%}
+{#- Per mailbox|IP: open partial chains [next step, first failure time],
+    as a detector matching the chain would hold them (steps 0-3
+    failures, 4 IMAP success, 5 POP3 success; at most 8 kept; a
+    completion clears the pair). -#}
+{%- set chains = shared.get('chains') -%}
 {#- Hostile source of a scan: a recurring host, a residential proxy from
     the same ranges as roaming clients, or a one-off host. -#}
 {%- set scanner = rand.choice(shared.get('repeat')) if rand.chance(0.6)
@@ -223,9 +242,9 @@
   {%- do clock.update({'setup': now + 1 + (num.exponential(1 / 36000) | int)}) -%}
 {%- endif -%}
 {%- if clock.cleanup <= now -%}
-  {%- for key in fails | list -%}
-    {%- if fails[key][-1] < now - guard -%}
-      {%- do fails.pop(key) -%}
+  {%- for key in chains | list -%}
+    {%- if chains[key][-1][1] < now - window -%}
+      {%- do chains.pop(key) -%}
     {%- endif -%}
   {%- endfor -%}
   {%- do clock.update({'cleanup': now + 600}) -%}
@@ -235,18 +254,26 @@
       IMAP and POP3 from public addresses, and an external address; both
       differ from the previous episode's, and the address is not one the
       mailbox's clients use right now. The next episode is due one
-      interval after this actual start, plus a random start delay. -#}
+      interval after this actual start; the start is drawn in a window
+      of min(interval / 4, 6 h) centred on that due time, weighted
+      towards busy hours. -#}
   {%- set last = shared.get('last_ep') -%}
   {%- set seen = shared.get('public_seen') -%}
   {%- set candidates = [] -%}
+  {%- set capable = [] -%}
   {%- set roaming = [] -%}
   {%- for user in users -%}
     {%- if user.u != last.u and seen.get(user.u ~ '|imap') -%}
       {%- do roaming.append(user) -%}
       {%- if seen.get(user.u ~ '|pop3') -%}{%- do candidates.append(user) -%}{%- endif -%}
     {%- endif -%}
+    {#- Early in a run few clients have roamed yet: fall back to a mailbox
+        with a roaming client that polls POP3. -#}
+    {%- for device in user.devs if user.u != last.u and device.kind != 'ws' and device.proto != 'imap' -%}
+      {%- if loop.first -%}{%- do capable.append(user) -%}{%- endif -%}
+    {%- endfor -%}
   {%- endfor -%}
-  {%- set candidates = candidates or roaming or users -%}
+  {%- set candidates = candidates or capable or roaming or users -%}
   {%- set user = rand.choice(candidates) -%}
   {%- set own = [] -%}
   {%- for device in user.devs -%}{%- do own.append(device.ip) -%}{%- endfor -%}
@@ -258,7 +285,8 @@
   {%- do last.update({'u': user.u, 'ip': ip.v}) -%}
   {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'ep', 'u': user.u, 'ip': ip.v, 's': 0}]) -%}
   {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
-  {%- do clock.update({'ep_due': now + interval, 'ep_start': now + interval + num.integer(0, 900)}) -%}
+  {%- set width = [interval // 4, 21600] | min -%}
+  {%- do clock.update({'ep_start': draw_start(now + interval - width // 2, width, true) | int}) -%}
 {%- endif -%}
 {#- Pop due work until one login is produced. -#}
 {%- set out = namespace(done=false, u=none, ip=none, proto='imap', ok=true, att=1, ep=false) -%}
@@ -294,9 +322,6 @@
         {%- do d.update({'ip': d.office if place == 'office' else d.home if place == 'home'
             else '10.8.' ~ num.integer(0, 3) ~ '.' ~ num.integer(2, 254)}) -%}
       {%- endif -%}
-      {%- set key = d.u ~ '|' ~ d.ip -%}
-      {%- set f = fails.get(key, []) -%}
-      {%- set blocked = f | length >= 4 and f[-4] > now - guard -%}
       {%- set idle = d.last and now - d.last > 14400 -%}
       {%- if d.proto != 'pop3' and rand.chance(0.06 if idle and d.kind != 'mobile' else 0.012) -%}
         {#- A rejected login: a mistyped password at the client prompt
@@ -306,13 +331,20 @@
         {%- set out.done = true -%}
         {%- set out.u = d.u -%}{%- set out.ip = d.ip -%}{%- set out.proto = 'imap' -%}{%- set out.ok = false -%}
         {%- do hq.heappush(heap, [now + 1 + (num.lognormal(ln(12), 0.7) | int), num.floating(0, 1), item]) -%}
-      {%- elif d.proto == 'pop3' and blocked -%}
-        {%- do hq.heappush(heap, [f[-4] + guard + num.integer(1, 300), num.floating(0, 1), item]) -%}
       {%- else -%}
         {%- do d.update({'last': now, 'rw': 0}) -%}
-        {%- set first = 'pop3' if d.proto == 'pop3' or (d.proto == 'dual' and not blocked and rand.chance(0.35)) else 'imap' -%}
-        {%- set out.done = true -%}
-        {%- set out.u = d.u -%}{%- set out.ip = d.ip -%}{%- set out.proto = first -%}{%- set out.ok = true -%}
+        {%- set first = 'pop3' if d.proto == 'pop3' or (d.proto == 'dual' and rand.chance(0.35)) else 'imap' -%}
+        {#- Guard: a POP3 login that would complete the chain for this
+            mailbox and IP is dropped; its time and the client's
+            schedule stay as they are. -#}
+        {%- set open = namespace(v=false) -%}
+        {%- for p in chains.get(d.u ~ '|' ~ d.ip, []) if p[0] == 5 and now - p[1] <= window -%}
+          {%- set open.v = true -%}
+        {%- endfor -%}
+        {%- if not (first == 'pop3' and open.v) -%}
+          {%- set out.done = true -%}
+          {%- set out.u = d.u -%}{%- set out.ip = d.ip -%}{%- set out.proto = first -%}{%- set out.ok = true -%}
+        {%- endif -%}
         {%- if d.proto == 'dual' -%}
           {%- do hq.heappush(heap, [now + 1 + (num.lognormal(ln(15), 1.0) | int), num.floating(0, 1),
               {'k': 'p2', 'u': d.u, 'ip': d.ip, 'proto': 'imap' if first == 'pop3' else 'pop3'}]) -%}
@@ -321,10 +353,11 @@
       {%- endif -%}
     {%- endif -%}
   {%- elif item.k == 'p2' -%}
-    {%- set f = fails.get(item.u ~ '|' ~ item.ip, []) -%}
-    {%- if item.proto == 'pop3' and f | length >= 4 and f[-4] > now - guard -%}
-      {%- do hq.heappush(heap, [f[-4] + guard + num.integer(1, 300), num.floating(0, 1), item]) -%}
-    {%- else -%}
+    {%- set open = namespace(v=false) -%}
+    {%- for p in chains.get(item.u ~ '|' ~ item.ip, []) if p[0] == 5 and now - p[1] <= window -%}
+      {%- set open.v = true -%}
+    {%- endfor -%}
+    {%- if not (item.proto == 'pop3' and open.v) -%}
       {%- set out.done = true -%}
       {%- set out.u = item.u -%}{%- set out.ip = item.ip -%}{%- set out.proto = item.proto -%}{%- set out.ok = true -%}
     {%- endif -%}
@@ -373,10 +406,27 @@
 {%- if out.ok and not out.ep and not client.startswith('10.') -%}
   {%- do shared.get('public_seen').update({user ~ '|' ~ protocol: true}) -%}
 {%- endif -%}
-{%- if not out.ok -%}
-  {%- set key = user ~ '|' ~ client -%}
-  {%- set f = fails.get(key, []) + [now] -%}
-  {%- do fails.update({key: f[-4:]}) -%}
+{%- set key = user ~ '|' ~ client -%}
+{%- set step = 'F' if not out.ok else 'I' if protocol == 'imap' else 'P' -%}
+{%- set kept = [] -%}
+{%- set m = namespace(done=false) -%}
+{%- for p in chains.get(key, []) if now - p[1] <= window -%}
+  {%- if m.done -%}
+  {%- elif step == ('F' if p[0] < 4 else 'I' if p[0] == 4 else 'P') -%}
+    {%- if p[0] == 5 -%}
+      {%- set m.done = true -%}
+    {%- else -%}
+      {%- do kept.append([p[0] + 1, p[1]]) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- do kept.append(p) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if step == 'F' and not m.done -%}{%- do kept.append([1, now]) -%}{%- endif -%}
+{%- if kept and not m.done -%}
+  {%- do chains.update({key: kept[-8:]}) -%}
+{%- else -%}
+  {%- do chains.pop(key, none) -%}
 {%- endif -%}
 {%- set session_id = module.base64.b64encode(module.os.urandom(12)).decode('ascii') -%}
 {%- set details = 'user=<' ~ user ~ '>, method=PLAIN, rip=' ~ client
