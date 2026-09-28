@@ -4,17 +4,17 @@ Synthetic ISC BIND 9.18 `queries` category records from one recursive resolver s
 
 ## Event Types
 
-Shares are measured from a 78-hour default-configuration capture (23,525 events, about 300 per hour on average; each client follows its own daily activity window). The traffic mix is a synthetic assumption, not measured resolver traffic.
+Shares are measured from a 156-hour default-configuration capture (55,810 events, about 360 per hour on average; each client follows its own daily activity window). The traffic mix is a synthetic assumption, not measured resolver traffic.
 
 | Query | Share | Category | Description |
 | --- | ---: | --- | --- |
-| `A` | 41.8% | network | Host lookups under `example.com`, `example.net`, `example.org`, plus the mail host after an `MX` |
-| `AAAA` | 20.9% | network | IPv6 lookups, usually right after the matching `A` |
-| `TXT` on analytics zones | 11.8% | network | Runs of high-entropy labels under `metrics.example.net` / `insights.example.org` |
-| `PTR` | 11.4% | network | Reverse lookups in `10.in-addr.arpa` |
+| `A` | 41.1% | network | Host lookups under `example.com`, `example.net`, `example.org`, plus the mail host after an `MX` |
+| `AAAA` | 20.5% | network | IPv6 lookups, usually right after the matching `A` |
+| `TXT` on analytics zones | 12.3% | network | Runs of high-entropy labels under `metrics.example.net` / `insights.example.org` |
+| `PTR` | 11.6% | network | Reverse lookups in `10.in-addr.arpa` |
 | `MX` | 5.8% | network | Mail-exchanger lookups |
-| `TXT` on tunnel zones | 3.3% | network | Short high-entropy runs under the tunnel zones, plus the anomaly episodes |
-| `TXT` DKIM / DMARC | 3.8% | network | `<selector>._domainkey.<domain>` and `_dmarc.<domain>` |
+| `TXT` on tunnel zones | 3.4% | network | Short high-entropy runs under the tunnel zones, plus the anomaly episodes |
+| `TXT` DKIM / DMARC | 3.9% | network | `<selector>._domainkey.<domain>` and `_dmarc.<domain>` |
 | `A` / `AAAA` / `NS` on tunnel-zone apex | 1.3% | network | Plain lookups of the tunnel zones themselves |
 
 About 3% of queries arrive over TCP (`T` flag). Flags follow the BIND order: recursion (`+`/`-`), `E(0)`, `T`, `D`, then cookie `V` or `K`. About 90% of queries carry EDNS (`E(0)`). DO (`D`) and the cookie flags come from the EDNS OPT record, so they appear only together with `E(0)`; a query without EDNS shows only `+`/`-` and `T`.
@@ -24,13 +24,13 @@ About 3% of queries arrive over TCP (`T` flag). Flags follow the BIND order: rec
 A DNS-exfiltration burst: one client sends a run of TXT queries to one tunnel zone, each with a distinct high-entropy first label.
 
 1. `TXT` query for `<hex>.<zone>` from client `C`, where `<zone>` is one of `tunnel_zones`.
-2. Seven or more further `TXT` queries from `C` for new `<hex>.<zone>` names under the same `<zone>`.
+2. Seven further `TXT` queries from `C` for new `<hex>.<zone>` names under the same `<zone>`.
 
 - **Linking fields:** `source.ip` and `dns.question.registered_domain`. Every label is new, so `dns.question.name` never repeats.
-- **Episode shape:** 10 to 16 queries with random log-normal spacing (median about 12 s), spanning 122-181 s in the measured capture.
-- **Recurrence:** an episode becomes due every `anomaly_interval_hours` of source time (default 24, minimum 2). Its start comes after an exponential delay (mean 15 minutes). The next due time counts from the actual start, and missed intervals are never caught up. The measured default capture has 3 episodes with gaps of 25.15 h and 24.05 h, and a 6-hour run has 12 episodes with gaps of 6.04-6.63 h.
+- **Episode shape:** exactly 8 queries with random log-normal spacing (median about 12 s), spanning about 1.5-2 minutes; nothing from the episode follows the query that completes the chain. When the same client already sent TXT queries to that zone in the preceding hour, the chain completes before the eighth episode query, and the remaining episode queries are not sent. Each episode therefore completes the chain exactly once. Runs of 8 or more high-entropy TXT queries from one client to one zone within an hour are ordinary in the background too: the analytics zones receive 227-284 of them per 156-hour background capture.
+- **Recurrence:** the first episode starts within the first `anomaly_interval_hours` (at most 24 h) of generation, at a time of day drawn from the overall background hour curve (the combined activity windows of all clients). Each later episode is due `anomaly_interval_hours` after the actual start of the previous one (default 24, minimum 2) and starts within a window centred on that due time, a quarter of the interval wide (at most 6 hours), favouring busier hours. A 156-hour default capture has 7 episodes, the first after 7.6 h, with gaps of 21.6-26.7 h; a 156-hour run at 6 hours has 26 episodes with gaps of 5.4-6.7 h. Because the client activity windows are spread over the day, the background hour curve is nearly flat (2.7-5.4% of queries per hour), and so are the episode start hours.
 - **Variation:** the client and the tunnel zone both change from one episode to the next, and every label is freshly random.
-- **Background overlap:** each part of the chain also occurs on its own in both modes. All 24 clients send high-entropy TXT queries to the tunnel zones in short runs (geometric length, 1-2 queries typical), and they also look up the zone apex. Analytics zones get high-entropy TXT runs of 8 or more queries per hour (about 870-1,360 per 78-hour capture). A guard on the final chain step keeps background traffic below 8 tunnel-zone TXT queries per client and zone within an hour (measured maximum: 6). Only an episode completes the chain.
+- **Background overlap:** each part of the chain also occurs on its own in both modes. All 24 clients send high-entropy TXT queries to the tunnel zones in short runs (geometric length, 1-2 queries typical), and they also look up the zone apex. A guard acts on the final chain step only: a background TXT query that would follow seven or more TXT queries from its client to the same tunnel zone within the preceding hour keeps its time and goes to an analytics zone instead. Only an episode completes the chain. In six 156-hour background captures, 49 runs of seven such queries occur. A further TXT query from the same client to the same zone follows at 0.25-1.1 per hour just after the one-hour window. TXT queries from that client to other zones (4-11 per hour) and same-zone queries from other clients (4-9 per hour) occur at similar rates inside and outside the window.
 - **Detection idea:** alert when a single client sends 8 or more TXT queries with distinct long labels to one watched zone within an hour. Query logs record requests only, with no response codes or answer data, so a match shows the pattern, not that data was actually transferred.
 
 `anomaly_mode` defaults to `true`. Set it to `false` to get background traffic only, with no complete chain.
@@ -80,7 +80,7 @@ For a batch capture, set `start` and `end` on the `cron` input and run with `--l
 An episode event copied from the default `anomaly_mode: true` capture:
 
 ```json
-{"@timestamp": "2026-09-01T21:15:10.279000+00:00", "bind9": {"query": {"client_object": "@0x7fed853a1c48", "flags": "+E(0)K"}}, "destination": {"ip": "10.20.30.53", "port": 53}, "dns": {"question": {"class": "IN", "name": "3e1ce784fc1248e6fad96dfda3b.telemetry.example.test", "registered_domain": "telemetry.example.test", "type": "TXT"}, "type": "query"}, "ecs": {"version": "8.17.0"}, "event": {"action": "dns-query", "category": ["network"], "dataset": "bind9.query", "kind": "event", "original": "2026-09-01T21:15:10.279Z queries: info: client @0x7fed853a1c48 10.20.40.26#8731 (3e1ce784fc1248e6fad96dfda3b.telemetry.example.test): query: 3e1ce784fc1248e6fad96dfda3b.telemetry.example.test IN TXT +E(0)K (10.20.30.53)", "type": ["protocol", "info"]}, "host": {"name": "ns1.example.test"}, "network": {"protocol": "dns", "transport": "udp"}, "observer": {"hostname": "ns1.example.test", "product": "BIND", "type": "dns", "vendor": "ISC"}, "related": {"ip": ["10.20.40.26", "10.20.30.53"]}, "source": {"ip": "10.20.40.26", "port": 8731}}
+{"@timestamp": "2026-09-01T07:38:33.538000+00:00", "bind9": {"query": {"client_object": "@0x7f1a4b8ee4a8", "flags": "+E(0)"}}, "destination": {"ip": "10.20.30.53", "port": 53}, "dns": {"question": {"class": "IN", "name": "5d91b8581444e3e8edd8dba61ff18aceb65aa7e62c87a7a4b3ff70a9c.sync.example.test", "registered_domain": "sync.example.test", "type": "TXT"}, "type": "query"}, "ecs": {"version": "8.17.0"}, "event": {"action": "dns-query", "category": ["network"], "dataset": "bind9.query", "kind": "event", "original": "2026-09-01T07:38:33.538Z queries: info: client @0x7f1a4b8ee4a8 10.20.40.11#17988 (5d91b8581444e3e8edd8dba61ff18aceb65aa7e62c87a7a4b3ff70a9c.sync.example.test): query: 5d91b8581444e3e8edd8dba61ff18aceb65aa7e62c87a7a4b3ff70a9c.sync.example.test IN TXT +E(0) (10.20.30.53)", "type": ["protocol", "info"]}, "host": {"name": "ns1.example.test"}, "network": {"protocol": "dns", "transport": "udp"}, "observer": {"hostname": "ns1.example.test", "product": "BIND", "type": "dns", "vendor": "ISC"}, "related": {"ip": ["10.20.40.11", "10.20.30.53"]}, "source": {"ip": "10.20.40.11", "port": 17988}}
 ```
 
 ## Limitations

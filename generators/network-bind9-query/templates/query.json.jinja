@@ -18,6 +18,26 @@
 {%- set tunnels = params.tunnel_zones -%}
 {%- set analytics = params.analytics_zones -%}
 
+{#- Draw an episode start in [a, b): 10-minute slots weighted by the
+    background hour curve (sq: curve^2 + 0.05), uniform within a slot. -#}
+{%- macro draw_start(a, b, sq) -%}
+  {%- set curve = shared.get('curve') -%}
+  {%- set base = (a // 600) * 600 -%}
+  {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
+  {%- for i in range((b - base) // 600 + 1) -%}
+    {%- set lo = [a, base + i * 600] | max -%}
+    {%- set hi = [b, base + (i + 1) * 600] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = curve[((base + i * 600) % 86400) // 600] -%}
+      {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
+      {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set j = module.rand.weighted_choice(range(ws | length) | list, ws) -%}
+  {%- do shared.set('start_at',
+      module.rand.number.integer(lows[j], highs[j] - 1)) -%}
+{%- endmacro -%}
+
 {%- if not shared.get('initialized', false) -%}
   {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {%- if params.client_count < 4 or params.client_first + params.client_count > 255 -%}
@@ -47,22 +67,38 @@
       {%- do web.append(host ~ '.' ~ dom) -%}
     {%- endfor -%}
   {%- endfor -%}
+  {#- Background hour curve per 10-minute slot of the UTC day: the
+      weighted sum of every client's activity factor, max 1. -#}
+  {%- set wsum = weights | sum -%}
+  {%- set curve = [] -%}
+  {%- for k in range(144) -%}
+    {%- set h = (k + 0.5) / 6 -%}
+    {%- set acc = namespace(v=0) -%}
+    {%- for ip in clients -%}
+      {%- set dw = day[ip] -%}
+      {%- set acc.v = acc.v + weights[loop.index0]
+          * (1.0 if ((h - dw[0]) % 24) < dw[1] else dw[2]) -%}
+    {%- endfor -%}
+    {%- do curve.append(acc.v / wsum) -%}
+  {%- endfor -%}
+  {%- set cmax = curve | max -%}
+  {%- set norm = [] -%}
+  {%- for v in curve -%}{%- do norm.append(v / cmax) -%}{%- endfor -%}
   {%- do shared.update({'initialized': true, 'clients': clients,
-      'weights': weights, 'day': day, 'web': web, 'q': [], 'hist': {},
-      'next_due': now + (interval * 3600) | int, 'start_at': none,
-      'last_client': none, 'last_zone': none}) -%}
+      'weights': weights, 'day': day, 'web': web, 'q': [], 'm': {},
+      'curve': norm, 'start_at': none, 'last_client': none,
+      'last_zone': none}) -%}
+  {#- First episode inside the first min(interval, 24 h), its time of
+      day drawn from the background hour curve. -#}
+  {%- if params.anomaly_mode -%}
+    {{- draw_start(now, now + ([interval, 24] | min * 3600) | int, false) -}}
+  {%- endif -%}
 {%- endif -%}
 
 {%- set clients = shared.get('clients') -%}
 {%- set q = shared.get('q') -%}
 {%- set web = shared.get('web') -%}
-{%- set hist = shared.get('hist') -%}
-{%- if now % 600 == 0 -%}
-  {%- for k in hist | list -%}
-    {%- set keep = hist[k] | select('gt', now - window) | list -%}
-    {%- if keep -%}{%- do hist.update({k: keep}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
-  {%- endfor -%}
-{%- endif -%}
+{%- set mstate = shared.get('m') -%}
 {%- set dt = timestamp.astimezone(utc) -%}
 {%- set hour = dt.hour + dt.minute / 60 -%}
 
@@ -75,9 +111,9 @@
 {%- endmacro -%}
 
 {#- Queue one query: name, registered zone, type, transport, at time. -#}
-{%- macro enq(client, name, zone, qtype, tcp, at) -%}
+{%- macro enq(client, name, zone, qtype, tcp, at, ep=false) -%}
   {%- do q.append({'due': at, 'client': client, 'name': name, 'zone': zone,
-      'qtype': qtype, 'tcp': tcp}) -%}
+      'qtype': qtype, 'tcp': tcp, 'ep': ep}) -%}
 {%- endmacro -%}
 
 {#- 1. Background: one merged Poisson stream of independent clients,
@@ -131,11 +167,8 @@
     {%- endfor -%}
   {%- else -%}
     {#- Occasional short high-entropy TXT touches on an attacker zone
-        (ordinary background probing / stray lookups). Guard on the
-        final chain step: a client keeps fewer than `chain_steps - 1`
-        background TXT on one tunnel zone within `window` seconds either
-        side, the overflow goes to an analytics zone, so background never
-        completes an ordered run of `chain_steps` TXT to one tunnel. -#}
+        (ordinary background probing / stray lookups). The guard on the
+        final chain step sits at emission (step 3). -#}
     {#- Uniform client (thinned by its own window), so a heavy client
         does not concentrate these touches and the guard rarely fires. -#}
     {%- set u = module.rand.choice(clients) -%}
@@ -144,7 +177,6 @@
       {%- set c = u -%}
     {%- endif -%}
     {%- set zone = module.rand.choice(tunnels) -%}
-    {%- set hk = c ~ '|' ~ zone -%}
     {#- Geometric run length (continue with p 0.35): decays smoothly and
         passes 6 in about 0.2% of runs, so the guard rarely fires. -#}
     {%- set rl = namespace(n=1, go=true) -%}
@@ -155,15 +187,7 @@
     {%- set runlen = rl.n -%}
     {%- set at = namespace(t=now) -%}
     {%- for i in range(runlen) -%}
-      {%- set near = hist.get(hk, []) | select('gt', at.t - window)
-          | select('lt', at.t + window) | list | length -%}
-      {%- if near < chain_steps - 2 -%}
-        {{- enq(c, hexlabel() ~ '.' ~ zone, zone, 'TXT', tcp, at.t) -}}
-        {%- do hist.update({hk: hist.get(hk, []) + [at.t]}) -%}
-      {%- else -%}
-        {%- set alt = module.rand.choice(analytics) -%}
-        {{- enq(c, hexlabel() ~ '.' ~ alt, alt, 'TXT', tcp, at.t) -}}
-      {%- endif -%}
+      {{- enq(c, hexlabel() ~ '.' ~ zone, zone, 'TXT', tcp, at.t) -}}
       {%- set at.t = at.t + gap(15, 0.9) | int -%}
     {%- endfor -%}
   {%- endif -%}
@@ -175,25 +199,28 @@
   {%- endif -%}
 {%- endif -%}
 
-{#- 2. Episode: due by source time, random start delay, next due from
-    the actual start, no catch-up. One rotated client sends a run of
-    high-entropy TXT queries to one rotated attacker zone. -#}
+{#- 2. Episode: one rotated client sends a run of high-entropy TXT
+    queries to one rotated attacker zone. The next start is drawn in a
+    window of w = min(interval / 4, 6 h) centred on due = this start +
+    interval, weighted by the hour curve squared plus a floor. -#}
 {%- if params.anomaly_mode -%}
-  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
-    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 900)) | int) -%}
-  {%- endif -%}
-  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {%- if now >= shared.get('start_at') -%}
     {%- set c = module.rand.choice(clients | reject('equalto', shared.get('last_client')) | list) -%}
     {%- set zone = module.rand.choice(tunnels | reject('equalto', shared.get('last_zone')) | list) -%}
-    {%- set n = module.rand.number.integer(chain_steps + 2, chain_steps + 8) -%}
+    {#- Exactly one completion per episode: `chain_steps` queries, and
+        the rest are skipped once one of them completes the chain (when
+        the client already queried that zone in the past hour). -#}
+    {%- set n = chain_steps -%}
     {%- set at = namespace(t=now) -%}
     {%- for i in range(n) -%}
       {%- set tcp = module.rand.chance(0.03) -%}
-      {{- enq(c, hexlabel() ~ '.' ~ zone, zone, 'TXT', tcp, at.t) -}}
+      {{- enq(c, hexlabel() ~ '.' ~ zone, zone, 'TXT', tcp, at.t, now) -}}
       {%- set at.t = at.t + gap(12, 0.8) | int -%}
     {%- endfor -%}
-    {%- do shared.update({'start_at': none, 'last_client': c, 'last_zone': zone,
-        'next_due': now + (interval * 3600) | int}) -%}
+    {%- do shared.update({'last_client': c, 'last_zone': zone}) -%}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+    {{- draw_start(due - half, due + half, true) -}}
   {%- endif -%}
 {%- endif -%}
 
@@ -206,6 +233,31 @@
 {%- endfor -%}
 {%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
 {%- set e = q.pop(pick.i) -%}
+{%- set ms = module.rand.number.integer(0, 999) -%}
+
+{#- Guard on the final chain step over every binding: a tunnel-zone
+    TXT completes a chain when its client sent `chain_steps - 1` or
+    more emitted TXT to that zone in the preceding `window` s (no cap,
+    no reset). A background TXT that would complete one keeps its time
+    and moves to an analytics zone; an episode row completes at most
+    once per episode, later rows of that episode are skipped. -#}
+{%- if e.qtype == 'TXT' and e.zone in tunnels -%}
+  {%- set tt = now + ms / 1000 -%}
+  {%- set hk = e.client ~ '|' ~ e.zone -%}
+  {%- set recent = mstate.get(hk, []) | select('ge', tt - window) | list -%}
+  {%- if recent | length >= chain_steps - 1 -%}
+    {%- if not e.ep -%}
+      {%- set alt = module.rand.choice(analytics) -%}
+      {%- do e.update({'name': hexlabel() ~ '.' ~ alt, 'zone': alt}) -%}
+    {%- elif shared.get('ep_done') == e.ep -%}
+      {{ dispatch.drop() }}
+    {%- else -%}
+      {%- do shared.set('ep_done', e.ep) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if e.zone in tunnels -%}{%- do recent.append(tt) -%}{%- endif -%}
+  {%- do mstate.update({hk: recent}) -%}
+{%- endif -%}
 
 {#- Flags: recursion, EDNS, TCP, DO, CD, cookie. Order per query.c. -#}
 {%- set rd = '+' if module.rand.chance(0.98) else '-' -%}
@@ -219,7 +271,6 @@
 {%- set flags = rd ~ edns ~ t ~ d ~ ck -%}
 {%- set port = module.rand.number.integer(1024, 65535) -%}
 {%- set obj = '0x7f' ~ module.rand.string.hex(10) -%}
-{%- set ms = module.rand.number.integer(0, 999) -%}
 {%- set iso = module.datetime.datetime.fromtimestamp(now, utc)
     + module.datetime.timedelta(milliseconds=ms) -%}
 {%- set stamp = iso.strftime('%Y-%m-%dT%H:%M:%S') ~ '.' ~ '%03d' | format(ms) ~ 'Z' -%}
