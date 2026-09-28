@@ -27,6 +27,22 @@
 {%- set alert_sigs = sigs | rejectattr('drop') | list -%}
 {%- set paths = ['/', '/index.html', '/login', '/favicon.ico', '/robots.txt', '/about', '/news', '/static/app.js'] -%}
 
+{#- Episode start time in [lo, hi) (epoch s), drawn by rejection with
+    weight curve(hour) ** p (+ 0.1 when p = 2): curve is the background
+    record rate by UTC hour (diurnal visits plus flat probing and
+    blocked attempts), 2.05 by day, 1.6 in the evening, 1.15 at night. -#}
+{%- macro pick_start(lo, hi, p) -%}
+  {%- set r = namespace(t=none, c=lo) -%}
+  {%- for n in range(400) if r.t is none -%}
+    {%- set r.c = lo + module.rand.number.floating(0, hi - lo) -%}
+    {%- set h = (r.c // 3600) % 24 -%}
+    {%- set cv = (1.35 if 7 <= h < 19 else (0.9 if 19 <= h < 23 else 0.45)) + 0.7 -%}
+    {%- set wt = cv / 2.05 if p == 1 else (cv * cv + 0.1) / (2.05 * 2.05 + 0.1) -%}
+    {%- if module.rand.chance(wt) -%}{%- set r.t = r.c -%}{%- endif -%}
+  {%- endfor -%}
+  {{- (r.t if r.t is not none else r.c) | int -}}
+{%- endmacro -%}
+
 {%- if not shared.get('initialized', false) -%}
   {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {%- if params.client_count < 20 or params.client_count > 1000 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
@@ -51,7 +67,7 @@
       'cw': clients | map(attribute='w') | list,
       'sw': params.web_servers | map(attribute='weight') | list,
       'q': [], 'hist': {}, 'counters': counters,
-      'next_due': now + (interval * 3600) | int,
+      'ep_at': pick_start(now, now + ([interval * 3600, 86400] | min), 1) | int,
       'last_client': none, 'last_server': none}) -%}
 {%- endif -%}
 {%- set q = shared.get('q') -%}
@@ -144,10 +160,12 @@
   {%- endfor -%}
 {%- endif -%}
 
-{#- 2. Episode: due by source time, exponential start delay (mean
-    20 min, flat over the day like background probing), next due from
-    the actual start, never catching up. -#}
-{%- if params.anomaly_mode and now >= shared.get('next_due') and module.rand.chance(1 / 1200) -%}
+{#- 2. Episode: the first starts within the first min(interval, 24 h),
+    its hour drawn from the background curve; each next one within
+    w = min(interval / 4, 6 h) centred on its due, one interval after
+    the previous actual start (no catch-up), weighted by curve^2 plus
+    a small floor. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_at') -%}
   {%- set pool = namespace(c=[], w=[]) -%}
   {%- for cl in clients -%}
     {%- if cl.ip != shared.get('last_client') -%}
@@ -165,8 +183,10 @@
   {%- set chosen = [] -%}
   {{- pick_sigs(drop_sigs, 'burst', module.rand.weighted_choice([3, 4, 5], [58, 28, 14]), chosen) -}}
   {{- probe_burst(c, srv, chosen, 443, true) -}}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set w = [interval * 3600 / 4, 21600] | min -%}
   {%- do shared.update({'last_client': c.ip, 'last_server': srv.ip,
-      'next_due': now + (interval * 3600) | int}) -%}
+      'ep_at': pick_start(due - w / 2, due + w / 2, 2) | int}) -%}
 {%- endif -%}
 
 {#- 3. Emit the earliest due record, otherwise nothing. -#}
@@ -191,23 +211,18 @@
   {%- set key = s.c.ip ~ '>' ~ s.srv.ip -%}
   {%- if kind == 'start' and s.port == 443 and not e.episode -%}
     {#- Guard on the final chain step only: an ordinary HTTPS
-        connection that would follow drops of three or more distinct
-        signatures from the same client to the same server within the
-        chain window keeps its time and server but goes to another
-        client, drawn by the background weights. -#}
+        connection start from a client to a server that already
+        dropped three or more distinct signatures of that client in the
+        last 3600 s (the chain window, anchored at the first of those
+        drops as in the matcher) is not opened - the record is dropped
+        with its connection end; no other record moves. -#}
     {%- if hist.get(key, []) | map(attribute='1') | unique | list | length >= 3 -%}
-      {%- set alt = namespace(c=none) -%}
-      {%- for n in range(40) -%}
-        {%- if alt.c is none -%}
-          {%- set cand = module.rand.weighted_choice(clients, shared.get('cw')) -%}
-          {%- if hist.get(cand.ip ~ '>' ~ s.srv.ip, []) | map(attribute='1') | unique | list | length < 3 -%}
-            {%- set alt.c = cand -%}
-          {%- endif -%}
-        {%- endif -%}
-      {%- endfor -%}
-      {%- if alt.c is none -%}{{ dispatch.drop() }}{%- endif -%}
-      {%- do s.update({'c': alt.c}) -%}
+      {{- dispatch.drop() -}}
     {%- endif -%}
+  {%- elif kind == 'start' and s.port == 443 and hist.get(key, []) | map(attribute='1') | unique | list | length >= 3 -%}
+    {#- The episode's HTTPS start completes the chain: like the
+        matcher, forget the client's earlier drops. -#}
+    {%- for k in hist | list if k.startswith(s.c.ip ~ '>') -%}{%- do hist.pop(k) -%}{%- endfor -%}
   {%- endif -%}
   {%- set inst = module.rand.number.integer(1, params.snort_instances) -%}
   {%- do counters.update({inst: counters[inst] + module.rand.number.integer(1, 60)}) -%}
@@ -234,7 +249,7 @@
   {%- if e.g.drop -%}
     {%- do s.update({'dropped': true}) -%}
     {%- set key = s.c.ip ~ '>' ~ s.srv.ip -%}
-    {%- do hist.update({key: (hist.get(key, []) + [[now, e.g.gid ~ ':' ~ e.g.sid]])[-24:]}) -%}
+    {%- do hist.update({key: hist.get(key, []) + [[now, e.g.gid ~ ':' ~ e.g.sid]]}) -%}
   {%- endif -%}
 {%- endif -%}
 
