@@ -4,14 +4,14 @@ Edge Security Pack (ESP) user logs of a Progress Kemp LoadMaster in Common Event
 
 ## Event Types
 
-Shares measured on the final default capture (156 h, `anomaly_mode: true`, 26,430 events). The `anomaly_mode: false` capture of the same window differs by less than 0.9 percentage points per class.
+Shares measured on the final default capture (156 h, `anomaly_mode: true`, 25,371 events). The `anomaly_mode: false` capture of the same window differs by less than 0.9 percentage points per class.
 
 | CEF class ID | Name | `event.action` | Share | ECS category |
 | --- | --- | --- | --- | --- |
-| `14` | Request | `request` | 48.1% | `web` |
-| `2` | SSL accept | `ssl-accept` | 13.3% | `network` |
-| `4` | Connected | `connected` | 11.0% | `network` |
-| `15` | Attempt | `attempt` | 6.7% | `web` |
+| `14` | Request | `request` | 48.8% | `web` |
+| `2` | SSL accept | `ssl-accept` | 12.9% | `network` |
+| `4` | Connected | `connected` | 10.7% | `network` |
+| `15` | Attempt | `attempt` | 6.5% | `web` |
 | `100` | User AAA | `user-aaa` | 5.0% | `authentication` |
 | `8` | Logged on | `logged-on` | 5.0% | `authentication`, `session` |
 | `6` | Logged off | `logged-off` | 2.8% | `authentication`, `session` |
@@ -44,7 +44,7 @@ Recurrence: the first episode starts within the first `anomaly_interval_hours` (
 
 Variation: the number of denials, the user, the address, the `/ecp/` paths and the rest of the session change between episodes.
 
-Nothing in the chain is unique to it: every user, address type, class ID and `/ecp/` path also occurs in background, including logons that follow three or more denials from the same address (61 to 81 per 156-hour background capture) and `/ecp/` requests by every user (40 of 40 per capture). Only the full sequence is kept out of background: an ordinary `/ecp/` request that would complete the chain (three denials, then a logon, from the request's address, the first denial at most 30 minutes earlier) becomes a request for an `/owa/` path, at the same time. The guard uses the chain window exactly, so an `/ecp/` request more than 30 minutes after the first denial is left as is.
+Nothing in the chain is unique to it: every user, address type, class ID and `/ecp/` path also occurs in background, including logons that follow three or more denials from the same address (61 to 81 per 156-hour background capture) and `/ecp/` requests by every user (40 of 40 per capture). Only the full sequence is kept out of background: an ordinary `/ecp/` request that would complete the chain (three denials, then a logon, from the request's address, the first denial at most 30 minutes earlier) becomes a request for an `/owa/` path at the same time, with the method that path always uses (POST for `/owa/service.svc` and `/owa/ev.owa2`, GET otherwise). The guard uses the chain window exactly, so an `/ecp/` request more than 30 minutes after the first denial is left as is.
 
 Detection idea: for one user and source address, three or more `Access Denied` records followed within 30 minutes by `Logged on` and a `Request` for `/ecp/`. The logs show portal behavior; they do not show whether the account was compromised.
 
@@ -112,10 +112,10 @@ eventum generate --path generators/network-kemp-loadmaster/generator.yml --id ke
 
 ## Sample Output
 
-The first `/ecp/` request of the first episode, copied byte for byte from the final default capture (line 3474):
+The first `/ecp/` request of the first episode, copied byte for byte from the final default capture (line 1453):
 
 ```json
-{"@timestamp": "2026-09-26T21:10:49+00:00", "destination": {"ip": "10.42.20.15", "port": 443}, "ecs": {"version": "8.17.0"}, "event": {"action": "request", "category": ["web"], "code": "14", "dataset": "kemp_loadmaster.esp", "kind": "event", "module": "kemp_loadmaster", "original": "CEF:0|Kemp|LM|1.0|14|Request|1|vs=10.42.20.15:443 event=Request srcip=10.60.11.68 srcport=61824 method=GET url=https://mail.example.test/ecp/Security/AdminRoles.slab user=e.lindqvist@example.test useragent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0", "severity": 1, "type": ["access"]}, "http": {"request": {"method": "GET"}}, "kemp": {"loadmaster": {"cef": {"device_event_class_id": "14", "device_product": "LM", "device_vendor": "Kemp", "device_version": "1.0", "name": "Request", "severity": 1, "version": 0}, "extension": {"event": "Request", "method": "GET", "srcip": "10.60.11.68", "srcport": "61824", "url": "https://mail.example.test/ecp/Security/AdminRoles.slab", "user": "e.lindqvist@example.test", "useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0", "vs": "10.42.20.15:443"}}}, "observer": {"hostname": "lm-edge-01", "product": "LoadMaster", "type": "load-balancer", "vendor": "Progress Kemp"}, "related": {"ip": ["10.60.11.68", "10.42.20.15"], "user": ["e.lindqvist@example.test"]}, "source": {"ip": "10.60.11.68", "port": 61824}, "url": {"domain": "mail.example.test", "full": "https://mail.example.test/ecp/Security/AdminRoles.slab", "path": "/ecp/Security/AdminRoles.slab", "scheme": "https"}, "user": {"name": "e.lindqvist@example.test"}, "user_agent": {"original": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0"}}
+{"@timestamp": "2026-09-26T10:51:23+00:00", "destination": {"ip": "10.42.20.15", "port": 443}, "ecs": {"version": "8.17.0"}, "event": {"action": "request", "category": ["web"], "code": "14", "dataset": "kemp_loadmaster.esp", "kind": "event", "module": "kemp_loadmaster", "original": "CEF:0|Kemp|LM|1.0|14|Request|1|vs=10.42.20.15:443 event=Request srcip=10.60.13.64 srcport=61373 method=GET url=https://mail.example.test/ecp/UsersGroups/Mailboxes.slab user=v.tanaka@example.test useragent=Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0", "severity": 1, "type": ["access"]}, "http": {"request": {"method": "GET"}}, "kemp": {"loadmaster": {"cef": {"device_event_class_id": "14", "device_product": "LM", "device_vendor": "Kemp", "device_version": "1.0", "name": "Request", "severity": 1, "version": 0}, "extension": {"event": "Request", "method": "GET", "srcip": "10.60.13.64", "srcport": "61373", "url": "https://mail.example.test/ecp/UsersGroups/Mailboxes.slab", "user": "v.tanaka@example.test", "useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0", "vs": "10.42.20.15:443"}}}, "observer": {"hostname": "lm-edge-01", "product": "LoadMaster", "type": "load-balancer", "vendor": "Progress Kemp"}, "related": {"ip": ["10.60.13.64", "10.42.20.15"], "user": ["v.tanaka@example.test"]}, "source": {"ip": "10.60.13.64", "port": 61373}, "url": {"domain": "mail.example.test", "full": "https://mail.example.test/ecp/UsersGroups/Mailboxes.slab", "path": "/ecp/UsersGroups/Mailboxes.slab", "scheme": "https"}, "user": {"name": "v.tanaka@example.test"}, "user_agent": {"original": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0"}}
 ```
 
 ## References
