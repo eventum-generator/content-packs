@@ -4,18 +4,18 @@ Generates the Kaspersky NGFW 1.0 Firewall session log (CEF) of one device as ECS
 
 ## Event Types
 
-Shares measured on the final default capture (78 h, `anomaly_mode: true`, 43,364 records).
+Shares measured on the final default capture (156 h, `anomaly_mode: true`, 90,190 records).
 
 | CEF name | Traffic | Share | Category |
 |---|---|---:|---|
-| `Session start` | HTTPS (TCP/443) | 21.82% (9463) | Network |
-| `Firewall` | HTTPS (TCP/443) | 21.82% (9463) | Network |
-| `Session start` | DNS (UDP/53) | 15.94% (6913) | Network |
-| `Firewall` | DNS (UDP/53) | 15.94% (6913) | Network |
-| `Session start` | SMB (TCP/445) | 10.45% (4531) | Network |
-| `Firewall` | SMB (TCP/445) | 10.45% (4531) | Network |
-| `Session start` | HTTP (TCP/80) | 1.79% (775) | Network |
-| `Firewall` | HTTP (TCP/80) | 1.79% (775) | Network |
+| `Session start` | HTTPS (TCP/443) | 21.83% (19684) | Network |
+| `Firewall` | HTTPS (TCP/443) | 21.82% (19682) | Network |
+| `Session start` | DNS (UDP/53) | 16.04% (14466) | Network |
+| `Firewall` | DNS (UDP/53) | 16.04% (14463) | Network |
+| `Session start` | SMB (TCP/445) | 10.35% (9332) | Network |
+| `Firewall` | SMB (TCP/445) | 10.35% (9332) | Network |
+| `Session start` | HTTP (TCP/80) | 1.79% (1616) | Network |
+| `Firewall` | HTTP (TCP/80) | 1.79% (1615) | Network |
 
 `Session start` is logged when a session is created, `Firewall` when it is removed, with duration, directional packet and byte counters. Every client, file server, cloud destination and every session type used by the chain occurs in ordinary background in both modes. No field labels an episode.
 
@@ -39,11 +39,11 @@ Sequence, all for one client C (`source.ip`):
 
 Linking fields: `source.ip` (C) in all steps, `destination.ip` (F) in steps 1-2; each session's start and end share `devicePayloadId` (`kaspersky.ngfw.session_id`), addresses, ports and `start`.
 
-Recurrence: an episode becomes due every `anomaly_interval_hours` of source time (default 24, minimum 2), first one interval after generation starts. It starts after a random delay (exponential, mean 20 min). The next due time counts from the actual start, so a late episode never causes catch-up. Episodes in the final captures spanned 5-22 minutes (8-14 minutes at the default interval).
+Recurrence: the first episode starts within the first `anomaly_interval_hours` (at most 24 h) of generation, at a time drawn from the office-hours load curve, so it does not sit at a fixed offset from the generation start. Each next episode is due `anomaly_interval_hours` (default 24, minimum 2) after the actual start of the previous one and starts in a window of a quarter of the interval (at most 6 h) centred on the due time, weighted by the square of the load curve plus a small floor, so most episodes fall in office hours and few at night. There is no catch-up. In the final 156 h captures the default configuration produced 7 episodes, all starting between 08:00 and 12:00 UTC, 21.2-26.4 h apart; a 6 h interval produced 26, 5.3-6.6 h apart. Episodes spanned 5-30 minutes (8-20 minutes at the default interval).
 
-Variation: the client differs from the previous episode's, the cloud destination too, and the file server is random. Read sizes come from the upper tail of the background SMB size distribution, the upload size from the background upload distribution, raised to at least 55-75 MB (so episode uploads never fall at 50-55 MB); the episode client is picked uniformly among clients other than the previous one and its start time ignores the day/night load curve, so night-time episodes are relatively more visible against the lower night background; gaps (read to read median 2 min, read to upload median 7 min) are random. Firewall sessions carry no state that the chain changes, so there is nothing to restore.
+Variation: the client differs from the previous episode's, the cloud destination too, and the file server is random. Read sizes come from the upper tail of the background SMB size distribution, the upload size from the background upload distribution, raised to at least 55-75 MB (so episode uploads never fall at 50-55 MB); the episode client is picked uniformly among clients other than the previous one; gaps (read to read median 2 min, read to upload median 7 min) are random. Firewall sessions carry no state that the chain changes, so there is nothing to restore.
 
-Detection idea: a client reads two large files from one server over SMB and then uploads more than 50 MB to an external address within an hour (staging and exfiltration). Each fragment occurs in background: bursts of large SMB reads, large cloud uploads, and uploads after a single large read. Only the complete sequence is kept out of the background: an ordinary upload that would follow two large reads from one server within two hours is reduced below 50 MB.
+Detection idea: a client reads two large files from one server over SMB and then uploads more than 50 MB to an external address within an hour (staging and exfiltration). Each fragment occurs in background: bursts of large SMB reads, large cloud uploads, and uploads after a single large read. Only the complete sequence is kept out of the background: an ordinary upload above 50 MB that would complete the chain (two large reads from one server by the same client, the first at most one hour before the upload) is reduced to 5-45 MB. The guard uses the chain window exactly, so an upload more than an hour after the first read is left as is.
 
 ## Parameters
 
@@ -102,10 +102,10 @@ eventum generate --path generators/network-kaspersky-ngfw/generator.yml --id ngf
 
 ## Sample Output
 
-The upload that completes the first episode, copied byte for byte from the final default capture (line 13753):
+The upload that completes the first episode, copied byte for byte from the final default capture (line 6956):
 
 ```json
-{"@timestamp": "2026-09-27T00:17:20+00:00", "destination": {"bytes": 7086664, "ip": "203.0.113.10", "packets": 136282, "port": 443}, "ecs": {"version": "8.17.0"}, "event": {"action": "Firewall", "category": ["network"], "dataset": "kaspersky.ngfw", "duration": 153000000000, "end": "2026-09-27T00:17:20+00:00", "kind": "event", "original": "CEF:0|Kaspersky|NGFW|1.0.0.0|Firewall|Firewall|Unknown|rt=2026-09-27T00:17:20Z dtz=UTC+00:00 cs4=Low cs4Label=Priority devicePayloadId=941162 cs1=Users to Internet cs1Label=SecurityRule act=Inspect FullMatch=yes start=2026-09-27T00:14:47Z end=2026-09-27T00:17:20Z cn1=153 cn1Label=Duration cn2=257829 cn2Label=ClientPackets cn3=136282 cn3Label=ServerPackets in=360111992 out=7086664 dvchost=ngfw-01.example.test src=10.20.1.38 dst=203.0.113.10 proto=TCP spt=62411 dpt=443 KasperskyNGFWTCPRedir=no app=Unknown sproc=Unknown", "start": "2026-09-27T00:14:47+00:00", "type": ["connection", "end"]}, "kaspersky": {"ngfw": {"action": "Inspect", "full_match": "yes", "session_id": "941162"}}, "network": {"bytes": 367198656, "packets": 394111, "protocol": "tls", "transport": "tcp"}, "observer": {"hostname": "ngfw-01.example.test", "product": "NGFW", "vendor": "Kaspersky", "version": "1.0.0.0"}, "related": {"ip": ["10.20.1.38", "203.0.113.10"]}, "rule": {"name": "Users to Internet"}, "source": {"bytes": 360111992, "ip": "10.20.1.38", "packets": 257829, "port": 62411}}
+{"@timestamp": "2026-09-26T11:34:27+00:00", "destination": {"bytes": 5111184, "ip": "203.0.113.13", "packets": 98292, "port": 443}, "ecs": {"version": "8.17.0"}, "event": {"action": "Firewall", "category": ["network"], "dataset": "kaspersky.ngfw", "duration": 87000000000, "end": "2026-09-26T11:34:27+00:00", "kind": "event", "original": "CEF:0|Kaspersky|NGFW|1.0.0.0|Firewall|Firewall|Unknown|rt=2026-09-26T11:34:27Z dtz=UTC+00:00 cs4=Low cs4Label=Priority devicePayloadId=1643667 cs1=Users to Internet cs1Label=SecurityRule act=Inspect FullMatch=yes start=2026-09-26T11:33:00Z end=2026-09-26T11:34:27Z cn1=87 cn1Label=Duration cn2=164155 cn2Label=ClientPackets cn3=98292 cn3Label=ServerPackets in=186629933 out=5111184 dvchost=ngfw-01.example.test src=10.20.1.38 dst=203.0.113.13 proto=TCP spt=61506 dpt=443 KasperskyNGFWTCPRedir=no app=Unknown sproc=Unknown", "start": "2026-09-26T11:33:00+00:00", "type": ["connection", "end"]}, "kaspersky": {"ngfw": {"action": "Inspect", "full_match": "yes", "session_id": "1643667"}}, "network": {"bytes": 191741117, "packets": 262447, "protocol": "tls", "transport": "tcp"}, "observer": {"hostname": "ngfw-01.example.test", "product": "NGFW", "vendor": "Kaspersky", "version": "1.0.0.0"}, "related": {"ip": ["10.20.1.38", "203.0.113.13"]}, "rule": {"name": "Users to Internet"}, "source": {"bytes": 186629933, "ip": "10.20.1.38", "packets": 164155, "port": 61506}}
 ```
 
 ## References
