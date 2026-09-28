@@ -22,7 +22,30 @@
 {%- set lmax = 1.6 -%}
 {%- set hour = timestamp.astimezone(utc).hour -%}
 {#- Office-hours intensity, mean over a day about 1.0. -#}
-{%- set load = 1.6 if 7 <= hour < 17 else (0.9 if 17 <= hour < 21 else 0.33) -%}
+{%- macro load_at(h) -%}
+{{- 1.6 if 7 <= h < 17 else (0.9 if 17 <= h < 21 else 0.33) -}}
+{%- endmacro -%}
+{%- set load = load_at(hour) | float -%}
+{#- Chain window of the detector (first denial to /ecp/ request),
+    shared by the background guard. -#}
+{%- set chain_s = 1800 -%}
+{#- A second in [a, b), density proportional to the load curve (sq
+    false) or to its square plus a small floor (sq true). -#}
+{%- macro pick_time(a, b, sq) -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- for hh in range(a // 3600, (b - 1) // 3600 + 1) -%}
+    {%- set lo = [hh * 3600, a] | max -%}
+    {%- set hi = [hh * 3600 + 3600, b] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = load_at(hh % 24) | float -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set sl = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.integer(sl[0], sl[1] - 1) -}}
+{%- endmacro -%}
 
 {%- macro external_ip() -%}
 {{- module.rand.choice(['198.51.100.', '203.0.113.']) ~ module.rand.number.integer(2, 254) -}}
@@ -42,9 +65,11 @@
   {%- endfor -%}
   {%- set amin = users | map(attribute='next') | min -%}
   {%- do shared.update({'initialized': true, 'users': users, 'queue': [],
-      'q_min': none, 'a_min': amin, 'busy': {}, 'denials': {}, 'logon_at': {}, 'seq': 0,
+      'q_min': none, 'a_min': amin, 'busy': {}, 'partial': {}, 'logon_at': {}, 'seq': 0,
       'probe_next': now + module.rand.number.exponential(params.probes_per_day / 86400) | int,
-      'next_due': now + (interval * 3600) | int, 'start_at': none,
+      'next_due': none,
+      'start_at': pick_time(now, now + ([interval, 24] | min * 3600) | int,
+          false) | int,
       'last_chain_user': none}) -%}
 {%- endif -%}
 {%- set queue = shared.get('queue') -%}
@@ -157,13 +182,13 @@
   {%- do shared.set('probe_next', now + [module.rand.number.exponential(params.probes_per_day / 86400) | int, 1] | max) -%}
 {%- endif -%}
 
-{#- 3. Episode: due by source time, random start delay, next due from
-    the actual start, no catch-up, a different user each time. -#}
+{#- 3. Episode: the first starts within min(interval, 24 h), its time
+    drawn from the load curve; each later one in a window of
+    min(interval / 4, 6 h) centred on its due time (previous start
+    plus the interval), weighted by the squared load curve. A
+    different, idle user each time. -#}
 {%- if params.anomaly_mode -%}
-  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
-    {%- do shared.set('start_at', now + module.rand.number.exponential(1 / 1200) | int) -%}
-  {%- endif -%}
-  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {%- if now >= shared.get('start_at') -%}
     {%- set free = [] -%}
     {%- for u in shared.get('users') -%}
       {%- if not busy.get(u.name, false) and u.name != shared.get('last_chain_user') -%}
@@ -173,8 +198,10 @@
     {%- if free -%}
       {%- set cu = module.rand.choice(free) -%}
       {{- plan(cu, now, true, module.rand.weighted_choice([3, 4, 5], [50, 30, 20])) -}}
-      {%- do shared.update({'last_chain_user': cu.name, 'start_at': none,
-          'next_due': now + (interval * 3600) | int}) -%}
+      {%- set due = now + (interval * 3600) | int -%}
+      {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+      {%- do shared.update({'last_chain_user': cu.name, 'next_due': due,
+          'start_at': pick_time(due - half, due + half, true) | int}) -%}
     {%- endif -%}
   {%- endif -%}
 {%- endif -%}
@@ -192,21 +219,46 @@
 {%- set r = queue.pop(best.i) -%}
 {%- do shared.set('q_min', (queue | map(attribute='due') | min) if queue else none) -%}
 {%- if r.get('last') -%}{%- do busy.update({r.u: false}) -%}{%- endif -%}
-{%- set denials = shared.get('denials') -%}
 {%- set path = r.get('path') -%}
 {%- if r.c == 8 -%}
   {%- do shared.get('logon_at').update({r.u: now}) -%}
-{%- elif r.c == 9 -%}
-  {%- set h = denials.get(r.u, []) + [[now, r.ip]] -%}
-  {%- do denials.update({r.u: h[-8:]}) -%}
-{%- elif r.c == 14 and not r.ep and path in ecp_paths -%}
-  {#- Guard on the final chain step: an ordinary session whose user
-      failed three times from this address within the hour does not
-      open the control panel. -#}
-  {%- set recent = denials.get(r.u, []) | selectattr('1', 'equalto', r.ip)
-      | selectattr('0', 'ge', now - 3600) | list -%}
-  {%- if recent | length >= 3 -%}
-    {%- set path = module.rand.weighted_choice(owa_paths, owa_weights) -%}
+{%- endif -%}
+{#- Per-user replica of the chain detector: partial matches
+    [next step, first denial time, address]. Steps: denial, denial,
+    denial, logon, /ecp/ request, one address, the first denial at
+    most chain_s before the current record; completion starts over. -#}
+{%- if r.u and (r.c in [8, 9] or (r.c == 14 and path in ecp_paths)) -%}
+  {%- set pm = shared.get('partial') -%}
+  {%- set parts = pm.get(r.u, []) | selectattr('1', 'ge', now - chain_s) | list -%}
+  {%- set st = namespace(done=false, new=[]) -%}
+  {%- if r.c == 14 -%}
+    {%- set ready = parts | selectattr('0', 'equalto', 4)
+        | selectattr('2', 'equalto', r.ip) | list -%}
+    {%- if ready and not r.ep -%}
+      {#- Guard on the final chain step: an ordinary request that would
+          complete the chain opens a mailbox page instead. -#}
+      {%- set path = module.rand.weighted_choice(owa_paths, owa_weights) -%}
+      {%- set st.new = parts -%}
+    {%- elif ready -%}
+      {%- set st.done = true -%}
+    {%- else -%}
+      {%- set st.new = parts -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- for p in parts -%}
+      {%- if p[2] == r.ip and ((r.c == 9 and p[0] in [1, 2])
+          or (r.c == 8 and p[0] == 3)) -%}
+        {%- do st.new.append([p[0] + 1, p[1], p[2]]) -%}
+      {%- else -%}
+        {%- do st.new.append(p) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if r.c == 9 -%}{%- do st.new.append([1, now, r.ip]) -%}{%- endif -%}
+  {%- endif -%}
+  {%- if st.done or not st.new -%}
+    {%- do pm.pop(r.u, none) -%}
+  {%- else -%}
+    {%- do pm.update({r.u: st.new[-8:]}) -%}
   {%- endif -%}
 {%- endif -%}
 

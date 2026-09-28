@@ -4,20 +4,20 @@ Edge Security Pack (ESP) user logs of a Progress Kemp LoadMaster in Common Event
 
 ## Event Types
 
-Shares measured on the final default capture (78 h, `anomaly_mode: true`, 13,332 events). The `anomaly_mode: false` capture of the same window differs by less than 0.6 percentage points per class.
+Shares measured on the final default capture (156 h, `anomaly_mode: true`, 26,430 events). The `anomaly_mode: false` capture of the same window differs by less than 0.9 percentage points per class.
 
 | CEF class ID | Name | `event.action` | Share | ECS category |
 | --- | --- | --- | --- | --- |
-| `14` | Request | `request` | 49.8% | `web` |
-| `2` | SSL accept | `ssl-accept` | 13.0% | `network` |
-| `4` | Connected | `connected` | 10.7% | `network` |
-| `15` | Attempt | `attempt` | 6.4% | `web` |
-| `100` | User AAA | `user-aaa` | 4.8% | `authentication` |
-| `8` | Logged on | `logged-on` | 4.8% | `authentication`, `session` |
-| `6` | Logged off | `logged-off` | 2.7% | `authentication`, `session` |
-| `102` | User session kill | `user-session-kill` | 2.7% | `session` |
+| `14` | Request | `request` | 48.1% | `web` |
+| `2` | SSL accept | `ssl-accept` | 13.3% | `network` |
+| `4` | Connected | `connected` | 11.0% | `network` |
+| `15` | Attempt | `attempt` | 6.7% | `web` |
+| `100` | User AAA | `user-aaa` | 5.0% | `authentication` |
+| `8` | Logged on | `logged-on` | 5.0% | `authentication`, `session` |
+| `6` | Logged off | `logged-off` | 2.8% | `authentication`, `session` |
+| `102` | User session kill | `user-session-kill` | 2.8% | `session` |
+| `101` | User session timeout | `user-session-timeout` | 2.2% | `session` |
 | `9` | Access Denied | `access-denied` | 2.2% | `authentication` |
-| `101` | User session timeout | `user-session-timeout` | 2.0% | `session` |
 | `3` | Connection timed out | `connection-timed-out` | 0.7% | `network` |
 | `5` | Connection failed | `connection-failed` | 0.2% | `network` |
 
@@ -38,13 +38,13 @@ A user fails the ESP logon repeatedly and then logs on and opens the Exchange co
 3. `Request` (14) for one to three `/ecp/` paths by U from I, among the first requests of the session.
 4. The session ends like any other: `Logged off` (6) and `User session kill` (102), or `User session timeout` (101).
 
-Linking fields: `user.name`, `source.ip` (CEF `user`, `srcip`), the same virtual service `vs`, and `@timestamp`. The measured episodes lasted 1.6 to 21.2 minutes from the first denial to the session end.
+Linking fields: `user.name`, `source.ip` (CEF `user`, `srcip`), the same virtual service `vs`, and `@timestamp`. The measured episodes lasted 3.0 to 27.5 minutes from the first denial to the session end.
 
-Recurrence: the first episode is due `anomaly_interval_hours` after the start of generation, and each next one is due that long after the actual start of the previous one; missed episodes are not caught up. When an episode is due, its start is delayed by a random exponential time with a 20-minute mean. The chain user is drawn at random among users without an open session, never the previous episode's user; the address comes from that user's normal choice (office or external). The default interval is 24 h; the minimum is 6 h.
+Recurrence: the first episode starts within the first `anomaly_interval_hours` (at most 24 h) of generation, at a time drawn from the background activity curve, so it does not sit at a fixed offset from the generation start. Each next episode is due `anomaly_interval_hours` after the actual start of the previous one and starts in a window of a quarter of the interval (at most 6 h) centred on the due time, weighted by the square of the activity curve plus a small floor, so most episodes fall in office hours; missed episodes are not caught up. The chain user is drawn at random among users without an open session, never the previous episode's user; the address comes from that user's normal choice (office or external). The default interval is 24 h; the minimum is 6 h. In the final 156 h captures the default configuration produced 6 episodes, 23.3-26.1 h apart, and a 12 h interval produced 12, 11.7-13.4 h apart. The window is narrower than the night: after a first episode at night (in the default capture at 21:00 UTC), later ones can stay at night for several days, as they did there (20:00-03:00 UTC).
 
 Variation: the number of denials, the user, the address, the `/ecp/` paths and the rest of the session change between episodes.
 
-Nothing in the chain is unique to it: every user, address type, class ID and `/ecp/` path also occurs in background, including logons that follow three or more denials from the same address (30 to 49 per 78-hour background capture) and `/ecp/` requests by nearly every user (39 or 40 of 40 per capture). Only the full sequence is kept out of background: an ordinary session whose user had three or more denials from the same address in the past hour does not request `/ecp/`.
+Nothing in the chain is unique to it: every user, address type, class ID and `/ecp/` path also occurs in background, including logons that follow three or more denials from the same address (61 to 81 per 156-hour background capture) and `/ecp/` requests by every user (40 of 40 per capture). Only the full sequence is kept out of background: an ordinary `/ecp/` request that would complete the chain (three denials, then a logon, from the request's address, the first denial at most 30 minutes earlier) becomes a request for an `/owa/` path, at the same time. The guard uses the chain window exactly, so an `/ecp/` request more than 30 minutes after the first denial is left as is.
 
 Detection idea: for one user and source address, three or more `Access Denied` records followed within 30 minutes by `Logged on` and a `Request` for `/ecp/`. The logs show portal behavior; they do not show whether the account was compromised.
 
@@ -112,10 +112,10 @@ eventum generate --path generators/network-kemp-loadmaster/generator.yml --id ke
 
 ## Sample Output
 
-The first `/ecp/` request of the first episode, copied byte for byte from the final default capture (line 4425):
+The first `/ecp/` request of the first episode, copied byte for byte from the final default capture (line 3474):
 
 ```json
-{"@timestamp": "2026-09-27T00:37:18+00:00", "destination": {"ip": "10.42.20.15", "port": 443}, "ecs": {"version": "8.17.0"}, "event": {"action": "request", "category": ["web"], "code": "14", "dataset": "kemp_loadmaster.esp", "kind": "event", "module": "kemp_loadmaster", "original": "CEF:0|Kemp|LM|1.0|14|Request|1|vs=10.42.20.15:443 event=Request srcip=203.0.113.129 srcport=64175 method=GET url=https://mail.example.test/ecp/Security/AdminRoles.slab user=x.romero@example.test useragent=Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1", "severity": 1, "type": ["access"]}, "http": {"request": {"method": "GET"}}, "kemp": {"loadmaster": {"cef": {"device_event_class_id": "14", "device_product": "LM", "device_vendor": "Kemp", "device_version": "1.0", "name": "Request", "severity": 1, "version": 0}, "extension": {"event": "Request", "method": "GET", "srcip": "203.0.113.129", "srcport": "64175", "url": "https://mail.example.test/ecp/Security/AdminRoles.slab", "user": "x.romero@example.test", "useragent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1", "vs": "10.42.20.15:443"}}}, "observer": {"hostname": "lm-edge-01", "product": "LoadMaster", "type": "load-balancer", "vendor": "Progress Kemp"}, "related": {"ip": ["203.0.113.129", "10.42.20.15"], "user": ["x.romero@example.test"]}, "source": {"ip": "203.0.113.129", "port": 64175}, "url": {"domain": "mail.example.test", "full": "https://mail.example.test/ecp/Security/AdminRoles.slab", "path": "/ecp/Security/AdminRoles.slab", "scheme": "https"}, "user": {"name": "x.romero@example.test"}, "user_agent": {"original": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1"}}
+{"@timestamp": "2026-09-26T21:10:49+00:00", "destination": {"ip": "10.42.20.15", "port": 443}, "ecs": {"version": "8.17.0"}, "event": {"action": "request", "category": ["web"], "code": "14", "dataset": "kemp_loadmaster.esp", "kind": "event", "module": "kemp_loadmaster", "original": "CEF:0|Kemp|LM|1.0|14|Request|1|vs=10.42.20.15:443 event=Request srcip=10.60.11.68 srcport=61824 method=GET url=https://mail.example.test/ecp/Security/AdminRoles.slab user=e.lindqvist@example.test useragent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0", "severity": 1, "type": ["access"]}, "http": {"request": {"method": "GET"}}, "kemp": {"loadmaster": {"cef": {"device_event_class_id": "14", "device_product": "LM", "device_vendor": "Kemp", "device_version": "1.0", "name": "Request", "severity": 1, "version": 0}, "extension": {"event": "Request", "method": "GET", "srcip": "10.60.11.68", "srcport": "61824", "url": "https://mail.example.test/ecp/Security/AdminRoles.slab", "user": "e.lindqvist@example.test", "useragent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0", "vs": "10.42.20.15:443"}}}, "observer": {"hostname": "lm-edge-01", "product": "LoadMaster", "type": "load-balancer", "vendor": "Progress Kemp"}, "related": {"ip": ["10.60.11.68", "10.42.20.15"], "user": ["e.lindqvist@example.test"]}, "source": {"ip": "10.60.11.68", "port": 61824}, "url": {"domain": "mail.example.test", "full": "https://mail.example.test/ecp/Security/AdminRoles.slab", "path": "/ecp/Security/AdminRoles.slab", "scheme": "https"}, "user": {"name": "e.lindqvist@example.test"}, "user_agent": {"original": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0"}}
 ```
 
 ## References
