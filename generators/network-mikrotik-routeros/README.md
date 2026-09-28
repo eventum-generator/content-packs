@@ -1,33 +1,52 @@
 # MikroTik RouterOS Syslog
 
-Produces ECS-wrapped RouterOS account, mangle configuration, DHCP and UDP firewall messages from one router. The JSON output contains a constructed BSD Syslog `event.original`; exact remote framing remains **BLOCKED_RAW_EVIDENCE**.
+Produces the remote syslog stream of one MikroTik RouterOS edge router: Winbox logins and logouts of six administrators, generic mangle-rule and item edits, DHCP lease assignments for 40 LAN clients, and internet UDP packets logged by an input-chain rule. Each record is ECS JSON carrying the RouterOS message and a constructed BSD-syslog line in `event.original`.
 
 ## Event Types
 
-| Action | Background pattern | Category |
-| --- | --- | --- |
-| DHCP assigned / deassigned | 5% of ordinary non-session slots, toggled per client | Network |
-| UDP firewall packet | 95% of ordinary non-session slots | Network |
-| Winbox login / logout | Paired normal, external administrator and internal maintenance sessions | Authentication |
-| Mangle rule added / moved / changed / removed | One temporary rule lifecycle during daily internal maintenance | Configuration |
+Shares measured over the five 73-hour `anomaly_mode: false` calibration captures (39,799 records).
 
-These are synthetic workload weights, not measured production frequencies. The generator emits one record per minute, about 1,440 per day. Eight clients retain bounded lease state. Firewall packets retain the documented input-chain UDP grammar; the emitted MAC, IPs, ports and packet length agree with their parsed ECS fields. Packet logging does not establish an accept/drop decision. This pack does not model TCP connection tracking, NAT or filter-rule policy changes, and mangle edits do not alter the unrelated UDP packet workload.
+| Action | Message | Share | Category |
+| --- | --- | ---: | --- |
+| `firewall_log` | `input: in:ether1 out:(none), src-mac ..., proto UDP, <src>:<port>-><dst>:<port>, len <n>` | 85.65% | Network |
+| `dhcp_assigned` | `defconf assigned <ip> for <MAC> <host>` | 3.64% | Network |
+| `dhcp_deassigned` | `defconf deassigned <ip> for <MAC> <host>` | 3.44% | Network |
+| `login` | `user <u> logged in from <ip> via winbox` | 1.98% | Authentication |
+| `logout` | `user <u> logged out from <ip> via winbox` | 1.98% | Authentication |
+| `mangle_rule_changed` | `mangle rule changed by <u>` | 1.29% | Configuration |
+| `mangle_rule_added` | `mangle rule added by <u>` | 0.62% | Configuration |
+| `mangle_rule_removed` | `mangle rule removed by <u>` | 0.56% | Configuration |
+| `mangle_rule_moved` | `mangle rule moved by <u>` | 0.51% | Configuration |
+| `item_added` | `item added by <u>` | 0.33% | Configuration |
+
+About 2,600 records per day. Rates are synthetic workload choices, not measured production frequencies:
+
+- **Firewall packets** - unsolicited UDP probes of the WAN address (DNS, NTP, SNMP, IKE, SSDP, SIP), random sources, exponential gaps with short repeat bursts. The rule uses `action=log`, which records the packet and passes it to the next rule, so no accept/drop outcome is claimed.
+- **DHCP** - per client: joins (workstations and laptops follow a working-hours curve, phones, printers and cameras do not), a lognormal lease stay, then a deassignment.
+- **Administrator sessions** - per user: session arrivals thinned by the working-hours curve, about 40% from the user's own external addresses (`203.0.113.0/24`), the rest from the user's internal workstation. A session carries zero to a dozen edits with lognormal gaps; a user may hold overlapping sessions and often reconnects from the same address minutes after logging out. Edit types are random, so background sessions - external ones included - contain partial add/move/change/remove sequences and complete ones from internal addresses. Temporary rules added in background are removed by later edits; at most eight exist at a time.
 
 ## Anomaly Chain
 
-`anomaly_mode: true` is the default. The default `anomaly_interval_hours: 24` schedules repeated administrator episodes using generated UTC event time:
+`anomaly_mode: true` is the default; `anomaly_mode: false` produces only the background above.
 
-1. The administrator logs in from an external address via Winbox.
-2. A temporary mangle rule is added.
-3. The existing rule is moved and changed.
-4. The temporary rule is removed.
-5. The administrator logs out from the same address.
+An administrator logs in via Winbox from an external address and, within one session, adds, moves, changes and removes a mangle rule, then logs out - a short remote change of packet marking/routing that leaves no rule behind.
 
-The six records span five minutes. The first episode starts 24 hours and one minute after the first record, then every 24 hours at the shipped cadence. Scheduling waits for ordinary sessions and their rule lifecycle to finish and reserves their upcoming daily slots. Custom or fractional intervals can therefore be delayed or rounded to the next minute. Intervals below one hour are clamped to one hour.
+1. `system,info,account` - `user <U> logged in from <external IP> via winbox`
+2. `system,info` - `mangle rule added by <U>`
+3. `system,info` - `mangle rule moved by <U>`
+4. `system,info` - `mangle rule changed by <U>`
+5. `system,info` - `mangle rule removed by <U>`
+6. `system,info,account` - `user <U> logged out from <external IP> via winbox`
 
-Episodes rotate through `anomaly_source_ip` and `additional_external_source_ips`. That same pool rotates through ordinary external logins in both modes. Native account messages identify user, source IP and Winbox, but provide no session ID. Generic mangle messages identify only user and operation, with no rule ID, command, target or client IP. Correlate the external login, edit burst and matching logout by router, user and time; the editing session and single temporary rule are scenario assumptions, not links proven by those raw lines. No episode ID is inserted into source fields. Addresses may be reused after a pool cycle.
+**Linking fields.** `user.name` joins the steps; `source.ip` joins login and logout. RouterOS edit messages carry no session, rule ID or client address, so the link from edits to the external session is by user and time only.
 
-Both modes also emit daily external administrator sessions from minute 20 to 25 without configuration changes, internal administrator maintenance from minute 600 to 608, and normal operator sessions from minute 900 to 910, relative to the first event. Internal maintenance adds, moves, changes and removes the same modeled temporary rule among pre-existing unchanged mangle rules. Each operation and actor occurs in background. Set `anomaly_mode: false` for this background without the close external-login-and-edit sequence. All modeled temporary rules are removed before logout; there is no silent reset or growing rule collection.
+**Recurrence.** `anomaly_interval_hours` (default `24`, minimum `4`) is measured in event time. The first episode starts within the first min(interval, 24 h) of the run, its hour drawn from the working-hours curve squared; each later start is drawn in a window of min(interval / 4, 6 h) centred one interval after the previous actual start, with the same weighting, so episodes stay in busy hours. At intervals up to 8 h the window covers much of the clock. A lognormal delay (median one minute) follows each start. Missed episodes are not replayed.
+
+**Variation.** Each episode picks a user other than the previous episode's, weighted like background sessions, and one of that user's external addresses - the same user/address pairs that appear in background sessions. Edit gaps, logout delay and the reconnect chance follow the background session model; the whole chain fits in 30 minutes (measured spans 311, 499 and 608 s at the default interval; 87 to 1,753 s at 12 h).
+
+**Background guard.** Background never completes the chain: when a background `mangle rule removed` would finish an external login, add, move and change by the same user inside the 30-minute chain window, that edit is not logged, and the rule stays until a later ordinary remove. Complete add/move/change/remove sequences from internal addresses, and external sessions with any subset of the edits, remain in both modes.
+
+**Detection idea.** Per user, an external Winbox login followed within 30 minutes by mangle add, move, change and remove.
 
 ## Parameters
 
@@ -37,116 +56,63 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 | --- | --- | --- |
-| `router_name`, `router_ip` | `mt-edge-01`, `10.30.0.1` | Router identity and UDP packet destination |
-| `normal_user`, `normal_source_ip` | `netops`, `10.30.1.12` | Ordinary operator and management address |
-| `admin_internal_source_ip` | `10.30.1.11` | Internal administrator maintenance address |
-| `anomaly_user` | `admin` | Administrator used in both background and incident sessions |
-| `anomaly_source_ip` | `198.51.100.83` | First address in the shared external administrator pool |
-| `additional_external_source_ips` | `[198.51.100.84, 198.51.100.85]` | Other addresses in that pool, used by both modes |
-| `anomaly_interval_hours` | `24` | First wait and recurrence, minimum one hour; ordinary sessions can delay scheduling |
-| `anomaly_mode` | `true` | Include periodic external-login-and-edit episodes |
+| `router_name` | `mt-edge-01` | Router identity in the syslog header and `observer.hostname` |
+| `router_ip` | `10.30.0.1` | Management address in `observer.ip` |
+| `wan_ip` | `192.0.2.10` | WAN address targeted by logged UDP packets |
+| `wan_gateway_mac` | `02:00:5E:10:00:01` | Upstream gateway MAC in packet lines (`src-mac`) |
+| `anomaly_mode` | `true` | Include recurring external-session mangle episodes |
+| `anomaly_interval_hours` | `24` | Episode interval in hours, minimum 4 |
 
-Keep the external pool to at least two distinct addresses, separate from the two internal management addresses. The example external addresses are RFC 5737 documentation addresses. Recurrence uses event time, not a count of ordinary selections. Keep the shipped one-minute/count-one input profile when interpreting the stated timings.
+Administrators (user, weight, internal and external addresses) live in `samples/admins.json`; DHCP clients (IP, MAC, host name, device kind) in `samples/dhcp_clients.json`. Keep external addresses in `203.0.113.0/24` or adjust the detection idea accordingly.
 
 ### Output Parameters
 
-The generator writes `output/events.json` relative to its directory. It has no top-level `${params.*}` or `${secrets.*}` placeholders. Change `output.file.path` or the output plugin to deliver elsewhere.
+The shipped `generator.yml` writes `output/events.json` and has no `${params.*}` or `${secrets.*}` placeholders. To send elsewhere, replace the output with placeholders and pass them at run time, for example:
 
-## RouterOS Logging Profile and Evidence Limits
-
-The selected profile follows the current RouterOS 7 manual's BSD Syslog path, with `target=remote`, `remote-log-format=syslog`, `syslog-facility=local0`, `syslog-severity=info`, `syslog-time-format=bsd-syslog` and `add-topics-string=yes`. Syslog uses UDP in this path. The modeled router clock is UTC, yielding priority 134. Logging topics include `system`, `dhcp` and `firewall`; packet records require a logging-enabled firewall rule.
-
-The manual supplies local account, mangle add/move/change, DHCP and UDP packet examples. A firsthand RouterOS 6.35rc record supplies the generic mangle removal text; its continued use in RouterOS 7 is an explicit **inference**, pending a versioned capture. The manual's Elasticsearch guide also documents parsing MAC, protocol, packet endpoints and length. The pack parses those packet values but does not reproduce that whole ingest pipeline.
-
-The BSD header, hostname and topic placement in `event.original` remain **BLOCKED_RAW_EVIDENCE**: a complete remote UDP frame from this exact configuration was not found in the bounded vendor search. No RouterOS point release or full native parity is claimed. ECS metadata and selection frequencies are synthetic. Source grammar checks do not clear this missing-capture limit.
+```yaml
+output:
+  - opensearch:
+      hosts: ["${params.opensearch_host}"]
+      username: ${params.opensearch_user}
+      password: ${secrets.opensearch_password}
+      index: mikrotik-routeros
+```
 
 ## Usage
 
-From the content-packs repository root:
+From the content-packs repository root, live:
 
 ```bash
-uv run --project ../eventum eventum generate --path generators/network-mikrotik-routeros/generator.yml --id network-mikrotik-routeros --live-mode true --keep-order true
+eventum generate --path generators/network-mikrotik-routeros/generator.yml --id network-mikrotik-routeros --live-mode true
 ```
 
-For a finite accelerated 73-hour run with three complete default episodes:
+As a batch (add `start`/`end` to the `cron` input for a finite window; the second episode can start up to 51 hours after the run start plus its start delay, so use at least 52 hours to see two at the default interval):
 
-~~~bash
-uv run --project ../eventum python - <<'PYCODE'
-from pathlib import Path
-from yaml import safe_load, safe_dump
-root = Path("generators/network-mikrotik-routeros")
-config = safe_load((root / "generator.yml").read_text())
-config["input"][0]["cron"].update(
-    start="2026-09-25T00:00:00+00:00",
-    end="2026-09-28T01:00:00+00:00",
-)
-(root / ".sample-finite.yml").write_text(safe_dump(config, sort_keys=False))
-PYCODE
-flock -x /tmp/eventum-generator-heavy.lock uv run --project ../eventum eventum generate --path generators/network-mikrotik-routeros/.sample-finite.yml --id network-mikrotik-routeros-sample --live-mode false --keep-order true
-rm generators/network-mikrotik-routeros/.sample-finite.yml
-~~~
-
-This produces 4,381 records and exits normally. Set `anomaly_mode: false` in the temporary configuration for the same background window with no complete incidents. Extend the window when increasing the interval. The custom validation uses a 12-hour interval and `--timezone Europe/Moscow`; emitted native/ECS timestamps remain UTC.
+```bash
+eventum generate --path generators/network-mikrotik-routeros/generator.yml --id network-mikrotik-routeros --live-mode false --keep-order true
+```
 
 ## Sample Output
 
-Complete synthetic event copied from the final enabled run; its remote envelope has the evidence limit described above:
+A chain step from the final default-on capture:
 
 ```json
-{
-  "@timestamp": "2026-09-26T00:04:00+00:00",
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "kind": "event",
-    "module": "mikrotik",
-    "dataset": "mikrotik.routeros.syslog",
-    "category": [
-      "configuration"
-    ],
-    "type": [
-      "info"
-    ],
-    "action": "mangle_rule_changed",
-    "original": "<134>Sep 26 00:04:00 mt-edge-01 system,info mangle rule changed by admin"
-  },
-  "message": "mangle rule changed by admin",
-  "observer": {
-    "hostname": "mt-edge-01",
-    "ip": "10.30.0.1",
-    "vendor": "MikroTik",
-    "product": "RouterOS",
-    "type": "router"
-  },
-  "log": {
-    "syslog": {
-      "priority": 134,
-      "facility": {
-        "code": 16
-      },
-      "severity": {
-        "code": 6
-      }
-    }
-  },
-  "mikrotik": {
-    "topics": [
-      "system",
-      "info"
-    ]
-  },
-  "user": {
-    "name": "admin"
-  }
-}
+{"@timestamp": "2026-09-01T16:10:24+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "mikrotik", "dataset": "mikrotik.routeros.syslog", "category": ["configuration"], "type": ["change"], "action": "mangle_rule_added", "original": "<134>Sep  1 16:10:24 mt-edge-01 system,info mangle rule added by admin"}, "message": "mangle rule added by admin", "observer": {"hostname": "mt-edge-01", "ip": "10.30.0.1", "vendor": "MikroTik", "product": "RouterOS", "type": "router"}, "log": {"syslog": {"priority": 134, "facility": {"code": 16, "name": "local0"}, "severity": {"code": 6, "name": "info"}}}, "mikrotik": {"topics": ["system", "info"]}, "user": {"name": "admin"}, "related": {"user": ["admin"]}}
 ```
+
+## Limitations
+
+- **Remote envelope not verified.** The manual shows local `/log print` lines and documents `remote-log-format=syslog` (BSD syslog, always UDP), facility, severity, `bsd-syslog` time format and `add-topics-string`. No complete remote frame from RouterOS 7 with this profile was found, so the PRI, header, hostname and topic placement in `event.original` are constructed from RFC 3164 and the manual. The router clock is modeled as UTC (PRI 134 = local0.info).
+- **Removal message inferred.** `mangle rule removed by <user>` comes from a RouterOS 6.35rc record; its RouterOS 7 wording is assumed.
+- **One service.** Only `via winbox` logins are modeled; login failures, SSH/WebFig/API sessions, and other rule types (filter, NAT) are out of scope.
+- **Generic edits.** RouterOS logs no rule ID or change content, so which rule an edit touches is not visible, and packet logging is not tied to mangle changes.
+- **ECS mapping** follows the vendor Elasticsearch guide's packet fields; the rest of the ECS envelope is a synthetic choice, not a published integration.
+- **Rates** are synthetic.
 
 ## References
 
-- [RouterOS Log manual](https://manual.mikrotik.com/docs/diagnostics-monitoring-and-troubleshooting/log/) - local message examples and remote-action properties.
-- [RouterOS Syslog with Elasticsearch](https://manual.mikrotik.com/docs/diagnostics-monitoring-and-troubleshooting/log/syslog-with-elasticsearch/) - source packet fields and custom UDP collection.
-- [MikroTik common firewall actions](https://help.mikrotik.com/docs/spaces/ROS/pages/250708064/Common+Firewall+Matchers+and+Actions) - `action=log` continues rule processing and does not establish outcome.
-- [Firsthand RouterOS 6.35rc mangle removal record](https://forum.mikrotik.com/t/v6-35rc-release-candidate-is-released-new-wireless-package/94918?page=5) - older removal vocabulary; RouterOS 7 parity remains inferred.
-- [RFC 3164](https://www.rfc-editor.org/rfc/rfc3164) - priority and space-padded BSD timestamp.
-- [KUMA supported event sources](https://support.kaspersky.com/kuma/4.0/en-US/255782.htm) - source inventory, not wire-format validation.
+- [RouterOS Log manual](https://manual.mikrotik.com/docs/diagnostics-monitoring-and-troubleshooting/log/) - local message examples, remote action properties, topics.
+- [RouterOS Syslog with Elasticsearch](https://manual.mikrotik.com/docs/diagnostics-monitoring-and-troubleshooting/log/syslog-with-elasticsearch/) - packet-line fields.
+- [Common firewall matchers and actions](https://help.mikrotik.com/docs/spaces/ROS/pages/250708064/Common+Firewall+Matchers+and+Actions) - `action=log` passes the packet to the next rule.
+- [RouterOS 6.35rc forum record](https://forum.mikrotik.com/t/v6-35rc-release-candidate-is-released-new-wireless-package/94918?page=5) - `mangle rule removed by` wording.
+- [RFC 3164](https://www.rfc-editor.org/rfc/rfc3164) - BSD syslog PRI and timestamp.
