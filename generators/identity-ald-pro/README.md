@@ -1,55 +1,56 @@
 # ALD Pro Domain Controller Audit Generator
 
-Produces ECS JSON for selected MIT KDC, 389 Directory Server access and extended audit records from one ALD Pro domain controller. `event.original` carries the corresponding native line or multiline LDIF change record. The source profile follows the vendor's SIEM guide dated **06/10/2025**, whose examples are dated 2023/2024 and do not identify the installed ALD Pro/component builds. This generator therefore does not claim exact fidelity to a particular ALD Pro release.
+Produces ECS JSON for selected MIT KDC, 389 Directory Server access and extended audit records from one ALD Pro domain controller. `event.original` carries the corresponding native line or multiline LDIF change record. The source profile follows the vendor's SIEM guide dated **06/10/2025**, whose examples are dated 2023/2024 without identifying installed ALD Pro or component builds.
 
 ## Event Types
 
-| Event | Workload | Category | Source |
-|---|---|---|---|
-| AS_REQ ISSUE | Frequent successful TGT issuance | Authentication | `/var/log/auth.log` |
-| TGS_REQ ISSUE | Frequent service tickets using an already issued TGT | Authentication | `/var/log/auth.log` |
-| AS_REQ PREAUTH_FAILED | Isolated background failures and periodic spray | Authentication | `/var/log/auth.log` |
-| SSL connection, TLS, UNBIND, clean disconnect | Every selected LDAP session | Network | 389 DS `access` |
-| GSSAPI BIND / RESULT | Three rounds: op 0/1 return err 14, op 2 succeeds | Authentication | 389 DS `access` |
-| MOD / RESULT | Existing group or SUDO rule, success after a completed bind | IAM | 389 DS `access` |
-| Add / delete member LDIF | Observable membership changes and restoration | IAM | 389 DS `audit` |
-| Replace / delete cmdCategory LDIF | Observable SUDO activation and restoration | IAM | 389 DS `audit` |
+| Event | Workload | Source |
+|---|---|---|
+| AS_REQ NEEDED_PREAUTH / ISSUE | Preauthentication challenge and successful TGT issuance | `/var/log/auth.log` |
+| TGS_REQ ISSUE | Service tickets using an already observed TGT | `/var/log/auth.log` |
+| AS_REQ PREAUTH_FAILED | Isolated failures and periodic password spray | `/var/log/auth.log` |
+| SSL connection, TLS, UNBIND, clean disconnect | Administrative LDAP sessions | 389 DS `access` |
+| GSSAPI BIND / RESULT | Three rounds: op 0/1 return err 14, op 2 succeeds | 389 DS `access` |
+| MOD / RESULT | Successful changes to existing groups or SUDO rules | 389 DS `access` |
+| Add / delete member LDIF | Membership changes and restoration | 389 DS `audit` |
+| Replace / delete cmdCategory LDIF | SUDO activation and restoration | 389 DS `audit` |
+| Replace description LDIF | Ordinary policy maintenance | 389 DS `audit` |
 
-Both modes emit all these classes, both administrators and both administrative client IPs. Ordinary activations change one object; cleanup can restore both. An episode changes the group and SUDO rule on the same freshly numbered connection after a four-principal spray. There is no chain label, synthetic sequence number or separate attack-only actor/action in the output.
+The selected small-domain workload averages **61,200 records/day**: 0.5 records/s overnight and about 1 record/s during 08:00-18:00 UTC+03:00. Arrival times vary within two-second baseline periods, with additional office-hour activity and a small daily volume variation. Human accounts are less active overnight; service accounts continue throughout the day. KDC traffic dominates, with about 2% failed authentication attempts. LDAP administration is sparse and more frequent during office hours. These rates are synthetic workload assumptions, not vendor production measurements.
 
-The selected small-domain workload emits **30 records per minute**, averaging 0.5 records/s or 43,200 records/day. Input records arrive in minute buckets. A complete bounded LDAP trace occupies up to 18 records in a bucket; its native timestamps describe a subsecond transaction. Remaining KDC events advance by one second within that bucket. This burst pattern, 12% ordinary-session selection on eligible minute buckets and latency distributions are synthetic assumptions, not vendor production measurements. Session durations use bounded log-normal samples, with smaller exponential queue waits. Their request/result timestamps agree with `etime`; `wtime + optime = etime` in the selected model.
+Both modes include both administrators, both shared administrative client IPs, all event classes and ordinary changes to the same eight policy resources. Each ordinary LDAP session changes one attribute. Membership and SUDO activations last about one hour, followed by visible deletion of the added member or `cmdCategory` value. A capture can end before a pending restoration appears.
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`; `false` emits background without the complete sequence. The default recurrence is **24 hours**, with a supported minimum of **6 hours**. The first episode becomes eligible after one interval. Its next due time is based on the actual first failure, not an event counter.
+`anomaly_mode` defaults to `true`; `false` emits background without a complete chain. An episode contains:
 
-1. Four distinct principals receive one PREAUTH_FAILED each from `attack_ip`, one minute apart. The fourth is `compromised_user`.
-2. One minute later that administrator receives a TGT and an `ldap/<dc_host>` service ticket with the TGT's authentication time.
-3. A fresh 389 DS SSL connection completes all three GSSAPI rounds. Its authenticated DN remains constant.
-4. The connection adds the pre-existing `added_user` to the pre-existing privileged group, then sets the pre-existing SUDO rule's `cmdCategory` to `all`. Each change has a MOD request, matching successful RESULT and a following audit record.
-5. After at least one hour, ordinary administrator sessions visibly remove the member and delete the existing `cmdCategory: all` value. Subsequent episodes wait for both states to be restored.
+1. PREAUTH_FAILED for four distinct principals from one shared client IP, approximately one minute apart.
+2. Successful TGT issuance and an `ldap/<dc_host>` service ticket for the selected administrator from that IP.
+3. A fresh SSL connection and three successful GSSAPI negotiation rounds, retaining the authenticated administrator DN.
+4. Addition of the existing `added_user` to an existing group, followed by `cmdCategory: all` on the corresponding existing SUDO rule. Each change has a MOD request, successful RESULT and audit record.
+5. Ordinary administrator sessions that remove both permissions after about one hour.
 
-The four failures span three minutes; the final successful session follows at four minutes. Each episode has a new monotonic `conn` and new `entryusn` values. Immutable account/group/rule identities are reused because these are changes to existing resources. When an episode is due, new ordinary activations stop until due cleanup completes. Restoration runs at the first eligible minute bucket, less than 61 seconds after the one-hour hold. Eligibility can postpone an episode by up to 61 minutes; missed episodes are not replayed in a burst. A finite capture may end with ordinary permissions still active. No invisible reset is emitted to close its tail.
+The chain completes within 15 minutes. Administrators and policy resources change between consecutive episodes. Both administrative IPs also carry ordinary activity. No anomaly label is added to the records. The first episode starts within the first 24 hours, or within the configured interval when it is shorter. Later starts vary around the configured interval, favoring office hours. The default is 24 hours with a six-hour start window; a 12-hour interval has a three-hour window. The supported minimum interval is six hours.
 
-Detection ideas: four-principal password spray followed by TGT success and an LDAP service ticket; GSSAPI authentication followed by group addition and SUDO activation on one connection. Join KDC on source IP/principal and ticket `authtime`, and access on `conn`/`op`. Audit records have no connection ID: match successful MOD to actor/target and the same native second. Native `time` is local time without an offset; this profile selects UTC for the source server. `modifytimestamp` is UTC GeneralizedTime. KDC syslog and audit timestamps have second precision, so their ECS `@timestamp` preserves seconds. Access retains the fractional native timestamp. Interleaved audit events can consequently have an ECS timestamp earlier than the preceding access RESULT by less than one second. No subsecond audit timestamp is invented.
+Detection ideas: four-principal password spray followed by TGT success, an LDAP service ticket and administrative changes from the same IP and successful principal. Join KDC records by source IP, principal and ticket `authtime`; join access records by `conn` and `op`. Audit records contain actor and target DNs but no connection ID.
 
 ## Source Profile and Limits
 
-The selected inventory contains two enabled administrators with rights to modify both targets, existing unlocked principals, one existing group and one existing service account initially outside it. The existing SUDO rule is enabled, applies to the selected group/hosts and has no `memberAllowCmd`, `memberDenyCmd` or `cmdCategory` initially. That dormant rule allows no commands until `cmdCategory: all` is set. FreeIPA rejects setting that category while explicit allowed commands exist; this generator does not model such a contradictory rule. The rule's native RDN is **`ipauniqueid=<uuid>`**, not its display name `cn`. Recovery deletes the category rather than replacing it with an invalid category value.
+The inventory contains two enabled administrators, unlocked user and service principals, and eight existing group/SUDO-rule pairs. The selected service account initially belongs to none of these groups. Each SUDO rule is enabled, applies to its selected group/hosts and initially has no explicit allowed commands or command category. Setting `cmdCategory: all` enables commands; deleting that value restores the dormant rule. Its native RDN is `ipauniqueid=<uuid>`, while `cn` is its display name. The profile does not create or delete accounts, groups or rules.
 
-The selected password policy uses `maxfail=3` and `failinterval=120` seconds. Ordinary failures are globally separated by at least ten minutes; each spray victim fails only once per episode. Successful AS issuance resets that principal's failure count. No account-lock event or fabricated unlock is needed. TGT cache lifetime is a synthetic eight-hour assumption; a TGS is emitted only after an observed TGT for the same user/IP and uses that TGT's `authtime`.
+The password-policy profile uses `maxfail=3` and a 120-second failure window. At most two unsuccessful attempts occur for a principal within that window before a pause; successful AS issuance resets its failure count. TGT lifetime is a synthetic eight-hour assumption. A service ticket requires a preceding TGT for the same user/IP and retains its authentication time.
 
-The access log must be enabled and `nsslapd-auditlog-logging-enabled=on` must be configured for the extended audit feed. Direct administrative LDAP clients use the pre-existing account rights and do not represent a portal HTTP proxy. This profile selects no optional audit display attributes, C-locale English month names, source timezone UTC, two AES request encryption types and one sequential LDAP connection at a time. These are explicit configuration/workload assumptions. The template retains a fixed inventory and two permission flags, a ticket cache capped at 48 entries, one trace capped at 18 records and scalar scheduler/counter state. Successful changes are reflected only when their raw RESULT is emitted; their audit record follows. No resource creation/deletion or unbounded entity pool is modeled.
+The access log and `nsslapd-auditlog-logging-enabled=on` are required for the selected source records. Administrative clients connect directly through LDAP. This profile selects C-locale month names, source timezone UTC+03:00, the eight request encryption types shown in the vendor guide, and no optional audit display attributes. LDAP requests and results occupy separate record arrivals, typically about one to four seconds apart. Their `etime` equals the observed request/result duration, with `wtime + optime = etime`; this sparse workload does not reproduce subsecond LDAP throughput.
 
-Complete vendor examples establish the selected KDC, access and group-member audit grammars. SUDO LDIF is inferred from FreeIPA's schema and 389 DS's documented serializer, not an exact ALD Pro SUDO capture. Tagged upstream MIT Kerberos 1.18.3, FreeIPA 4.9.11 and 389 DS 1.4.4.20 sources support ticket, rule and audit/result semantics; those versions are not asserted to be bundled with ALD Pro. The selected native-field map covers 38/38 modeled fields, not all ALD Pro fields. No matching Elastic ALD Pro integration or live source/parser validation is available. Keep exact-version/raw parity unconfirmed.
+Native KDC syslog and audit `time` have second precision in UTC+03:00; access timestamps retain fractional seconds and an explicit offset. Audit `modifytimestamp` is UTC GeneralizedTime. ECS `@timestamp` is the full observation timestamp, including fractions absent from some raw records. Source IP and authenticated user on later access/audit records are enrichment from the modeled LDAP connection. Audit `object_name` is inventory enrichment for the group or rule display name.
 
-Connection IP and authenticated actor context on later LDAP access records are ECS enrichment from the synthetic connection/bind, because those lines do not repeat the original address. Audit `object_name` is inventory enrichment for the group or rule display name; the native record contains its DN. Other LDAP operations, internal updates, NEEDED_PREAUTH, OS auditd, Samba, DNS, application UI audit and Windows event IDs are outside this selected feed.
+Vendor examples establish the selected KDC, access and group-member audit grammars. SUDO LDIF is derived from FreeIPA's schema and the 389 DS serializer, rather than an exact ALD Pro SUDO capture. Tagged MIT Kerberos 1.18.3, FreeIPA 4.9.11 and 389 DS 1.4.4.20 sources support the selected semantics; those versions are not asserted to be bundled with ALD Pro. Exact release/raw parity and a matching Elastic integration remain unconfirmed. Other LDAP operations, internal user updates, OS auditd, Samba, DNS, application UI audit and Windows event IDs are outside this feed.
 
 ## Parameters
 
 ### Event Parameters
 
-Edit `event.template.params` in `generator.yml`. Principal/client/service inventory is in `samples/principals.json`. Keep the first two principal names, `svc_backup`, and `compromised_user` distinct so the spray has four targets. Hostnames, realms, account names and DN components use ASCII labels without quotes, backslashes, whitespace or newlines; custom suffixes/services must be consistent with the sample inventory. Supply a valid UUID for the existing SUDO rule.
+Edit `event.template.params` in `generator.yml`. Principal/client/service inventory is in `samples/principals.json`. Keep at least three distinct ordinary principal names separate from the two administrator names. Policy resources are listed in `samples/resources.json`; the group and SUDO parameters below override its first entry. Hostnames, realms, account names and DN components use ASCII labels without quotes, backslashes, whitespace or newlines; custom suffixes/services must be consistent with the sample inventory. Supply a valid UUID for the existing SUDO rule.
 
 | Parameter | Default | Purpose |
 |---|---|---|
@@ -95,19 +96,19 @@ output:
 From the content-packs repository root:
 
 ```bash
-uv run --project ../eventum eventum generate --path generators/identity-ald-pro/generator.yml --id ald-pro --live-mode false
-uv run --project ../eventum eventum generate --path generators/identity-ald-pro/generator.yml --id ald-pro --live-mode true
+uv run --project ../eventum eventum generate --path generators/identity-ald-pro/generator.yml --id ald-pro --live-mode false --keep-order true
+uv run --project ../eventum eventum generate --path generators/identity-ald-pro/generator.yml --id ald-pro --live-mode true --keep-order true
 ```
 
-Both commands run continuously until interrupted. To make a finite batch, set the cron input's ISO 8601 `start` and `end`. Thirty records are generated for each included minute bucket. Change `anomaly_mode` to `false` for the ordinary feed.
+Both commands run continuously until interrupted. For a finite batch, set ISO 8601 `oscillator.start` and `oscillator.end` in both `patterns/*.yml`, using UTC midnight boundaries for full days. Set `anomaly_mode: false` for ordinary activity. Live mode follows the source rate.
 
 ## Sample Output
 
-The complete example below is copied from the final default anomaly-enabled finite run:
+A complete SUDO audit record from an anomaly-enabled run:
 
 ```json
 {
-  "@timestamp": "2026-09-27T01:05:00+00:00",
+  "@timestamp": "2026-09-20T01:03:03.401103+00:00",
   "aldpro": {
     "dirsrv": {
       "audit": {
@@ -115,13 +116,13 @@ The complete example below is copied from the final default anomaly-enabled fini
         "attribute_operation": "replace",
         "attribute_value": "all",
         "changetype": "modify",
-        "dn": "ipauniqueid=a4a19e36-4c0c-4d2f-97aa-e7fe42aa6ae1,cn=sudorules,cn=sudo,dc=lab,dc=example",
-        "entryusn": 100084,
-        "modifiersname": "uid=helpdesk.admin,cn=users,cn=accounts,dc=lab,dc=example",
-        "modifytimestamp": "20260927010500Z",
-        "object_name": "maintenance",
+        "dn": "ipauniqueid=a4a19e36-4c0c-4d2f-97aa-e7fe42aa6ae4,cn=sudorules,cn=sudo,dc=lab,dc=example",
+        "entryusn": 100002,
+        "modifiersname": "uid=directory.admin,cn=users,cn=accounts,dc=lab,dc=example",
+        "modifytimestamp": "20260920010303Z",
+        "object_name": "operations-3",
         "result": 0,
-        "time": "20260927010500"
+        "time": "20260920040303"
       }
     }
   },
@@ -136,7 +137,7 @@ The complete example below is copied from the final default anomaly-enabled fini
     "dataset": "aldpro.dirsrv_audit",
     "kind": "event",
     "module": "aldpro",
-    "original": "time: 20260927010500\ndn: ipauniqueid=a4a19e36-4c0c-4d2f-97aa-e7fe42aa6ae1,cn=sudorules,cn=sudo,dc=lab,dc=example\nresult: 0\nchangetype: modify\nreplace: cmdCategory\ncmdCategory: all\n-\nreplace: modifiersname\nmodifiersname: uid=helpdesk.admin,cn=users,cn=accounts,dc=lab,dc=example\n-\nreplace: modifytimestamp\nmodifytimestamp: 20260927010500Z\n-\nreplace: entryusn\nentryusn: 100084\n-\n\n",
+    "original": "time: 20260920040303\ndn: ipauniqueid=a4a19e36-4c0c-4d2f-97aa-e7fe42aa6ae4,cn=sudorules,cn=sudo,dc=lab,dc=example\nresult: 0\nchangetype: modify\nreplace: cmdCategory\ncmdCategory: all\n-\nreplace: modifiersname\nmodifiersname: uid=directory.admin,cn=users,cn=accounts,dc=lab,dc=example\n-\nreplace: modifytimestamp\nmodifytimestamp: 20260920010303Z\n-\nreplace: entryusn\nentryusn: 100002\n-\n\n",
     "outcome": "success",
     "type": [
       "change"
@@ -150,15 +151,18 @@ The complete example below is copied from the final default anomaly-enabled fini
       "path": "/var/log/dirsrv/slapd-LAB-EXAMPLE/audit"
     }
   },
-  "message": "time: 20260927010500\ndn: ipauniqueid=a4a19e36-4c0c-4d2f-97aa-e7fe42aa6ae1,cn=sudorules,cn=sudo,dc=lab,dc=example\nresult: 0\nchangetype: modify\nreplace: cmdCategory\ncmdCategory: all\n-\nreplace: modifiersname\nmodifiersname: uid=helpdesk.admin,cn=users,cn=accounts,dc=lab,dc=example\n-\nreplace: modifytimestamp\nmodifytimestamp: 20260927010500Z\n-\nreplace: entryusn\nentryusn: 100084\n-\n\n",
+  "message": "time: 20260920040303\ndn: ipauniqueid=a4a19e36-4c0c-4d2f-97aa-e7fe42aa6ae4,cn=sudorules,cn=sudo,dc=lab,dc=example\nresult: 0\nchangetype: modify\nreplace: cmdCategory\ncmdCategory: all\n-\nreplace: modifiersname\nmodifiersname: uid=directory.admin,cn=users,cn=accounts,dc=lab,dc=example\n-\nreplace: modifytimestamp\nmodifytimestamp: 20260920010303Z\n-\nreplace: entryusn\nentryusn: 100002\n-\n\n",
   "related": {
     "user": [
-      "helpdesk.admin"
+      "directory.admin"
     ]
+  },
+  "source": {
+    "ip": "10.20.4.22"
   },
   "user": {
     "domain": "LAB.EXAMPLE",
-    "name": "helpdesk.admin"
+    "name": "directory.admin"
   }
 }
 ```
