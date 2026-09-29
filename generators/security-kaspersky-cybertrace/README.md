@@ -18,9 +18,9 @@ Shares were measured over 14 synthetic days of the default configuration (about 
 - a phishing redirect, in which two phishing URLs match within seconds;
 - a download: a malicious URL, then a file MD5 about a minute or two later, and often further contacts with other malicious URLs over the next minutes;
 - a hash-first detection: a file MD5, sometimes rescanned, sometimes followed by a malicious URL contact;
-- beacon-like repeats: one malicious URL contacted two to six times over one or two hours.
+- beacon-like repeats: one malicious URL contacted two to six times usually over 15 minutes to two hours.
 
-Most endpoints have one user. A few are shared hosts with several users, and six run under two service accounts (`svc-sccm`, `svc-build`, three endpoints each). Indicators come from `samples/malicious_urls.json`, `samples/phishing_urls.json` and `samples/hashes.json`, each with fixed feed record fields (mask, first and last seen dates, popularity, threat name, category or industry, file hashes and size). All domains use reserved `.test`, `.example` and `.invalid` names, and all addresses are documentation or RFC 1918 ranges.
+Most endpoints have one user. About one in five are shared hosts with several users, and six run under two service accounts (`svc-sccm`, `svc-build`, three endpoints each). Indicators come from `samples/malicious_urls.json`, `samples/phishing_urls.json` and `samples/hashes.json`, each with fixed feed record fields (mask, first and last seen dates, popularity, threat name, category or industry, file hashes and size). All domains use reserved `.test`, `.example` and `.invalid` names, and all addresses are documentation or RFC 1918 ranges.
 
 ## Anomaly Chain
 
@@ -34,7 +34,7 @@ With `anomaly_mode: true` (the default), the generator adds a recurring episode 
 
 **Recurrence**: the first episode starts at a random time within the first `anomaly_interval_hours` (default 24, minimum 3) or the first 24 hours, whichever is shorter; its hour of day follows the detection rate, so 06:00-17:00 UTC is more likely than the night. Each next episode starts within a window centred on `anomaly_interval_hours` after the actual start of the previous one; the window is a quarter of the interval wide, at most six hours, and inside it hours with more detections are preferred (squared detection rate plus a small floor), so episode times tend toward busy hours, though a run of episodes can wander through the night before returning. Episodes are scheduled on event time. A missed episode is not caught up. Measured: 14 episodes in 14 days at the default interval (gaps 21.3-26.7 hours), 12 in 4 days at 8 hours (gaps 7.4-9.0 hours); an episode usually spans 2-25 minutes, occasionally up to about 30.
 
-**Variation**: each episode picks another endpoint, URL and file hash than the previous one. The endpoint and user are drawn in proportion to their ordinary detection volume at that hour, among endpoint and user pairs with at least about one incident a day, so busy endpoints and daytime users are chosen most often. A user who works on several endpoints can appear in consecutive episodes. The endpoint and user continue their ordinary detections during the episode.
+**Variation**: each episode picks another endpoint, URL and file hash than the previous one. The endpoint and user are drawn in proportion to their ordinary detection volume at that hour, among endpoint and user pairs with at least about 1.4 incidents a day, so busy endpoints and daytime users are chosen most often. A user who works on several endpoints can appear in consecutive episodes. The endpoint and user continue their ordinary detections during the episode.
 
 **Volume**: episode detections take the place of about as many ordinary detections at random endpoints, so the daily volume and the hour curve are the same with `anomaly_mode` true or false. With `anomaly_mode: true` each episode adds its own URL, file hash and repeated URL detections, so the counts of these patterns are about one per episode higher and ordinary detections about five per episode lower.
 
