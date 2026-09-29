@@ -1,247 +1,330 @@
-{#- One F5 BIG-IP AFM (11.3) message per one-second tick at most, in
-    the ArcSight CEF format: Network Event (23003137) records for
-    accepted, opened, closed and dropped traffic, and Network DoS
-    Event records for attack start, samples and stop. Background is a
-    superposition of independent per-client random processes; the
-    anomaly episode only adds records for one client and never touches
-    the background queue. -#}
+{#- One F5 BIG-IP AFM (11.3) message per input timestamp, in the
+    ArcSight CEF format: Network Event (23003137) records for accepted,
+    opened, closed and dropped traffic, and Network DoS Event records
+    for attack start, samples and stop. The input sets the rate: `svc`
+    timestamps follow the daily curve of service use, `scan` timestamps
+    are a flat stream of closed-port hits, `dos` timestamps start a
+    Network DoS attack. Each timestamp emits the earliest due queued
+    record (a later connection of a session, a flow close, a further
+    closed-port attempt, a DoS sample or stop, an episode step); when
+    nothing is due, an `svc` timestamp opens a service session and a
+    `scan` timestamp a closed-port burst of a scanner, and its first
+    record is emitted. Nothing is discarded. -#}
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set within = 3600 -%}
+{#- Relative record rate by UTC hour (peak 1.0) of the shipped input
+    patterns together (service floor + beta day curve + flat closed-port
+    stream), used for episode placement. -#}
+{%- set curve = [0.295, 0.243, 0.208, 0.192, 0.221, 0.327, 0.455, 0.584, 0.704, 0.807, 0.890, 0.950,
+    0.986, 1.000, 0.991, 0.963, 0.916, 0.854, 0.780, 0.698, 0.611, 0.523, 0.439, 0.361] -%}
+{#- Scanner closed-port bursts a day with the shipped patterns; sizes
+    the busy tier episodes draw their scanner and address from. -#}
+{%- set bursts_per_day = 1150 -%}
 {%- set dos_names = ['TCP SYN Flood', 'UDP Flood', 'ICMPv4 Flood', 'Bad TCP checksum',
     'TCP RST Flood', 'Single Endpoint Flood', 'Single Endpoint Sweep', 'IP Fragment Overlap',
     'DNS Response Flood', 'LAND Attack'] -%}
 {%- set dos_weights = [26, 18, 14, 10, 8, 7, 6, 5, 4, 2] -%}
-
-{#- Background load by UTC hour (7-19 busy, 19-23 evening, night). -#}
-{%- macro load_at(h) -%}
-{{- (1.35 if 7 <= h < 19 else (0.9 if 19 <= h < 23 else 0.45)) / 0.975 -}}
-{%- endmacro -%}
-
-{#- Draw an episode start in [a, b): 10-minute slots weighted by the
-    background load curve (sq: curve^2 + 0.05, curve max 1), uniform
-    within a slot. -#}
-{%- macro draw_start(a, b, sq) -%}
-  {%- set base = (a // 600) * 600 -%}
-  {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
-  {%- for i in range((b - base) // 600 + 1) -%}
-    {%- set lo = [a, base + i * 600] | max -%}
-    {%- set hi = [b, base + (i + 1) * 600] | min -%}
-    {%- if hi > lo -%}
-      {%- set c = (load_at(((base + i * 600) % 86400) // 3600) | float) * 0.975 / 1.35 -%}
-      {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
-      {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- set j = module.rand.weighted_choice(range(ws | length) | list, ws) -%}
-  {%- do shared.set('start_at',
-      module.rand.number.integer(lows[j], highs[j] - 1)) -%}
-{%- endmacro -%}
-
-{%- if not shared.get('initialized', false) -%}
-  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- if params.client_count < 20 or params.client_count > 500 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- set clients = [] -%}
-  {%- set weights = [] -%}
-  {%- set seen = [] -%}
-  {%- for n in range(params.client_count * 4) -%}
-    {%- if clients | length < params.client_count -%}
-      {%- set ip = module.rand.weighted_choice(['198.51.100.', '192.0.2.'], [60, 40])
-          ~ module.rand.number.integer(1, 254) -%}
-      {%- if ip not in seen -%}
-        {%- do seen.append(ip) -%}
-        {%- do clients.append(ip) -%}
-        {%- do weights.append(module.rand.number.lognormal(0, 1.0)) -%}
-      {%- endif -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- set servers = params.virtual_servers -%}
-  {%- set addresses = [] -%}
-  {%- set addr_w = {} -%}
-  {%- for vs in servers -%}
-    {%- set checked = module.ipaddress.IPv4Address(vs.address) -%}
-    {%- if vs.logging not in ['rule', 'flow'] or vs.protocol not in ['TCP', 'UDP'] -%}
-      {{ module.math.sqrt(-1) }}
-    {%- endif -%}
-    {%- if vs.address not in addresses -%}
-      {%- do addresses.append(vs.address) -%}
-    {%- endif -%}
-    {%- do addr_w.update({vs.address: addr_w.get(vs.address, 0) + vs.weight}) -%}
-  {%- endfor -%}
-  {%- set addr_weights = [] -%}
-  {%- for ip in addresses -%}{%- do addr_weights.append(addr_w[ip]) -%}{%- endfor -%}
-  {%- if addresses | length < 2 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- do shared.update({'initialized': true, 'clients': clients, 'weights': weights,
-      'addresses': addresses, 'addr_weights': addr_weights,
-      'vs_weights': servers | map(attribute='weight') | list,
-      'q': [], 'm': {}, 'start_at': none,
-      'last_client': none, 'last_address': none}) -%}
-  {#- First episode inside the first min(interval, 24 h), its time of
-      day drawn from the background load curve. -#}
-  {%- if params.anomaly_mode -%}
-    {{- draw_start(now, now + ([interval, 24] | min * 3600) | int, false) -}}
-  {%- endif -%}
-{%- endif -%}
-{%- set q = shared.get('q') -%}
-{%- set mstate = shared.get('m') -%}
 {%- set servers = params.virtual_servers -%}
-{%- set hour = timestamp.astimezone(utc).hour -%}
-{%- set load = load_at(hour) | float -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
 {%- endmacro -%}
 
-{#- Queue one allowed connection to a virtual server; the Accept or
-    Open record is due at `at`. A flow-logging virtual server queues
-    its Closed record when the Open is emitted. -#}
-{%- macro open_conn(client, vs, at, episode=false) -%}
-  {%- if vs.port == 53 -%}
-    {%- set dur = 0 -%}
-  {%- elif vs.port == 80 -%}
-    {%- set dur = gap(6, 1.3) | int -%}
-  {%- elif vs.port == 25 -%}
-    {%- set dur = gap(4, 1.0) | int -%}
-  {%- else -%}
-    {%- set dur = gap(1500, 1.2) | int -%}
-  {%- endif -%}
-  {%- do q.append({'due': at, 'kind': 'start', 'episode': episode,
-      's': {'client': client, 'vs': vs, 'dur': dur}}) -%}
+{#- A second in [lo, hi) drawn with density curve(hour)^power (+ floor
+    when power is 2), by rejection. -#}
+{%- macro draw_start(lo, hi, power) -%}
+  {%- set ns = namespace(t=lo, done=false) -%}
+  {%- set top = 1.0 + (0.05 if power == 2 else 0) -%}
+  {%- for n in range(600) -%}
+    {%- if not ns.done -%}
+      {%- set t = module.rand.number.integer(lo, [hi - 1, lo] | max) -%}
+      {%- set w = curve[(t // 3600) % 24] ** power + (0.05 if power == 2 else 0) -%}
+      {%- if module.rand.number.floating(0, top) < w -%}
+        {%- set ns.t = t -%}{%- set ns.done = true -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- ns.t -}}
 {%- endmacro -%}
 
-{%- macro deny(client, address, port, at, episode=false) -%}
-  {%- do q.append({'due': at, 'kind': 'deny', 'episode': episode,
-      's': {'client': client, 'address': address, 'port': port}}) -%}
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- Internet clients from the sample file: users (weight = service
+      use) and scanners (weight = closed-port hits). -#}
+  {%- set clients = [] -%}
+  {%- set users = {'i': [], 'cum': []} -%}
+  {%- set scanners = {'i': [], 'w': [], 'cum': []} -%}
+  {%- set acc = namespace(u=0.0, s=0.0) -%}
+  {%- for i in range(samples.clients | length) -%}
+    {%- set row = samples.clients[i] -%}
+    {%- set checked = module.ipaddress.IPv4Address(row.ip) -%}
+    {%- do clients.append(row.ip) -%}
+    {%- if row.role == 'scanner' -%}
+      {%- set acc.s = acc.s + row.weight | float -%}
+      {%- do scanners.i.append(i) -%}{%- do scanners.w.append(row.weight | float) -%}{%- do scanners.cum.append(acc.s) -%}
+    {%- elif row.role == 'user' -%}
+      {%- set acc.u = acc.u + row.weight | float -%}
+      {%- do users.i.append(i) -%}{%- do users.cum.append(acc.u) -%}
+    {%- else -%}
+      {{ module.math.sqrt(-1) }}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if users.i | length < 50 or scanners.i | length < 4 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- Public addresses and the virtual servers on each. -#}
+  {%- set addresses = [] -%}
+  {%- set vs_addr = [] -%}
+  {%- for vs in servers -%}
+    {%- set checked = module.ipaddress.IPv4Address(vs.address) -%}
+    {%- if vs.logging not in ['rule', 'flow'] or vs.protocol not in ['TCP', 'UDP']
+        or vs.port in params.closed_ports -%}
+      {{ module.math.sqrt(-1) }}
+    {%- endif -%}
+    {%- if vs.address not in addresses -%}{%- do addresses.append(vs.address) -%}{%- endif -%}
+    {%- do vs_addr.append(addresses.index(vs.address)) -%}
+  {%- endfor -%}
+  {%- if addresses | length < 2 or params.closed_ports | length < 5 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set addr_vs = [] -%}
+  {%- for ip in addresses -%}
+    {%- set ai = loop.index0 -%}
+    {%- set here = {'v': [], 'w': []} -%}
+    {%- for vs in servers -%}
+      {%- if vs_addr[loop.index0] == ai -%}
+        {%- do here.v.append(loop.index0) -%}{%- do here.w.append(vs.weight) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do addr_vs.append(here) -%}
+  {%- endfor -%}
+  {#- Busy tier for episodes: scanner and address pairs with at least
+      five expected closed-port bursts a day (a scanner is picked by
+      weight and sweeps every address uniformly), weighted by that
+      expectation (the top 8 when fewer reach it). -#}
+  {%- set cands = [] -%}
+  {%- for ci in scanners.i -%}
+    {%- set w = scanners.w[loop.index0] -%}
+    {%- for a in addresses -%}
+      {%- do cands.append([bursts_per_day * w / acc.s / (addresses | length), ci, loop.index0]) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set cands = cands | sort(attribute='0', reverse=true) | list -%}
+  {%- set tier = cands | selectattr('0', 'ge', 5) | list -%}
+  {%- if tier | length < 8 -%}{%- set tier = cands[:8] -%}{%- endif -%}
+  {%- set tacc = namespace(w=0.0) -%}
+  {%- set tier_cum = [] -%}
+  {%- for b in tier -%}{%- set tacc.w = tacc.w + b[0] -%}{%- do tier_cum.append(tacc.w) -%}{%- endfor -%}
+  {%- do shared.update({'initialized': true, 'clients': clients,
+      'users': users.i, 'users_cum': users.cum, 'users_total': acc.u,
+      'scanners': scanners.i, 'scanners_cum': scanners.cum, 'scanners_total': acc.s,
+      'addresses': addresses, 'vs_addr': vs_addr, 'addr_vs': addr_vs,
+      'vs_w': servers | map(attribute='weight') | list,
+      'tier': tier, 'tier_cum': tier_cum, 'tier_total': tacc.w,
+      'q': [], 'seq': 0, 'hist': {}, 'live': {}, 'last': {},
+      'start_at': none, 'last_client': none, 'last_address': none}) -%}
+  {#- First episode inside the first min(interval, 24 h), its time of
+      day drawn from the record rate curve. -#}
+  {%- if params.anomaly_mode -%}
+    {%- do shared.set('start_at', draw_start(now, now + ([interval, 24] | min * 3600) | int, 1) | int) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set live = shared.get('live') -%}
+{%- set lastd = shared.get('last') -%}
+{%- set clients = shared.get('clients') -%}
+{%- set addresses = shared.get('addresses') -%}
+{%- set vs_addr = shared.get('vs_addr') -%}
+{%- set addr_vs = shared.get('addr_vs') -%}
+{%- set vs_idx = range(servers | length) | list -%}
+
+{#- Queue of future records ordered by due time, then by push order. -#}
+{%- macro push(t, item) -%}
+  {%- if q | length < 20000 -%}
+    {%- set n = shared.get('seq') + 1 -%}
+    {%- do shared.set('seq', n) -%}
+    {%- do module.heapq.heappush(q, [t, n, item]) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- A user by service weight or a scanner by scanning weight. -#}
+{%- macro pick_client(role) -%}
+  {%- set idx = shared.get(role) -%}
+  {{- idx[[module.bisect.bisect_right(shared.get(role ~ '_cum'), module.random.random() * shared.get(role ~ '_total')),
+      idx | length - 1] | min] -}}
+{%- endmacro -%}
+
+{#- One allowed connection to a virtual server; the Accept or Open
+    record is due at `at`. A flow-logging virtual server logs its Closed
+    record `dur` seconds after the Open. -#}
+{%- macro conn_dur(port) -%}
+  {%- if port == 53 -%}0
+  {%- elif port == 80 -%}{{ gap(6, 1.3) }}
+  {%- elif port == 25 -%}{{ gap(4, 1.0) }}
+  {%- else -%}{{ gap(1500, 1.2) }}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro open_conn(c, v, at, episode=false) -%}
+  {{- push(at, {'k': 'start', 'c': c, 'v': v, 'dur': conn_dur(servers[v].port) | int, 'ep': episode}) -}}
+{%- endmacro -%}
+
+{#- A client comes back to closed ports of an address no sooner than an
+    hour after its previous attempt there. -#}
+{%- macro free(c, a) -%}
+{{- 'y' if lastd.get(c ~ '>' ~ a, now - 86400) + within < now else '' -}}
 {%- endmacro -%}
 
 {#- Dropped attempts on several closed ports of one public address,
     then optionally an allowed connection to a virtual server on that
     address. The same law serves background and the episode. -#}
-{%- macro probe_burst(client, address, ports, follow, episode=false) -%}
+{%- macro probe_burst(c, a, ports, follow, episode=false) -%}
   {%- set t = namespace(v=now) -%}
   {%- for port in ports -%}
     {%- if not loop.first -%}{%- set t.v = t.v + gap(20, 1.1) | int -%}{%- endif -%}
-    {%- for a in range(module.rand.weighted_choice([1, 2, 3], [55, 32, 13])) -%}
+    {%- for n in range(module.rand.weighted_choice([1, 2, 3], [55, 32, 13])) -%}
       {%- if not loop.first -%}{%- set t.v = t.v + gap(3, 0.7) | int -%}{%- endif -%}
-      {{- deny(client, address, port, t.v, episode) -}}
+      {{- push(t.v, {'k': 'deny', 'c': c, 'a': a, 'p': port, 'ep': episode}) -}}
     {%- endfor -%}
   {%- endfor -%}
+  {%- do lastd.update({c ~ '>' ~ a: t.v}) -%}
   {%- if follow -%}
-    {%- set here = servers | selectattr('address', 'equalto', address) | list -%}
-    {{- open_conn(client, module.rand.weighted_choice(here, here | map(attribute='weight') | list),
-        t.v + gap(90, 1.0) | int, episode) -}}
+    {%- set here = addr_vs[a] -%}
+    {{- open_conn(c, module.rand.weighted_choice(here.v, here.w), t.v + gap(90, 1.0) | int, episode) -}}
   {%- endif -%}
 {%- endmacro -%}
 
-{#- 1. Background arrivals, independent Poisson streams. -#}
-{%- set clients = shared.get('clients') -%}
-{%- set weights = shared.get('weights') -%}
-{%- if module.rand.chance(0.055 * load) -%}
-  {%- set c = module.rand.weighted_choice(clients, weights) -%}
-  {%- set vs = module.rand.weighted_choice(servers, shared.get('vs_weights')) -%}
-  {%- set t = namespace(v=now) -%}
-  {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4], [62, 22, 10, 6])) -%}
-    {%- if not loop.first -%}{%- set t.v = t.v + gap(15, 1.4) | int -%}{%- endif -%}
-    {{- open_conn(c, vs, t.v) -}}
+{#- 1. Episode: starts drawn by source time (see README), next due
+    from the actual start, never catching up. The client and address
+    come from the busy tier, both different from the previous episode,
+    and the scanner has not tried that address in the last hour. Its
+    records join the queue on top of ordinary traffic. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {%- set tier = shared.get('tier') -%}
+  {%- set pick = namespace(b=none) -%}
+  {%- for n in range(64) -%}
+    {%- if pick.b is none -%}
+      {%- set b = tier[[module.bisect.bisect_right(shared.get('tier_cum'), module.random.random() * shared.get('tier_total')),
+          tier | length - 1] | min] -%}
+      {%- if b[1] != shared.get('last_client') and b[2] != shared.get('last_address') and free(b[1], b[2]) -%}
+        {%- set pick.b = b -%}
+      {%- endif -%}
+    {%- endif -%}
   {%- endfor -%}
+  {%- if pick.b is none -%}
+    {%- for b in tier -%}
+      {%- if pick.b is none and free(b[1], b[2]) -%}{%- set pick.b = b -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if pick.b is none -%}{%- set pick.b = module.rand.choice(tier) -%}{%- endif -%}
+  {%- set k = module.rand.weighted_choice([3, 4, 5], [58, 28, 14]) -%}
+  {%- set end = probe_burst(pick.b[1], pick.b[2], module.rand.shuffle(params.closed_ports | list)[:k], true, true) -%}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set w = ([interval / 4, 6] | min * 3600) | int -%}
+  {%- do shared.update({'last_client': pick.b[1], 'last_address': pick.b[2],
+      'start_at': draw_start([due - w // 2, now + 1] | max, due + w // 2, 2) | int}) -%}
 {%- endif -%}
-{%- if module.rand.chance(0.0055) -%}
-  {#- Internet background noise: a client hitting closed ports of a
-      public address - a scanner, a misconfigured tool, a user trying
-      another protocol - sometimes followed by ordinary use. -#}
-  {%- set c = module.rand.weighted_choice(clients, weights) -%}
-  {%- set a = module.rand.weighted_choice(shared.get('addresses'), shared.get('addr_weights')) -%}
-  {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5], [50, 24, 14, 8, 4]) -%}
-  {{- probe_burst(c, a, module.rand.shuffle(params.closed_ports | list)[:k], module.rand.chance(0.5)) -}}
-{%- endif -%}
-{%- if module.rand.chance(1 / 7200) -%}
-  {#- Network DoS attack lifecycle: Started, dropped samples, Stopped. -#}
-  {%- set c = module.rand.weighted_choice(clients, weights) -%}
-  {%- set vs = module.rand.weighted_choice(servers, shared.get('vs_weights')) -%}
+
+{#- 2. A `dos` timestamp starts a Network DoS attack: Started, dropped
+    samples, Stopped. -#}
+{%- if 'dos' in tags -%}
+  {%- set c = pick_client('scanners') | int -%}
+  {%- set v = module.rand.weighted_choice(vs_idx, shared.get('vs_w')) -%}
   {%- set name = module.rand.weighted_choice(dos_names, dos_weights) -%}
   {%- set aid = module.rand.number.integer(1000000000, 4294967295) -%}
   {%- set t = namespace(v=now) -%}
-  {%- do q.append({'due': t.v, 'kind': 'dos', 'episode': false,
-      's': {'status': 'Attack Started', 'id': aid, 'name': name}}) -%}
+  {{- push(t.v, {'k': 'dos', 'st': 'Attack Started', 'id': aid, 'name': name}) -}}
   {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4, 5, 6, 8, 12], [18, 18, 16, 14, 11, 9, 8, 6])) -%}
     {%- set t.v = t.v + gap(40, 1.1) | int -%}
-    {%- do q.append({'due': t.v, 'kind': 'dos', 'episode': false,
-        's': {'status': 'Attack Sampled', 'id': aid, 'name': name, 'client': c, 'vs': vs,
-        'spt': module.rand.number.integer(1024, 65535)}}) -%}
+    {{- push(t.v, {'k': 'dos', 'st': 'Attack Sampled', 'id': aid, 'name': name, 'c': c, 'v': v,
+        'spt': module.rand.number.integer(1024, 65535)}) -}}
   {%- endfor -%}
-  {%- do q.append({'due': t.v + gap(60, 1.0) | int, 'kind': 'dos', 'episode': false,
-      's': {'status': 'Attack Stopped', 'id': aid, 'name': name}}) -%}
+  {{- push(t.v + gap(60, 1.0) | int, {'k': 'dos', 'st': 'Attack Stopped', 'id': aid, 'name': name}) -}}
 {%- endif -%}
 
-{#- 2. Episode: the next start is drawn in a window of
-    w = min(interval / 4, 6 h) centred on due = this start + interval,
-    weighted by the load curve squared plus a floor. -#}
-{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
-  {%- set pool = namespace(c=[], w=[]) -%}
-  {%- for ip in clients -%}
-    {%- if ip != shared.get('last_client') -%}
-      {%- do pool.c.append(ip) -%}{%- do pool.w.append(weights[loop.index0]) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- set c = module.rand.weighted_choice(pool.c, pool.w) -%}
-  {%- set apool = namespace(a=[], w=[]) -%}
-  {%- for ip in shared.get('addresses') -%}
-    {%- if ip != shared.get('last_address') -%}
-      {%- do apool.a.append(ip) -%}{%- do apool.w.append(shared.get('addr_weights')[loop.index0]) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- set a = module.rand.weighted_choice(apool.a, apool.w) -%}
-  {%- set k = module.rand.weighted_choice([3, 4, 5], [58, 28, 14]) -%}
-  {{- probe_burst(c, a, module.rand.shuffle(params.closed_ports | list)[:k], true, true) -}}
-  {%- do shared.update({'last_client': c, 'last_address': a}) -%}
-  {%- set due = now + (interval * 3600) | int -%}
-  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
-  {{- draw_start(due - half, due + half, true) -}}
-{%- endif -%}
-
-{#- 3. Emit the earliest due record, otherwise nothing. -#}
-{%- set pick = namespace(i=-1, due=now + 1) -%}
-{%- for e in q -%}
-  {%- if e.due <= now and e.due < pick.due -%}
-    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+{#- 3. When nothing is due, open new background activity by the
+    timestamp's tag: a closed-port burst of a scanner (by weight, on an
+    address drawn uniformly, 1-5 ports), else mostly a user's service
+    session of 1-4 connections to one virtual server and sometimes a
+    user's closed-port burst on 1-2 ports (another protocol tried, a
+    misconfigured tool). A burst on three or more ports is not followed
+    by service use. -#}
+{%- if not (q and q[0][0] <= now) -%}
+  {%- set go = namespace(c=-1, a=-1) -%}
+  {%- if 'scan' in tags -%}
+    {%- for n in range(16) -%}
+      {%- if go.c < 0 -%}
+        {%- set c = pick_client('scanners') | int -%}
+        {%- set a = module.rand.number.integer(0, addresses | length - 1) -%}
+        {%- if free(c, a) -%}{%- set go.c = c -%}{%- set go.a = a -%}{%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set ks = [1, 2, 3, 4, 5] -%}{%- set kw = [50, 24, 14, 8, 4] -%}{%- set pf = 0.8 -%}
+  {%- elif module.rand.chance(0.017) -%}
+    {%- set c = pick_client('users') | int -%}
+    {%- set a = module.rand.number.integer(0, addresses | length - 1) -%}
+    {%- if free(c, a) -%}{%- set go.c = c -%}{%- set go.a = a -%}{%- endif -%}
+    {%- set ks = [1, 2] -%}{%- set kw = [50, 24] -%}{%- set pf = 0.68 -%}
   {%- endif -%}
-{%- endfor -%}
-{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set e = q.pop(pick.i) -%}
-{%- set s = e.s -%}
-{%- set kind = e.kind -%}
+  {%- if go.c >= 0 -%}
+    {%- set k = module.rand.weighted_choice(ks, kw) -%}
+    {%- set end = probe_burst(go.c, go.a, module.rand.shuffle(params.closed_ports | list)[:k],
+        k <= 2 and module.rand.chance(pf)) -%}
+  {%- else -%}
+    {%- set c = pick_client('users') | int -%}
+    {%- set v = module.rand.weighted_choice(vs_idx, shared.get('vs_w')) -%}
+    {%- set t = namespace(v=now) -%}
+    {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4], [62, 22, 10, 6])) -%}
+      {%- if not loop.first -%}{%- set t.v = t.v + gap(15, 1.4) | int -%}{%- endif -%}
+      {{- open_conn(c, v, t.v) -}}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set e = module.heapq.heappop(q)[2] -%}
+{%- set kind = e.k -%}
 
-{#- Guard on the final chain step over every binding: an Accept/Open
-    completes a chain when its client was dropped on three or more
-    distinct ports of that address in the preceding `within` s (no cap,
-    no reset). A background allowed connection that would complete one
-    is not made; episode records never are dropped. -#}
+{#- Guard on the final chain step: an Accept/Open completes a chain when
+    its client was dropped on three or more distinct ports of that
+    address in the preceding `within` s (history kept across
+    completions, episode drops included). A background connection that
+    would complete one keeps its time and client and goes to a virtual
+    server on another address instead, drawn by the virtual server
+    weights among addresses where it would not complete one. Drop
+    history per client and address is trimmed to the window whenever
+    the pair is touched. -#}
+{%- macro scanned(c, a) -%}
+  {%- set hk = c ~ '>' ~ a -%}
+  {%- set recent = hist.get(hk, []) | selectattr('0', 'ge', now - within) | list -%}
+  {%- if recent -%}{%- do hist.update({hk: recent}) -%}{%- else -%}{%- do hist.pop(hk, none) -%}{%- endif -%}
+  {{- 'y' if recent | map(attribute='1') | unique | list | length >= 3 else '' -}}
+{%- endmacro -%}
+{%- if kind == 'start' and not e.ep and scanned(e.c, vs_addr[e.v]) -%}
+  {%- set alt = namespace(v=[], w=[]) -%}
+  {%- for vs in servers -%}
+    {%- if vs_addr[loop.index0] != vs_addr[e.v] and not scanned(e.c, vs_addr[loop.index0]) -%}
+      {%- do alt.v.append(loop.index0) -%}{%- do alt.w.append(vs.weight) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if not alt.v -%}{{ dispatch.drop() }}{%- endif -%}
+  {%- set v = module.rand.weighted_choice(alt.v, alt.w) -%}
+  {%- set e = {'k': 'start', 'c': e.c, 'v': v, 'dur': conn_dur(servers[v].port) | int, 'ep': false} -%}
+{%- endif -%}
 {%- if kind == 'deny' -%}
-  {%- set hk = s.client ~ '>' ~ s.address -%}
-  {%- set recent = mstate.get(hk, []) | selectattr('0', 'ge', now - within) | list -%}
-  {%- do recent.append([now, s.port]) -%}
-  {%- do mstate.update({hk: recent}) -%}
+  {%- set hk = e.c ~ '>' ~ e.a -%}
+  {%- set recent = hist.get(hk, []) | selectattr('0', 'ge', now - within) | list -%}
+  {%- do recent.append([now, e.p]) -%}
+  {%- do hist.update({hk: recent}) -%}
 {%- elif kind == 'start' -%}
-  {%- set hk = s.client ~ '>' ~ s.vs.address -%}
-  {%- set recent = mstate.get(hk, []) | selectattr('0', 'ge', now - within) | list -%}
-  {%- do mstate.update({hk: recent}) -%}
-  {%- if not e.episode and recent | map(attribute='1') | unique | list | length >= 3 -%}
-    {{ dispatch.drop() }}
-  {%- endif -%}
-  {#- Source port not in use by an open flow of the same client to the
-      same virtual server (a live 4-tuple is never reused). -#}
-  {%- set busy = q | selectattr('kind', 'equalto', 'close')
-      | map(attribute='s') | selectattr('client', 'equalto', s.client)
-      | map(attribute='spt') | list -%}
+  {#- Source port not in use by an open flow of the same client. -#}
   {%- set sp = namespace(v=module.rand.number.integer(1024, 65535)) -%}
   {%- for i in range(8) -%}
-    {%- if sp.v in busy -%}{%- set sp.v = module.rand.number.integer(1024, 65535) -%}{%- endif -%}
+    {%- if (e.c ~ '|' ~ sp.v) in live -%}{%- set sp.v = module.rand.number.integer(1024, 65535) -%}{%- endif -%}
   {%- endfor -%}
-  {%- do s.update({'spt': sp.v}) -%}
-  {%- if s.vs.logging == 'flow' -%}
-    {%- do q.append({'due': now + s.dur, 'kind': 'close', 'episode': e.episode, 's': s}) -%}
+  {%- if servers[e.v].logging == 'flow' -%}
+    {%- do live.update({e.c ~ '|' ~ sp.v: 1}) -%}
+    {{- push(now + e.dur, {'k': 'close', 'c': e.c, 'v': e.v, 'spt': sp.v, 'ep': e.ep}) -}}
   {%- endif -%}
+  {%- set e = {'k': 'start', 'c': e.c, 'v': e.v, 'spt': sp.v} -%}
+{%- elif kind == 'close' -%}
+  {%- do live.pop(e.c ~ '|' ~ e.spt, none) -%}
 {%- endif -%}
 
 {#- 4. The CEF message, key order as in the External Monitoring
@@ -251,44 +334,46 @@
 {%- set head = 'CEF:0|F5|Advanced Firewall Module|' ~ params.product_version ~ '|' -%}
 {%- set rd = params.route_domain | string -%}
 {%- if kind == 'dos' -%}
-  {%- set sampled = s.status == 'Attack Sampled' -%}
+  {%- set sampled = e.st == 'Attack Sampled' -%}
   {%- set act = 'Drop' if sampled else 'None' -%}
-  {%- set src_ip = s.client if sampled else none -%}
-  {%- set dst_ip = s.vs.address if sampled else none -%}
-  {%- set src_port = s.spt if sampled else none -%}
-  {%- set dst_port = s.vs.port if sampled else none -%}
+  {%- set vs = servers[e.v] if sampled else none -%}
+  {%- set src_ip = clients[e.c] if sampled else none -%}
+  {%- set dst_ip = vs.address if sampled else none -%}
+  {%- set src_port = e.spt if sampled else none -%}
+  {%- set dst_port = vs.port if sampled else none -%}
   {%- set vlan = params.vlan if sampled else '' -%}
-  {%- set vname = s.vs.name if sampled else '' -%}
-  {%- set proto = s.vs.protocol if sampled else none -%}
-  {%- set raw = head ~ s.name ~ '|' ~ act ~ '|8|dvchost=' ~ params.bigip_host
+  {%- set vname = vs.name if sampled else '' -%}
+  {%- set proto = vs.protocol if sampled else none -%}
+  {%- set raw = head ~ e.name ~ '|' ~ act ~ '|8|dvchost=' ~ params.bigip_host
     ~ ' dvc=' ~ params.bigip_management_ip ~ ' rt=' ~ rt_text ~ ' act=' ~ act
-    ~ ' cn1=' ~ s.id ~ ' cn1Label=attack_id cs1=' ~ s.status ~ ' cs1Label=attack_status'
+    ~ ' cn1=' ~ e.id ~ ' cn1Label=attack_id cs1=' ~ e.st ~ ' cs1Label=attack_status'
     ~ ' src=' ~ (src_ip or '') ~ ' spt=' ~ (src_port or '') ~ ' dst=' ~ (dst_ip or '')
     ~ ' dpt=' ~ (dst_port or '') ~ ' cs2=' ~ vlan ~ ' cs2Label=vlan'
     ~ ' cs3=' ~ vname ~ ' cs3Label=virtual_name cn4=' ~ rd ~ ' cn4Label=route_domain'
     ~ ' c6a2= c6a2Label=source_address c6a3= c6a3Label=destination_address' -%}
-  {%- set afm = {'attack_id': s.id | string, 'attack_status': s.status,
-      'attack_name': s.name, 'action': act, 'route_domain': params.route_domain} -%}
+  {%- set afm = {'attack_id': e.id | string, 'attack_status': e.st,
+      'attack_name': e.name, 'action': act, 'route_domain': params.route_domain} -%}
   {%- if sampled -%}{%- do afm.update({'vlan': vlan, 'virtual_name': vname}) -%}{%- endif -%}
   {%- set event = {'kind': 'event',
       'category': ['network', 'intrusion_detection'],
-      'type': ['start'] if s.status == 'Attack Started' else (['denied'] if sampled else ['end']),
-      'action': s.status | lower | replace(' ', '_'), 'code': '23003138'} -%}
+      'type': ['start'] if e.st == 'Attack Started' else (['denied'] if sampled else ['end']),
+      'action': e.st | lower | replace(' ', '_'), 'code': '23003138'} -%}
   {%- set rule_name = none -%}
 {%- else -%}
   {%- if kind == 'deny' -%}
     {%- set act = 'Drop' -%}
-    {%- set src_ip = s.client -%}{%- set dst_ip = s.address -%}{%- set dst_port = s.port -%}
+    {%- set src_ip = clients[e.c] -%}{%- set dst_ip = addresses[e.a] -%}{%- set dst_port = e.p -%}
     {%- set src_port = module.rand.number.integer(1024, 65535) -%}
     {%- set proto = 'TCP' -%}
     {%- set vname = '' -%}{%- set vlabel = 'Global' -%}
     {%- set drop_reason = 'Policy' -%}{%- set rule_name = params.deny_rule -%}
   {%- else -%}
-    {%- set act = ('Accept' if s.vs.logging == 'rule' else 'Open') if kind == 'start' else 'Closed' -%}
-    {%- set src_ip = s.client -%}{%- set dst_ip = s.vs.address -%}{%- set dst_port = s.vs.port -%}
-    {%- set src_port = s.spt -%}{%- set proto = s.vs.protocol -%}
-    {%- set vname = s.vs.name -%}{%- set vlabel = 'virtual_name' -%}
-    {%- set drop_reason = '' -%}{%- set rule_name = s.vs.rule if act == 'Accept' else '' -%}
+    {%- set vs = servers[e.v] -%}
+    {%- set act = ('Accept' if vs.logging == 'rule' else 'Open') if kind == 'start' else 'Closed' -%}
+    {%- set src_ip = clients[e.c] -%}{%- set dst_ip = vs.address -%}{%- set dst_port = vs.port -%}
+    {%- set src_port = e.spt -%}{%- set proto = vs.protocol -%}
+    {%- set vname = vs.name -%}{%- set vlabel = 'virtual_name' -%}
+    {%- set drop_reason = '' -%}{%- set rule_name = vs.rule if act == 'Accept' else '' -%}
   {%- endif -%}
   {%- set vlan = params.vlan -%}
   {%- set raw = head ~ '23003137|Network Event|8|rt=' ~ rt_text ~ ' dvchost=' ~ params.bigip_host
