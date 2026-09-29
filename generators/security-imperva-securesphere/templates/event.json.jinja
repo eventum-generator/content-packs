@@ -1,98 +1,166 @@
-{#- One SecureSphere security alert or system event per one-second tick
-    at most, as the Management Server action sets send them in CEF
-    (SecureSphere CEF guide templates, v14 placeholders). Background is
-    a superposition of independent random processes per client; the
-    anomaly episode only adds alerts of one client against two
-    applications and never touches the background queue. -#}
-{%- set now = timestamp.timestamp() | int -%}
+{#- One SecureSphere security alert or system event per input
+    timestamp, as the Management Server action sets send them in CEF
+    (SecureSphere CEF guide templates, v14 placeholders). Timestamps
+    come in three populations (tags): `traffic` for single alerts on
+    ordinary web traffic, `automation` for bursts of scanners, attack
+    tools and broken clients (and standalone correlation alerts),
+    `console` for administrator logins. A traffic or automation
+    timestamp emits the earliest due queued alert (the next alert of a
+    running burst, a correlation follow-up, an episode step); when none
+    is due it starts a new single alert or burst of its population and
+    emits its first alert. A console timestamp always logs in. -#}
+{%- set now_s = timestamp.timestamp() | int -%}
+{%- set pop = 'console' if 'console' in tags else ('automation' if 'automation' in tags else 'traffic') -%}
+{%- set heapq = module.heapq -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {#- Chain window: two distinct signature violations of one client on
     one application, then a signature violation of that client on
-    another application. -#}
+    another application; the background guard uses the same window. -#}
 {%- set window_s = 1800 -%}
-
-{%- if not shared.get('initialized', false) -%}
-  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- if not (40 <= params.client_count <= 600) or not (5 <= params.user_count <= 500) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- if params.applications | length < 2 or params.signatures | length < 3 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- set clients = [] -%}
-  {%- set seen = [] -%}
-  {%- for n in range(params.client_count * 6) -%}
-    {%- if clients | length < params.client_count -%}
-      {%- set internal = module.rand.chance(1 - params.external_share) -%}
-      {%- set net = module.ipaddress.IPv4Network(params.internal_network if internal else module.rand.choice(params.external_networks | list)) -%}
-      {%- set ip = (net.network_address + module.rand.number.integer(2, net.num_addresses - 2)) | string -%}
-      {%- if ip not in seen -%}
-        {%- do seen.append(ip) -%}
-        {%- do clients.append({'ip': ip, 'internal': internal}) -%}
-      {%- endif -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- set cw = [] -%}{%- for c in clients -%}{%- do cw.append(module.rand.number.lognormal(0, 1.0)) -%}{%- endfor -%}
-  {#- Every client mostly uses one home application. -#}
-  {%- set home = [] -%}
-  {%- for c in clients -%}
-    {%- do home.append(module.rand.weighted_choice(range(params.applications | length) | list, params.applications | map(attribute='weight') | list)) -%}
-  {%- endfor -%}
-  {%- set fk = module.faker.locale['en_US'] -%}
-  {%- set users = [] -%}
-  {%- for n in range(params.user_count * 4) -%}
-    {%- if users | length < params.user_count -%}
-      {%- set u = fk.first_name() | lower ~ '.' ~ fk.last_name() | lower -%}
-      {%- if u not in users -%}{%- do users.append(u) -%}{%- endif -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- set uw = [] -%}{%- for u in users -%}{%- do uw.append(module.rand.number.lognormal(0, 0.9)) -%}{%- endfor -%}
-  {%- do shared.update({'initialized': true, 'clients': clients, 'cw': cw, 'home': home, 'users': users, 'uw': uw,
-      'q': [], 'hist': {}, 'recent': [], 'next_due': now + (interval * 3600) | int,
-      'last_client': none, 'last_app': none, 'last_pivot': none}) -%}
-{%- endif -%}
-{%- set q = shared.get('q') -%}
-{%- set hist = shared.get('hist') -%}
-{%- set clients = shared.get('clients') -%}
-{%- set cw = shared.get('cw') -%}
-{%- set home = shared.get('home') -%}
-{%- set apps = params.applications | list -%}
-{%- set aw = apps | map(attribute='weight') | list -%}
-{%- set ci_all = range(clients | length) | list -%}
-{%- set ai_all = range(apps | length) | list -%}
-{%- set hour = timestamp.astimezone(utc).hour -%}
-{%- set load = (1.4 if 8 <= hour < 19 else (0.9 if 19 <= hour < 23 else 0.5)) / 0.98 -%}
+{#- Relative rate of burst starts by UTC hour: the flat automation
+    stream less the share of its timestamps that running bursts take
+    (larger at night, when traffic timestamps are sparse). Used to
+    place episodes. -#}
+{%- set curve = [0.79] * 7 + [0.93] * 2 + [1.0] * 9 + [0.93] * 3 + [0.79] * 3 -%}
+{#- Alerts of all clients per day (sum of patterns/traffic-*.yml and
+    patterns/automation.yml less console logins), used to find the
+    clients active enough on two applications to carry an episode. -#}
+{%- set alerts_per_day = 9700 -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
 {%- endmacro -%}
 
-{#- Application of one alert of a client: its home application, or any
-    application by the global weights. -#}
-{%- macro pick_app(ci) -%}
-{{- home[ci] if module.rand.chance(0.85) else module.rand.weighted_choice(ai_all, aw) -}}
-{%- endmacro -%}
-
-{#- Applications other than ai on which the client raised two or more
-    distinct signature rules within the chain window (emitted so far). -#}
-{%- macro prefix_apps(ci, ai) -%}
-  {%- set h = hist.get(ci | string, []) | selectattr('0', 'ge', now - window_s) | list -%}
-  {%- set out = [] -%}
-  {%- for a in h | map(attribute='1') | unique | list -%}
-    {%- if a != ai and (h | selectattr('1', 'equalto', a) | map(attribute='2') | unique | list | length) >= 2 -%}{%- do out.append(a | string) -%}{%- endif -%}
+{#- A second in [a, b), density proportional to the curve (sq false)
+    or to its square plus a small floor (sq true). -#}
+{%- macro pick_time(a, b, sq) -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- for hh in range(a // 3600, (b - 1) // 3600 + 1) -%}
+    {%- set lo = [hh * 3600, a] | max -%}
+    {%- set hi = [hh * 3600 + 3600, b] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = curve[hh % 24] -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
+    {%- endif -%}
   {%- endfor -%}
-  {{- out | join(',') -}}
+  {%- set sl = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.integer(sl[0], sl[1] - 1) -}}
 {%- endmacro -%}
 
-{#- Draw a burst plan of one client: signature violations (a repeated
-    rule or a new one) with some protocol violations mixed in. -#}
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set apps = [] -%}
+  {%- for r in samples.applications -%}
+    {%- do apps.append({'server_group': r.server_group, 'service': r.service, 'application': r.application,
+        'servers': r.servers | list, 'port': r.port | int, 'weight': r.weight | float, 'internal_only': r.internal_only}) -%}
+  {%- endfor -%}
+  {%- set rules = {'Signature': [], 'Protocol': [], 'Profile': [], 'Correlation': []} -%}
+  {%- set rw = {'Signature': [], 'Protocol': [], 'Profile': [], 'Correlation': []} -%}
+  {%- for r in samples.rules -%}
+    {%- do rules[r.kind].append({'name': r.name, 'description': r.description, 'severity': r.severity}) -%}
+    {%- do rw[r.kind].append(r.weight | float) -%}
+  {%- endfor -%}
+  {%- if apps | length < 2 or rules.Signature | length < 3 or not rules.Protocol or not rules.Profile or not rules.Correlation -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set aw = apps | map(attribute='weight') | list -%}
+  {%- set ai_all = range(apps | length) | list -%}
+  {#- Clients (samples/clients.csv): address, zone, activity weight,
+      home and second application, and the application user the
+      address signs in as when it signs in at all. -#}
+  {%- set app_ix = {} -%}
+  {%- for x in apps -%}{%- do app_ix.update({x.application: loop.index0}) -%}{%- endfor -%}
+  {%- set clients = [] -%}
+  {%- set cw = [] -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(v=0.0) -%}
+  {%- for r in samples.clients -%}
+    {%- do clients.append({'ip': r.ip, 'internal': r.zone == 'internal', 'home': app_ix[r.home],
+        'second': app_ix[r.second], 'user': r.user}) -%}
+    {%- do cw.append(r.weight | float) -%}
+    {%- set acc.v = acc.v + r.weight | float -%}
+    {%- do cum.append(acc.v) -%}
+  {%- endfor -%}
+  {#- Global application weights by zone: external clients do not
+      reach internal-only applications. -#}
+  {%- set aw_ext = [] -%}
+  {%- for x in apps -%}{%- do aw_ext.append(0 if x.internal_only else x.weight) -%}{%- endfor -%}
+  {#- Clients able to carry an episode: expected signature violations
+      over four days of at least 20 on each of two applications (their
+      home and second application, or any other). -#}
+  {%- set elig = [] -%}
+  {%- set scores = [] -%}
+  {%- for c in clients -%}
+    {%- set ci = loop.index0 -%}
+    {%- set base = 4 * alerts_per_day * cw[ci] / acc.v * 0.55 -%}
+    {%- set ok = [] -%}
+    {%- for a in ai_all -%}
+      {%- set gw = aw if c.internal else aw_ext -%}
+      {%- set sh = (0.7 if a == c.home else 0) + (0.2 if a == c.second else 0) + 0.1 * gw[a] / (gw | sum) -%}
+      {%- if base * sh >= 20 -%}{%- do ok.append(a) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if ok | length >= 2 -%}{%- do elig.append([ci, ok]) -%}{%- endif -%}
+    {%- do scores.append([cw[ci], ci]) -%}
+  {%- endfor -%}
+  {%- if elig | length < 10 -%}
+    {%- set elig = [] -%}
+    {%- for s in (scores | sort(reverse=true))[:10] -%}
+      {%- do elig.append([s[1], [clients[s[1]].home, clients[s[1]].second]]) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set first = none -%}
+  {%- if params.anomaly_mode -%}
+    {%- set first = pick_time(now_s, now_s + ([interval, 24] | min * 3600) | int, false) | int -%}
+  {%- endif -%}
+  {%- do shared.update({'initialized': true, 'apps': apps, 'rules': rules, 'rw': rw, 'aw': aw, 'aw_ext': aw_ext,
+      'clients': clients, 'cw': cw, 'cum': cum, 'cw_sum': acc.v, 'elig': elig,
+      'heap': [], 'ctr': {'seq': 0, 'swept': now_s}, 'hist': {}, 'busy': {},
+      'ep': none, 'ep_at': first, 'last': {'c': none, 'a': none, 'b': none}}) -%}
+{%- endif -%}
+{%- set apps = shared.get('apps') -%}
+{%- set rules = shared.get('rules') -%}
+{%- set rw = shared.get('rw') -%}
+{%- set aw = shared.get('aw') -%}
+{%- set aw_ext = shared.get('aw_ext') -%}
+{%- set clients = shared.get('clients') -%}
+{%- set cw = shared.get('cw') -%}
+{%- set heap = shared.get('heap') -%}
+{%- set ctr = shared.get('ctr') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set busy = shared.get('busy') -%}
+{%- set ai_all = range(apps | length) | list -%}
+
+{#- Client of a new alert or burst, by activity weight. -#}
+{%- macro pick_client() -%}
+{{- [module.bisect.bisect_right(shared.get('cum'), module.rand.number.floating(0, shared.get('cw_sum'))), clients | length - 1] | min -}}
+{%- endmacro -%}
+
+{#- Application of an alert or burst of a client: its home
+    application, its second one, or any application by weight. -#}
+{%- macro pick_app(ci) -%}
+  {%- set r = module.rand.number.floating(0, 1) -%}
+  {{- clients[ci].home if r < 0.7 else (clients[ci].second if r < 0.9
+      else module.rand.weighted_choice(ai_all, aw if clients[ci].internal else aw_ext)) -}}
+{%- endmacro -%}
+
+{%- macro share(ci, a) -%}
+  {%- set gw = aw if clients[ci].internal else aw_ext -%}
+  {{- (0.7 if a == clients[ci].home else 0) + (0.2 if a == clients[ci].second else 0) + 0.1 * gw[a] / (gw | sum) -}}
+{%- endmacro -%}
+
+{#- Draw a burst plan: signature violations (a repeated rule or a new
+    one) with some protocol violations mixed in. -#}
 {%- macro make_plan(plan) -%}
   {%- set st = namespace(prev=none) -%}
   {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [34, 26, 17, 11, 7, 5])) -%}
     {%- if module.rand.chance(0.2) -%}
-      {%- do plan.append(['Protocol', module.rand.weighted_choice(params.protocol_violations, params.protocol_violations | map(attribute='weight') | list)]) -%}
+      {%- do plan.append(['Protocol', module.rand.weighted_choice(rules.Protocol, rw.Protocol)]) -%}
     {%- else -%}
       {%- if st.prev is not none and module.rand.chance(0.45) -%}
         {%- set s = st.prev -%}
       {%- else -%}
-        {%- set s = module.rand.weighted_choice(params.signatures, params.signatures | map(attribute='weight') | list) -%}
+        {%- set s = module.rand.weighted_choice(rules.Signature, rw.Signature) -%}
       {%- endif -%}
       {%- set st.prev = s -%}
       {%- do plan.append(['Signature', s]) -%}
@@ -100,128 +168,129 @@
   {%- endfor -%}
 {%- endmacro -%}
 
-{#- User of a burst or a single alert: logged-in application user or
-    none (the placeholder stays unresolved). -#}
-{%- macro draw_user(c, kind) -%}
-  {%- set p = 0.7 if kind == 'Profile' else (0.3 if c.internal else 0.06) -%}
-  {%- if module.rand.chance(p) -%}{{- module.rand.weighted_choice(shared.get('users'), shared.get('uw')) -}}{%- endif -%}
+{#- User of a burst or a single alert: the client's application user
+    when it is signed in, otherwise none (the placeholder stays
+    unresolved). -#}
+{%- macro draw_user(ci, kind) -%}
+  {%- set p = 0.7 if kind == 'Profile' else (0.3 if clients[ci].internal else 0.06) -%}
+  {%- if module.rand.chance(p) -%}{{- clients[ci].user -}}{%- endif -%}
 {%- endmacro -%}
 
-{%- macro push(kind, item, ci, ai, user, at, episode=false, block=none) -%}
-  {%- do q.append({'due': at, 'kind': kind, 'item': item, 'ci': ci, 'ai': ai, 'user': user,
-      'server': module.rand.choice(apps[ai].servers | list), 'episode': episode, 'block': block}) -%}
+{%- macro push(due, kind, item, ci, ai, user, bg=true, ep=false, final=false, block=none) -%}
+  {%- do heapq.heappush(heap, [due, ctr.seq, {'kind': kind, 'item': item, 'ci': ci, 'ai': ai, 'user': user,
+      'server': module.rand.choice(apps[ai].servers), 'bg': bg, 'ep': ep, 'final': final, 'block': block}]) -%}
+  {%- do ctr.update({'seq': ctr.seq + 1}) -%}
+  {%- if bg -%}{%- do busy.update({ci: busy.get(ci, 0) + 1}) -%}{%- endif -%}
 {%- endmacro -%}
 
-{#- A burst of alerts of one client against one application, then an
-    optional correlation alert. The same law serves background and the
-    episode prefix; end.v receives the time of the last violation. -#}
-{%- macro burst(ci, ai, plan, follow, end, episode=false) -%}
-  {%- set user = draw_user(clients[ci], 'Signature') -%}
-  {%- set t = namespace(v=now) -%}
+{#- Queue a burst of alerts of one client against one application,
+    then an optional correlation alert; times are offsets from now. -#}
+{%- macro burst(ci, ai, plan, times, follow, bg=true, ep=false) -%}
+  {%- set user = draw_user(ci, 'Signature') -%}
+  {%- for e in plan -%}
+    {{- push(now_s + times[loop.index0], e[0], e[1], ci, ai, user, bg, ep) -}}
+  {%- endfor -%}
+  {%- if follow -%}
+    {{- push(now_s + times[-1] + gap(90, 1.0) | int, 'Correlation', module.rand.weighted_choice(rules.Correlation, rw.Correlation),
+        ci, ai, user, bg, ep, false, module.rand.chance(0.55)) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro offsets(plan, out) -%}
+  {%- set t = namespace(v=0) -%}
   {%- for e in plan -%}
     {%- if not loop.first -%}{%- set t.v = t.v + gap(25, 1.1) | int -%}{%- endif -%}
-    {{- push(e[0], e[1], ci, ai, user, t.v, episode) -}}
+    {%- do out.append(t.v) -%}
   {%- endfor -%}
-  {%- set end.v = t.v -%}
-  {%- if follow -%}
-    {%- set corr = module.rand.weighted_choice(params.correlations, params.correlations | map(attribute='weight') | list) -%}
-    {{- push('Correlation', corr, ci, ai, user, t.v + gap(90, 1.0) | int, episode, module.rand.chance(0.55)) -}}
-  {%- endif -%}
 {%- endmacro -%}
 
-{#- 1. Background arrivals, independent random streams. -#}
-{%- if module.rand.chance(0.018 * load) -%}
-  {#- Single alerts of ordinary traffic: false positives, profile
-      deviations of logged-in users, odd clients; diurnal. -#}
-  {%- set ci = module.rand.weighted_choice(ci_all, cw) -%}
-  {%- set ai = pick_app(ci) | int -%}
-  {%- set kind = module.rand.weighted_choice(['Signature', 'Profile', 'Protocol'], [52, 33, 15]) -%}
-  {%- set items = params.signatures if kind == 'Signature' else (params.profile_violations if kind == 'Profile' else params.protocol_violations) -%}
-  {{- push(kind, module.rand.weighted_choice(items, items | map(attribute='weight') | list), ci, ai, draw_user(clients[ci], kind), now) -}}
-{%- endif -%}
-{%- if module.rand.chance(0.0035) -%}
-  {#- Bursts: scanners, attack tools, broken clients; flat over the day.
-      A correlation alert follows a quarter of them, whatever the
-      number of rules. -#}
-  {%- set ci = module.rand.weighted_choice(ci_all, cw) -%}
-  {%- set plan = [] -%}{{- make_plan(plan) -}}
-  {%- set end = namespace(v=now) -%}
-  {{- burst(ci, pick_app(ci) | int, plan, module.rand.chance(0.25), end) -}}
-{%- endif -%}
-{%- if module.rand.chance(0.0002) -%}
-  {#- Correlation alerts over traffic that raised no single alert. -#}
-  {%- set ci = module.rand.weighted_choice(ci_all, cw) -%}
-  {{- push('Correlation', module.rand.weighted_choice(params.correlations, params.correlations | map(attribute='weight') | list),
-      ci, pick_app(ci) | int, draw_user(clients[ci], 'Correlation'), now, false, module.rand.chance(0.55)) -}}
-{%- endif -%}
-{%- if module.rand.chance(0.0003 * load) -%}
-  {#- Management console logins, system events. -#}
-  {%- set adm = module.rand.weighted_choice(params.admins | list, [50, 30, 20][:params.admins | length] + [10] * (params.admins | length - 3)) -%}
-  {%- do q.append({'due': now, 'kind': 'System', 'admin': adm, 'episode': false}) -%}
-{%- endif -%}
-
-{#- 2. Episode: due by source time, exponential start delay (mean
-    20 min, flat over the day like background bursts), next due from
-    the actual start, never catching up. -#}
-{%- if params.anomaly_mode and now >= shared.get('next_due') and module.rand.chance(1 / 1200) -%}
-  {#- The client, its first application A and the application B it
-      moves to come from recent background alerts of a client seen on
-      two or more applications, so all keep the background weighting
-      and both pairs occur in the background; client, A and B differ
-      from the previous episode's. -#}
-  {%- set apps_of = {} -%}
-  {%- for r in shared.get('recent') -%}
-    {%- set k = r[0] | string -%}
-    {%- if r[1] not in apps_of.get(k, []) -%}{%- do apps_of.update({k: apps_of.get(k, []) + [r[1]]}) -%}{%- endif -%}
-  {%- endfor -%}
-  {%- set cand = [] -%}
-  {%- for r in shared.get('recent') -%}
-    {%- set others = apps_of[r[0] | string] | reject('equalto', r[1]) | reject('equalto', shared.get('last_pivot')) | list -%}
-    {%- if clients[r[0]].ip != shared.get('last_client') and r[1] != shared.get('last_app') and others -%}
-      {%- do cand.append([r[0], r[1], others]) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- if cand -%}
-    {%- set r = module.rand.choice(cand) -%}
-    {%- set ci = r[0] -%}{%- set ai = r[1] -%}{%- set bi = module.rand.choice(r[2]) -%}
-  {%- else -%}
-    {%- set ci = module.rand.weighted_choice(ci_all, cw) -%}
-    {%- set ai = home[ci] -%}
-    {%- set bi = module.rand.weighted_choice(ai_all | reject('equalto', ai) | list, aw[:ai] + aw[ai + 1:]) -%}
-  {%- endif -%}
-  {#- Prefix: a background burst plan conditioned on two or more
-      distinct signature rules, with the background correlation
-      follow-up law. -#}
-  {%- set pl = namespace(v=[]) -%}
-  {%- for n in range(60) -%}
-    {%- if (pl.v | selectattr('0', 'equalto', 'Signature') | map(attribute='1') | map(attribute='name') | unique | list | length) < 2 -%}
-      {%- set plan = [] -%}{{- make_plan(plan) -}}
-      {%- set pl.v = plan -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- set end = namespace(v=now) -%}
-  {{- burst(ci, ai, pl.v, module.rand.chance(0.25), end, true) -}}
-  {#- Final step: one signature violation of the same client on B a few
+{%- if pop != 'console' -%}
+  {#- Episode, due by the recurrence plan: a background-like burst of
+      two or more distinct signature rules of client C on application
+      A, then one signature violation of C on application B a few
       minutes later, inside the chain window. -#}
-  {%- set lag = namespace(v=gap(240, 1.0) | int) -%}
-  {%- for n in range(20) -%}
-    {%- if end.v - now + lag.v > window_s - 120 -%}{%- set lag.v = gap(240, 1.0) | int -%}{%- endif -%}
-  {%- endfor -%}
-  {{- push('Signature', module.rand.weighted_choice(params.signatures, params.signatures | map(attribute='weight') | list),
-      ci, bi, draw_user(clients[ci], 'Signature'), end.v + lag.v, true) -}}
-  {%- do shared.update({'last_client': clients[ci].ip, 'last_app': ai, 'last_pivot': bi, 'next_due': now + (interval * 3600) | int}) -%}
+  {%- set ep_at = shared.get('ep_at') -%}
+  {%- if params.anomaly_mode and ep_at is not none and now_s >= ep_at and shared.get('ep') is none -%}
+    {%- set last = shared.get('last') -%}
+    {%- set cands = [] -%}
+    {%- set cws = [] -%}
+    {%- for r in shared.get('elig') -%}
+      {%- set ci = r[0] -%}
+      {%- set h = hist.get(ci) -%}
+      {%- if ci != last.c and not busy.get(ci) and not (h and (h | last)[0] >= now_s - window_s) -%}
+        {%- set pairs = [] -%}
+        {%- set pws = [] -%}
+        {%- for a in r[1] -%}
+          {%- for b in r[1] -%}
+            {%- if a != b and a != last.a and b != last.b -%}
+              {%- do pairs.append([a, b]) -%}
+              {%- do pws.append((share(ci, a) | float) * (share(ci, b) | float)) -%}
+            {%- endif -%}
+          {%- endfor -%}
+        {%- endfor -%}
+        {%- if pairs -%}
+          {%- do cands.append([ci, pairs, pws]) -%}
+          {%- do cws.append(cw[ci]) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if cands -%}
+      {%- set cd = module.rand.weighted_choice(cands, cws) -%}
+      {%- set ci = cd[0] -%}
+      {%- set ab = module.rand.weighted_choice(cd[1], cd[2]) -%}
+      {%- set ai = ab[0] -%}{%- set bi = ab[1] -%}
+      {#- Burst plan of the background law, conditioned on two or more
+          distinct signature rules. -#}
+      {%- set pl = namespace(plan=[], times=[]) -%}
+      {%- for n in range(80) -%}
+        {%- if not pl.plan -%}
+          {%- set plan = [] -%}{{- make_plan(plan) -}}
+          {%- set names = plan | selectattr('0', 'equalto', 'Signature') | map(attribute='1') | map(attribute='name') | unique | list -%}
+          {%- if names | length >= 2 -%}
+            {%- set times = [] -%}{{- offsets(plan, times) -}}
+            {%- if times[-1] <= 900 -%}{%- set pl.plan = plan -%}{%- set pl.times = times -%}{%- endif -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {{- burst(ci, ai, pl.plan, pl.times, module.rand.chance(0.25), false, true) -}}
+      {%- set lag = namespace(v=gap(240, 1.0) | int) -%}
+      {%- for n in range(20) -%}
+        {%- if pl.times[-1] + lag.v > window_s - 300 -%}{%- set lag.v = gap(240, 1.0) | int -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set lag.v = [lag.v, window_s - 300 - pl.times[-1]] | min -%}
+      {{- push(now_s + pl.times[-1] + lag.v, 'Signature', module.rand.weighted_choice(rules.Signature, rw.Signature),
+          ci, bi, draw_user(ci, 'Signature'), false, true, true) -}}
+      {%- set due = now_s + (interval * 3600) | int -%}
+      {%- set w = ([interval / 4, 6] | min * 3600) | int -%}
+      {%- do shared.update({'ep': {'ci': ci, 'a': ai}, 'last': {'c': ci, 'a': ai, 'b': bi},
+          'ep_at': pick_time(due - w // 2, due + w // 2, true) | int}) -%}
+    {%- endif -%}
+  {%- endif -%}
+
+  {#- A new single alert or burst when nothing queued is due. -#}
+  {%- if not heap or heap[0][0] > now_s -%}
+    {%- set ci = pick_client() | int -%}
+    {%- if pop == 'traffic' -%}
+      {#- Single alerts of ordinary traffic: false positives, profile
+          deviations of signed-in users, odd clients. -#}
+      {%- set kind = module.rand.weighted_choice(['Signature', 'Profile', 'Protocol'], [52, 33, 15]) -%}
+      {{- push(now_s, kind, module.rand.weighted_choice(rules[kind], rw[kind]), ci, pick_app(ci) | int, draw_user(ci, kind)) -}}
+    {%- elif module.rand.chance(0.946) -%}
+      {#- Bursts: scanners, attack tools, broken clients. A correlation
+          alert follows a quarter of them, whatever the number of rules. -#}
+      {%- set plan = [] -%}{{- make_plan(plan) -}}
+      {%- set times = [] -%}{{- offsets(plan, times) -}}
+      {{- burst(ci, pick_app(ci) | int, plan, times, module.rand.chance(0.25)) -}}
+    {%- else -%}
+      {#- Correlation alerts over traffic that raised no single alert. -#}
+      {{- push(now_s, 'Correlation', module.rand.weighted_choice(rules.Correlation, rw.Correlation), ci, pick_app(ci) | int,
+          draw_user(ci, 'Correlation'), true, false, false, module.rand.chance(0.55)) -}}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set e = heapq.heappop(heap)[2] -%}
 {%- endif -%}
 
-{#- 3. Emit the earliest due event, otherwise nothing. -#}
-{%- set pk = namespace(i=-1, due=now + 1) -%}
-{%- for e in q -%}
-  {%- if e.due <= now and e.due < pk.due -%}{%- set pk.i = loop.index0 -%}{%- set pk.due = e.due -%}{%- endif -%}
-{%- endfor -%}
-{%- if pk.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set e = q.pop(pk.i) -%}
-{%- set kind = e.kind -%}
-
-{%- set rt = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set rt = module.datetime.datetime.fromtimestamp(now_s, utc) -%}
 {%- set rt_text = rt.strftime('%b %d %Y %H:%M:%S') -%}
 {%- set iso = rt.strftime('%Y-%m-%dT%H:%M:%S') ~ '.000Z' -%}
 {%- set sevnum = {'Low': 0, 'Medium': 4, 'High': 7} -%}
@@ -229,9 +298,9 @@
 {%- set dev = {'product': 'SecureSphere', 'receipt_time': iso, 'vendor': 'Imperva Inc.', 'version': params.device_version} -%}
 {%- set obs = {'product': 'SecureSphere', 'vendor': 'Imperva Inc.', 'version': params.device_version} -%}
 
-{%- if kind == 'System' -%}
+{%- if pop == 'console' -%}
   {#- System event action set (CEF guide "Configuring a System Event"). -#}
-  {%- set adm = e.admin -%}
+  {%- set adm = module.rand.weighted_choice(samples.admins | list, samples.admins | map(attribute='weight') | list) -%}
   {%- set name = 'User ' ~ adm.name ~ ' logged in from ' ~ adm.ip ~ '.' -%}
   {%- set raw = head ~ 'User logged in|' ~ name ~ '|High|suser=' ~ adm.name ~ ' rt=' ~ rt_text ~ ' cat=SystemEvent' -%}
   {%- do dev.update({'event': {'category': 'SystemEvent', 'class_id': 'User logged in'}}) -%}
@@ -243,44 +312,54 @@
       'source': {'user': {'name': adm.name}},
       'tags': ['preserve_original_event', 'preserve_duplicate_custom_fields']} -%}
 {%- else -%}
-  {%- set c = clients[e.ci] -%}
+  {%- set ci = e.ci -%}
+  {%- set kind = e.kind -%}
+  {%- set item = e.item -%}
+  {%- if e.bg -%}
+    {%- set n = busy.get(ci, 1) - 1 -%}
+    {%- if n > 0 -%}{%- do busy.update({ci: n}) -%}{%- else -%}{%- do busy.pop(ci, none) -%}{%- endif -%}
+  {%- endif -%}
+  {%- set h = (hist.get(ci) or []) | selectattr('0', 'ge', now_s - window_s) | list -%}
   {%- set tgt = namespace(ai=e.ai, server=e.server) -%}
-  {%- if kind == 'Signature' and not e.episode -%}
+  {%- if kind == 'Signature' and e.bg -%}
     {#- Guard on the final chain step only, window equal to the chain
         window: an ordinary signature violation of a client that raised
         two or more distinct signature rules on another application
         within the window is reported on that application instead;
-        time, client and rule stay unchanged. -#}
-    {%- set pa = prefix_apps(e.ci, e.ai) -%}
+        time, client and rule stay unchanged. While the client's own
+        episode is still before its last step, its ordinary signature
+        violations go to the episode's first application the same way,
+        so no second application collects two rules. -#}
+    {%- set pa = [] -%}
+    {%- for a in h | map(attribute='1') | unique -%}
+      {%- if a != e.ai and (h | selectattr('1', 'equalto', a) | map(attribute='2') | unique | list | length) >= 2 -%}{%- do pa.append(a) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set ep = shared.get('ep') -%}
+    {%- if not pa and ep is not none and ep.ci == ci and e.ai != ep.a -%}{%- do pa.append(ep.a) -%}{%- endif -%}
     {%- if pa -%}
-      {%- set tgt.ai = module.rand.choice(pa.split(',')) | int -%}
-      {%- set tgt.server = module.rand.choice(apps[tgt.ai].servers | list) -%}
+      {%- set tgt.ai = module.rand.choice(pa) -%}
+      {%- set tgt.server = module.rand.choice(apps[tgt.ai].servers) -%}
     {%- endif -%}
   {%- endif -%}
-  {%- if not e.episode -%}
-    {%- set recent = shared.get('recent') -%}
-    {%- do recent.append([e.ci, tgt.ai]) -%}
-    {%- if recent | length > 300 -%}{%- do recent.pop(0) -%}{%- endif -%}
-  {%- endif -%}
-  {%- set a = apps[tgt.ai] -%}
-  {%- set server = tgt.server -%}
-  {%- set item = e.item -%}
-  {%- set key = e.ci | string -%}
-  {%- set kept = hist.get(key, []) | selectattr('0', 'ge', now - window_s) | list -%}
   {%- if kind == 'Signature' -%}
-    {%- set kept = (kept + [[now, tgt.ai, item.name]])[-40:] -%}
+    {%- do h.append([now_s, tgt.ai, item.name]) -%}
     {%- set block = module.rand.chance(0.35 if item.severity == 'High' else (0.15 if item.severity == 'Medium' else 0.03)) -%}
   {%- elif kind == 'Correlation' -%}
     {%- set block = e.block -%}
   {%- else -%}
     {%- set block = module.rand.chance(0.1 if kind == 'Protocol' else 0.05) -%}
   {%- endif -%}
-  {%- if kept -%}{%- do hist.update({key: kept}) -%}{%- else -%}{%- do hist.pop(key, none) -%}{%- endif -%}
-  {%- if hist | length > 400 -%}
+  {%- if h -%}{%- do hist.update({ci: h[-40:]}) -%}{%- else -%}{%- do hist.pop(ci, none) -%}{%- endif -%}
+  {%- if e.final -%}{%- do shared.set('ep', none) -%}{%- endif -%}
+  {%- if now_s - ctr.swept >= 3600 -%}
     {%- for k in hist | list -%}
-      {%- if (hist[k] | last)[0] < now - window_s -%}{%- do hist.pop(k) -%}{%- endif -%}
+      {%- if (hist[k] | last)[0] < now_s - window_s -%}{%- do hist.pop(k) -%}{%- endif -%}
     {%- endfor -%}
+    {%- do ctr.update({'swept': now_s}) -%}
   {%- endif -%}
+  {%- set a = apps[tgt.ai] -%}
+  {%- set server = tgt.server -%}
+  {%- set c = clients[ci] -%}
   {%- set policy = params.signature_policy if kind == 'Signature' else (params.protocol_policy if kind == 'Protocol'
       else (params.profile_policy if kind == 'Profile' else params.correlation_policy)) -%}
   {%- set act = 'block' if block else 'none' -%}
