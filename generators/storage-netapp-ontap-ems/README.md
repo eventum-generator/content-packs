@@ -43,7 +43,7 @@ Each episode models a password attack on the management interface followed by sw
 4. Several minutes after that, `arw.volume.state` with `op` `disabled` for volume V.
 5. Restoration: `arw.volume.state` with `op` `enabled` for V after a hold drawn from the same distribution as ordinary pauses; A is unlocked on the same schedule as in the background, and B's attempts end with a successful login that resets B's counter, as most ordinary sessions do.
 
-Linking fields: `user.name` (`netapp.ems.parameters.userName` / `username`) ties steps 1-2 and separates B in step 3; `netapp.ems.parameters.volumeName` and `volumeUuid` tie steps 4-5. A chain spans about 3-40 minutes and always completes within one hour. There is no client IP, because these EMS messages do not carry one.
+Linking fields: `user.name` (`netapp.ems.parameters.userName` / `username`) ties steps 1-2 and separates B in step 3; `netapp.ems.parameters.volumeName` and `volumeUuid` tie steps 4-5. From the first failure to the disable a chain spans about 3-40 minutes and always within one hour; the re-enable follows later (median about 50 minutes, sometimes hours). There is no client IP, because these EMS messages do not carry one.
 
 Episode actors come from the busiest accounts and volumes: A and B are two of the first three administrators, logging in over their usual application to the first node, and V is one of the frequently paused volumes. A differs from the previous episode's A, V from the previous V, and B from the previous B when that account is free.
 
