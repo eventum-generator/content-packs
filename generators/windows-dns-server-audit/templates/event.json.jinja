@@ -1,21 +1,22 @@
 {#- Microsoft DNS Server Audit and Analytical records as parsed ECS JSON.
-    One input tick per second; each tick emits the earliest due record,
-    stamped with its own time, or drops. Independent background
-    processes: client A queries (Poisson arrivals thinned by a UTC hour
-    curve, random client and name), Windows DNS client retransmissions
-    of dropped queries (1, 1, 2, 4 s), and per-admin sessions that create
-    Ignore policies with lognormal lifetimes. A query whose name matches
-    an active policy is dropped (259) instead of answered (257). Times
-    are in microseconds. -#}
+    Every input timestamp yields exactly one record at that time; the
+    input sets the rate and its hour-of-day curve. A small queue holds
+    scheduled records - answers, drops and further names of a lookup,
+    Windows DNS client retransmissions of dropped queries (1, 1, 2, 4 s),
+    policy creations and deletions of administrator sessions and episode
+    steps. The earliest due queued record takes the timestamp; otherwise
+    the timestamp starts a new client lookup. State changes (a policy
+    created or deleted, a query dropped or answered) take effect when
+    their record is emitted, and records are emitted in the order of
+    their scheduled times. Times are in microseconds. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set hq = module.heapq -%}
 {%- set hour = 3600000000 -%}
 {#- Chain window, counted from the 577: a background deletion by the
     creator within this window, after at least three dropped queries,
-    would complete the chain and is dropped; the policy stays until an
-    ordinary later deletion (see the 'del' and 'op' items). -#}
+    would complete the chain; it deletes another active policy instead
+    (see the 580 row). -#}
 {%- set window = 3600000000 -%}
 {%- macro ln(med, sig) -%}
   {#- Lognormal seconds with median med; returns microseconds. -#}
@@ -27,14 +28,14 @@
   {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
 {%- endmacro -%}
 {%- macro pick_start(lo, span) -%}
-  {#- Time in [lo, lo + span) with its UTC hour weighted by the activity
-      curve squared plus a small floor. -#}
+  {#- Time in [lo, lo + span) with its hour weighted by the
+      administrator activity curve squared plus a small floor. -#}
   {%- set curve = shared.get('curve') -%}
   {%- set top = (curve | max) ** 2 + 0.02 -%}
   {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
   {%- for _ in range(500) if not r.ok -%}
     {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
-    {%- if module.rand.number.floating(0, top) < curve[(c // 3600000000) % 24] ** 2 + 0.02 -%}
+    {%- if module.rand.number.floating(0, top) < curve[((c + shared.get('tzoff')) // 3600000000) % 24] ** 2 + 0.02 -%}
       {%- set r.v = c -%}
       {%- set r.ok = true -%}
     {%- endif -%}
@@ -47,56 +48,23 @@
   {%- for i in idx -%}{%- do ws.append(1 / samples.admins[i].gap_h) -%}{%- endfor -%}
   {{- module.rand.weighted_choice(idx, ws) -}}
 {%- endmacro -%}
-{%- macro ask(ci, qi, t, attempt, xid, port) -%}
-  {#- One received query at t: 256, then 259 if an active policy matches
-      the name (with a retransmission while the client still waits),
-      otherwise the authoritative 257 answer. -#}
-  {%- set guid = '{' ~ (module.rand.crypto.uuid4() | string | upper) ~ '}' -%}
-  {{- push(t, {'k': 'row', 'code': 256, 'c': ci, 'n': qi, 'xid': xid, 'port': port, 'guid': guid}) -}}
-  {%- set qn = samples.queries[qi].qname -%}
+{%- macro received(it, d) -%}
+  {#- Effects of a received query (256) with scheduled time d: dropped
+      (259 right after it, and a retransmission while the client still
+      waits) if an active policy matches the name, otherwise answered
+      (257) after the answer time. -#}
+  {%- set qn = samples.queries[it.n].qname -%}
   {%- set active = shared.get('active') -%}
   {%- set hit = namespace(p=none) -%}
   {%- for pname, pol in active.items() if hit.p is none and (qn.endswith(pol.m) if pol.wild else qn == pol.m) -%}{%- set hit.p = pname -%}{%- endfor -%}
   {%- if hit.p is not none -%}
-    {%- set pol = active[hit.p] -%}
-    {{- push(t + (ln(0.0003, 0.5) | int), {'k': 'row', 'code': 259, 'c': ci, 'n': qi, 'xid': xid, 'pol': hit.p}) -}}
-    {%- do pol.update({'drops': pol.drops + 1}) -%}
-    {%- if pol.ep and not pol.planned and pol.drops >= 3 -%}
-      {%- do pol.update({'planned': true}) -%}
-      {{- push([t + (ln(180, 0.9) | int), pol.deadline] | min, {'k': 'del', 'p': hit.p, 'by': pol.by, 'own': true}) -}}
-    {%- endif -%}
-    {%- if attempt < 4 -%}
-      {{- push(t + [1, 1, 2, 4][attempt] * 1000000 + (ln(0.004, 0.8) | int), {'k': 'retry', 'c': ci, 'n': qi, 'a': attempt + 1, 'xid': xid, 'port': port}) -}}
+    {{- push(d, {'k': 'row', 'code': 259, 'c': it.c, 'n': it.n, 'xid': it.xid, 'pol': hit.p}) -}}
+    {%- if it.a < 4 -%}
+      {{- push(d + [1, 1, 2, 4][it.a] * 1000000 + (ln(0.004, 0.8) | int), {'k': 'row', 'code': 256, 'c': it.c, 'n': it.n, 'a': it.a + 1, 'xid': it.xid, 'port': it.port}) -}}
     {%- endif -%}
   {%- else -%}
     {%- set el = ln(0.0007, 0.7) | int -%}
-    {{- push(t + el, {'k': 'row', 'code': 257, 'c': ci, 'n': qi, 'xid': xid, 'port': port, 'guid': guid, 'el': el}) -}}
-  {%- endif -%}
-{%- endmacro -%}
-{%- macro create(ai, t, ep) -%}
-  {#- Create an Ignore policy for a target without an active policy;
-      returns the policy name or nothing when every target is taken. -#}
-  {%- set active = shared.get('active') -%}
-  {%- set taken = [] -%}
-  {%- for pol in active.values() -%}{%- do taken.append(pol.ti) -%}{%- endfor -%}
-  {%- if ep -%}{%- do taken.append(shared.get('ep_last_target')) -%}{%- endif -%}
-  {%- set free = range(samples.targets | length) | reject('in', taken) | list -%}
-  {%- if free -%}
-    {%- set ws = [] -%}
-    {%- for i in free -%}{%- do ws.append(samples.targets[i].weight) -%}{%- endfor -%}
-    {%- set ti = module.rand.weighted_choice(free, ws) -%}
-    {%- set tg = samples.targets[ti] -%}
-    {%- set n = namespace(v=params.policy_name ~ '-' ~ tg.label ~ '-' ~ module.rand.string.hex(4) | lower) -%}
-    {%- set recent = shared.get('recent') -%}
-    {%- for _ in range(8) if n.v in recent -%}{%- set n.v = params.policy_name ~ '-' ~ tg.label ~ '-' ~ module.rand.string.hex(4) | lower -%}{%- endfor -%}
-    {%- do recent.append(n.v) -%}
-    {%- if recent | length > 300 -%}{%- do recent.pop(0) -%}{%- endif -%}
-    {%- set crit = tg.criteria.split(',', 1)[1] -%}
-    {%- set wild = crit.startswith('*.') -%}
-    {%- set order = (active | length) + 1 -%}
-    {%- do active.update({n.v: {'by': ai, 't0': t, 'ti': ti, 'm': (crit[1:] if wild else crit) ~ '.', 'wild': wild, 'drops': 0, 'ep': ep, 'planned': false, 'deadline': t + module.builtins.int(window * module.rand.number.floating(0.4, 0.97))}}) -%}
-    {{- push(t, {'k': 'row', 'code': 577, 'pol': n.v, 'by': ai, 'crit': tg.criteria, 'order': order}) -}}
-    {{- n.v -}}
+    {{- push(d + el, {'k': 'row', 'code': 257, 'c': it.c, 'n': it.n, 'xid': it.xid, 'port': it.port, 'guid': it.guid, 'el': el}) -}}
   {%- endif -%}
 {%- endmacro -%}
 {%- if shared.get('queue') is none -%}
@@ -105,22 +73,28 @@
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 2, 'le': 8760}}
   }} -%}
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python({'anomaly_mode': params.anomaly_mode, 'anomaly_interval_hours': params.anomaly_interval_hours}) -%}
-  {#- Relative activity by UTC hour (peak 1): client queries and admin
-      sessions are thinned by it; episode starts are weighted by its
-      square. -#}
-  {%- do shared.update({'queue': [], 'seq': 0, 'active': {}, 'recent': [], 'last_us': now - 1, 'record': module.rand.number.integer(2000, 60000), 'curve': [0.08, 0.06, 0.05, 0.05, 0.06, 0.1, 0.25, 0.55, 0.85, 1.0, 1.0, 0.95, 0.85, 0.95, 1.0, 1.0, 0.9, 0.7, 0.45, 0.3, 0.2, 0.15, 0.12, 0.1]}) -%}
-  {%- set cw = [] -%}
-  {%- for _ in samples.clients -%}{%- do cw.append(module.rand.number.lognormal(0, 0.9)) -%}{%- endfor -%}
-  {%- set qw = [] -%}
-  {%- for row in samples.queries -%}{%- do qw.append(row.weight) -%}{%- endfor -%}
-  {%- do shared.update({'cw': cw, 'ci': range(samples.clients | length) | list, 'qw': qw, 'qi': range(samples.queries | length) | list}) -%}
-  {{- push(now + module.builtins.int(module.rand.number.exponential(0.12) * 1000000), {'k': 'q'}) -}}
-  {#- Episode admin weights: background self-deletions per admin are
-      proportional to its activity (1 / gap_h). An episode excludes the
-      previous episode's admin, so the weights are solved such that the
-      long-run episode share per admin equals that activity share. -#}
+  {#- Relative administrator activity by hour of the generator timezone
+      (peak 1): admin sessions are thinned by it; episode starts are
+      weighted by its square. Client traffic follows the input. -#}
+  {%- do shared.update({'queue': [], 'seq': 0, 'active': {}, 'recent': [], 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()) * 1000000, 'record': module.rand.number.integer(2000, 60000), 'guarded': 0, 'suppressed': 0, 'curve': [0.08, 0.06, 0.05, 0.05, 0.06, 0.1, 0.25, 0.55, 0.85, 1.0, 1.0, 0.95, 0.85, 0.95, 1.0, 1.0, 0.9, 0.7, 0.45, 0.3, 0.2, 0.15, 0.12, 0.1]}) -%}
+  {%- set ccw = namespace(v=[], acc=0) -%}
+  {%- for _ in samples.clients -%}
+    {%- set ccw.acc = ccw.acc + module.rand.number.lognormal(0, 0.9) -%}
+    {%- do ccw.v.append(ccw.acc) -%}
+  {%- endfor -%}
+  {%- set qcw = namespace(v=[], acc=0) -%}
+  {%- for row in samples.queries -%}
+    {%- set qcw.acc = qcw.acc + row.weight -%}
+    {%- do qcw.v.append(qcw.acc) -%}
+  {%- endfor -%}
+  {%- do shared.update({'ccw': ccw.v, 'ci': range(samples.clients | length) | list, 'qcw': qcw.v, 'qi': range(samples.queries | length) | list}) -%}
+  {#- Episode admin weights: episodes go to the administrators who own
+      an area (a target they manage), in proportion to their activity
+      (1 / gap_h). An episode excludes the previous episode's admin, so
+      the weights are solved such that the long-run episode share per
+      admin equals that activity share. -#}
   {%- set pa = [] -%}
-  {%- for row in samples.admins -%}{%- do pa.append(1 / row.gap_h) -%}{%- endfor -%}
+  {%- for row in samples.admins -%}{%- do pa.append(1 / row.gap_h if row.area else 0) -%}{%- endfor -%}
   {%- set ew = namespace(v=pa) -%}
   {%- for _ in range(200) -%}
     {%- set tot = ew.v | sum -%}
@@ -134,147 +108,234 @@
   {%- endfor -%}
   {%- set threads = [] -%}
   {%- for _ in range(module.rand.number.integer(6, 12)) -%}{%- do threads.append(4 * module.rand.number.integer(200, 2500)) -%}{%- endfor -%}
-  {%- do shared.update({'ep_w': ew.v, 'pid': 4 * module.rand.number.integer(300, 1500), 'threads': threads}) -%}
+  {%- set area = [] -%}
+  {%- for row in samples.admins -%}
+    {%- set m = namespace(v=none) -%}
+    {%- for tg in samples.targets -%}{%- if tg.label == row.area -%}{%- set m.v = loop.index0 -%}{%- endif -%}{%- endfor -%}
+    {%- do area.append(m.v) -%}
+  {%- endfor -%}
+  {%- do shared.update({'area': area, 'ep_w': ew.v, 'pid': 4 * module.rand.number.integer(300, 1500), 'threads': threads}) -%}
   {%- for row in samples.admins -%}
     {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(row.gap_h * 3600, 0.8) | int)), {'k': 'adm', 'a': loop.index0}) -}}
   {%- endfor -%}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-  {%- do shared.update({'ep_last_admin': none, 'ep_last_target': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
+  {%- do shared.update({'ep_last_admin': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
 {%- endif -%}
 {%- set queue = shared.get('queue') -%}
 {%- set active = shared.get('active') -%}
 {%- set curve = shared.get('curve') -%}
+{%- set tzoff = shared.get('tzoff') -%}
 {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{#- Episode: at the first tick at or after the drawn start, and after a
-    random delay, an admin other than the previous episode's creates an
-    Ignore policy for a target other than the previous episode's. Client
-    traffic is unchanged; the policy drops whatever queries match it, and
-    once three have been dropped the creator deletes it again inside the
-    chain window. The first start falls within the first
-    min(interval, 24 h); each later start within a window of
-    min(interval / 4, 6 h) centred one interval after the actual start,
-    weighted by the activity curve squared. Missed episodes are not
-    replayed. -#}
+{#- Episode: at the first timestamp at or after the drawn start, and
+    after a random delay, an admin other than the previous episode's
+    creates an Ignore policy for a target other than the previous
+    episode's. Client traffic is unchanged; the policy drops whatever
+    queries match it, and once three have been dropped the creator
+    deletes it again inside the chain window. The first start falls
+    within the first min(interval, 24 h); each later start within a
+    window of min(interval / 4, 6 h) centred one interval after the
+    actual start, weighted by the activity curve squared. Missed
+    episodes are not replayed. Episode records are queued like any
+    administrator record and take over the next timestamp once due. -#}
 {%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
   {{- push(now + (ln(45, 0.8) | int), {'k': 'epc'}) -}}
   {%- do shared.set('ep_due', now + 1000 * 24 * hour) -%}
 {%- endif -%}
-{%- if now < queue[0][0] -%}
-  {%- do shared.set('next_due', queue[0][0]) -%}
-  {{- dispatch.drop() -}}
-{%- endif -%}
-{%- set out = namespace(row=none, rec=0) -%}
+{%- set out = namespace(row=none) -%}
 {%- for _ in range(64) if out.row is none and queue and queue[0][0] <= now -%}
   {%- set top = hq.heappop(queue) -%}
   {%- set due = top[0] -%}
   {%- set item = top[2] -%}
-  {%- if item.k == 'row' -%}
+  {%- if item.k == 'row' and item.code == 256 -%}
+    {%- do item.update({'guid': '{' ~ (module.rand.crypto.uuid4() | string | upper) ~ '}'}) -%}
+    {{- received(item, due) -}}
     {%- set out.row = item -%}
-    {%- set out.rec = [due, shared.get('last_us') + 1] | max -%}
-    {%- do shared.set('last_us', out.rec) -%}
-  {%- elif item.k == 'q' -%}
-    {#- A client lookup: one name, or several distinct names resolved in
-        parallel within a millisecond or so (application start, logon). -#}
-    {{- push(due + module.builtins.int(module.rand.number.exponential(0.12) * 1000000), item) -}}
-    {%- if module.rand.chance(curve[(due // hour) % 24]) -%}
-      {%- set ci = module.rand.weighted_choice(shared.get('ci'), shared.get('cw')) -%}
-      {%- set b = namespace(n=1, go=module.rand.chance(0.45), t=due, names=[]) -%}
-      {%- for _ in range(5) if b.go -%}
-        {%- set b.n = b.n + 1 -%}
-        {%- set b.go = module.rand.chance(0.5) -%}
-      {%- endfor -%}
-      {%- for _ in range(b.n) -%}
-        {%- set qi = module.rand.weighted_choice(shared.get('qi'), shared.get('qw')) -%}
-        {%- if qi not in b.names -%}
-          {%- do b.names.append(qi) -%}
-          {{- ask(ci, qi, b.t, 0, module.rand.number.integer(1, 65535), module.rand.number.integer(49152, 65535)) -}}
-          {%- set b.t = b.t + (ln(0.0008, 1.2) | int) -%}
-        {%- endif -%}
-      {%- endfor -%}
+  {%- elif item.k == 'row' and item.code == 257 -%}
+    {%- set out.row = item -%}
+  {%- elif item.k == 'row' and item.code == 259 -%}
+    {%- set pol = active.get(item.pol) -%}
+    {%- if pol is none -%}{%- set pol = {'ep': false, 'drops': 0, 'planned': true} -%}{%- endif -%}
+    {%- do pol.update({'drops': pol.drops + 1}) -%}
+    {%- if pol.ep and not pol.planned and pol.drops >= 3 -%}
+      {%- do pol.update({'planned': true}) -%}
+      {{- push([due + (ln(180, 0.9) | int), pol.deadline] | min, {'k': 'row', 'code': 580, 'p': item.pol, 'by': pol.by, 'own': true}) -}}
     {%- endif -%}
-  {%- elif item.k == 'retry' -%}
-    {{- ask(item.c, item.n, due, item.a, item.xid, item.port) -}}
+    {%- set out.row = item -%}
+  {%- elif item.k == 'row' and item.code == 577 -%}
+    {#- Policy creation for a target without an active policy. An
+        administrator with an area mostly blocks its own target, or
+        another free target when its own is already blocked; an episode
+        always blocks its own. Nothing when no target is free. -#}
+    {%- set taken = [] -%}
+    {%- for pol in active.values() -%}{%- do taken.append(pol.ti) -%}{%- endfor -%}
+    {%- set area = shared.get('area')[item.a] -%}
+    {%- if item.ta is defined -%}
+      {%- set free = [item.ta] | reject('in', taken) | list -%}
+    {%- elif area is not none and (item.ep or module.rand.chance(0.9)) and area not in taken -%}
+      {%- set free = [area] -%}
+    {%- elif item.ep -%}
+      {%- set free = [] -%}
+    {%- else -%}
+      {%- set free = range(samples.targets | length) | reject('in', taken) | list -%}
+    {%- endif -%}
+    {%- if free -%}
+      {%- set ws = [] -%}
+      {%- for i in free -%}{%- do ws.append(samples.targets[i].weight) -%}{%- endfor -%}
+      {%- set ti = module.rand.weighted_choice(free, ws) -%}
+      {%- set tg = samples.targets[ti] -%}
+      {%- set n = namespace(v=params.policy_name ~ '-' ~ tg.label ~ '-' ~ module.rand.string.hex(4) | lower) -%}
+      {%- set recent = shared.get('recent') -%}
+      {%- for _ in range(8) if n.v in recent -%}{%- set n.v = params.policy_name ~ '-' ~ tg.label ~ '-' ~ module.rand.string.hex(4) | lower -%}{%- endfor -%}
+      {%- do recent.append(n.v) -%}
+      {%- if recent | length > 300 -%}{%- do recent.pop(0) -%}{%- endif -%}
+      {%- set crit = tg.criteria.split(',', 1)[1] -%}
+      {%- set wild = crit.startswith('*.') -%}
+      {%- set order = (active | length) + 1 -%}
+      {%- set pol = {'by': item.a, 't0': now, 'ti': ti, 'm': (crit[1:] if wild else crit) ~ '.', 'wild': wild, 'drops': 0, 'ep': item.ep, 'planned': false, 'deadline': due + module.builtins.int(window * module.rand.number.floating(0.4, 0.97))} -%}
+      {%- do active.update({n.v: pol}) -%}
+      {%- set out.row = {'code': 577, 'pol': n.v, 'by': item.a, 'crit': tg.criteria, 'order': order} -%}
+      {%- if item.ep -%}
+        {#- The creator deletes an episode policy after its third drop,
+            or at the deadline if fewer queries reached it. -#}
+        {{- push(pol.deadline, {'k': 'epd', 'p': n.v}) -}}
+        {%- set w = [interval // 4, 6 * hour] | min -%}
+        {%- do shared.update({'ep_last_admin': item.a, 'ep_due': pick_start(due + interval - w // 2, w) | int}) -%}
+      {%- else -%}
+        {#- Background lifetime: a mistake undone by its creator within
+            a minute or so; a block rolled back by a colleague after
+            users complain (about half an hour); a temporary block of
+            about two hours; or a block kept for several hours. -#}
+        {%- set r = module.rand.number.floating(0, 1) -%}
+        {%- if r < 0.2 -%}
+          {%- set life = ln(60, 0.8) | int -%}
+          {%- set same = module.rand.chance(0.95) -%}
+        {%- elif r < 0.6 -%}
+          {%- set life = ln(1500, 0.6) | int -%}
+          {%- set same = false -%}
+        {%- elif r < 0.87 -%}
+          {%- set life = ln(7200, 0.5) | int -%}
+          {%- set same = module.rand.chance(0.6) -%}
+        {%- else -%}
+          {%- set life = ln(18000, 0.5) | int -%}
+          {%- set same = module.rand.chance(0.5) -%}
+        {%- endif -%}
+        {{- push(due + life, {'k': 'row', 'code': 580, 'p': n.v, 'by': item.a if same else other_admin(item.a) | int, 'own': false}) -}}
+        {%- if r < 0.2 and same and module.rand.chance(0.5) -%}
+          {#- The mistake is corrected: the creator adds the policy for
+              the same target again shortly after removing it. -#}
+          {{- push(due + life + (ln(40, 0.6) | int), {'k': 'row', 'code': 577, 'a': item.a, 'ep': false, 'ta': ti}) -}}
+        {%- endif -%}
+      {%- endif -%}
+    {%- elif item.ep -%}
+      {{- push(due + (ln(300, 0.8) | int), {'k': 'epc'}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'row' and item.code == 580 -%}
+    {#- Policy deletion. A background deletion that would complete the
+        chain (by the creator, within the window after the 577, after
+        three drops) keeps its time and account but deletes another
+        active policy whose deletion completes nothing and that is not
+        an episode's; if there is none, it is not performed. The
+        guarded policy stays until an ordinary later deletion. -#}
+    {%- if item.p in active -%}
+      {%- set pol = active[item.p] -%}
+      {%- if item.own or not (item.by == pol.by and now - pol.t0 <= window and pol.drops >= 3) -%}
+        {%- do active.pop(item.p) -%}
+        {%- set out.row = {'code': 580, 'pol': item.p, 'by': item.by} -%}
+      {%- else -%}
+        {%- set cand = [] -%}
+        {%- for qn, q in active.items() if qn != item.p and not q.ep and not (item.by == q.by and now - q.t0 <= window and q.drops >= 3) -%}{%- do cand.append(qn) -%}{%- endfor -%}
+        {%- if cand -%}
+          {%- set qn = module.rand.choice(cand) -%}
+          {%- do active.pop(qn) -%}
+          {%- do shared.set('guarded', shared.get('guarded') + 1) -%}
+          {%- set out.row = {'code': 580, 'pol': qn, 'by': item.by} -%}
+        {%- else -%}
+          {%- do shared.set('suppressed', shared.get('suppressed') + 1) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
   {%- elif item.k == 'adm' -%}
-    {#- Admin session arrival, thinned by the curve of its UTC hour; a
-        session creates one or more policies a minute or so apart. -#}
+    {#- Admin session arrival, thinned by the curve of its hour; a
+        session performs one policy operation, sometimes two a minute or
+        so apart. -#}
     {%- set adm = samples.admins[item.a] -%}
-    {{- push(due + (ln(adm.gap_h * 3600, 0.8) | int), item) -}}
-    {%- if module.rand.chance(curve[(due // hour) % 24]) -%}
+    {{- push(due + (ln(adm.gap_h * 3600, 0.7) | int), item) -}}
+    {%- if module.rand.chance(curve[((due + tzoff) // hour) % 24]) -%}
       {%- set n = namespace(v=1, go=true) -%}
-      {%- for _ in range(3) if n.go -%}
-        {%- if module.rand.chance(0.35) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
+      {%- for _ in range(1) if n.go -%}
+        {%- if module.rand.chance(0.2) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
       {%- endfor -%}
       {{- push(due, {'k': 'op', 'a': item.a, 'left': n.v}) -}}
     {%- endif -%}
   {%- elif item.k == 'op' -%}
     {#- Delete an active policy picked at random (cleanup), or create a
-        policy and plan its deletion: quick (test or mistake), medium or
-        long-lived, by the creator or another admin. -#}
-    {%- set names = active.keys() | list -%}
-    {%- if names and module.rand.chance(0.25) -%}
-      {{- push(due, {'k': 'del', 'p': module.rand.choice(names), 'by': item.a}) -}}
-      {%- set name = '' -%}
+        policy. An episode's policy is left to its creator. -#}
+    {%- set names = [] -%}
+    {%- for pn, pol in active.items() if not pol.ep -%}{%- do names.append(pn) -%}{%- endfor -%}
+    {%- if names and module.rand.chance(0.12) -%}
+      {{- push(due, {'k': 'row', 'code': 580, 'p': module.rand.choice(names), 'by': item.a, 'own': false}) -}}
     {%- else -%}
-      {%- set name = create(item.a, due, false) -%}
-    {%- endif -%}
-    {%- if name -%}
-      {%- set r = module.rand.number.floating(0, 1) -%}
-      {%- if r < 0.35 -%}
-        {%- set life = ln(240, 0.9) | int -%}
-        {%- set same = module.rand.chance(0.85) -%}
-      {%- elif r < 0.8 -%}
-        {%- set life = ln(5400, 1.0) | int -%}
-        {%- set same = module.rand.chance(0.5) -%}
-      {%- else -%}
-        {%- set life = ln(14400, 0.8) | int -%}
-        {%- set same = module.rand.chance(0.5) -%}
-      {%- endif -%}
-      {{- push(due + life, {'k': 'del', 'p': name, 'by': item.a if same else other_admin(item.a) | int}) -}}
+      {{- push(due, {'k': 'row', 'code': 577, 'a': item.a, 'ep': false}) -}}
     {%- endif -%}
     {%- if item.left > 1 -%}
       {{- push(due + (ln(70, 0.9) | int), {'k': 'op', 'a': item.a, 'left': item.left - 1}) -}}
     {%- endif -%}
-  {%- elif item.k == 'del' -%}
-    {#- Deletion of a policy. A background deletion that would complete
-        the chain (by the creator, within the window after the 577, after
-        three drops) is dropped at its own time and the policy stays. -#}
-    {%- if item.p in active -%}
-      {%- set pol = active[item.p] -%}
-      {%- if item.get('own') or not (item.by == pol.by and due - pol.t0 <= window + 2000 and pol.drops >= 3) -%}
-        {%- do active.pop(item.p) -%}
-        {{- push(due, {'k': 'row', 'code': 580, 'pol': item.p, 'by': item.by}) -}}
-      {%- endif -%}
-    {%- endif -%}
   {%- elif item.k == 'epc' -%}
-    {%- set idx = range(samples.admins | length) | reject('equalto', shared.get('ep_last_admin')) | list -%}
-    {%- set ws = [] -%}
-    {%- for i in idx -%}{%- do ws.append(shared.get('ep_w')[i]) -%}{%- endfor -%}
-    {%- set ai = module.rand.weighted_choice(idx, ws) -%}
-    {%- set name = create(ai, due, true) -%}
-    {%- if name -%}
-      {%- set pol = active[name] -%}
-      {{- push(pol.deadline, {'k': 'epd', 'p': name}) -}}
-      {%- set w = [interval // 4, 6 * hour] | min -%}
-      {%- do shared.update({'ep_last_admin': ai, 'ep_last_target': pol.ti, 'ep_due': pick_start(due + interval - w // 2, w) | int}) -%}
+    {#- Episode admin: an account other than the previous episode's
+        whose own name has no active policy; if there is none, try
+        again later. -#}
+    {%- set taken = [] -%}
+    {%- for pol in active.values() -%}{%- do taken.append(pol.ti) -%}{%- endfor -%}
+    {%- set idx = [] -%}
+    {%- for i in range(samples.admins | length) if samples.admins[i].area and i != shared.get('ep_last_admin') and shared.get('area')[i] not in taken -%}{%- do idx.append(i) -%}{%- endfor -%}
+    {%- if idx -%}
+      {%- set ws = [] -%}
+      {%- for i in idx -%}{%- do ws.append(shared.get('ep_w')[i]) -%}{%- endfor -%}
+      {{- push(due, {'k': 'row', 'code': 577, 'a': module.rand.weighted_choice(idx, ws), 'ep': true}) -}}
     {%- else -%}
-      {{- push(due + (ln(300, 0.8) | int), item) -}}
+      {{- push(due + (ln(1800, 0.5) | int), {'k': 'epc'}) -}}
     {%- endif -%}
   {%- elif item.k == 'epd' -%}
     {#- Episode deadline: the creator deletes the policy even if fewer
         than three queries were dropped. -#}
     {%- if item.p in active and not active[item.p].planned -%}
-      {%- set pol = active.pop(item.p) -%}
-      {{- push(due, {'k': 'row', 'code': 580, 'pol': item.p, 'by': pol.by}) -}}
+      {%- set pol = active[item.p] -%}
+      {%- do pol.update({'planned': true}) -%}
+      {{- push(due, {'k': 'row', 'code': 580, 'p': item.p, 'by': pol.by, 'own': true}) -}}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', queue[0][0] if queue else now + 1000000) -%}
-{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- if out.row is none -%}
+  {#- A new client lookup: one name, or several distinct names resolved
+      in parallel within a millisecond or so (application start, logon);
+      the further names are queued right behind the first. -#}
+  {%- set ci = module.random.choices(shared.get('ci'), cum_weights=shared.get('ccw'))[0] -%}
+  {%- set b = namespace(n=1, go=module.rand.chance(0.45), t=now, names=[]) -%}
+  {%- for _ in range(5) if b.go -%}
+    {%- set b.n = b.n + 1 -%}
+    {%- set b.go = module.rand.chance(0.5) -%}
+  {%- endfor -%}
+  {%- for _ in range(b.n) -%}
+    {%- set qi = module.random.choices(shared.get('qi'), cum_weights=shared.get('qcw'))[0] -%}
+    {%- if qi not in b.names -%}
+      {%- do b.names.append(qi) -%}
+      {%- set it = {'k': 'row', 'code': 256, 'c': ci, 'n': qi, 'a': 0, 'xid': module.rand.number.integer(1, 65535), 'port': module.rand.number.integer(49152, 65535)} -%}
+      {%- if out.row is none -%}
+        {%- do it.update({'guid': '{' ~ (module.rand.crypto.uuid4() | string | upper) ~ '}'}) -%}
+        {{- received(it, now) -}}
+        {%- set out.row = it -%}
+      {%- else -%}
+        {{- push(b.t, it) -}}
+      {%- endif -%}
+      {%- set b.t = b.t + (ln(0.0008, 1.2) | int) -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
 {%- set row = out.row -%}
+{%- set moment = ts -%}
 {#- Records in the Elastic microsoft_dnsserver parsed shape: the native
     event data renamed under microsoft_dnsserver.*, ECS fields added by
     the ingest pipeline, duplicates kept (preserve_duplicate_custom_fields). -#}
-{%- set moment = ts + module.datetime.timedelta(microseconds=out.rec - now) -%}
 {%- set code = row.code -%}
 {%- set eid = code | string -%}
 {%- set is_audit = code in [577, 580] -%}
