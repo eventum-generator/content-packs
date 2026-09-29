@@ -1,9 +1,12 @@
 {#- Selected 1C 8.3.27 event-log collector projection. Native system-event Data
-    is a proven subset, not full raw bytes. One source second per tick: a due
-    background job or a random background draw takes the tick first; an
-    anomaly step only uses seconds that background leaves free, so episodes
-    never delay or re-phase background processes. The chain guard below
-    follows every emitted record, episode records included. -#}
+    is a proven subset, not full raw bytes. The input sets the rate and every
+    timestamp yields one record: the earliest due queued background record
+    takes it first, then a due anomaly step, otherwise a new random
+    background action starts. Timestamps tagged `admin_login` (their own
+    time pattern) start administrator login attempts. Episodes only take
+    timestamps that would have started a random action and never delay,
+    cancel or re-phase background work. The chain guard below follows every
+    emitted record, episode records included. -#}
 {%- set utc = timestamp.astimezone(module.datetime.timezone.utc).replace(microsecond=0) -%}
 {%- set now = utc.timestamp() | int -%}
 {%- set rnd = module.rand -%}
@@ -24,7 +27,7 @@
     {%- do objects.update({o.metadata: {'metadata': o.metadata, 'presentation': o.presentation, 'logged_column': o.logged_column, 'weight': o.weight}}) -%}
   {%- endfor -%}
   {%- set staff = {} -%}
-  {%- set lists = {'staff': [], 'acc': [], 'acc_w': [], 'fail': [], 'fail_w': [], 'deny': [], 'deny_w': [], 'admins': [], 'admin_w': []} -%}
+  {%- set lists = {'staff': [], 'acc': [], 'acc_w': [], 'fail': [], 'fail_w': [], 'afail': [], 'afail_w': [], 'deny': [], 'deny_w': [], 'admins': [], 'admin_w': []} -%}
   {%- for i in range(samples.actors | length) -%}
     {%- set a = samples.actors[i] -%}
     {%- set allowed = a.read_metadata.split('|') -%}
@@ -33,7 +36,11 @@
     {%- do staff.update({a.name: {'id': a.id, 'name': a.name, 'computer': a.computer, 'os_user': a.os_user, 'allowed': allowed, 'allowed_w': allowed_w, 'denied': a.denied_metadata, 'admin': a.role == 'Roles.FullAccess'}}) -%}
     {%- do lists.staff.append(a.name) -%}
     {%- do lists.acc.append(a.name) -%}{%- do lists.acc_w.append(a.weight) -%}
-    {%- do lists.fail.append(a.name) -%}{%- do lists.fail_w.append(a.fail_weight) -%}
+    {%- if a.role == 'Roles.FullAccess' -%}
+      {%- do lists.afail.append(a.name) -%}{%- do lists.afail_w.append(a.fail_weight) -%}
+    {%- else -%}
+      {%- do lists.fail.append(a.name) -%}{%- do lists.fail_w.append(a.fail_weight) -%}
+    {%- endif -%}
     {%- if a.denied_metadata -%}{%- do lists.deny.append(a.name) -%}{%- do lists.deny_w.append(a.weight) -%}{%- endif -%}
     {%- if a.role == 'Roles.FullAccess' -%}{%- do lists.admins.append(a.name) -%}{%- do lists.admin_w.append(a.weight) -%}{%- endif -%}
   {%- endfor -%}
@@ -51,12 +58,25 @@
       {%- do sessions.update({name: {'s': pre.s, 'c': pre.c, 'start': now - (life - left) | int, 'end': now + ([left, 1] | max) | int}}) -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- do shared.update({'objects': objects, 'staff': staff, 'lists': lists, 'pending': {}, 'sessions': sessions, 'chain': {}}) -%}
+  {#- Each administrator keeps its own temporary names (round robin). -#}
+  {%- set own = {} -%}
+  {%- for n in temp_names -%}
+    {%- do own.setdefault(lists.admins[loop.index0 % (lists.admins | length)], []).append(n) -%}
+  {%- endfor -%}
+  {%- do shared.update({'objects': objects, 'staff': staff, 'lists': lists, 'pending': {}, 'sessions': sessions, 'own': own}) -%}
   {%- do shared.update({'session_counter': counters.s, 'connection_counter': counters.c}) -%}
-  {%- do shared.update({'lc_at': now + (num.exponential(1.0 / 36000)) | int, 'sr_at': now + (num.exponential(1.0 / 86400)) | int}) -%}
+  {%- do shared.update({'lc_at': now + (num.exponential(1.0 / 7200)) | int, 'sr_at': now + (num.exponential(1.0 / 86400)) | int}) -%}
   {#- Rates do not vary by time of day, so the first episode start is
       uniform over the first min(interval, 24 h). -#}
   {%- do shared.update({'episode': none, 'episode_at': now + num.floating(0, [interval, 86400] | min) | int, 'last_ep_admin': none, 'last_ep_name': none}) -%}
+  {#- Chain matcher state per administrator (only they can complete it):
+      the latest first-failure time of a partial match at each step, and
+      per created incarnation after the creation step. -#}
+  {%- set guard = {} -%}
+  {%- for name in lists.admins -%}
+    {%- do guard.update({name: {'f1': none, 'f2': none, 'f3': none, 'f4': none, 'a': none, 'n': {}, 'd': none}}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'guard': guard, 'guard_drops': 0}) -%}
   {%- do shared.set('ready', true) -%}
 {%- endif -%}
 
@@ -65,22 +85,31 @@
 {%- set lists = shared.get('lists') -%}
 {%- set pending = shared.get('pending') -%}
 {%- set sessions = shared.get('sessions') -%}
-{%- set chain = shared.get('chain') -%}
 {%- set ep = shared.get('episode') -%}
+{%- set guard = shared.get('guard') -%}
+{%- set own = shared.get('own') -%}
+
+{#- An administrator login attempt from the `admin_login` stream joins the
+    queue as due now, so records already due go first. -#}
+{%- if 'admin_login' in tags -%}
+  {%- set qa = pending.get('as') -%}
+  {%- do pending.update({'as': {'job': 'astart', 'n': qa.n + 1 if qa else 1, 'at': qa.at if qa else now}}) -%}
+{%- endif -%}
 
 {#- Poisson arrivals: temporary-account lifecycles not tied to a login
-    (mean 10 h apart; most start from administrator logins after failed
-    attempts, see below) and standalone old-log reductions (mean one per
-    day). -#}
+    (mean 2 h apart; maintenance sessions after administrator logins add
+    about a third more, see below) and standalone old-log reductions
+    (mean one per day). -#}
 {%- if now >= shared.get('lc_at') -%}
-  {%- do shared.set('lc_at', now + ([num.exponential(1.0 / 36000), 1] | max) | int) -%}
+  {%- do shared.set('lc_at', now + ([num.exponential(1.0 / 7200), 1] | max) | int) -%}
   {%- set busy = [] -%}
   {%- for k in pending -%}{%- if k.startswith('lc:') -%}{%- do busy.append(k[3:]) -%}{%- endif -%}{%- endfor -%}
   {%- if ep -%}{%- do busy.append(ep.name) -%}{%- endif -%}
-  {%- set free = temp_names | reject('in', busy) | list -%}
+  {%- set la = rnd.weighted_choice(lists.admins, lists.admin_w) -%}
+  {%- set free = (own[la] | reject('in', busy) | list) or (temp_names | reject('in', busy) | list) -%}
   {%- if free -%}
     {%- set name = rnd.choice(free) -%}
-    {%- do pending.update({'lc:' ~ name: {'job': 'lc', 'stage': 'new', 'name': name, 'admin': rnd.weighted_choice(lists.admins, lists.admin_w), 'at': now}}) -%}
+    {%- do pending.update({'lc:' ~ name: {'job': 'lc', 'stage': 'new', 'name': name, 'admin': la, 'at': now}}) -%}
   {%- endif -%}
 {%- endif -%}
 {%- if now >= shared.get('sr_at') -%}
@@ -91,51 +120,99 @@
 {%- endif -%}
 
 {#- Episode arming at the drawn start time; the first failed attempt takes
-    the next second background leaves free. The next start is drawn
+    the next timestamp no due background record takes. The next start is drawn
     uniformly within min(interval / 4, 6 h) centred on one interval after
     the actual first attempt. Administrator and temporary name rotate
-    between consecutive episodes. -#}
+    between consecutive episodes; the name is one of the administrator's
+    own, and the episode waits while both are in use. -#}
 {%- set ep_admin = rnd.choice((lists.admins | reject('equalto', shared.get('last_ep_admin')) | list) or lists.admins) if params.anomaly_mode and not ep and now >= shared.get('episode_at') else none -%}
 {%- if ep_admin -%}
   {%- set busy = [] -%}
   {%- for k in pending -%}{%- if k.startswith('lc:') -%}{%- do busy.append(k[3:]) -%}{%- endif -%}{%- endfor -%}
-  {%- set free = temp_names | reject('in', busy) | reject('equalto', shared.get('last_ep_name')) | list -%}
+  {%- set free = own[ep_admin] | reject('in', busy) | reject('equalto', shared.get('last_ep_name')) | list -%}
   {%- if free -%}
     {%- set run = namespace(n=4) -%}
-    {%- for _ in range(40) -%}{%- if rnd.chance(0.5) -%}{%- set run.n = run.n + 1 -%}{%- else -%}{%- break -%}{%- endif -%}{%- endfor -%}
+    {%- for _ in range(40) -%}{%- if rnd.chance(0.75) -%}{%- set run.n = run.n + 1 -%}{%- else -%}{%- break -%}{%- endif -%}{%- endfor -%}
     {%- set ep = {'stage': 'fail', 'left': run.n, 'admin': ep_admin, 'name': rnd.choice(free), 'at': now, 'started': false} -%}
     {%- do shared.set('episode', ep) -%}
   {%- endif -%}
 {%- endif -%}
 
-{#- Tick arbitration: earliest due background job, else a random background
-    draw, else a due anomaly step, else no record in this second. -#}
+{#- Timestamp arbitration: the earliest due queued background record, else
+    a due anomaly step, else a new random background action.
+    Chain guard, on the final step only: a background reduction that would
+    complete the chain for its administrator (see the matcher below) is not
+    recorded, and this timestamp goes to the next choice. The reduction
+    class has no outcome or target to change instead. Its time, its
+    administrator and every earlier record stay as they are. -#}
 {%- set pick = namespace(key=none, at=none) -%}
 {%- for k, a in pending.items() -%}
   {%- if a.at <= now and (pick.at is none or a.at < pick.at) -%}{%- set pick.key = k -%}{%- set pick.at = a.at -%}{%- endif -%}
 {%- endfor -%}
-{%- set job = none -%}
-{%- set slot = pick.key -%}
-{%- if slot is not none -%}
-  {%- set job = pending.pop(slot) -%}
-{%- elif rnd.chance(0.065) -%}
-  {%- set job = {'job': 'random'} -%}
-{%- elif ep and now >= ep.at -%}
-  {%- set job = {'job': 'ep'} -%}
+{%- set g = namespace(job=none, slot=pick.key, fresh=none) -%}
+{%- if pick.key is not none -%}
+  {%- set g.job = pending.pop(pick.key) -%}
+  {%- if g.job.job == 'astart' and g.job.n > 1 -%}
+    {%- do pending.update({'as': dict(g.job, n=g.job.n - 1)}) -%}
+  {%- endif -%}
+  {%- if g.job.job == 'op' and g.job.kind == 'reduce' -%}
+    {%- set rs = sessions.get(g.job.actor) -%}
+    {%- set g.fresh = rs and now - rs.start >= 120 and rnd.chance(0.5) -%}
+    {%- set gd = guard[g.job.actor].d -%}
+    {%- if rs and now < rs.end and not g.fresh and gd is not none and now - gd <= chain_within -%}
+      {%- do shared.set('guard_drops', shared.get('guard_drops') + 1) -%}
+      {%- set g.job = none -%}{%- set g.slot = none -%}{%- set g.fresh = none -%}
+    {%- endif -%}
+  {%- endif -%}
 {%- endif -%}
-{%- if job is none -%}{{ dispatch.drop() }}{%- endif -%}
+{%- if g.job is none -%}
+  {%- set g.job = {'job': 'ep'} if ep and now >= ep.at else {'job': 'random'} -%}
+{%- endif -%}
+{%- set job = g.job -%}
+{%- set slot = g.slot -%}
 
 {#- Resolve the job into one concrete operation. -#}
 {%- set op = none -%}
 {%- set requeue = slot -%}
-{%- if job.job == 'random' -%}
-  {%- set k = rnd.weighted_choice(['access', 'denied', 'fail', 'update'], [900, 60, 24, 8]) -%}
-  {%- if k == 'access' -%}
+{%- if job.job in ['random', 'astart'] -%}
+  {#- A failed attempt that starts a run draws the run up front: its length
+      and whether it ends in a login. Random starts draw staff failures:
+      each retry fails again with probability 0.4, and 85% end in a login.
+      Administrator logins come only from the `admin_login` stream: 97.1%
+      succeed at once, 1.25% start with a mistyped password (each retry
+      fails again with probability 0.35, 85% end in a login) and 1.67%
+      are the maintenance client retrying a saved password that no longer
+      works (each retry fails again with probability 0.75) before the
+      administrator types it (90%) and runs the maintenance session the
+      client was opened for (90%). Any other administrator login is
+      followed by a maintenance session with probability 0.02. Every run
+      length law falls with the number of failures. A new attempt of an
+      account whose run is still going joins that run. -#}
+  {%- set r = namespace(k='fail' if job.job == 'astart' else rnd.weighted_choice(['access', 'denied', 'fail', 'update'], [900, 60, 0.3, 8]), fail=none) -%}
+  {%- if r.k == 'fail' -%}
+    {%- set fa = rnd.weighted_choice(lists.afail, lists.afail_w) if job.job == 'astart' else rnd.weighted_choice(lists.fail, lists.fail_w) -%}
+    {%- if ('fr:' ~ fa) in pending -%}
+      {%- set r.fail = {'kind': 'fail', 'actor': fa} -%}
+    {%- else -%}
+      {%- set ak = rnd.weighted_choice(['clean', 'typo', 'stale'], [970.8, 12.5, 16.7]) if job.job == 'astart' else 'typo' -%}
+      {%- if ak == 'clean' -%}
+        {%- set r.fail = {'kind': 'rauth', 'actor': fa, 'maint': rnd.chance(0.02)} -%}
+      {%- else -%}
+        {%- set q = 0.75 if ak == 'stale' else (0.35 if job.job == 'astart' else 0.4) -%}
+        {%- set run = namespace(n=1) -%}
+        {%- for _ in range(40) -%}{%- if rnd.chance(q) -%}{%- set run.n = run.n + 1 -%}{%- else -%}{%- break -%}{%- endif -%}{%- endfor -%}
+        {%- set fok = rnd.chance(0.9 if ak == 'stale' else 0.85) -%}
+        {%- set r.fail = {'kind': 'fail', 'actor': fa, 'n': run.n, 'ok': fok, 'maint': job.job == 'astart' and fok and rnd.chance(0.9 if ak == 'stale' else 0.02)} -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set k = r.k -%}
+  {%- if r.fail -%}
+    {%- set op = r.fail -%}
+  {%- elif k == 'access' -%}
     {%- set op = {'kind': 'access', 'actor': rnd.weighted_choice(lists.acc, lists.acc_w), 'burst': true} -%}
   {%- elif k == 'denied' -%}
     {%- set op = {'kind': 'denied', 'actor': rnd.weighted_choice(lists.deny, lists.deny_w)} -%}
-  {%- elif k == 'fail' -%}
-    {%- set op = {'kind': 'fail', 'actor': rnd.weighted_choice(lists.fail, lists.fail_w)} -%}
   {%- else -%}
     {%- set a = rnd.weighted_choice(lists.admins, lists.admin_w) -%}
     {%- set op = {'kind': 'update', 'actor': a, 'target': rnd.choice(lists.staff | reject('equalto', a) | list)} -%}
@@ -178,7 +255,7 @@
     administrator also opens a fresh session for half of its management
     tasks unless the current one is under two minutes old. -#}
 {%- set sess = sessions.get(actor.name) -%}
-{%- set fresh = kind in ['update', 'new', 'delete', 'reduce'] and sess and now - sess.start >= 120 and rnd.chance(0.5) -%}
+{%- set fresh = g.fresh if g.fresh is not none else (kind in ['update', 'new', 'delete', 'reduce'] and sess and now - sess.start >= 120 and rnd.chance(0.5)) -%}
 {%- if kind in ['access', 'denied', 'update', 'new', 'delete', 'reduce'] and (not sess or now >= sess.end or fresh) -%}
   {%- set later = now + ([num.lognormal(ln(10), 0.8), 1] | max) | int -%}
   {%- if job.job == 'ep' -%}
@@ -192,42 +269,31 @@
   {%- set job = {'job': 'gate'} -%}
 {%- endif -%}
 
-{#- Chain guard: a replica of the chain matcher per user name over emitted
-    records (four failed logins, a login, a creation, the deletion of that
-    incarnation and a reduction, the first failure at most 1800 s before
-    the reduction; completion resets the user; at most eight partial
-    matches). A background reduction that would complete it is not
-    recorded; its time and everything before it stay as they are. -#}
-{%- if kind == 'reduce' and job.job != 'ep' -%}
-  {%- for p in chain.get(actor.name, []) -%}
-    {%- if p[0] == 7 and now - p[1] <= chain_within -%}{{- dispatch.drop() -}}{%- endif -%}
-  {%- endfor -%}
-{%- endif -%}
-
 {#- Scheduling effects of the emitted operation. -#}
 {%- set retry = ([num.lognormal(ln(12), 0.7), 1] | max) | int -%}
 {%- set synthetic_target = none -%}
-{%- if job.job in ['random', 'fr'] and kind == 'fail' -%}
-  {%- set fr = 'fr:' ~ actor.name -%}
-  {%- if job.job == 'fr' or fr not in pending -%}
-    {%- if rnd.chance(0.5 if actor.admin else 0.4) -%}
-      {%- do pending.update({fr: {'job': 'fr', 'kind': 'fail', 'actor': actor.name, 'at': now + retry}}) -%}
-    {%- elif rnd.chance(0.85) -%}
-      {%- do pending.update({fr: {'job': 'fr', 'kind': 'rauth', 'actor': actor.name, 'at': now + retry}}) -%}
-    {%- endif -%}
+{%- if job.job in ['random', 'astart', 'fr'] and kind == 'fail' -%}
+  {%- set left = op.left if job.job == 'fr' else op.n -%}
+  {%- if left and left > 1 -%}
+    {%- do pending.update({'fr:' ~ actor.name: {'job': 'fr', 'kind': 'fail', 'actor': actor.name, 'left': left - 1, 'ok': op.ok, 'maint': op.maint, 'at': now + retry}}) -%}
+  {%- elif left and op.ok -%}
+    {%- do pending.update({'fr:' ~ actor.name: {'job': 'fr', 'kind': 'rauth', 'actor': actor.name, 'maint': op.maint, 'at': now + retry}}) -%}
   {%- endif -%}
-{%- elif job.job == 'fr' and op.kind == 'rauth' and actor.admin and rnd.chance(0.25) -%}
-  {#- An administrator who got in after failed attempts often logged in for
-      a short maintenance session: set up a temporary account, let it check
-      the payroll register, remove it and trim the log. -#}
+{%- elif job.job in ['fr', 'astart'] and op.kind == 'rauth' and op.maint -%}
+  {#- A short maintenance session: set up a temporary account, let it
+      check the payroll register, remove it and trim the log. -#}
   {%- set busy = [] -%}
   {%- for k in pending -%}{%- if k.startswith('lc:') -%}{%- do busy.append(k[3:]) -%}{%- endif -%}{%- endfor -%}
   {%- if ep -%}{%- do busy.append(ep.name) -%}{%- endif -%}
-  {%- set free = temp_names | reject('in', busy) | list -%}
+  {%- set free = (own[actor.name] | reject('in', busy) | list) or (temp_names | reject('in', busy) | list) -%}
   {%- if free -%}
     {%- set name = rnd.choice(free) -%}
     {%- do pending.update({'lc:' ~ name: {'job': 'lc', 'stage': 'new', 'name': name, 'admin': actor.name, 'session': true, 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}}) -%}
   {%- endif -%}
+{%- elif job.job == 'fr' and op.kind == 'rauth' and actor.admin and ('tr:' ~ actor.name) not in pending and rnd.chance(0.12) -%}
+  {#- Of the other administrators who got in after failed attempts, some
+      only trim the event log a few minutes later. -#}
+  {%- do pending.update({'tr:' ~ actor.name: {'job': 'op', 'kind': 'reduce', 'actor': actor.name, 'at': now + ([num.lognormal(ln(300), 0.8), 1] | max) | int}}) -%}
 {%- elif job.job in ['random', 'op'] and kind == 'access' and op.burst -%}
   {%- set bk = 'burst:' ~ actor.name -%}
   {%- if bk not in pending and rnd.chance(0.35) -%}
@@ -270,41 +336,51 @@
     {%- do ep.update({'stage': 'new', 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}) -%}
   {%- elif ep.stage == 'new' -%}
     {%- set synthetic_target = {'name': ep.name, 'id': module.uuid.uuid4() | string, 'computer': actor.computer, 'os_user': actor.os_user} -%}
-    {%- do ep.update({'stage': 'tauth', 'temp': synthetic_target, 'at': now + ([num.lognormal(ln(40), 0.8), 1] | max) | int}) -%}
+    {%- do ep.update({'stage': 'tauth', 'temp': synthetic_target, 'at': now + ([num.lognormal(ln(60), 1.0), 1] | max) | int}) -%}
   {%- elif ep.stage == 'tauth' -%}
-    {%- set reads = ([(num.lognormal(ln(8), 0.5) + 0.5) | round | int, 1] | max) -%}
-    {%- do ep.update({'stage': 'read', 'left': reads, 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}) -%}
+    {%- set reads = ([(num.lognormal(ln(5), 0.8) + 0.5) | round | int, 1] | max) -%}
+    {%- do ep.update({'stage': 'read', 'left': reads, 'at': now + ([num.lognormal(ln(15), 1.0), 1] | max) | int}) -%}
   {%- elif ep.stage == 'read' -%}
-    {%- if ep.left > 1 -%}
-      {%- do ep.update({'left': ep.left - 1, 'at': now + ([num.lognormal(ln(10), 0.8), 1] | max) | int}) -%}
+    {#- The episode completes within the chain window: reads stop 1000 s
+        after the first failed attempt, deletion and reduction come no
+        later than 1300 s and 1500 s after it. -#}
+    {%- if ep.left > 1 and now - ep.start < 1000 -%}
+      {%- do ep.update({'left': ep.left - 1, 'at': now + ([num.lognormal(ln(15), 1.0), 1] | max) | int}) -%}
     {%- else -%}
-      {%- do ep.update({'stage': 'delete', 'at': now + ([num.lognormal(ln(90), 0.8), 1] | max) | int}) -%}
+      {%- do ep.update({'stage': 'delete', 'at': [[now + num.lognormal(ln(90), 0.8), ep.start + 1300] | min, now + 1] | max | int}) -%}
     {%- endif -%}
   {%- elif ep.stage == 'delete' -%}
     {%- set synthetic_target = ep.temp -%}
-    {%- do ep.update({'stage': 'reduce', 'at': now + ([num.lognormal(ln(120), 0.9), 1] | max) | int}) -%}
+    {%- do ep.update({'stage': 'reduce', 'at': [[now + num.lognormal(ln(120), 0.9), ep.start + 1500] | min, now + 1] | max | int}) -%}
   {%- else -%}
     {%- do shared.update({'episode': none, 'last_ep_admin': ep.admin, 'last_ep_name': ep.name}) -%}
   {%- endif -%}
 {%- endif -%}
 
-{#- Feed the emitted record to the chain replica. -#}
-{%- set tid = synthetic_target.id if synthetic_target else none -%}
-{%- set parts = [] -%}
-{%- set m = namespace(done=false) -%}
-{%- for p in chain.get(actor.name, []) if now - p[1] <= chain_within -%}
-  {%- if (p[0] < 4 and kind == 'fail') or (p[0] == 4 and kind == 'auth') or (p[0] == 5 and kind == 'new') or (p[0] == 6 and kind == 'delete' and tid == p[2]) or (p[0] == 7 and kind == 'reduce') -%}
-    {%- if p[0] == 7 -%}{%- set m.done = true -%}{%- break -%}{%- endif -%}
-    {%- do parts.append([p[0] + 1, p[1], tid if p[0] == 5 else p[2]]) -%}
-  {%- else -%}
-    {%- do parts.append(p) -%}
+{#- Feed the emitted record to the chain matcher: per user name, four
+    failed logins, a login, a creation (binding the incarnation), the
+    deletion of that incarnation and a reduction, the first failure at
+    most 1800 s before the reduction. Every partial match is kept (a
+    completion resets nothing), so only the latest first-failure time
+    per step, and per incarnation after the creation, is needed. -#}
+{%- set gs = guard.get(actor.name) if not op.temp else none -%}
+{%- if gs -%}
+  {%- set lim = now - chain_within -%}
+  {%- set upd = {'n': {}} -%}
+  {%- for k in ['f1', 'f2', 'f3', 'f4', 'a', 'd'] -%}
+    {%- if gs[k] is not none and gs[k] < lim -%}{%- do upd.update({k: none}) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- for k, v in gs.n.items() if v >= lim -%}{%- do upd.n.update({k: v}) -%}{%- endfor -%}
+  {%- do gs.update(upd) -%}
+  {%- if kind == 'fail' -%}
+    {%- do gs.update({'f4': gs.f3, 'f3': gs.f2, 'f2': gs.f1, 'f1': now}) -%}
+  {%- elif kind == 'auth' and gs.f4 is not none -%}
+    {%- do gs.update({'a': gs.f4}) -%}
+  {%- elif kind == 'new' and gs.a is not none -%}
+    {%- do gs.n.update({synthetic_target.id: gs.a}) -%}
+  {%- elif kind == 'delete' and synthetic_target.id in gs.n and (gs.d is none or gs.n[synthetic_target.id] > gs.d) -%}
+    {%- do gs.update({'d': gs.n[synthetic_target.id]}) -%}
   {%- endif -%}
-{%- endfor -%}
-{%- if not m.done and kind == 'fail' -%}{%- do parts.append([1, now, none]) -%}{%- endif -%}
-{%- if m.done or not parts -%}
-  {%- do chain.pop(actor.name, none) -%}
-{%- else -%}
-  {%- do chain.update({actor.name: parts[-8:]}) -%}
 {%- endif -%}
 
 {#- Native event body. -#}
