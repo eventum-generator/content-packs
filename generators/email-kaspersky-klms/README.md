@@ -1,6 +1,6 @@
 # Kaspersky Security for Linux Mail Server CEF
 
-Generates ECS JSON containing a synthetic KLMS ScanLogic CEF record in `event.original`. The profile uses the legacy Kaspersky Security 8 documentation and its illustrative `8.0MP2` header. The selected stream is [KLMS CEF over syslog](https://support.kaspersky.com/KLMS/8.2/en-US/151504.htm), separately identified from Kaspersky Secure Mail Gateway (KSMG). Complete native ScanLogic capture fidelity remains unverified.
+Generates ECS JSON containing a synthetic KLMS ScanLogic CEF record in `event.original`. The profile uses the legacy Kaspersky Security 8 documentation and its illustrative `8.0MP2` header. The selected stream is [KLMS CEF over syslog](https://support.kaspersky.com/KLMS/8.2/en-US/151504.htm), separately identified from Kaspersky Secure Mail Gateway (KSMG): [KUMA's supported-source table](https://support.kaspersky.com/help/kuma/3.0.3/en-US/255782.htm) lists separate KLMS and KSMG CEF normalizers, so shared `LMS_EV_SCAN_LOGIC_*` IDs alone do not make the two product streams duplicates.
 
 ## Source Profile
 
@@ -10,14 +10,14 @@ Kaspersky exports ScanLogic events after message processing. This generator emit
 
 ## Event Types
 
-Shares are measured on the final 28-hour default capture with `anomaly_mode: true` (4,912 records); the `false` capture of the same window gives 32.9 / 17.1 / 48.8 / 1.2%.
+Shares are those of about a day of default output with `anomaly_mode: true` (they vary by a point or so from day to day); `false` output of the same window gives 38.9 / 11.1 / 49.6 / 0.4%.
 
 | Native class | Result | Share | Category | Documented field meanings |
 |---|---|---:|---|---|
-| `LMS_EV_SCAN_LOGIC_MA_STATUS` | `ViolationNotFound` | 32.7% | `email` | SPF, DKIM and DMARC verdicts for a message |
-| `LMS_EV_SCAN_LOGIC_MA_STATUS` | `ViolationFound` | 17.3% | `email` | At least one failing verdict; action `Reject` |
-| `LMS_EV_SCAN_LOGIC_AV_STATUS` | `Clean` | 48.6% | `malware` | Antivirus result for that same message |
-| `LMS_EV_SCAN_LOGIC_AV_STATUS` | `Infected` | 1.4% | `malware` | Infected result; action `Reject`, severity `High` |
+| `LMS_EV_SCAN_LOGIC_MA_STATUS` | `ViolationNotFound` | 38.9% | `email` | SPF, DKIM and DMARC verdicts for a message |
+| `LMS_EV_SCAN_LOGIC_MA_STATUS` | `ViolationFound` | 11.1% | `email` | At least one failing verdict; action `Reject` |
+| `LMS_EV_SCAN_LOGIC_AV_STATUS` | `Clean` | 49.5% | `malware` | Antivirus result for that same message |
+| `LMS_EV_SCAN_LOGIC_AV_STATUS` | `Infected` | 0.5% | `malware` | Infected result; action `Reject`, severity `High` |
 
 The [ScanLogic key table](https://support.kaspersky.com/KLMS/8.2/en-US/151789.htm) defines permitted keys, not mandatory complete records. This profile emits message ID, received-from server IP, action, size, sender, one recipient, rule and status. MA additionally includes `SpfVerdict`, `DkimVerdict` and `DmarcVerdict`. Other optional ScanLogic fields and classes are outside this profile. Verdicts use the documented [authentication](https://support.kaspersky.com/KLMS/8.2/en-US/149345.htm) and [antivirus](https://support.kaspersky.com/KLMS/8.2/en-US/90878.htm) catalogs. The tuples are all-pass, all-fail, SPF-only failure and DKIM-only failure; a single failure with DMARC passing assumes the other mechanism passes with alignment. No alignment field is invented.
 
@@ -25,17 +25,19 @@ The [ScanLogic key table](https://support.kaspersky.com/KLMS/8.2/en-US/151789.ht
 
 ## Traffic Model
 
-Every sender in `samples/senders.json` starts SMTP sessions as an independent random (Poisson) process at its own `sessions_per_day` rate. Human-driven senders follow a daily curve peaking at 13:00 UTC (0.6x to 1.4x of the mean); spoofing senders do not. A session delivers one or more messages; nothing runs on a fixed period, rotation or script, and no sender has a cooldown or minimum spacing.
+The server scans about 13,400 messages per day (about 26,800 records); daily volume varies by about 3%. Ordinary senders follow a daily curve from 0.6 of their mean hourly rate at night to 1.4 of it around 13:00 UTC; spoofing senders are active at a flat rate round the clock. The busiest hour carries about 780 messages and the quietest about 345.
+
+Senders come from `samples/senders.json`; each opens SMTP sessions at random moments with a share set by its `weight` within its population (ordinary or spoofing). A session delivers one or more messages; nothing runs on a fixed period or cooldown. Messages of one session follow each other within seconds: a bulk mailing reaches its recipients a median of 6 seconds apart (90% within 20 seconds), while a spoofing sender's messages are about half a minute apart.
 
 | Sender kind | Senders | Share of messages | Session shape | Authentication and AV |
 |---|---:|---:|---|---|
-| `partner` | 14 | 45.2% | 1-4 messages seconds apart, usually one recipient | Mostly pass; occasional SPF-only or DKIM-only failure; rare infection |
-| `spoof` | 6 | 22.4% | 1-6 messages about half a minute apart, often to one high-value mailbox | Mostly all-fail; infection more likely after the first message |
-| `notify` | 3 | 13.4% | 1-3 messages seconds apart | Pass or SPF-only failure |
-| `bulk` | 3 | 10.5% | 4-10 messages to distinct recipients | Pass, occasional single failure |
-| `forwarder` | 2 | 8.5% | 1-4 messages seconds apart | Forwarding breaks SPF, often DKIM and DMARC too |
+| `partner` | 24 | 53.0% | 1-4 messages, usually one recipient | Mostly pass; occasional SPF-only or DKIM-only failure; rare infection |
+| `notify` | 5 | 17.7% | 1-3 messages | Pass or SPF-only failure |
+| `bulk` | 5 | about 13% | 4-10 messages to distinct recipients | Pass, occasional single failure |
+| `forwarder` | 3 | 9.6% | 1-4 messages | Forwarding breaks SPF, often DKIM and DMARC too |
+| `spoof` | 6 | about 7% | 1-6 messages about half a minute apart, often to one high-value mailbox | Mostly all-fail; infection more likely after the first message |
 
-Shares are from the default `true` capture. Message sizes are log-normal per kind, and infected messages are larger. The default samples produce about 2,000-2,300 messages (4,100-4,500 records) per day. Consequently, ordinary traffic of both modes contains repeated all-fail messages from one spoofing sender to one recipient within minutes (124-152 same-flow pairs and 35-50 triples within 180 seconds per 28 hours in the default captures) and infected all-fail messages that follow such a failure (14-25 per 28 hours).
+Message sizes are log-normal per kind, and infected messages are larger. Ordinary traffic of both modes contains repeated all-fail messages from one spoofing sender to one high-value mailbox within minutes (154 same-flow pairs and 45 triples within 180 seconds per 28 hours of default `false` output) and infected all-fail messages that follow such a failure.
 
 ## Anomaly Chain
 
@@ -47,13 +49,11 @@ About every `anomaly_interval_hours` (6 hours by default), one spoofing sender f
 2. Message 2, about half a minute later: the same verdicts; AV `Clean`.
 3. Message 3: the same verdicts; AV `Infected`, action `Reject`, severity `High`.
 
-All three messages fall within 180 seconds and each produces an MA/AV pair joined by `cs1`/`email.local_id`. Each episode picks a sender and a mailbox that both differ from the previous episode; message IDs and sizes are new. A detection correlates relay, sender and recipient: at least two all-fail clean messages followed within 180 seconds by an all-fail message whose AV result is `Infected`. This models a spoofed-mail campaign that sends lures and then a malicious payload; everything is rejected, and no compromise or delivery is asserted.
+All three messages fall within 180 seconds (usually within about 90) and each produces an MA/AV pair joined by `cs1`/`email.local_id`. The sender is drawn with the same weights as spoofing traffic and the mailbox with the spoofing traffic's `lure_weight`; both differ from the previous episode's. Message IDs and sizes are new. A detection correlates relay, sender and recipient: at least two all-fail clean messages followed within 180 seconds by an all-fail message whose AV result is `Infected`. This models a spoofed-mail campaign that sends lures and then a malicious payload; everything is rejected, and no compromise or delivery is asserted.
 
-Every element of the chain occurs in ordinary traffic of both modes: the same senders, relays and mailboxes, the all-fail tuple, infected results, repeated failures within minutes and infections after a failure. Ordinary traffic only never completes the exact sequence: an ordinary infected all-fail message that would follow two all-fail clean messages of the same flow within 180 seconds is exported as clean. Episodes do not pause, delay or reschedule any ordinary sender. No mode or episode marker is emitted.
+Every element of the chain occurs in ordinary traffic of both modes: the same senders, relays and mailboxes, the all-fail tuple, infected results, repeated failures within minutes and infections after a failure. Ordinary traffic never completes the exact sequence: an ordinary all-fail message that would follow two all-fail clean messages of the same flow within 180 seconds is always scanned clean. The episode's messages are interleaved with the traffic (the total message count is the same in both modes); the episode sender's ordinary sessions and all other traffic continue as usual. No mode or episode marker is emitted.
 
-The first episode falls due one interval after the first input timestamp and starts after a random delay of 1 to 30 minutes. Each next episode falls due one interval after the actual start of the previous one and again starts 1 to 30 minutes later, so consecutive starts are 6 h 01 min to 6 h 30 min apart by default and episode clock times drift later: a 28-hour run holds four episodes. There is no catch-up: after a pause in live mode, one episode runs and the next is due one interval after its start. Intervals below 1 hour are raised to 1 hour. A finite run ending inside an episode can omit its remaining messages; every emitted message still has both records.
-
-State is bounded: one queue of scheduled messages (sessions last minutes), one pending MA/AV pair, a next-session time per sender, the last 180 seconds of history per sender-recipient flow, the next episode due time and the previous episode's sender and mailbox. Completed message IDs are not retained.
+Recurrence: spoofing traffic has no daily curve, so episode start times are uniform over the day. The first episode starts at a random moment within the first `anomaly_interval_hours` (at most 24 hours) of the data. Each next episode is due one interval after the actual start of the previous one and starts at a random moment within a window of a quarter of the interval (at most 6 hours) centred on that due time: with the default 6 hours, consecutive starts are 5 h 15 min to 6 h 45 min apart, and a 28-hour window holds four to six episodes. There is no catch-up: after a pause in live mode, one episode runs and the next is due one interval after its start. Intervals below 1 hour are raised to 1 hour.
 
 ## Parameters
 
@@ -64,18 +64,20 @@ Edit `event.template.params` in `generator.yml`:
 | Parameter | Default | Purpose |
 |---|---|---|
 | `anomaly_mode` | `true` | Periodic campaign enabled; `false` emits background only |
-| `anomaly_interval_hours` | `6` | Hours from one actual episode start until the next episode is due (a random 60-1800 s start delay follows); lower values than 1 are raised to 1 |
+| `anomaly_interval_hours` | `6` | Hours from one actual episode start until the next episode is due; values below 1 are raised to 1 |
 | `mail_host` | `mail-01.example.test` | Synthetic hostname with no whitespace or line breaks |
 | `product_version` | `8.0MP2` | Illustrative vendor header value, not a verified live build |
 
 ### Samples
 
-- `samples/senders.json`: `sender`, `relay` (IPv4 or IPv6), `kind` (`partner`, `bulk`, `notify`, `forwarder`, `spoof`) and `sessions_per_day`. Episodes need at least two `spoof` senders.
+- `samples/senders.json`: `sender`, `relay` (IPv4 or IPv6), `kind` (`partner`, `bulk`, `notify`, `forwarder`, `spoof`) and `weight`, the sender's share of session starts within its population (spoofing or ordinary). Episodes need at least two `spoof` senders.
 - `samples/recipients.json`: `mailbox`, `weight` (ordinary traffic), `lure_weight` (spoofing traffic) and `episode`. Episodes need at least two mailboxes with `"episode": true`.
 
 Shipped `.test`/`.example` names and RFC 5737 addresses are synthetic. Mailboxes may contain `=` or `+`; CEF escaping handles them.
 
-Keep `input[0].cron` at `expression: '* * * * * *'` and `count: 2`: the template exports an MA record on the first timestamp of a second and the AV record of the same message on the second.
+### Volume
+
+The message rate and its daily curve are set in `patterns/`: `ordinary-floor.yml` and `ordinary-daytime.yml` for ordinary senders, `spoof.yml` for spoofing senders; `multiplier.ratio` is the number of messages started per day by each file.
 
 ### Output Parameters
 
@@ -86,87 +88,40 @@ The file output needs no credentials. Replace it with a SIEM output plugin and c
 From the content-packs repository root, live mode:
 
 ```bash
-eventum generate --path generators/email-kaspersky-klms/generator.yml --id klms --live-mode true --keep-order true
+eventum generate --path generators/email-kaspersky-klms/generator.yml --id klms --live-mode true
 ```
 
-For a finite sample, add a window to the input in `generator.yml`:
-
-```yaml
-input:
-  - cron:
-      expression: '* * * * * *'
-      count: 2
-      start: '2026-09-25T00:00:00+00:00'
-      end: '2026-09-26T04:00:00+00:00'
-```
-
-Then run:
+For a finite sample, set `oscillator.start` and `oscillator.end` in each of the three `patterns/*.yml` files to the same window, starting at midnight UTC so the daily curve keeps its hours, for example `start: "2026-09-25T00:00:00Z"` and `end: "2026-09-26T04:00:00Z"`, then run:
 
 ```bash
-eventum generate --path generators/email-kaspersky-klms/generator.yml --id klms-batch --live-mode false --keep-order true
+eventum generate --path generators/email-kaspersky-klms/generator.yml --id klms-batch --live-mode false
 ```
 
-This 28-hour window with default parameters wrote 4,762-5,268 records in eight runs, with four complete episodes in each of the two `true` runs. Records go to `generators/email-kaspersky-klms/output/events.json`. Native timestamps assume server timezone UTC; the generator normalizes input timestamps to UTC.
+Records go to `generators/email-kaspersky-klms/output/events.json`. Native timestamps assume server timezone UTC.
+
+Performance: about 2,700 records per CPU second; a 14-day default window (375,224 records) took 141 CPU seconds.
 
 ## Sample Output
 
-This synthetic event is copied from the final default `true` run: the infected third message of the first episode, at 06:16:41, 85 seconds after message 1, which started 15 min 16 s after the episode fell due. Its MA record has the same ID and three `Fail` verdicts. It is not a vendor capture:
+This synthetic event is copied from default `true` output: the infected third message of an episode, at 07:00:23, 39 seconds after message 1 at 06:59:44. Its MA record has the same ID and three `Fail` verdicts. It is not a vendor capture:
 
 ```json
-{
-  "@timestamp": "2026-09-25T06:16:41+00:00",
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "email": {
-    "from": {
-      "address": [
-        "billing@invoice-example.test"
-      ]
-    },
-    "local_id": "6cf13957a6ca015e",
-    "to": {
-      "address": [
-        "finance@example.test"
-      ]
-    }
-  },
-  "event": {
-    "action": "reject",
-    "category": [
-      "malware"
-    ],
-    "code": "LMS_EV_SCAN_LOGIC_AV_STATUS",
-    "dataset": "kaspersky.klms",
-    "kind": "event",
-    "original": "September 25, 2026 06:16:41 mail-01.example.test CEF:0|AO Kaspersky Lab|Kaspersky Linux Mail Security|8.0MP2|LMS_EV_SCAN_LOGIC_AV_STATUS|antivirus scan status|High|cs1=6cf13957a6ca015e cs1Label=MessageId src=198.51.100.74 act=Reject fsize=166247 suser=billing@invoice-example.test duser=finance@example.test cs2=Default cs2Label=Rules outcome=Infected",
-    "type": [
-      "info"
-    ]
-  },
-  "kaspersky": {
-    "klms": {
-      "class_id": "LMS_EV_SCAN_LOGIC_AV_STATUS"
-    }
-  },
-  "observer": {
-    "hostname": "mail-01.example.test",
-    "product": "Kaspersky Linux Mail Security",
-    "vendor": "Kaspersky",
-    "version": "8.0MP2"
-  },
-  "source": {
-    "ip": "198.51.100.74"
-  }
-}
+{"@timestamp": "2026-09-25T07:00:23+00:00", "ecs": {"version": "8.17.0"}, "email": {"from": {"address": ["ceo.office@examp1e.test"]}, "local_id": "adf1b964db344ebc", "to": {"address": ["accounting@example.test"]}}, "event": {"action": "reject", "category": ["malware"], "code": "LMS_EV_SCAN_LOGIC_AV_STATUS", "dataset": "kaspersky.klms", "kind": "event", "original": "September 25, 2026 07:00:23 mail-01.example.test CEF:0|AO Kaspersky Lab|Kaspersky Linux Mail Security|8.0MP2|LMS_EV_SCAN_LOGIC_AV_STATUS|antivirus scan status|High|cs1=adf1b964db344ebc cs1Label=MessageId src=192.0.2.199 act=Reject fsize=72259 suser=ceo.office@examp1e.test duser=accounting@example.test cs2=Default cs2Label=Rules outcome=Infected", "type": ["info"]}, "kaspersky": {"klms": {"class_id": "LMS_EV_SCAN_LOGIC_AV_STATUS"}}, "observer": {"hostname": "mail-01.example.test", "product": "Kaspersky Linux Mail Security", "vendor": "Kaspersky", "version": "8.0MP2"}, "source": {"ip": "192.0.2.199"}}
 ```
 
-## Validation and Limits
+## Limitations
 
-Final finite runs: eight default 28-hour runs (two with `anomaly_mode: true`, 4 episodes each, and six background runs), a custom pair over 14 hours with a 3-hour interval, a different host, a product version containing `|`, mailboxes with `=` and `+` and an IPv6 relay (4 episodes / 0), and a 1-hour interval stress run over 12 hours (9 episodes). The streaming verifier checked CEF escaping and key sets, native-to-ECS identities, verdict/action/severity consistency, MA/AV pair continuity, UTC order, episode recurrence (due one interval after the previous actual start, started 1-30 minutes later, none missing), sender and mailbox rotation, and that every chain constituent occurs in ordinary traffic. Mode comparisons of volume, sender and recipient mix, verdict and infection shares, gap distributions including their minimum and low quantiles, and same-flow failure bursts found no difference between the modes beyond run-to-run variation; the same gates pass between all background runs.
+- Rates, session shapes, verdict weights and sizes are synthetic model choices, not measured vendor traffic.
+- Messages of one SMTP session are several seconds apart (see Traffic Model) rather than the sub-second spacing a fast sender can reach; about 8% of consecutive messages share one second.
+- With `anomaly_mode: true` each episode adds its own three messages, so counts of all-fail messages from a spoofing sender to a high-value mailbox, and of infected results after such failures, are about three and one per episode higher than in background.
+- Kaspersky's [complete CEF example](https://support.kaspersky.com/KLMS/8.2/en-US/151684.htm) is a Settings event; no complete MA or AV ScanLogic record was found in the vendor documentation. Exact MA/AV event names, severities, raw `act`/`outcome` vocabulary, `cs1` lexical form, product build, pair order and timestamps, and syslog framing are therefore inferred. The full-month prefix and vendor/product/version strings follow the illustrative Settings example. No PRI or unsupported transport detail is invented.
 
-Known limits:
+## References
 
-- Rates, session shapes, verdict weights and sizes are synthetic model choices, not measured vendor traffic. Throughput is at most one message per second.
-- Kaspersky's [complete CEF example](https://support.kaspersky.com/KLMS/8.2/en-US/151684.htm) is a Settings event. No complete MA/AV ScanLogic record was found in the bounded source search. Exact MA/AV event names, severities, raw `act`/`outcome` vocabulary, `cs1` lexical form, product build, pair ordering/timestamps and syslog framing remain **BLOCKED_RAW_EVIDENCE**. The full-month prefix and vendor/product/version strings follow the illustrative Settings example. No PRI or unsupported transport detail is invented.
-- [KUMA's supported-source table](https://support.kaspersky.com/help/kuma/3.0.3/en-US/255782.htm) identifies separate KLMS and KSMG CEF normalizers. Shared `LMS_EV_SCAN_LOGIC_*` IDs alone do not make the two product streams duplicates.
+- [Publishing program events to a SIEM system](https://support.kaspersky.com/KLMS/8.2/en-US/151504.htm)
+- [Values of fields in the body of CEF messages for classes of ScanLogic group events](https://support.kaspersky.com/KLMS/8.2/en-US/151789.htm)
+- [Content and properties of syslog messages in CEF format](https://support.kaspersky.com/KLMS/8.2/en-US/151684.htm)
+- [About Mail Sender Authentication statuses](https://support.kaspersky.com/KLMS/8.2/en-US/149345.htm) and [About Anti-Virus scan statuses](https://support.kaspersky.com/KLMS/8.2/en-US/90878.htm)
+- [Email processing algorithm](https://support.kaspersky.com/KLMS/8.2/en-US/42881.htm) and [Configuring actions on messages during DMARC, SPF and DKIM message authentication](https://support.kaspersky.com/KLMS/8.2/en-US/98046.htm)
+- [KUMA supported event sources](https://support.kaspersky.com/help/kuma/3.0.3/en-US/255782.htm)
+- No Elastic integration sample was available for KLMS; the ECS mapping is inferred.
