@@ -32,7 +32,7 @@ About 40,000 events a day (+/- 3% from day to day), with a working-day curve in 
 
 Per host:
 
-- Periodic refresh every 90 minutes plus a random 0-30 minute offset (the Windows default); intervals have a median of 104-112 minutes; about one in ten is shorter than 90 minutes (down to about 70) and about one in twenty longer than two hours (up to about 150), and there are no refreshes while a workstation is switched off.
+- Periodic refresh every 90 minutes plus a random 0-30 minute offset (the Windows default); intervals have a median of 104-112 minutes; about 5-9% are shorter than 90 minutes (down to about 70) and about 8-11% longer than two hours (up to about 150), servers more often than workstations, and there are no refreshes while a workstation is switched off.
 - Each refresh runs the extensions of the host's GPOs that have work: Registry, Security, Audit Policy Configuration, Group Policy Registry, Group Policy Folders, Group Policy Scheduled Tasks, EFS recovery. Registry runs first, the rest in extension-GUID order. A manual refresh runs all of them. A refresh is 5.1 events on average.
 - Audit Policy Configuration completes with `ErrorCode` 2147483658 (E_PENDING), which Microsoft documents as expected.
 
