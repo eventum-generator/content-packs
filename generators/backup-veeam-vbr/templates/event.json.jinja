@@ -1,51 +1,89 @@
 {#- Veeam Backup & Replication 13.1 syslog records wrapped in ECS JSON.
-    One input tick per second; each tick emits the earliest due record,
-    stamped with its own time (microseconds), or drops. Independent
-    background processes: per-operator web UI sessions (lognormal gaps
-    thinned by a UTC hour curve; random typos give 44002 denials before
-    the 44003 grant, sometimes a give-up), user-started backup job
-    sessions (110, one 10010 per VM, 190) launched from sessions,
-    SYSTEM retention removal of the oldest point (10050), manual point
-    cleanup by operators (10050), and one planned retirement of a
-    secondary repository (10050 + 28200). Times are in microseconds. -#}
+    Two tagged inputs set the rate and the hour-of-day curves; every
+    timestamp becomes exactly one record, stamped with the timestamp
+    itself. Any timestamp first takes the earliest due operator step
+    (denials, grant, job start, point removals, repository removal,
+    episode steps). Otherwise an 'ops' timestamp starts a web UI logon
+    of an operator drawn by logon weight, and a 'backup' timestamp
+    takes the next record of the backup lane: user-started job sessions
+    first (110 already sent), else a scheduled session of an idle job
+    (Veeam sends 110 only for user starts). A session writes one 10010
+    per VM in turn, a SYSTEM retention 10050 of the VM's oldest point
+    when its job's retention count is exceeded, and 190 at the end. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set now = ts.timestamp() -%}
 {%- set hq = module.heapq -%}
-{%- set sec = 1000000 -%}
-{%- set hour = 3600000000 -%}
-{#- Chain window, counted from the first denial: see the 'del' item. -#}
-{%- set window = 1800000000 -%}
+{#- Chain window, counted from the first denial: see the 'del' step. -#}
+{%- set window = 1800 -%}
+{#- Hour-of-day logon load relative to the peak. It repeats the bands
+    of patterns/ops-*.yml and only places episode and retirement
+    starts; the inputs alone set the event rate. -#}
+{%- set load = [0.084, 0.084, 0.084, 0.084, 0.084, 0.084, 0.263, 0.579, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.579, 0.579, 0.263, 0.263, 0.084, 0.084, 0.084] -%}
 {%- macro ln(med, sig) -%}
-  {#- Lognormal seconds with median med; returns microseconds. -#}
-  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+  {#- Lognormal seconds with median med. -#}
+  {{- module.rand.number.lognormal(module.math.log(med), sig) -}}
 {%- endmacro -%}
-{%- macro push(due, item) -%}
+{%- macro push(at, item) -%}
   {%- set s = shared.get('seq') + 1 -%}
   {%- do shared.set('seq', s) -%}
-  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+  {%- do module.heapq.heappush(shared.get('tq'), [at, s, item]) -%}
 {%- endmacro -%}
-{%- macro pick_start(lo, span) -%}
-  {#- Time in [lo, lo + span) with its UTC hour weighted by the activity
-      curve squared plus a small floor. -#}
-  {%- set curve = shared.get('curve') -%}
-  {%- set top = (curve | max) ** 2 + 0.02 -%}
-  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
-  {%- for _ in range(500) if not r.ok -%}
-    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
-    {%- if module.rand.number.floating(0, top) < curve[(c // 3600000000) % 24] ** 2 + 0.02 -%}
-      {%- set r.v = c -%}
-      {%- set r.ok = true -%}
+{%- macro pick_start(lo, hi, squared) -%}
+  {#- Time in [lo, hi): an hour slot weighted by its load (squared plus
+      a small floor when squared), then a uniform time inside it. -#}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range(((hi - top) // 3600) | int + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = load[((a // 3600) | int) % 24] -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
     {%- endif -%}
   {%- endfor -%}
-  {{- r.v -}}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.rand.number.floating(slot[0], slot[1]) -}}
 {%- endmacro -%}
-{%- macro pick_user(skip) -%}
-  {#- Operator weighted by session rate (1 / gap_h). -#}
-  {%- set idx = range(samples.operators | length) | reject('equalto', skip) | list -%}
-  {%- set ws = [] -%}
-  {%- for i in idx -%}{%- do ws.append(1 / samples.operators[i].gap_h) -%}{%- endfor -%}
-  {{- module.rand.weighted_choice(idx, ws) -}}
+{%- macro pick_user(skip, key='cum') -%}
+  {#- Operator drawn by logon weight (binary search over cumulative
+      weights), redrawn when it is skip or already in a web UI session;
+      key 'acum' draws among Backup Administrators only (others add
+      zero weight). -#}
+  {%- set cum = shared.get(key) -%}
+  {%- set busy = shared.get('busy') -%}
+  {%- set r = namespace(v=0) -%}
+  {%- for _ in range(32) -%}
+    {%- set r.v = module.bisect.bisect_right(cum, module.rand.number.floating(0, cum[-1])) -%}
+    {%- if r.v < cum | length and r.v != skip and busy.get(r.v, 0) <= now -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {#- Everyone eligible is in a session (rare): relax that, keep skip. -#}
+  {%- for _ in range(32) if r.v >= cum | length or r.v == skip or busy.get(r.v, 0) > now -%}
+    {%- set r.v = module.bisect.bisect_right(cum, module.rand.number.floating(0, cum[-1])) -%}
+    {%- if r.v < cum | length and r.v != skip -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {{- [r.v, cum | length - 1] | min -}}
+{%- endmacro -%}
+{%- macro sched_job(skip) -%}
+  {#- An idle job other than skip for the next scheduled session, drawn
+      with weight growing with the square of the time since its last
+      session started, so no job waits much longer than the others. -#}
+  {%- set last = shared.get('lastrun') -%}
+  {%- set c = namespace(j=[], w=[]) -%}
+  {%- for j in range(samples.jobs | length) if j not in shared.get('running') and j != skip -%}
+    {%- set c.j = c.j + [j] -%}
+    {%- set c.w = c.w + [(now - last[j] + 600) ** 2] -%}
+  {%- endfor -%}
+  {{- module.rand.weighted_choice(c.j, c.w) if c.j else -1 -}}
+{%- endmacro -%}
+{%- macro idle_job(skip) -%}
+  {#- A random job that is not running (and is not skip), or -1. -#}
+  {%- set r = namespace(v=-1) -%}
+  {%- for _ in range(40) if r.v < 0 -%}
+    {%- set j = module.rand.number.integer(0, samples.jobs | length - 1) -%}
+    {%- if j not in shared.get('running') and j != skip -%}{%- set r.v = j -%}{%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
 {%- endmacro -%}
 {%- macro denials(first) -%}
   {#- Denials before a grant: 0 or 1, continued with probability 0.45,
@@ -56,44 +94,35 @@
   {%- endfor -%}
   {{- n.v -}}
 {%- endmacro -%}
-{%- macro session(ui, ip, t, nd, grant, op) -%}
-  {#- nd denials at t, then (if grant) the 44003 and the post-login
-      operations; returns the grant time. -#}
-  {%- set c = namespace(t=t) -%}
-  {%- for _ in range(nd) -%}
-    {{- push(c.t, {'k': 'row', 'id': 44002, 'u': ui, 'ip': ip}) -}}
-    {%- set c.t = c.t + (ln(25, 0.7) | int) -%}
-  {%- endfor -%}
-  {%- if grant -%}
-    {{- push(c.t, {'k': 'row', 'id': 44003, 'u': ui, 'ip': ip}) -}}
-    {{- push(c.t, {'k': 'ops', 'u': ui, 'op': op}) -}}
-  {%- endif -%}
-  {{- c.t -}}
+{%- macro dt(t) -%}
+  {{- module.datetime.datetime.fromtimestamp(t, module.datetime.timezone.utc).strftime('%m/%d/%Y %H:%M:%S') -}}
 {%- endmacro -%}
-{%- macro cleanup(ui, t, own) -%}
-  {#- One to three manual point removals a few minutes after login. -#}
-  {%- set r = module.rand.number.floating(0, 1) -%}
-  {%- set k = 1 if r < 0.7 else 2 if r < 0.92 else 3 -%}
-  {%- set c = namespace(t=t) -%}
-  {%- for i in range(k) -%}
-    {{- push(c.t, {'k': 'del', 'u': ui, 'own': own and i == 0}) -}}
-    {%- set c.t = c.t + (ln(40, 0.7) | int) -%}
-  {%- endfor -%}
+{%- macro psize(vm) -%}
+  {{- (module.builtins.int(vm.size * module.rand.number.lognormal(0, 0.06)) // 4096) * 4096 -}}
 {%- endmacro -%}
-{%- macro dt(us) -%}
-  {{- module.datetime.datetime.fromtimestamp(us / 1000000, module.datetime.timezone.utc).strftime('%m/%d/%Y %H:%M:%S') -}}
-{%- endmacro -%}
-{%- if shared.get('queue') is none -%}
+{%- if shared.get('tq') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 2, 'le': 8760}}
   }} -%}
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python({'anomaly_mode': params.anomaly_mode, 'anomaly_interval_hours': params.anomaly_interval_hours}) -%}
-  {#- Relative operator activity by UTC hour (peak 1): sessions are
-      thinned by it; episode starts are weighted by its square. -#}
-  {%- do shared.update({'queue': [], 'seq': 0, 'last_us': now - 1, 'auth': {}, 'running': [], 'ep_user': none, 'ep_vm': none, 'curve': [0.08, 0.06, 0.05, 0.05, 0.06, 0.1, 0.25, 0.55, 0.85, 1.0, 1.0, 0.95, 0.85, 0.95, 1.0, 1.0, 0.9, 0.7, 0.45, 0.3, 0.2, 0.15, 0.12, 0.1]}) -%}
-  {#- Restore points already on the active repository, per VM (job
-      index, VM index): oldest first, all from finished sessions. -#}
+  {%- set cum = [] -%}
+  {%- set acum = [] -%}
+  {%- set rot = {} -%}
+  {%- set c = namespace(v=0, a=0) -%}
+  {%- for row in samples.operators -%}
+    {%- set c.v = c.v + row.weight -%}
+    {%- set c.a = c.a + (row.weight if row.admin else 0) -%}
+    {%- do cum.append(c.v) -%}
+    {%- do acum.append(c.a) -%}
+    {%- do rot.update({loop.index0: now + module.rand.number.exponential(1 / ((7 if row.admin else 60) * 86400))}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'tq': [], 'seq': 0, 'cum': cum, 'acum': acum, 'rot': rot, 'stale': module.builtins.set(), 'busy': {}, 'auth': {}, 'running': module.builtins.set(), 'live': module.builtins.set(), 'urq': [], 'cur': none, 'last_sched': -1, 'lastrun': {}, 'ep_user': none, 'ep_vm': none, 'guarded': 0}) -%}
+  {%- for job in samples.jobs -%}
+    {%- do shared.get('lastrun').update({loop.index0: now - module.rand.number.floating(0, 86400)}) -%}
+  {%- endfor -%}
+  {#- Restore points already on the active repository, per VM key
+      'job:vm': oldest first, all from finished sessions. -#}
   {%- set points = {} -%}
   {%- for job in samples.jobs -%}
     {%- set ji = loop.index0 -%}
@@ -101,116 +130,201 @@
       {%- set lst = [] -%}
       {%- set c = namespace(t=now) -%}
       {%- for _ in range(module.rand.number.integer(2, job.retention)) -%}
-        {%- set c.t = c.t - (ln(43200, 0.6) | int) -%}
-        {%- do lst.insert(0, {'oib': module.rand.crypto.uuid4() | string, 'dt': dt(c.t), 'size': (module.builtins.int(vm.size * module.rand.number.lognormal(0, 0.06)) // 4096) * 4096, 'sid': none}) -%}
+        {%- set c.t = c.t - (ln(43200, 0.6) | float) -%}
+        {%- do lst.insert(0, {'oib': module.rand.crypto.uuid4() | string, 'dt': dt(c.t), 'size': psize(vm) | int, 'sid': none}) -%}
       {%- endfor -%}
       {%- do points.update({ji ~ ':' ~ loop.index0: lst}) -%}
     {%- endfor -%}
   {%- endfor -%}
   {%- do shared.set('points', points) -%}
-  {%- for row in samples.operators -%}
-    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(row.gap_h * 3600, 0.8) | int)), {'k': 'sess', 'u': loop.index0}) -}}
-  {%- endfor -%}
+  {%- do shared.set('keys', points.keys() | list) -%}
   {#- Planned retirement of the unused secondary repository: once, at a
-      curve-weighted time within the first three days. -#}
+      load-weighted time between 6 and 72 hours after the first
+      timestamp. -#}
   {%- set sj = module.rand.number.integer(0, samples.jobs | length - 1) -%}
   {%- set sv = module.rand.number.integer(0, samples.jobs[sj].vms | length - 1) -%}
-  {%- do shared.set('secondary', {'j': sj, 'v': sv, 'dt': dt(now - (ln(20 * 86400, 0.4) | int)), 'present': true}) -%}
-  {{- push(pick_start(now + 6 * hour, 66 * hour) | int, {'k': 'ret'}) -}}
-  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-  {%- if params.anomaly_mode -%}
-    {{- push(pick_start(now, [interval, 24 * hour] | min) | int + (ln(120, 0.8) | int), {'k': 'ep'}) -}}
-  {%- endif -%}
+  {%- do shared.set('secondary', {'j': sj, 'v': sv, 'dt': dt(now - (ln(20 * 86400, 0.4) | float)), 'present': true}) -%}
+  {%- do shared.set('ret_at', pick_start(now + 6 * 3600, now + 72 * 3600, false) | float) -%}
+  {%- set interval = params.anomaly_interval_hours * 3600 -%}
+  {%- do shared.set('ep_at', pick_start(now, now + [interval, 86400] | min, false) | float if params.anomaly_mode else none) -%}
 {%- endif -%}
-{%- set queue = shared.get('queue') -%}
-{%- set curve = shared.get('curve') -%}
+{%- set tq = shared.get('tq') -%}
 {%- set points = shared.get('points') -%}
 {%- set running = shared.get('running') -%}
+{%- set live = shared.get('live') -%}
 {%- set auth = shared.get('auth') -%}
-{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{%- if now < queue[0][0] -%}
-  {%- do shared.set('next_due', queue[0][0]) -%}
-  {{- dispatch.drop() -}}
+{%- set interval = params.anomaly_interval_hours * 3600 -%}
+{%- if shared.get('ret_at') is not none and now >= shared.get('ret_at') -%}
+  {#- Planned retirement: a Backup Administrator logs on, removes the pre-existing
+      secondary point, then the repository. -#}
+  {%- do shared.set('ret_at', none) -%}
+  {%- set ui = pick_user(-1, 'acum') | int -%}
+  {%- set op = samples.operators[ui] -%}
+  {%- do shared.get('busy').update({ui: now + (ln(1200, 0.6) | float)}) -%}
+  {{- push(now, {'k': 'auth', 'u': ui, 'ip': module.rand.weighted_choice(op.ips, op.ip_weights), 'nd': denials(1 if module.rand.chance(op.fail) else 0) | int, 'i': 0, 'grant': true, 'op': 'retire'}) -}}
 {%- endif -%}
-{%- set out = namespace(row=none, rec=0) -%}
-{%- for _ in range(64) if out.row is none and queue and queue[0][0] <= now -%}
-  {%- set top = hq.heappop(queue) -%}
-  {%- set due = top[0] -%}
-  {%- set item = top[2] -%}
-  {%- set emit = namespace(v=none) -%}
-  {%- if item.k == 'row' -%}
-    {%- set emit.v = item -%}
-    {%- if item.id in [44002, 44003] -%}
-      {#- Authorization history of the operator, kept for one window. -#}
-      {%- set hist = auth.setdefault(item.u, []) -%}
-      {%- do hist.append([due, item.id, item.ip]) -%}
-      {%- for _ in range(hist | length) if hist and hist[0][0] < due - window - 60 * sec -%}{%- do hist.pop(0) -%}{%- endfor -%}
-    {%- endif -%}
-  {%- elif item.k == 'sess' -%}
-    {#- Session arrival of one operator, thinned by the hour curve. -#}
-    {%- set op = samples.operators[item.u] -%}
-    {{- push(due + (ln(op.gap_h * 3600, 0.8) | int), item) -}}
-    {%- if module.rand.chance(curve[(due // hour) % 24]) -%}
-      {%- set ip = module.rand.weighted_choice(op.ips, op.ip_weights) -%}
-      {%- set nd = denials(1 if module.rand.chance(op.fail) else 0) | int -%}
-      {%- set _ = session(item.u, ip, due, nd, nd == 0 or module.rand.chance(0.85), 'work') -%}
-    {%- endif -%}
-  {%- elif item.k == 'ops' -%}
-    {#- After a grant: maybe start an idle job, maybe clean up points. -#}
-    {%- if item.op == 'retire' -%}
-      {{- push(due + (ln(240, 0.9) | int), {'k': 'del', 'u': item.u, 'sec': true}) -}}
-    {%- else -%}
-      {#- Ordinary and episode logons alike may start a job; the episode's
-          cleanup is scheduled by the episode itself. -#}
-      {%- if module.rand.chance(0.3) -%}
-        {{- push(due + (ln(90, 0.8) | int), {'k': 'run', 'u': item.u, 'j': module.rand.number.integer(0, samples.jobs | length - 1)}) -}}
-      {%- endif -%}
-      {%- if item.op == 'work' and module.rand.chance(0.2) -%}
-        {{- cleanup(item.u, due + (ln(240, 0.9) | int), false) -}}
-      {%- endif -%}
-    {%- endif -%}
-  {%- elif item.k == 'run' -%}
-    {#- A user-started job session, unless that job is already running:
-        110, one 10010 per VM (snapshot time as DateTime), then 190. -#}
-    {%- if item.j not in running -%}
-      {%- do running.append(item.j) -%}
-      {%- set job = samples.jobs[item.j] -%}
-      {%- set sid = module.rand.crypto.uuid4() | string -%}
-      {{- push(due, {'k': 'row', 'id': 110, 'u': item.u, 'j': item.j, 'sid': sid}) -}}
-      {%- set c = namespace(t=due + (ln(40, 0.5) | int)) -%}
-      {%- for vm in job.vms -%}
-        {%- set snap = c.t -%}
-        {%- set c.t = c.t + (ln(150, 0.6) | int) -%}
-        {{- push(c.t, {'k': 'pt', 'j': item.j, 'v': loop.index0, 'sid': sid, 'dt': dt(snap), 'size': (module.builtins.int(vm.size * module.rand.number.lognormal(0, 0.06)) // 4096) * 4096}) -}}
-        {%- set c.t = c.t + (ln(4, 0.8) | int) -%}
+{%- if shared.get('ep_at') is not none and now >= shared.get('ep_at') -%}
+  {#- Episode: a Backup Administrator other than the previous episode's fails the
+      password at least twice from their primary (office) address, logs on, and
+      removes exactly one finished restore point of a VM other than the
+      previous episode's within the chain window. The first start falls
+      within the first min(interval, 24 h), its hour drawn from the load
+      curve; each later one within a window of min(interval / 4, 6 h)
+      centred one interval after the actual start, weighted by the
+      squared load plus a small floor. Missed episodes are not replayed.
+      Like any logon it starts only for an administrator who is not in
+      a web UI session and holds them for one session length. Its
+      steps queue with the other operator steps and take over
+      timestamps of both inputs. -#}
+  {%- set ui = pick_user(shared.get('ep_user') if shared.get('ep_user') is not none else -1, 'acum') | int -%}
+  {%- set op = samples.operators[ui] -%}
+  {%- do shared.get('busy').update({ui: now + (ln(1200, 0.6) | float)}) -%}
+  {{- push(now, {'k': 'auth', 'u': ui, 'ip': op.ips[0], 'nd': denials(2) | int, 'i': 0, 'grant': true, 'op': 'episode'}) -}}
+  {%- set w = [interval / 4, 6 * 3600] | min -%}
+  {%- do shared.update({'ep_user': ui, 'ep_at': pick_start(now + interval - w / 2, now + interval + w / 2, true) | float}) -%}
+{%- endif -%}
+{%- set out = namespace(row=none, n=0) -%}
+{%- for _ in range(64) if out.row is none -%}
+  {%- set out.n = out.n + 1 -%}
+  {%- if tq and tq[0][0] <= now and out.n < 64 -%}
+    {%- set item = hq.heappop(tq)[2] -%}
+  {%- elif 'ops' in tags -%}
+    {#- A new web UI session of an operator who is not in one, drawn by
+        weight, from one of their addresses; the session lasts a median
+        20 minutes. A mistyped password gives one or more denials. The
+        PAM vault rotates an administrator's password about once a week
+        (other operators' passwords expire about every 60 days); the
+        next logon from each address where the browser saved the old
+        password submits it first, which gives two or more denials
+        before the operator types the new one. Some attempts are
+        abandoned after the denials. -#}
+    {%- set ui = pick_user(-1) | int -%}
+    {%- set op = samples.operators[ui] -%}
+    {%- do shared.get('busy').update({ui: now + (ln(1200, 0.6) | float)}) -%}
+    {%- set rot = shared.get('rot') -%}
+    {%- set stale = shared.get('stale') -%}
+    {%- for _ in range(8) if now >= rot[ui] -%}
+      {%- for k in range(op.ips | length) -%}
+        {%- do stale.add(ui ~ ':' ~ k) -%}
       {%- endfor -%}
-      {{- push(c.t + (ln(6, 0.6) | int), {'k': 'fin', 'j': item.j, 'sid': sid}) -}}
-    {%- endif -%}
-  {%- elif item.k == 'pt' -%}
-    {#- Restore point created; SYSTEM retention removes the oldest point
-        of that VM once the retention count is exceeded. -#}
-    {%- set lst = points[item.j ~ ':' ~ item.v] -%}
-    {%- set oib = module.rand.crypto.uuid4() | string -%}
-    {%- do lst.append({'oib': oib, 'dt': item.dt, 'size': item.size, 'sid': item.sid}) -%}
-    {%- set emit.v = {'id': 10010, 'j': item.j, 'v': item.v, 'p': lst[-1]} -%}
-    {%- if lst | length > samples.jobs[item.j].retention -%}
-      {{- push(due + (ln(3, 0.8) | int), {'k': 'del', 'u': none, 'j': item.j, 'v': item.v, 'oib': lst[0].oib}) -}}
-    {%- endif -%}
-  {%- elif item.k == 'fin' -%}
-    {%- for key, lst in points.items() -%}
-      {%- for p in lst if p.sid == item.sid -%}{%- do p.update({'sid': none}) -%}{%- endfor -%}
+      {%- do rot.update({ui: rot[ui] + module.rand.number.exponential(1 / ((7 if op.admin else 60) * 86400))}) -%}
     {%- endfor -%}
-    {%- if item.j in running -%}{%- do running.remove(item.j) -%}{%- endif -%}
-    {%- set emit.v = {'id': 190, 'j': item.j, 'sid': item.sid} -%}
+    {%- set ik = module.rand.weighted_choice(range(op.ips | length), op.ip_weights) -%}
+    {%- set sk = ui ~ ':' ~ ik -%}
+    {%- set nd = denials(2 if sk in stale else 1 if module.rand.chance(op.fail) else 0) | int -%}
+    {%- do stale.discard(sk) -%}
+    {%- set item = {'k': 'auth', 'u': ui, 'ip': op.ips[ik], 'nd': nd, 'i': 0, 'grant': nd == 0 or module.rand.chance(0.85), 'op': 'work'} -%}
+  {%- else -%}
+    {%- set item = {'k': 'lane'} -%}
+  {%- endif -%}
+  {%- if item.k == 'auth' -%}
+    {%- if item.i == 0 -%}{%- do item.update({'t0': now}) -%}{%- endif -%}
+    {%- if item.i < item.nd -%}
+      {%- set out.row = {'id': 44002, 'u': item.u, 'ip': item.ip} -%}
+      {%- do item.update({'i': item.i + 1}) -%}
+      {%- if item.i < item.nd or item.grant -%}
+        {{- push(now + (ln(25, 0.7) | float), item) -}}
+      {%- endif -%}
+    {%- else -%}
+      {%- set out.row = {'id': 44003, 'u': item.u, 'ip': item.ip} -%}
+      {#- After the grant: a retirement removes the secondary point; any
+          other logon may start a job, an ordinary one may clean up
+          points, and an episode removes exactly one point. -#}
+      {%- if item.op == 'retire' -%}
+        {{- push(now + (ln(240, 0.9) | float), {'k': 'del', 'u': item.u, 'sec': true}) -}}
+      {%- else -%}
+        {%- if module.rand.chance(0.04) -%}
+          {{- push(now + (ln(90, 0.8) | float), {'k': 'run', 'u': item.u}) -}}
+        {%- endif -%}
+        {#- Housekeeping: after 8% of their sessions a Backup
+            Administrator removes old restore points. -#}
+        {%- if item.op == 'work' and samples.operators[item.u].admin and module.rand.chance(0.08) -%}
+          {%- set r = module.rand.number.floating(0, 1) -%}
+          {{- push(now + (ln(240, 0.9) | float), {'k': 'del', 'u': item.u, 'left': 0 if r < 0.7 else 1 if r < 0.92 else 2}) -}}
+        {%- elif item.op == 'episode' -%}
+          {%- set room = item.t0 + window - 120 - now -%}
+          {%- set d = namespace(v=ln(240, 0.9) | float) -%}
+          {%- for _ in range(50) if d.v > room -%}{%- set d.v = ln(240, 0.9) | float -%}{%- endfor -%}
+          {%- if d.v > room -%}{%- set d.v = [room / 2, 1] | max -%}{%- endif -%}
+          {{- push(now + d.v, {'k': 'del', 'u': item.u, 'own': true, 'left': 0}) -}}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+    {#- Authorization history of the operator, kept for one window and
+        never reset: the guard below reads it. -#}
+    {%- set hist = auth.setdefault(item.u, []) -%}
+    {%- do hist.append([now, out.row.id, item.ip]) -%}
+    {%- for _ in range(hist | length) if hist[0][0] < now - window - 60 -%}{%- do hist.pop(0) -%}{%- endfor -%}
+  {%- elif item.k == 'run' -%}
+    {#- A user-started session of an idle job (a running job is not
+        started again): 110 now, its points and 190 on the backup lane
+        ahead of scheduled sessions. -#}
+    {%- set j = idle_job(-1) | int -%}
+    {%- if j >= 0 -%}
+      {%- set sid = module.rand.crypto.uuid4() | string -%}
+      {%- do shared.get('lastrun').update({j: now}) -%}
+      {%- do running.add(j) -%}
+      {%- do live.add(sid) -%}
+      {%- do shared.get('urq').append({'j': j, 'v': 0, 'o': module.rand.shuffle(range(samples.jobs[j].vms | length)), 'sid': sid, 'prev': now, 'ready': now + (ln(40, 0.5) | float), 'ret': none}) -%}
+      {%- set out.row = {'id': 110, 'u': item.u, 'j': j, 'sid': sid} -%}
+    {%- endif -%}
+  {%- elif item.k == 'lane' -%}
+    {#- Backup lane: the oldest user-started session (its first point
+        about 40 s after the 110 at the earliest), else the current
+        scheduled session, else a new scheduled session of an idle job
+        other than the previous scheduled one (see sched_job). -#}
+    {%- set urq = shared.get('urq') -%}
+    {%- set ready = urq and (urq[0].v > 0 or now >= urq[0].ready) -%}
+    {%- if not ready and shared.get('cur') is none -%}
+      {%- set j = sched_job(shared.get('last_sched')) | int -%}
+      {%- set sid = module.rand.crypto.uuid4() | string -%}
+      {%- do shared.get('lastrun').update({j: now}) -%}
+      {%- do running.add(j) -%}
+      {%- do live.add(sid) -%}
+      {%- do shared.update({'last_sched': j, 'cur': {'j': j, 'v': 0, 'o': module.rand.shuffle(range(samples.jobs[j].vms | length)), 'sid': sid, 'prev': now - (ln(60, 0.5) | float), 'ret': none}}) -%}
+    {%- endif -%}
+    {%- set s = urq[0] if ready else shared.get('cur') -%}
+    {%- set job = samples.jobs[s.j] -%}
+    {%- if s.ret is not none -%}
+      {#- SYSTEM retention: the VM's oldest point, right after the new
+          one, unless an operator removed it meanwhile. -#}
+      {%- set lst = points[s.ret] -%}
+      {%- set jv = s.ret.split(':') -%}
+      {%- if lst | length > job.retention -%}
+        {%- set out.row = {'id': 10050, 'u': none, 'j': jv[0] | int, 'v': jv[1] | int, 'p': lst[0]} -%}
+        {%- do lst.pop(0) -%}
+      {%- endif -%}
+      {%- do s.update({'ret': none}) -%}
+    {%- endif -%}
+    {%- if out.row is none and s.v < job.vms | length -%}
+      {#- Restore point of the next VM in the session's order (VMs are
+          processed in parallel, so they finish in a random order);
+          DateTime is its snapshot time, a few seconds after the
+          session's previous record. -#}
+      {%- set vi = s.o[s.v] -%}
+      {%- set key = s.j ~ ':' ~ vi -%}
+      {%- set lst = points[key] -%}
+      {%- do lst.append({'oib': module.rand.crypto.uuid4() | string, 'dt': dt([s.prev + (ln(4, 0.8) | float), now] | min), 'size': psize(job.vms[vi]) | int, 'sid': s.sid}) -%}
+      {%- set out.row = {'id': 10010, 'j': s.j, 'v': vi, 'p': lst[-1]} -%}
+      {%- do s.update({'v': s.v + 1, 'prev': now, 'ret': key if lst | length > job.retention else none}) -%}
+    {%- elif out.row is none -%}
+      {%- do live.discard(s.sid) -%}
+      {%- do running.discard(s.j) -%}
+      {%- set out.row = {'id': 190, 'j': s.j, 'sid': s.sid} -%}
+      {%- if ready -%}{%- do urq.pop(0) -%}{%- else -%}{%- do shared.set('cur', none) -%}{%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'repo' -%}
+    {%- set out.row = {'id': 28200, 'u': item.u} -%}
   {%- elif item.k == 'del' -%}
-    {#- Point removal. A manual removal that would complete the chain
-        (the same operator denied twice and then granted from one address,
-        the first denial within the window) is dropped at its own time and
-        the point stays; the operator and the time are never changed. -#}
+    {#- Point removal by an operator. A removal that would complete the
+        chain (two denials and then a grant for that operator from one
+        address, the first denial within the window) is skipped at its
+        own time and the point stays; the timestamp goes to the next
+        step. The operator and the time are never changed. -#}
     {%- set guard = namespace(hit=false) -%}
-    {%- if item.u is not none and not item.get('own') -%}
+    {%- if not item.get('own') -%}
       {%- set hist = auth.get(item.u, []) -%}
-      {%- for i in range(hist | length) if not guard.hit and hist[i][1] == 44002 and hist[i][0] >= due - window -%}
+      {%- for i in range(hist | length) if not guard.hit and hist[i][1] == 44002 and hist[i][0] >= now - window -%}
         {%- set h = hist[i] -%}
         {%- set st = namespace(n=1) -%}
         {%- for g in hist[i + 1:] -%}
@@ -220,81 +334,47 @@
         {%- if st.n == 3 -%}{%- set guard.hit = true -%}{%- endif -%}
       {%- endfor -%}
     {%- endif -%}
+    {%- if guard.hit -%}{%- do shared.set('guarded', shared.get('guarded') + 1) -%}{%- endif -%}
     {%- if item.get('sec') -%}
       {#- The repository is removed after the point, whether or not the
-          guard dropped that removal (Veeam leaves the files in place). -#}
-      {{- push(due + (ln(900, 0.8) | int), {'k': 'row', 'id': 28200, 'u': item.u}) -}}
-    {%- endif -%}
-    {%- if not guard.hit -%}
-      {%- if item.get('sec') -%}
-        {%- set s2 = shared.get('secondary') -%}
-        {%- if s2.present -%}
-          {%- do s2.update({'present': false}) -%}
-          {%- set emit.v = {'id': 10050, 'u': item.u, 'j': s2.j, 'v': s2.v, 'p': {'oib': params.retired_point_id, 'dt': s2.dt, 'size': (module.builtins.int(samples.jobs[s2.j].vms[s2.v].size * 1.03) // 4096) * 4096}, 'repo': params.repository_id} -%}
-        {%- endif -%}
-      {%- elif item.get('oib') -%}
-        {%- set lst = points[item.j ~ ':' ~ item.v] -%}
-        {%- for p in lst if p.oib == item.oib -%}
-          {%- set emit.v = {'id': 10050, 'u': none, 'j': item.j, 'v': item.v, 'p': p} -%}
-        {%- endfor -%}
-        {%- if emit.v is not none -%}{%- do lst.remove(emit.v.p) -%}{%- endif -%}
-      {%- else -%}
-        {#- Manual cleanup: a random finished point of a random VM (other
-            than the previous episode's VM for an episode). -#}
-        {%- set keys = [] -%}
-        {%- for key, lst in points.items() -%}
-          {%- if key != (shared.get('ep_vm') if item.get('own') else none) and lst | selectattr('sid', 'none') | list -%}{%- do keys.append(key) -%}{%- endif -%}
-        {%- endfor -%}
-        {%- if keys -%}
+          guard skipped that removal (Veeam leaves the files in place). -#}
+      {{- push(now + (ln(900, 0.8) | float), {'k': 'repo', 'u': item.u}) -}}
+      {%- set s2 = shared.get('secondary') -%}
+      {%- if not guard.hit and s2.present -%}
+        {%- do s2.update({'present': false}) -%}
+        {%- set out.row = {'id': 10050, 'u': item.u, 'j': s2.j, 'v': s2.v, 'p': {'oib': params.retired_point_id, 'dt': s2.dt, 'size': (module.builtins.int(samples.jobs[s2.j].vms[s2.v].size * 1.03) // 4096) * 4096}, 'repo': params.repository_id} -%}
+      {%- endif -%}
+    {%- else -%}
+      {#- A random finished point of a random VM (other than the previous
+          episode's VM for an episode), then maybe another one a little
+          later. -#}
+      {%- if not guard.hit -%}
+        {%- set keys = shared.get('keys') -%}
+        {%- set pick = namespace(key=none, cand=[]) -%}
+        {%- for _ in range(40) if pick.key is none -%}
           {%- set key = module.rand.choice(keys) -%}
-          {%- set lst = points[key] -%}
-          {%- set p = module.rand.choice(lst | selectattr('sid', 'none') | list) -%}
-          {%- do lst.remove(p) -%}
-          {%- set jv = key.split(':') -%}
-          {%- set emit.v = {'id': 10050, 'u': item.u, 'j': jv[0] | int, 'v': jv[1] | int, 'p': p} -%}
-          {%- if item.get('own') -%}
-            {%- do shared.set('ep_vm', key) -%}
-            {%- do auth.update({item.u: []}) -%}
+          {%- set cand = points[key] | rejectattr('sid', 'in', live) | list -%}
+          {%- if cand and not (item.get('own') and key == shared.get('ep_vm')) -%}
+            {%- set pick.key = key -%}
+            {%- set pick.cand = cand -%}
           {%- endif -%}
+        {%- endfor -%}
+        {%- if pick.key is not none -%}
+          {%- set p = module.rand.choice(pick.cand) -%}
+          {%- do points[pick.key].remove(p) -%}
+          {%- set jv = pick.key.split(':') -%}
+          {%- set out.row = {'id': 10050, 'u': item.u, 'j': jv[0] | int, 'v': jv[1] | int, 'p': p} -%}
+          {%- if item.get('own') -%}{%- do shared.set('ep_vm', pick.key) -%}{%- endif -%}
         {%- endif -%}
       {%- endif -%}
+      {%- if item.left > 0 -%}
+        {{- push(now + (ln(40, 0.7) | float), {'k': 'del', 'u': item.u, 'left': item.left - 1}) -}}
+      {%- endif -%}
     {%- endif -%}
-  {%- elif item.k == 'ret' -%}
-    {#- Planned retirement: an operator logs in, removes the pre-existing
-        secondary point, then the repository. -#}
-    {%- set ui = pick_user(none) | int -%}
-    {%- set op = samples.operators[ui] -%}
-    {%- set nd = denials(1 if module.rand.chance(op.fail) else 0) | int -%}
-    {%- set _ = session(ui, module.rand.weighted_choice(op.ips, op.ip_weights), due, nd, true, 'retire') -%}
-  {%- elif item.k == 'ep' -%}
-    {#- Episode: an operator other than the previous episode's fails the
-        password at least twice from one of their addresses, logs in, and
-        removes a finished restore point of a VM other than the previous
-        episode's within the chain window. The first start falls within
-        the first min(interval, 24 h); each later start within a window of
-        min(interval / 4, 6 h) centred one interval after the actual
-        start, weighted by the activity curve squared, plus a random
-        delay. Missed episodes are not replayed. -#}
-    {%- set ui = pick_user(shared.get('ep_user')) | int -%}
-    {%- set op = samples.operators[ui] -%}
-    {%- set t_grant = session(ui, module.rand.weighted_choice(op.ips, op.ip_weights), due, denials(2) | int, true, 'episode') | int -%}
-    {%- set d = namespace(v=ln(240, 0.9) | int) -%}
-    {%- for _ in range(50) if t_grant + d.v > due + window - 30 * sec -%}{%- set d.v = ln(240, 0.9) | int -%}{%- endfor -%}
-    {{- cleanup(ui, t_grant + d.v, true) -}}
-    {%- set w = [interval // 4, 6 * hour] | min -%}
-    {%- do shared.set('ep_user', ui) -%}
-    {{- push(pick_start(due + interval - w // 2, w) | int + (ln(120, 0.8) | int), {'k': 'ep'}) -}}
-  {%- endif -%}
-  {%- if emit.v is not none -%}
-    {%- set out.row = emit.v -%}
-    {%- set out.rec = [due, shared.get('last_us') + 1] | max -%}
-    {%- do shared.set('last_us', out.rec) -%}
   {%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', queue[0][0] if queue else now + 1000000) -%}
-{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set row = out.row -%}
-{%- set moment = (ts + module.datetime.timedelta(microseconds=out.rec - now)).isoformat(timespec='microseconds') -%}
+{%- set moment = ts.isoformat(timespec='microseconds') -%}
 {%- set event_id = row.id -%}
 {%- set username = samples.operators[row.u].name if row.get('u') is not none else none -%}
 {%- set qualified_user = params.user_domain ~ '\\' ~ username if username else 'SYSTEM' -%}
