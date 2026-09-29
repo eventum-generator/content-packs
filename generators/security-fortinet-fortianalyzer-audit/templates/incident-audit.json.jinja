@@ -1,12 +1,18 @@
 {#- FortiAnalyzer 7.2.4 local APPEVENT / INCIDENT audit records (message
     IDs 100001, 100002, 100003, 100005, 100006) wrapped in ECS JSON.
-    One input tick every 5 seconds. Every incident is created by an arrival
-    process with a daytime peak and gets its own random lifecycle
-    (attachments, analyst work sessions, sometimes deletion), planned at
-    creation. Each tick emits the earliest due operation or drops.
-    Times are epoch seconds (UTC). -#}
+    Every input timestamp is one record. Inputs (tags): `playbook`
+    (round the clock, daytime bump), `raise` and `work` (analyst
+    working-day curve). A timestamp emits, in this order: the earliest
+    due tight step (next operation of a running work session, automatic
+    evidence, the deletion after a pre-delete removal, anomaly episode
+    creation and steps) on any input; on `work` the earliest due flexible step (work session
+    start, closure), planned at incident creation in analyst working
+    time; otherwise a new playbook-raised incident (`playbook`), a new
+    analyst-raised incident (`raise`) or an ad hoc update of a recent
+    open incident (`work`). Times are epoch seconds (UTC). -#}
 {%- set now = timestamp.timestamp() -%}
 {%- set window = 7200 -%}
+{%- set curve = [1, 1, 1, 1, 1, 1, 1, 5, 5, 8, 8, 8, 8, 8, 8, 8, 8, 5, 5, 1, 1, 1, 1, 1] -%}
 {%- macro d(lo, med, sig, hi) -%}
   {#- Offset lognormal in seconds, upper tail redrawn. -#}
   {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
@@ -15,22 +21,41 @@
   {%- endfor -%}
   {{- [ns.v, hi] | min -}}
 {%- endmacro -%}
-{%- macro next_arrival(t) -%}
-  {#- Thinned Poisson arrivals, rate peaking at 13:00 UTC. -#}
-  {%- set ns = namespace(t=t, go=true) -%}
-  {%- for _ in range(400) if ns.go -%}
-    {%- set ns.t = ns.t + module.rand.number.exponential(shared.get('lam_max')) -%}
-    {%- set h = (ns.t % 86400) / 3600.0 -%}
-    {%- set f = 0.45 + ([0, module.math.sin(module.math.pi * (h - 7) / 12)] | max) -%}
-    {%- if module.rand.number.floating(0, 1.45) < f -%}{%- set ns.go = false -%}{%- endif -%}
+{%- macro work_map(t0, dw) -%}
+  {#- Real time after dw seconds of analyst working time from t0: the
+      working-day curve sets the pace (1/8 at night, full in core
+      hours), so work left in the evening moves to the morning. One
+      working day holds 43200 seconds. -#}
+  {%- set days = dw // 43200 -%}
+  {%- set ns = namespace(t=t0 + days * 86400, dw=dw - days * 43200) -%}
+  {%- for _ in range(30) if ns.dw > 0 -%}
+    {%- set c = curve[module.builtins.int(ns.t % 86400 // 3600)] -%}
+    {%- set r = 3600 - ns.t % 3600 -%}
+    {%- if ns.dw <= r * c / 8 -%}
+      {%- set ns.t = ns.t + ns.dw * 8 / c -%}{%- set ns.dw = 0 -%}
+    {%- else -%}
+      {%- set ns.dw = ns.dw - r * c / 8 -%}{%- set ns.t = ns.t + r -%}
+    {%- endif -%}
   {%- endfor -%}
   {{- ns.t -}}
 {%- endmacro -%}
-{%- if shared.get('q') is none -%}
+{%- macro at_work(t0, lo, med, sig, hi) -%}
+  {{- work_map(t0, d(lo, med, sig, hi) | float) -}}
+{%- endmacro -%}
+{%- macro ep_time(lo, hi) -%}
+  {#- Episode arming time in [lo, hi], weighted by curve^2 + 1. -#}
+  {%- set ns = namespace(t=lo, go=true) -%}
+  {%- for _ in range(200) if ns.go -%}
+    {%- set ns.t = module.rand.number.floating(lo, hi) -%}
+    {%- set c = curve[module.builtins.int(ns.t % 86400 // 3600)] -%}
+    {%- set ns.go = module.rand.number.floating(0, 65) >= c * c + 1 -%}
+  {%- endfor -%}
+  {{- ns.t -}}
+{%- endmacro -%}
+{%- if shared.get('tight') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
-    'incidents_per_day': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 4, 'le': 2000}},
     'analyzer_serial': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9-]{1,16}$'}},
     'analyzer_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._-]{1,35}$'}},
     'adom': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._-]{1,64}$'}}
@@ -44,121 +69,162 @@
     {%- do weights.append(row.weight) -%}
     {%- do hosts.update({row.user: [row.ip, row.alt_ip]}) -%}
   {%- endfor -%}
+  {#- Episode actors come from the four busiest analysts. -#}
+  {%- set top = (samples.analysts | sort(attribute='weight', reverse=true) | list)[:4] -%}
+  {%- set busy = top | map(attribute='user') | list -%}
   {%- set interval = params.anomaly_interval_hours * 3600 -%}
-  {#- Mean of the daytime shape is 0.768, its peak 1.45. -#}
-  {%- do shared.update({'q': [], 'seq': 0, 'incidents': {}, 'users': users, 'weights': weights, 'hosts': hosts,
+  {%- do shared.update({'tight': [], 'flex': [], 'seq': 0, 'incidents': {}, 'cur_ip': {}, 'ring': {}, 'ring_i': 0,
+    'users': users, 'weights': weights, 'hosts': hosts, 'busy': busy, 'busy_w': top | map(attribute='weight') | list,
     'serial': module.rand.number.integer(120, 880), 'evt': module.rand.number.integer(1000, 90000),
     'rid': module.rand.number.integer(0, 9000000),
-    'lam_max': params.incidents_per_day / 86400.0 / 0.768 * 1.45,
-    'ep_arm': now + interval * module.rand.number.floating(0.3, 1.0) + module.rand.number.floating(0, [3600, interval / 8] | min),
-    'ep_last': none}) -%}
-  {%- do module.heapq.heappush(shared.get('q'), [next_arrival(now) | float, 0, 'arrival', none, none]) -%}
-  {%- do shared.set('next_due', shared.get('q')[0][0]) -%}
+    'ep_arm': ep_time(now, now + ([interval, 86400] | min) - 900) | float, 'ep_last': none}) -%}
+  {#- The first episode's incident is created at the arming time, on the
+      next timestamp of any input. -#}
+  {%- if params.anomaly_mode -%}
+    {%- do module.heapq.heappush(shared.get('tight'), [shared.get('ep_arm'), 0, 'ep_new', none, none, 0]) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
-{%- set q = shared.get('q') -%}
+{%- set tight = shared.get('tight') -%}
+{%- set flex = shared.get('flex') -%}
 {%- set incidents = shared.get('incidents') -%}
 {%- set users = shared.get('users') -%}
 {%- set weights = shared.get('weights') -%}
-{%- macro push(t, kind, iid, actor) -%}
+{%- macro push(heap, t, kind, iid, actor, n) -%}
   {%- do shared.set('seq', shared.get('seq') + 1) -%}
-  {%- do module.heapq.heappush(q, [t | float, shared.get('seq'), kind, iid, actor]) -%}
+  {%- do module.heapq.heappush(heap, [t | float, shared.get('seq'), kind, iid, actor, n]) -%}
   {%- do incidents[iid].update({'pend': incidents[iid].pend + 1}) -%}
 {%- endmacro -%}
 {%- macro pick(excluded) -%}
   {#- Analyst weighted by activity, excluding the given names. -#}
   {%- set pu = [] -%}{%- set pw = [] -%}
-  {%- for u in users if u not in excluded -%}{%- do pu.append(u) -%}{%- do pw.append(weights[loop.index0]) -%}{%- endfor -%}
+  {%- for u in users -%}
+    {%- if u not in excluded -%}{%- do pu.append(u) -%}{%- do pw.append(weights[loop.index0]) -%}{%- endif -%}
+  {%- endfor -%}
   {{- module.rand.weighted_choice(pu, pw) -}}
 {%- endmacro -%}
 {%- macro gap() -%}{{- d(3, 35, 0.9, 900) -}}{%- endmacro -%}
-{%- macro first_attach(creator) -%}
-  {{- d(2, 15, 1.0, 900) if creator == 'system' else d(5, 90, 1.2, 3600) -}}
+{%- macro session_len() -%}
+  {%- set ns = namespace(n=1, go=true) -%}
+  {%- for _ in range(5) if ns.go -%}
+    {%- if module.rand.chance(0.45) -%}{%- set ns.n = ns.n + 1 -%}{%- else -%}{%- set ns.go = false -%}{%- endif -%}
+  {%- endfor -%}
+  {{- ns.n -}}
 {%- endmacro -%}
-{%- set out = namespace(kind=none, iid=none, actor=none, sev=none, att=none, moment=none) -%}
-{%- for _ in range(40) if out.kind is none and q and q[0][0] <= now -%}
-  {%- set item = module.heapq.heappop(q) -%}
-  {%- set kind = item[2] -%}
-  {%- set t = item[0] -%}
-  {%- set moment = module.datetime.datetime.fromtimestamp(module.builtins.int(t), module.datetime.timezone.utc) -%}
-  {%- if kind == 'arrival' -%}
-    {%- do module.heapq.heappush(q, [next_arrival(item[0]) | float, 0, 'arrival', none, none]) -%}
+{%- set out = namespace(kind=none, iid=none, actor=none, att=none, sev=none) -%}
+{%- set stream = tags[0] -%}
+{%- set moment = timestamp.replace(microsecond=0) -%}
+{%- set t = moment.timestamp() -%}
+{%- for _ in range(200) if out.kind is none -%}
+  {%- if tight and tight[0][0] <= now -%}
+    {%- set item = module.heapq.heappop(tight) -%}
+  {%- elif stream == 'work' and flex and flex[0][0] <= now -%}
+    {%- set item = module.heapq.heappop(flex) -%}
+  {%- else -%}
+    {%- set item = none -%}
+  {%- endif -%}
+  {%- set ring = shared.get('ring') -%}
+  {%- set adhoc = namespace(inc=none) -%}
+  {%- if item is none and stream == 'work' -%}
+    {#- Nothing due for the analysts: one of them opens a recent open
+        incident and updates it (the assignee 65%, else a colleague). -#}
+    {%- for _ in range(4) if adhoc.inc is none -%}
+      {%- set cand = ring[module.rand.number.integer(0, ring | length - 1)] if ring else none -%}
+      {%- if cand is not none and not cand.dead -%}{%- set adhoc.inc = cand -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- if adhoc.inc is not none -%}
+    {%- set inc = adhoc.inc -%}
+    {%- if module.rand.chance(0.12) -%}
+      {%- do inc.update({'sev': module.rand.choice(['low', 'medium', 'high', 'critical'] | reject('equalto', inc.sev) | list)}) -%}
+    {%- endif -%}
+    {%- set out.kind = 'update' -%}{%- set out.iid = inc.iid -%}{%- set out.sev = inc.sev -%}
+    {%- set out.actor = inc.assignee if module.rand.chance(0.65) else pick([inc.assignee]) -%}
+  {%- elif item is none or item[2] == 'ep_new' -%}
+    {#- Nothing due: a new incident; or an episode's incident, raised by
+        one of the four busiest analysts drawn by activity. -#}
     {%- do shared.set('serial', (shared.get('serial') + 1) % 100000000) -%}
     {%- set iid = 'IN' ~ ('%08d' | format(shared.get('serial'))) -%}
-    {%- set creator = 'system' if module.rand.chance(0.62) else pick([]) -%}
+    {%- set ep = item is not none -%}
+    {%- if ep -%}
+      {%- set creator = module.rand.weighted_choice(shared.get('busy'), shared.get('busy_w')) -%}
+    {%- else -%}
+      {%- set creator = 'system' if stream == 'playbook' else pick([]) -%}
+    {%- endif -%}
     {%- set assignee = pick([]) if creator == 'system' else creator -%}
     {%- set sev = module.rand.weighted_choice(['low', 'medium', 'high', 'critical'], [30, 38, 24, 8]) -%}
-    {%- set ep = params.anomaly_mode and t >= shared.get('ep_arm') and creator != 'system' -%}
-    {%- do incidents.update({iid: {'sev': sev, 'creator': creator, 'created': t, 'atts': [], 'hist': [], 'pend': 0, 'ep': ep}}) -%}
+    {%- do incidents.update({iid: {'iid': iid, 'sev': sev, 'creator': creator, 'assignee': assignee, 'created': t,
+      'atts': [], 'hist': [], 'pend': 0, 'ep': ep, 'dead': false}}) -%}
+    {#- Recent incidents (bounded ring) for ad hoc analyst updates. -#}
+    {%- set ri = shared.get('ring_i') -%}
+    {%- do ring.update({ri: incidents[iid]}) -%}
+    {%- do shared.set('ring_i', (ri + 1) % 400) -%}
     {%- if ep -%}
-      {#- Anomaly episode on the next analyst-raised incident once due:
-          the creator attaches evidence as usual, then another analyst
-          removes the attachment and deletes the incident, all within
-          about 100 minutes of creation. -#}
-      {%- set deleter = pick([creator, shared.get('ep_last')]) -%}
+      {#- Anomaly episode: the creator attaches evidence as usual, then
+          another busy analyst removes it and deletes the incident, all
+          within about 90 minutes of creation. Every step is scheduled
+          from the previous one. The next episode's incident is queued
+          at its arming time, within the recurrence window less 900 s so
+          that the wait for the next timestamp stays inside it. -#}
+      {%- set cand = [] -%}{%- set cw = [] -%}
+      {%- for u in users -%}
+        {%- if u in shared.get('busy') and u != creator and u != shared.get('ep_last') -%}
+          {%- do cand.append(u) -%}{%- do cw.append(weights[loop.index0]) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- set deleter = module.rand.weighted_choice(cand, cw) -%}
       {%- set ns = namespace(a=0, g=0, u=0, k=0, ok=false) -%}
       {%- for _ in range(40) if not ns.ok -%}
-        {%- set ns.a = first_attach(creator) | float -%}
-        {%- set ns.g = d(60, 2400, 1.4, 259200) | float -%}
+        {%- set ns.a = d(5, 90, 1.2, 3600) | float -%}
+        {%- set ns.g = (at_work(t + ns.a, 60, 2400, 1.4, 259200) | float) - t - ns.a -%}
         {%- set ns.u = (gap() | float) if module.rand.chance(0.5) else 0 -%}
         {%- set ns.k = gap() | float -%}
-        {%- set ns.ok = ns.a + ns.g + ns.u + ns.k <= window - 1200 -%}
+        {%- set ns.ok = ns.a + ns.g + ns.u + ns.k <= window - 1800 -%}
       {%- endfor -%}
       {%- if not ns.ok -%}{%- set ns.g = 300 -%}{%- set ns.a = [ns.a, 600] | min -%}{%- endif -%}
-      {%- do push(t + ns.a, 'attach_add', iid, creator) -%}
-      {%- if ns.u -%}{%- do push(t + ns.a + ns.g, 'update', iid, deleter) -%}{%- endif -%}
-      {%- do push(t + ns.a + ns.g + ns.u, 'attach_delete', iid, deleter) -%}
-      {%- do push(t + ns.a + ns.g + ns.u + ns.k, 'delete', iid, deleter) -%}
+      {%- do incidents[iid].update({'ep_d': deleter, 'ep_g': ns.g, 'ep_u': ns.u, 'ep_k': ns.k}) -%}
+      {%- do push(tight, t + ns.a, 'ep_att', iid, creator, 0) -%}
       {%- set interval = params.anomaly_interval_hours * 3600 -%}
-      {%- do shared.update({'ep_last': deleter, 'ep_arm': t + interval + module.rand.number.floating(0, [3600, interval / 8] | min)}) -%}
+      {%- set w = [interval / 4, 21600] | min -%}
+      {%- set arm = ep_time(t + interval - w / 2, t + interval + w / 2 - 900) | float -%}
+      {%- do shared.update({'ep_last': deleter, 'ep_arm': arm, 'seq': shared.get('seq') + 1}) -%}
+      {%- do module.heapq.heappush(tight, [arm, shared.get('seq'), 'ep_new', none, none, 0]) -%}
     {%- else -%}
-      {#- The whole lifecycle is planned first as [time, kind, actor]
-          and queued at the end. -#}
-      {%- set plan = [] -%}
       {%- if creator == 'system' -%}
         {%- if module.rand.chance(0.75) -%}
-          {%- set ns = namespace(t=t) -%}
-          {%- for _ in range(1 + (1 if module.rand.chance(0.35) else 0) + (1 if module.rand.chance(0.15) else 0)) -%}
-            {%- set ns.t = ns.t + (first_attach('system') | float) -%}
-            {%- do plan.append([ns.t, 'attach_add', 'system']) -%}
-          {%- endfor -%}
+          {%- do push(tight, t + (d(2, 15, 1.0, 900) | float), 'sys_att', iid, 'system',
+            (1 if module.rand.chance(0.35) else 0) + (1 if module.rand.chance(0.15) else 0)) -%}
         {%- endif -%}
       {%- elif module.rand.chance(0.45) -%}
-        {%- do plan.append([t + (first_attach(creator) | float), 'attach_add', creator]) -%}
+        {%- do push(tight, t + (d(5, 90, 1.2, 3600) | float), 'att1', iid, creator, 0) -%}
       {%- endif -%}
-      {#- Work sessions: one analyst, a few operations seconds to
-          minutes apart. -#}
+      {#- Work sessions on the working-day curve: the assignee (65%) or a
+          colleague, one to six operations seconds to minutes apart. -#}
       {%- set ns = namespace(t=t, go=true) -%}
       {%- for _ in range(8) if ns.go -%}
         {%- if module.rand.chance(0.62) -%}
-          {%- set ns.t = ns.t + (d(60, 2400, 1.4, 259200) | float) -%}
-          {%- set actor = assignee if module.rand.chance(0.8) else pick([assignee]) -%}
-          {%- set tt = namespace(t=ns.t, go=true) -%}
-          {%- for _ in range(6) if tt.go -%}
-            {%- do plan.append([tt.t, module.rand.weighted_choice(['update', 'attach_add', 'attach_delete'], [58, 26, 16]), actor]) -%}
-            {%- set tt.t = tt.t + (gap() | float) -%}
-            {%- set tt.go = module.rand.chance(0.45) -%}
-          {%- endfor -%}
+          {%- set ns.t = at_work(ns.t, 60, 2400, 1.4, 259200) | float -%}
+          {%- do push(flex, ns.t, 'sess', iid, assignee if module.rand.chance(0.65) else pick([assignee]), session_len() | int) -%}
         {%- else -%}
           {%- set ns.go = false -%}
         {%- endif -%}
       {%- endfor -%}
-      {%- set dl = namespace(op=none) -%}
       {%- if module.rand.chance(0.2) -%}
-        {#- Deletion, usually right after removing an attachment. A
-            third are duplicates or false positives removed within
-            minutes; the rest go hours to days later. The deleter is
-            the assignee (60%) or a colleague. The removal before it is
-            usually by the deleter (85%) or a colleague. On an
-            analyst-raised incident deleted by a colleague it is often a
-            handover: the creator (50%) or a third analyst (35%)
-            removed the evidence, the deleter only in 15%. -#}
+        {#- Closure: deletion, usually right after removing an
+            attachment. A third are duplicates or false positives
+            removed within minutes; the rest go hours to days later.
+            The deleter is the assignee (60%) or a colleague. The
+            removal before it is usually by the deleter (85%) or a
+            colleague. On an analyst-raised incident deleted by a
+            colleague it is often a handover: the creator (50%) or a
+            third analyst (35%) removed the evidence, the deleter only
+            in 15%. -#}
         {%- if module.rand.chance(0.35) -%}
-          {%- set dt = t + (d(20, 600, 1.0, 7200) | float) -%}
+          {%- set dt = at_work(t, 20, 600, 1.0, 7200) | float -%}
         {%- else -%}
-          {%- set dt = t + (d(600, 14400, 1.5, 432000) | float) -%}
+          {%- set dt = at_work(t, 600, 14400, 1.5, 432000) | float -%}
         {%- endif -%}
         {%- set deleter = assignee if module.rand.chance(0.6) else pick([assignee]) -%}
+        {%- set remover = none -%}
         {%- if module.rand.chance(0.75) -%}
           {%- if creator != 'system' and deleter != creator -%}
             {%- set rr = module.rand.number.floating(0, 1) -%}
@@ -166,91 +232,89 @@
           {%- else -%}
             {%- set remover = deleter if module.rand.chance(0.85) else pick([deleter]) -%}
           {%- endif -%}
-          {%- do plan.append([[t + 2, dt - (gap() | float)] | max, 'attach_delete', remover]) -%}
         {%- endif -%}
-        {%- set dl.op = [dt, 'delete', deleter] -%}
-        {%- do plan.append(dl.op) -%}
+        {%- do push(flex, dt, 'close', iid, [remover, deleter], 0) -%}
       {%- endif -%}
-      {#- Planning guard, final step only, analyst-raised incidents:
-          replay the plan as the records will come out (a removal
-          without attachments is written as an update). If the first
-          removal by someone other than the creator after an attachment
-          is by D and D would delete within the window (one minute of
-          slack for emission delay), the deletion is redrawn by the
-          ordinary deleter rule until it is not D. Its time and every
-          other operation stay. Playbook incidents are outside the
-          sequence. -#}
-      {%- if creator != 'system' and dl.op is not none and dl.op[0] - t <= window + 60 -%}
-        {%- set sim = namespace(n=0, bind=none, done=false) -%}
-        {%- for op in plan | sort(attribute='0') if not sim.done -%}
-          {%- if op[1] == 'delete' -%}{%- set sim.done = true -%}
-          {%- elif op[1] == 'attach_add' -%}{%- set sim.n = sim.n + 1 -%}
-          {%- elif op[1] == 'attach_delete' and sim.n > 0 -%}
-            {%- set sim.n = sim.n - 1 -%}
-            {%- if sim.bind is none and op[2] != creator -%}{%- set sim.bind = op[2] -%}{%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
-        {%- if sim.bind is not none and sim.bind == dl.op[2] -%}
-          {%- set rd = namespace(u=sim.bind) -%}
-          {%- for _ in range(40) if rd.u == sim.bind -%}
-            {%- set rd.u = assignee if module.rand.chance(0.6) else pick([assignee]) -%}
-          {%- endfor -%}
-          {%- if rd.u == sim.bind -%}{%- set rd.u = creator -%}{%- endif -%}
-          {%- do dl.op.pop(2) -%}{%- do dl.op.append(rd.u) -%}
-        {%- endif -%}
-      {%- endif -%}
-      {%- for op in plan -%}{%- do push(op[0], op[1], iid, op[2]) -%}{%- endfor -%}
     {%- endif -%}
-    {%- set out.kind = 'create' -%}{%- set out.moment = moment -%}{%- set out.iid = iid -%}{%- set out.actor = creator -%}{%- set out.sev = sev -%}
+    {%- set out.kind = 'create' -%}{%- set out.iid = iid -%}{%- set out.actor = creator -%}{%- set out.sev = sev -%}
     {%- if incidents[iid].pend == 0 -%}{%- do incidents.pop(iid) -%}{%- endif -%}
   {%- elif item[3] in incidents -%}
     {%- set iid = item[3] -%}
     {%- set inc = incidents[iid] -%}
-    {%- set actor = item[4] -%}
+    {%- set kind = item[2] -%}
     {%- do inc.update({'pend': inc.pend - 1}) -%}
-    {%- if kind == 'attach_add' -%}
+    {%- set op = namespace(kind='update', actor=item[4]) -%}
+    {%- if kind == 'sys_att' -%}
+      {%- set op.kind = 'attach_add' -%}
+      {%- if item[5] > 0 -%}{%- do push(tight, t + (d(2, 15, 1.0, 900) | float), 'sys_att', iid, 'system', item[5] - 1) -%}{%- endif -%}
+    {%- elif kind in ('att1', 'ep_att') -%}
+      {%- set op.kind = 'attach_add' -%}
+      {%- if kind == 'ep_att' -%}{%- do push(tight, t + inc.ep_g, 'ep_upd' if inc.ep_u else 'ep_rm', iid, inc.ep_d, 0) -%}{%- endif -%}
+    {%- elif kind == 'ep_upd' -%}
+      {%- do push(tight, t + inc.ep_u, 'ep_rm', iid, inc.ep_d, 0) -%}
+    {%- elif kind == 'ep_rm' -%}
+      {%- set op.kind = 'attach_delete' -%}
+      {%- do push(tight, t + inc.ep_k, 'ep_del', iid, inc.ep_d, 0) -%}
+    {%- elif kind == 'ep_del' -%}
+      {%- set op.kind = 'delete' -%}
+    {%- elif kind == 'sess' -%}
+      {%- set op.kind = module.rand.weighted_choice(['update', 'attach_add', 'attach_delete'], [58, 26, 16]) -%}
+      {%- if item[5] > 1 -%}{%- do push(tight, t + (gap() | float), 'sess', iid, item[4], item[5] - 1) -%}{%- endif -%}
+    {%- elif kind == 'close' -%}
+      {%- if item[4][0] is none -%}
+        {%- set op.kind = 'delete' -%}{%- set op.actor = item[4][1] -%}
+      {%- else -%}
+        {%- set op.kind = 'attach_delete' -%}{%- set op.actor = item[4][0] -%}
+        {%- do push(tight, t + (gap() | float), 'del', iid, item[4][1], 0) -%}
+      {%- endif -%}
+    {%- elif kind == 'del' -%}
+      {%- set op.kind = 'delete' -%}
+    {%- endif -%}
+    {%- if op.kind == 'attach_delete' and not inc.atts -%}{%- set op.kind = 'update' -%}{%- endif -%}
+    {%- if op.kind == 'attach_add' -%}
       {%- do shared.set('evt', (shared.get('evt') + module.rand.number.integer(1, 60)) % 1000000000) -%}
-      {%- set att = moment.strftime('%Y%m%d') ~ (1000000000 + shared.get('evt')) -%}
-      {%- do inc.atts.append(att) -%}
-      {%- do inc.hist.append([t, 'add', actor]) -%}
-      {%- set out.kind = 'attach_add' -%}{%- set out.att = att -%}
-    {%- elif kind == 'attach_delete' and inc.atts -%}
-      {%- set att = inc.atts.pop(0 if inc.ep else module.rand.number.integer(0, inc.atts | length - 1)) -%}
-      {%- do inc.hist.append([t, 'del', actor]) -%}
-      {%- set out.kind = 'attach_delete' -%}{%- set out.att = att -%}
-    {%- elif kind == 'delete' -%}
-      {#- Backstop for the planning guard (emission delay past its
-          slack): on an analyst-raised incident, a deletion that would
-          still complete the anomaly sequence keeps its time and is done
-          by the creator. -#}
-      {%- set g = namespace(add=false, bind=none) -%}
-      {%- if not inc.ep and inc.creator != 'system' and t - inc.created <= window and inc.creator != actor -%}
+      {%- set out.att = moment.strftime('%Y%m%d') ~ (1000000000 + shared.get('evt')) -%}
+      {%- do inc.atts.append(out.att) -%}
+      {%- do inc.hist.append(['add', op.actor]) -%}
+    {%- elif op.kind == 'attach_delete' -%}
+      {%- set out.att = inc.atts.pop(0 if inc.ep else module.rand.number.integer(0, inc.atts | length - 1)) -%}
+      {%- do inc.hist.append(['del', op.actor]) -%}
+    {%- elif op.kind == 'delete' -%}
+      {#- Guard, final step only, background analyst-raised incidents:
+          a deletion within the window by an analyst other than the
+          creator who removed evidence after an attachment was added
+          would complete the anomaly sequence. It keeps its time and
+          only the deleter is redrawn by the ordinary rule (assignee
+          60%, otherwise a colleague by weight) until it is none of
+          them. -#}
+      {%- if not inc.ep and inc.creator != 'system' and t - inc.created <= window -%}
+        {%- set g = namespace(add=false, bind=[]) -%}
         {%- for h in inc.hist -%}
-          {%- if h[1] == 'add' -%}{%- set g.add = true -%}
-          {%- elif h[1] == 'del' and g.add -%}
-            {%- if g.bind is none and h[2] != inc.creator -%}{%- set g.bind = h[2] -%}{%- endif -%}
-          {%- endif -%}
+          {%- if h[0] == 'add' -%}{%- set g.add = true -%}
+          {%- elif g.add and h[1] != inc.creator -%}{%- do g.bind.append(h[1]) -%}{%- endif -%}
         {%- endfor -%}
+        {%- if op.actor in g.bind -%}
+          {%- set rd = namespace(u=op.actor) -%}
+          {%- for _ in range(40) if rd.u in g.bind -%}
+            {%- set rd.u = inc.assignee if module.rand.chance(0.6) else pick([inc.assignee]) -%}
+          {%- endfor -%}
+          {%- if rd.u in g.bind -%}{%- set rd.u = inc.creator -%}{%- endif -%}
+          {%- set op.actor = rd.u -%}
+        {%- endif -%}
       {%- endif -%}
-      {%- if g.bind is not none and g.bind == actor -%}
-        {%- set actor = inc.creator -%}
-      {%- endif -%}
-      {%- set out.kind = 'delete' -%}
-      {%- do incidents.pop(iid) -%}
     {%- else -%}
       {%- if module.rand.chance(0.12) -%}
         {%- do inc.update({'sev': module.rand.choice(['low', 'medium', 'high', 'critical'] | reject('equalto', inc.sev) | list)}) -%}
       {%- endif -%}
-      {%- set out.kind = 'update' -%}
     {%- endif -%}
-    {%- set out.iid = iid -%}{%- set out.actor = actor -%}{%- set out.sev = inc.sev -%}{%- set out.moment = moment -%}
-    {%- if out.kind != 'delete' and iid in incidents and inc.pend == 0 -%}{%- do incidents.pop(iid) -%}{%- endif -%}
+    {%- set out.kind = op.kind -%}{%- set out.iid = iid -%}{%- set out.actor = op.actor -%}{%- set out.sev = inc.sev -%}
+    {%- if op.kind == 'delete' -%}{%- do inc.update({'dead': true}) -%}{%- endif -%}
+    {%- if op.kind == 'delete' or inc.pend == 0 -%}{%- do incidents.pop(iid) -%}{%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', q[0][0]) -%}
 {%- if out.kind is none -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set iid = out.iid -%}
-{%- set timestamp = out.moment -%}
+{%- set timestamp = moment -%}
 {%- if out.kind == 'create' -%}
   {%- set logid = '100001' -%}{%- set desc = 'New_Incident_Create' -%}
   {%- set message = 'Incident ' ~ iid ~ ' created' -%}{%- set etype = ['creation'] -%}
@@ -276,7 +340,7 @@
   {%- set tnow = timestamp.timestamp() -%}
   {%- if out.actor not in cur or tnow >= cur[out.actor][1] -%}
     {%- set hp = shared.get('hosts')[out.actor] -%}
-    {%- do cur.update({out.actor: [hp[0] if module.rand.chance(0.85) else hp[1], tnow + (d(900, 10800, 1.0, 86400) | float)]}) -%}
+    {%- do cur.update({out.actor: [hp[0] if module.rand.chance(0.8) else hp[1], tnow + (d(600, 3600, 0.8, 28800) | float)]}) -%}
     {%- do shared.set('cur_ip', cur) -%}
   {%- endif -%}
   {%- set ip = cur[out.actor][0] -%}
