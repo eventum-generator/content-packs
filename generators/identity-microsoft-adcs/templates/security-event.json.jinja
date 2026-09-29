@@ -1,90 +1,106 @@
-{%- for key in ['to_routine_request', 'to_routine_disposition', 'to_audit_change', 'to_attack_request', 'to_attack_issue'] -%}{%- do shared.pop(key, none) -%}{%- endfor -%}
-{%- set stage = vars.stage -%}
-{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set interval = module.datetime.timedelta(hours=[params.anomaly_interval_hours|float, 6]|max) -%}
-{%- if shared.get('next_anomaly_at', none) is none -%}
-  {%- do shared.set('next_anomaly_at', utc + interval) -%}
-  {%- do shared.set('next_maintenance_at', utc + module.datetime.timedelta(hours=8)) -%}
+{# One pending request, one episode, fixed administrative histories. #}
+{%- set event_time = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = event_time.timestamp() -%}
+{%- set interval = [params.anomaly_interval_hours | float,6] | max * 3600 -%}
+{%- set half = [interval / 4,21600] | min / 2 -%}
+{%- set curve = [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,1,1,1,1,1,1,1,1,1,1,0.5,0.5,0.5,0.5,0.5,0.5] -%}
+{%- if shared.get('maintenance_phase') is none -%}
+  {%- set phase = now + module.rand.number.floating(0,43200) -%}
+  {%- do shared.set('maintenance_phase',phase) -%}
+  {%- do shared.set('next_maintenance',phase) -%}
 {%- endif -%}
-{%- if shared.get('restart_completed_at', none) is not none and utc >= shared.get('restart_completed_at') -%}
-  {%- do shared.set('active_audit_filter', shared.pop('pending_active_filter')) -%}
-  {%- do shared.pop('restart_completed_at') -%}
+{%- macro schedule(first=false) -%}
+  {%- set lo = now + 180 if first else now + interval - half + 180 -%}
+  {%- set hi = now + [interval,86400] | min - 180 if first else now + interval + half - 180 -%}
+  {%- set candidates = [] -%}{%- set weights = [] -%}
+  {%- for i in range(((hi-lo)/60) | int + 1) -%}
+    {%- set candidate = lo + i*60 -%}
+    {%- set maintenance_distance = (candidate-shared.get('maintenance_phase')) % 43200 -%}
+    {# Do not move or cancel the independent twice-daily maintenance. #}
+    {%- if 2160 < maintenance_distance < 41040 -%}
+      {%- do candidates.append(candidate) -%}
+      {%- set weight = curve[(candidate // 3600) | int % 24] -%}
+      {%- do weights.append(weight if first else weight*weight+0.01) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('episode_due',module.rand.weighted_choice(candidates,weights)) -%}
+{%- endmacro -%}
+{%- if shared.get('episode_due') is none -%}{%- do schedule(true) -%}{%- endif -%}
+{%- set process_id = shared.get('process_id',652) -%}
+{%- if shared.get('restart_due') is not none and now >= shared.get('restart_due') -%}
+  {%- set process_id = process_id + 48 -%}
+  {%- do shared.set('process_id',process_id) -%}
+  {%- do shared.pop('restart_due') -%}
 {%- endif -%}
-{%- set seq = shared.get('record_id', 310000) + module.rand.number.integer(4, 40) -%}{%- do shared.set('record_id', seq) -%}
-{%- set process_id = shared.get('process_id', 652) -%}
-{%- set thread_id = shared.get('thread_id', 368) -%}
+{%- set pending = shared.get('pending',{}) -%}
+{%- set episode = shared.get('episode',{}) -%}
+{%- set audit_filter = shared.get('audit_filter',127) -%}
 {%- set code = 4886 -%}
-{%- set user = shared.get('requester', 'anna') -%}
-{%- set req_id = shared.get('request_id', 3000) -%}
-{%- set attributes = shared.get('attributes', 'CertificateTemplate:' ~ params.routine_template) -%}
-{%- if stage == 'routine_request' -%}
-  {%- set thread_id = module.rand.choice([368, 412, 588, 724]) -%}{%- do shared.set('thread_id', thread_id) -%}
-  {%- set last_change = shared.get('last_audit_at', none) -%}
-  {%- set privileged = shared.get('routine_pairs', 0) % 240 == 20 and (last_change is none or (utc - last_change).total_seconds() >= 1800) -%}
-  {%- set user = params.suspicious_requester if privileged else module.rand.choice(['anna', 'boris', 'irina', 'pavel', 'marina']) -%}
-  {%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template ~ '\nSAN:upn=' ~ params.privileged_upn if privileged else 'CertificateTemplate:' ~ params.routine_template -%}
-  {%- set req_id = req_id + 1 -%}
-  {%- do shared.set('request_id', req_id) -%}{%- do shared.set('requester', user) -%}
-  {%- do shared.set('attributes', attributes) -%}{%- do shared.set('request_is_privileged', privileged) -%}
-  {%- do shared.set('to_routine_disposition', true) -%}
-{%- elif stage == 'routine_disposition' -%}
-  {%- set code = 4887 if shared.get('request_is_privileged', false) else module.rand.weighted_choice([4887, 4888], [94, 6]) -%}
-  {%- set pairs = (shared.get('routine_pairs', 0) + 1) % 240 -%}{%- do shared.set('routine_pairs', pairs) -%}
-  {%- set current_filter = shared.get('audit_filter', 127) -%}
-  {%- if current_filter == 119 and utc >= shared.get('restore_at') -%}
-    {%- do shared.set('audit_reason', 'restore') -%}
-    {%- do shared.set('to_audit_change', true) -%}
-  {%- elif params.anomaly_mode and current_filter == 127 and utc >= shared.get('next_anomaly_at') -%}
-    {%- do shared.set('audit_reason', 'episode') -%}
-    {%- do shared.set('to_audit_change', true) -%}
-  {%- elif current_filter == 127 and utc >= shared.get('next_maintenance_at') -%}
-    {%- do shared.set('audit_reason', 'maintenance') -%}
-    {%- do shared.set('to_audit_change', true) -%}
-  {%- else -%}{%- do shared.set('to_routine_request', true) -%}{%- endif -%}
-{%- elif stage == 'audit_change' -%}
-  {%- set code = 4885 -%}
-  {%- set thread_id = module.rand.choice([1024, 1172]) -%}
-  {%- set user = params.suspicious_requester -%}
-  {%- set reason = shared.pop('audit_reason') -%}
-  {%- set audit_filter = 127 if reason == 'restore' else 119 -%}
-  {%- do shared.set('audit_filter', audit_filter) -%}
-  {%- do shared.set('last_audit_at', utc) -%}
-  {%- do shared.set('process_id', 652 if process_id >= 32716 else process_id + 48) -%}
-  {%- if audit_filter == 119 -%}
-    {%- do shared.set('restore_at', utc + module.datetime.timedelta(hours=1)) -%}
-    {%- do shared.set('next_maintenance_at', utc + module.datetime.timedelta(hours=8)) -%}
-  {%- else -%}
-    {%- do shared.pop('restore_at') -%}
+{%- set ai = 50 -%}
+{%- set thread_id = module.rand.choice([368,412,588,724]) -%}
+{%- set req_id = shared.get('request_id',3000) -%}
+{%- set attributes = 'CertificateTemplate:' ~ params.routine_template -%}
+{%- set reductions = shared.get('reductions',{}) -%}
+{%- if pending -%}
+  {%- set ai = pending.ai -%}{%- set user = pending.user -%}
+  {%- set attributes = pending.attributes -%}{%- set thread_id = pending.thread -%}
+  {%- set code = 4887 if pending.episode else module.rand.weighted_choice([4887,4888],[98,2]) -%}
+  {# Exact final-step guard, including prefixes emitted by earlier episodes. #}
+  {%- if not pending.episode and code == 4887 and 'SAN:upn=' in attributes and now-reductions.get(ai,-1000000)<=180 -%}
+    {%- set code = 4888 -%}
   {%- endif -%}
-  {%- if reason == 'episode' -%}
-    {%- do shared.set('next_anomaly_at', utc + interval) -%}
-    {%- do shared.set('to_attack_request', true) -%}
-  {%- else -%}{%- do shared.set('to_routine_request', true) -%}{%- endif -%}
-{%- elif stage == 'attack_request' -%}
-  {%- set thread_id = module.rand.choice([368, 412, 588, 724]) -%}{%- do shared.set('thread_id', thread_id) -%}
-  {%- set user = params.suspicious_requester -%}
-  {%- set req_id = req_id + 1 -%}
+  {%- do shared.set('pending',{}) -%}
+{%- elif audit_filter == 119 and now >= shared.get('restore_due') -%}
+  {%- set code = 4885 -%}{%- set audit_filter = 127 -%}
+  {%- set ai = module.rand.choice([50,51]) -%}
+{%- elif episode -%}
+  {%- set ai = episode.ai -%}
   {%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template ~ '\nSAN:upn=' ~ params.privileged_upn -%}
-  {%- do shared.set('request_id', req_id) -%}{%- do shared.set('requester', user) -%}
-  {%- do shared.set('attributes', attributes) -%}
-  {%- do shared.set('to_attack_issue', true) -%}
+  {%- do shared.set('episode',{}) -%}
+{%- elif audit_filter == 127 and params.anomaly_mode and now >= shared.get('episode_due') -%}
+  {%- set code = 4885 -%}{%- set audit_filter = 119 -%}
+  {%- set ai = module.rand.choice([50,51] | reject('equalto',shared.get('previous_actor')) | list) -%}
+  {%- do shared.set('previous_actor',ai) -%}
+  {%- do shared.set('episode',{'ai':ai}) -%}
+  {%- do schedule() -%}
+{%- elif audit_filter == 127 and now >= shared.get('next_maintenance') -%}
+  {%- set code = 4885 -%}{%- set audit_filter = 119 -%}
+  {%- set ai = module.rand.choice([50,51]) -%}
+  {%- do shared.set('next_maintenance',shared.get('next_maintenance')+43200) -%}
 {%- else -%}
-  {%- set code = 4887 -%}
-  {%- do shared.set('to_routine_request', true) -%}
+  {%- set admin_request = module.rand.chance(0.025) -%}
+  {%- if admin_request -%}
+    {%- set ai = module.rand.choice([50,51]) -%}
+    {%- if module.rand.chance(0.2) -%}
+      {%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template ~ '\nSAN:upn=' ~ params.privileged_upn -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set ai = module.rand.number.integer(0,19) if module.rand.chance(0.3 if 8<=event_time.hour<18 else 0.03) else module.rand.number.integer(20,49) -%}
+  {%- endif -%}
 {%- endif -%}
+{%- set user = params.suspicious_requester if ai == 50 else samples.accounts[ai].name -%}
 {%- if code == 4885 -%}
-  {%- set data = {'AuditFilter': audit_filter|string, 'SubjectUserSid': 'S-1-5-21-1000000000-2000000000-3000000000-1105', 'SubjectUserName': user, 'SubjectDomainName': params.domain, 'SubjectLogonId': '0x' ~ module.rand.string.hex(6)} -%}
+  {%- set thread_id = module.rand.choice([1024,1172]) -%}
+  {%- do shared.set('audit_filter',audit_filter) -%}
+  {%- do shared.set('restart_due',now+15) -%}
+  {%- if audit_filter == 119 -%}
+    {%- do reductions.update({ai:now}) -%}
+    {%- do shared.set('reductions',reductions) -%}
+    {%- do shared.set('restore_due',now+module.rand.number.floating(900,1800)) -%}
+  {%- endif -%}
+{%- elif code == 4886 -%}
+  {%- set req_id = req_id+1 -%}{%- do shared.set('request_id',req_id) -%}
+  {%- do shared.set('pending',{'ai':ai,'user':user,'attributes':attributes,'thread':thread_id,'episode':episode | length > 0}) -%}
+{%- endif -%}
+{%- set seq = shared.get('record_id',310000)+module.rand.number.integer(4,40) -%}{%- do shared.set('record_id',seq) -%}
+{%- if code == 4885 -%}
+  {%- set data = {'AuditFilter': audit_filter|string, 'SubjectUserSid': 'S-1-5-21-1000000000-2000000000-3000000000-' ~ samples.accounts[ai].sid, 'SubjectUserName': user, 'SubjectDomainName': params.domain, 'SubjectLogonId': '0x' ~ module.rand.string.hex(6)} -%}
 {%- else -%}
   {%- set data = {'RequestId': req_id|string, 'Requester': params.domain ~ '\\' ~ user, 'Attributes': attributes} -%}
   {%- if code == 4887 or code == 4888 -%}
     {%- set ski = [] -%}{%- for index in range(20) -%}{%- do ski.append(module.rand.string.hex(2)) -%}{%- endfor -%}
     {%- do data.update({'Disposition': '3' if code == 4887 else '-2146875375', 'SubjectKeyIdentifier': ski|join(' '), 'Subject': 'CN=' ~ user if code == 4887 else ''}) -%}
   {%- endif -%}
-{%- endif -%}
-{%- set event_time = utc + module.datetime.timedelta(microseconds=module.rand.number.integer(1, 999999)) -%}
-{%- if code == 4885 -%}
-  {%- do shared.set('pending_active_filter', audit_filter) -%}
-  {%- do shared.set('restart_completed_at', event_time + module.datetime.timedelta(seconds=45)) -%}
 {%- endif -%}
 {%- set created = event_time.isoformat(timespec='microseconds').replace('+00:00', 'Z') -%}
 {%- set ns = namespace(xml='<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-A5BA-3E3B0328C30D}"/><EventID>' ~ code ~ '</EventID><Version>0</Version><Level>0</Level><Task>12805</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime="' ~ created ~ '"/><EventRecordID>' ~ seq ~ '</EventRecordID><Correlation/><Execution ProcessID="' ~ process_id ~ '" ThreadID="' ~ thread_id ~ '"/><Channel>Security</Channel><Computer>' ~ (params.ca_host|e) ~ '</Computer><Security/></System><EventData>') -%}
