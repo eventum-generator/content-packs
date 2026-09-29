@@ -1,39 +1,36 @@
 {#- OpenVPN 2.6.14 server file log (--log-append, --verb 3, UDP,
-    --ifconfig-pool-persist) of one multi-client server. Each tick emits
-    at most one line: the earliest due one. Every user is an independent
-    random process (idle gap, connection, session segments that end by
-    exit notification, ping timeout or a reconnect from the same or
-    another network); the anomaly episode only queues its own lines for
-    one idle user and never touches the background. -#}
+    --ifconfig-pool-persist) of one multi-client server. The input sets
+    the line rate and its hour-of-day curve; every timestamp is one
+    line. A timestamp carries the earliest due queued line (the rest of
+    a connection handshake, a session end, a reconnect, an episode
+    step); when nothing is due it starts a new connection of an idle
+    user drawn by activity weight. The anomaly episode queues its own
+    connections for one idle user and never touches the background. -#}
 {%- set now = timestamp.timestamp() | int -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set window = 600 -%}
 {%- set ping_restart = 240 -%}
+{#- Episode users connect often from two networks: activity weight and
+    the share of the user's address weight each episode address has.
+    The pair then shows up in every few days of ordinary traffic. -#}
+{%- set ep_min_w = 2.4 -%}
+{%- set ep_min_share = 0.33 -%}
 
+{#- Relative line rate by UTC hour; the same curve as patterns/. -#}
 {%- macro hload(t) -%}
   {%- set h = ((t | int) // 3600) % 24 -%}
-  {{- 1.0 if 8 <= h < 18 else (0.55 if 7 <= h < 8 or 18 <= h < 21 else (0.3 if 21 <= h < 23 else 0.08)) -}}
+  {{- 1.0 if 8 <= h < 18 else (0.55 if 7 <= h < 8 or 18 <= h < 21 else (0.3 if 21 <= h < 23 else 0.15)) -}}
 {%- endmacro -%}
 
 {%- macro gap(median, sigma, lo, hi) -%}
   {{- [[module.random.lognormvariate(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
 {%- endmacro -%}
 
-{#- Next connection of an idle user: lognormal idle gaps thinned by the
-    hour-of-day load. -#}
-{%- macro next_wake(t0, w) -%}
-  {%- set s = namespace(t=t0) -%}
-  {%- for i in range(80) -%}
-    {%- set s.t = s.t + gap(6000 / w, 1.0, 60, 400000) | int -%}
-    {%- if module.random.random() < hload(s.t) | float -%}{%- break -%}{%- endif -%}
-  {%- endfor -%}
-  {{- s.t -}}
-{%- endmacro -%}
-
 {#- Session segment length: short on an unstable network (more likely
-    right after a reconnect), long otherwise. -#}
-{%- macro seg_len(short_p) -%}
-  {{- gap(150, 0.9, 15, 3600) if module.random.random() < short_p else gap(5400, 0.9, 120, 43200) -}}
+    right after a reconnect), long otherwise; an active user (weight w)
+    has shorter long segments and connects more often. -#}
+{%- macro seg_len(short_p, w) -%}
+  {{- gap(150, 0.9, 15, 3600) if module.random.random() < short_p else gap(5400 / w, 0.9, 120, 43200) -}}
 {%- endmacro -%}
 
 {#- Time from a client's network change to its new Initial packet: an
@@ -47,88 +44,140 @@
 {%- if not shared.get('initialized', false) -%}
   {%- if not (2 <= interval <= 720) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {#- One fixed site: per-user activity and network instability come
-      from a fixed seed; only behaviour is random. -#}
+      from a fixed seed, bounded so every user stays active; only
+      behaviour is random. `freq` lists the addresses an episode may
+      use: those of a very active user that carry a large share of the
+      user's address weight. -#}
   {%- set rnd = module.random.Random(2614) -%}
   {%- set users = [] -%}
-  {%- set heap = [] -%}
-  {%- for i in range(samples.clients | length) -%}
-    {%- set row = samples.clients[i] -%}
-    {%- set w = rnd.lognormvariate(0, 0.6) -%}
-    {%- set wake = next_wake(now, w) | int -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(t=0.0) -%}
+  {%- for row in samples.clients -%}
+    {%- set w = [[rnd.lognormvariate(0, 0.7), 0.35] | max, 4.0] | min -%}
+    {%- set acc.t = acc.t + w -%}
+    {%- do cum.append(acc.t) -%}
+    {%- set aws = row.address_weights | sum -%}
+    {%- set freq = [] -%}
+    {%- for j in range(row.addresses | length) if w >= ep_min_w and row.address_weights[j] >= ep_min_share * aws -%}
+      {%- do freq.append(row.addresses[j]) -%}
+    {%- endfor -%}
     {%- do users.append({'cn': row.cn, 'vip': row.vip, 'addrs': row.addresses | list,
-        'aw': row.address_weights | list, 'seen': [], 'w': w, 'flaky': rnd.lognormvariate(0, 0.7),
-        'wake': wake, 'active': none, 'busy': false}) -%}
-    {%- do module.heapq.heappush(heap, [wake, i, {'k': 'wake', 'u': i}]) -%}
+        'aw': row.address_weights | list, 'seen': [], 'w': w, 'freq': freq,
+        'flaky': [[rnd.lognormvariate(0, 0.7), 0.3] | max, 3.0] | min,
+        'rest': 0, 'active': none, 'busy': false}) -%}
   {%- endfor -%}
-  {%- do shared.update({'initialized': true, 'users': users, 'heap': heap,
-      'seq': users | length, 'peers': [], 'partials': {},
-      'start_at': none, 'last_user': none}) -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'cum': cum,
+      'ctr': {'seq': 0, 'peer': 0, 'last': 0, 'total': acc.t}, 'heap': [], 'free': [],
+      'partials': {}, 'inuse': {}, 'start_at': none, 'last_user': none, 'ep_plan': none}) -%}
 {%- endif -%}
 {%- set users = shared.get('users') -%}
+{%- set cum = shared.get('cum') -%}
+{%- set ctr = shared.get('ctr') -%}
 {%- set heap = shared.get('heap') -%}
-{%- set peers = shared.get('peers') -%}
+{%- set free = shared.get('free') -%}
 {%- set partials = shared.get('partials') -%}
+{%- set inuse = shared.get('inuse') -%}
+
+{#- A source port the client's NAT is not already using for a live
+    instance on that address. -#}
+{%- macro take_port(ip) -%}
+  {%- set r = namespace(p=0) -%}
+  {%- for i in range(20) -%}
+    {%- set r.p = module.random.randint(1025, 65535) -%}
+    {%- if (ip ~ ':' ~ r.p) not in inuse -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do inuse.update({ip ~ ':' ~ r.p: 1}) -%}
+  {{- r.p -}}
+{%- endmacro -%}
 
 {%- macro push(at, item) -%}
-  {%- set n = shared.get('seq') + 1 -%}
-  {%- do shared.set('seq', n) -%}
-  {%- do module.heapq.heappush(heap, [at | int, n, item]) -%}
+  {%- do ctr.update({'seq': ctr.seq + 1}) -%}
+  {%- do module.heapq.heappush(heap, [at | int, ctr.seq, item]) -%}
 {%- endmacro -%}
 
+{#- A user whose session ended rests before connecting again; an active
+    user rests for a shorter time. -#}
 {%- macro idle(u, t0) -%}
-  {%- set user = users[u] -%}
-  {%- set wake = next_wake(t0, user.w) | int -%}
-  {%- do user.update({'busy': false, 'wake': wake}) -%}
-  {{- push(wake, {'k': 'wake', 'u': u}) -}}
+  {%- do users[u].update({'busy': false, 'rest': t0 + gap(2700 / users[u].w, 1.0, 300, 86400) | int}) -%}
 {%- endmacro -%}
 
-{#- Detector replica of the chain on one CN: session replacements
-    (duplicate-cn drops) alternating X, Y, X, Y between two source
-    addresses within `window` seconds of the first. Returns 1 when a
-    drop from `ip` at `t` would complete it. -#}
+{%- macro recent(cn, t) -%}
+  {%- set r = namespace(n=0) -%}
+  {%- for p in partials.get(cn, []) if t - p[1] <= window -%}{%- set r.n = 1 -%}{%- endfor -%}
+  {{- r.n -}}
+{%- endmacro -%}
+
+{#- Eligibility: idle and rested; an episode user in addition is not
+    the previous episode's user, had no replacement within the chain
+    window and has connected from two or more of their frequent
+    addresses (`freq`). -#}
+{%- macro ok(j, t, ep) -%}
+  {%- set user = users[j] -%}
+  {{- 1 if not user.busy and user.rest <= t and user.active is none
+      and (not ep or (user.freq | select('in', user.seen) | list | length >= 2 and user.cn != shared.get('last_user')
+      and not recent(user.cn, t) | int)) else 0 -}}
+{%- endmacro -%}
+
+{#- Draw a user by activity weight among users for whom `ok` holds:
+    rejection sampling over the cumulative weights, then a scan. -#}
+{%- macro draw(t, ep) -%}
+  {%- set r = namespace(u=-1) -%}
+  {%- for i in range(64 if ep else 256) -%}
+    {%- set j = [module.bisect.bisect_right(cum, module.random.random() * ctr.total), cum | length - 1] | min -%}
+    {%- if ok(j, t, ep) | int -%}{%- set r.u = j -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if r.u < 0 -%}
+    {%- set c = namespace(a=[], w=[]) -%}
+    {%- for j in range(users | length) if ok(j, t, ep) | int -%}
+      {%- do c.a.append(j) -%}{%- do c.w.append(users[j].w) -%}
+    {%- endfor -%}
+    {%- if c.a -%}{%- set r.u = module.rand.weighted_choice(c.a, c.w) -%}{%- endif -%}
+  {%- endif -%}
+  {{- r.u -}}
+{%- endmacro -%}
+
+{#- Detector replica of the chain on one CN, with every binding kept:
+    session replacements (duplicate-cn drops) from X, Y, X, Y within
+    `window` seconds of the first. A partial is [step, t0, [X, Y]]. -#}
 {%- macro completes(cn, ip, t) -%}
   {%- set r = namespace(hit=0) -%}
-  {%- for p in partials.get(cn, []) if t - p[1] <= window and p[0] == 3 and p[2][1] == ip -%}
+  {%- for p in partials.get(cn, []) if p[0] == 3 and t - p[1] <= window and p[2][1] == ip -%}
     {%- set r.hit = 1 -%}
   {%- endfor -%}
   {{- r.hit -}}
 {%- endmacro -%}
 
 {%- macro feed(cn, ip, t) -%}
-  {%- set st = namespace(new=[], done=false) -%}
+  {%- set keep = [] -%}
+  {%- set sigs = [] -%}
   {%- for p in partials.get(cn, []) if t - p[1] <= window -%}
-    {%- if not st.done -%}
-      {%- if p[0] == 1 and ip != p[2][0] -%}
-        {%- set st.new = st.new + [[2, p[1], [p[2][0], ip]]] -%}
-      {%- elif p[0] == 2 and ip == p[2][0] -%}
-        {%- set st.new = st.new + [[3, p[1], p[2]]] -%}
-      {%- elif p[0] == 3 and ip == p[2][1] -%}
-        {%- set st.done = true -%}
-      {%- else -%}
-        {%- set st.new = st.new + [p] -%}
-      {%- endif -%}
+    {%- set cand = [p] -%}
+    {%- if p[0] == 1 and ip != p[2][0] -%}
+      {%- do cand.append([2, p[1], [p[2][0], ip]]) -%}
+    {%- elif p[0] == 2 and ip == p[2][0] -%}
+      {%- do cand.append([3, p[1], p[2]]) -%}
     {%- endif -%}
+    {%- for c in cand -%}
+      {%- set sig = c[0] ~ '|' ~ c[1] ~ '|' ~ c[2] | join(',') -%}
+      {%- if sig not in sigs -%}{%- do sigs.append(sig) -%}{%- do keep.append(c) -%}{%- endif -%}
+    {%- endfor -%}
   {%- endfor -%}
-  {%- if st.done -%}
-    {%- do partials.pop(cn, none) -%}
-  {%- else -%}
-    {%- do partials.update({cn: (st.new + [[1, t, [ip]]])[-8:]}) -%}
-  {%- endif -%}
+  {%- do keep.append([1, t, [ip]]) -%}
+  {%- do partials.update({cn: keep}) -%}
 {%- endmacro -%}
 
-{#- A new connection of user u from `ip`. `old` is the session it may
-    replace. -#}
+{#- A new connection of user u from `ip` at `t`. -#}
 {%- macro connect(u, ip, t, ep, short_p) -%}
-  {%- set s = {'u': u, 'ip': ip, 'port': module.random.randint(1025, 65535),
+  {%- set s = {'u': u, 'ip': ip, 'port': take_port(ip) | int,
       'sid': '%08x %08x' | format(module.random.getrandbits(32), module.random.getrandbits(32)),
-      'ep': ep, 'alive': false, 'peer': none, 'short_p': short_p} -%}
+      'ep': ep, 'alive': false, 'dead': false, 'peer': none, 'short_p': short_p} -%}
   {{- push(t, {'k': 'initial', 's': s}) -}}
 {%- endmacro -%}
 
 {#- 1. Episode scheduling, by source time. The first start falls within
-    min(interval, 24 h) of the first tick, its hour drawn from the
-    background hour-of-day curve. Each later start is due one interval
-    after the actual previous start and falls in a window of
+    min(interval, 24 h) of the first line, its hour drawn from the
+    hour-of-day curve. Each later start is due one interval after the
+    actual previous start and falls in a window of
     w = min(interval / 4, 6 h) centred on the due time, weighted by the
     squared curve plus a small floor. -#}
 {%- macro pick_start(lo, hi, squared) -%}
@@ -146,121 +195,113 @@
   {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
   {{- module.random.randint(slot[0], slot[1] - 1) -}}
 {%- endmacro -%}
-{%- if params.anomaly_mode and not shared.get('scheduled', false) -%}
-  {%- do shared.update({'scheduled': true, 'start_at':
-      pick_start(now, now + ([interval, 24] | min * 3600) | int, false) | int}) -%}
+{%- if params.anomaly_mode and shared.get('start_at') is none -%}
+  {%- do shared.set('start_at', pick_start(now, now + ([interval, 24] | min * 3600) | int, false) | int) -%}
 {%- endif -%}
-{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+{%- if params.anomaly_mode and now >= shared.get('start_at') and now >= shared.get('ep_retry', 0) -%}
   {#- One client certificate used from two places at once: the user's
       device connects from one of the user's usual networks, a second
       device with the same certificate connects from another of them,
       and each kicked device reconnects when its ping-restart fires,
-      replacing the other: k = 4-6 alternating replacements. The user
-      is drawn with background activity weights among idle users whose
-      own next connection comes after the episode and who have no
-      replacement within the chain window; the previous episode's user
-      sits this one out. -#}
-  {%- if shared.get('ep_plan') is none -%}
-    {%- set k = module.rand.weighted_choice([4, 5, 6], [6, 3, 1]) -%}
-    {%- set first = gap(900, 0.8, 60, 3600) | int -%}
-    {%- set gaps = [] -%}
-    {%- for i in range(k - 1) -%}{%- do gaps.append(detect_gap(true) | int) -%}{%- endfor -%}
-    {%- do shared.set('ep_plan', {'k': k, 'first': first, 'gaps': gaps,
-        'tail': gap(5400, 0.9, 120, 43200) | int,
-        'exit': module.rand.chance(0.75)}) -%}
-  {%- endif -%}
-  {%- set p = shared.get('ep_plan') -%}
-  {%- set end = now + p.first + p.gaps | sum + p.tail + ping_restart + 600 -%}
-  {%- set ep = namespace(c=[], w=[]) -%}
-  {%- for i in range(users | length) -%}
-    {%- set user = users[i] -%}
-    {%- set recent = namespace(n=0) -%}
-    {%- for q in partials.get(user.cn, []) if now - q[1] <= window -%}{%- set recent.n = 1 -%}{%- endfor -%}
-    {%- if not user.busy and user.active is none and user.wake > end
-        and user.cn != shared.get('last_user') and recent.n == 0
-        and user.seen | length >= 2 -%}
-      {%- set ep.c = ep.c + [i] -%}{%- set ep.w = ep.w + [user.w] -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- if ep.c -%}
-    {%- set u = module.rand.weighted_choice(ep.c, ep.w) -%}
+      replacing the other: four alternating replacements, then the
+      surviving device stays for an ordinary session. The user is
+      drawn with background activity weights among idle, rested users
+      as background draws them, restricted to users with two frequent
+      addresses, and both addresses are frequent ones. -#}
+  {%- set u = draw(now, true) | int -%}
+  {%- if u >= 0 -%}
     {%- set user = users[u] -%}
+    {%- set gaps = [] -%}
+    {%- for i in range(3) -%}{%- do gaps.append(detect_gap(true) | int) -%}{%- endfor -%}
     {%- set own = namespace(a=[], w=[]) -%}
-    {%- for j in range(user.addrs | length) if user.addrs[j] in user.seen -%}
-      {%- set own.a = own.a + [user.addrs[j]] -%}{%- set own.w = own.w + [user.aw[j]] -%}
+    {%- for j in range(user.addrs | length) if user.addrs[j] in user.seen and user.addrs[j] in user.freq -%}
+      {%- do own.a.append(user.addrs[j]) -%}{%- do own.w.append(user.aw[j]) -%}
     {%- endfor -%}
     {%- set a1 = module.rand.weighted_choice(own.a, own.w) -%}
     {%- set rest = namespace(a=[], w=[]) -%}
-    {%- for j in range(user.addrs | length) if user.addrs[j] != a1 and user.addrs[j] in user.seen -%}
-      {%- set rest.a = rest.a + [user.addrs[j]] -%}{%- set rest.w = rest.w + [user.aw[j]] -%}
+    {%- for j in range(own.a | length) if own.a[j] != a1 -%}
+      {%- do rest.a.append(own.a[j]) -%}{%- do rest.w.append(own.w[j]) -%}
     {%- endfor -%}
     {%- set a2 = module.rand.weighted_choice(rest.a, rest.w) -%}
-    {%- do p.update({'u': u, 'addrs': [a1, a2], 'i': 0}) -%}
-    {%- do shared.set('ep_plan', none) -%}
+    {%- set p = {'k': 4, 'd': 0, 'first': gap(900, 0.8, 60, 3600) | int, 'gaps': gaps,
+        'tail': gap(5400 / user.w, 0.9, 120, 43200) | int, 'exit': module.rand.chance(0.75),
+        'addrs': [a1, a2]} -%}
+    {%- do user.update({'busy': true}) -%}
     {{- connect(u, a1, now, p, 0) -}}
-    {{- connect(u, a2, now + p.first, p, 0) -}}
-    {%- set due = now + (interval * 3600) | int -%}
+    {%- set due = shared.get('start_at') + (interval * 3600) | int -%}
     {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
     {%- do shared.update({'last_user': user.cn,
-        'start_at': pick_start(due - half, due + half, true) | int}) -%}
+        'start_at': pick_start([due - half, now + 1] | max, [due + half, now + 2] | max, true) | int}) -%}
+  {%- else -%}
+    {%- do shared.set('ep_retry', now + 60) -%}
   {%- endif -%}
 {%- endif -%}
 
-{#- 2. Pop the earliest due item. A wake starts a background connection
-    of an idle user; a segment end decides how the session goes on. -#}
-{%- set ns = namespace(item=none) -%}
-{%- for i in range(60) -%}
+{#- 2. Take the earliest due queued line. It is logged at its own due
+    time, or right after the previous line if that is later, so the
+    lines of one moment stay together and the log stays ordered. A
+    segment end decides how the session goes on; lines of an instance
+    that is already gone are skipped. -#}
+{%- set ns = namespace(item=none, t=now) -%}
+{%- for i in range(64) -%}
   {%- if not heap or heap[0][0] > now -%}{%- break -%}{%- endif -%}
   {%- set entry = module.heapq.heappop(heap) -%}
+  {%- set d = entry[0] -%}
   {%- set item = entry[2] -%}
-  {%- if item.k == 'wake' -%}
-    {%- set user = users[item.u] -%}
-    {%- do user.update({'busy': true}) -%}
-    {{- connect(item.u, module.rand.weighted_choice(user.addrs, user.aw), now, none,
-        [0.5, 0.1 * user.flaky] | min) -}}
-  {%- elif item.k == 'segend' -%}
-    {%- set s = item.s -%}
+  {%- set s = item.s -%}
+  {%- if item.k == 'segend' -%}
     {%- set user = users[s.u] -%}
     {%- if s.alive and not s.ep -%}
       {%- set short = item.short -%}
       {%- set r = module.random.random() -%}
       {%- set roam_p = 0.8 if short else 0.08 -%}
-      {%- set timeout_at = now - module.random.randint(0, 10) + ping_restart -%}
+      {%- set timeout_at = d - module.random.randint(0, 10) + ping_restart -%}
       {%- if r < roam_p -%}
         {#- Reconnect from the same or another network; the server
-            drops the old instance only if it has not timed out. -#}
-        {%- set g = detect_gap(false) | int -%}
+            drops the old instance if it has not timed out yet. -#}
         {%- do s.update({'roam': true}) -%}
-        {%- if now + g + 3 >= timeout_at -%}
-          {{- push(timeout_at, {'k': 'timeout', 's': s}) -}}
-        {%- endif -%}
+        {{- push(timeout_at, {'k': 'timeout', 's': s}) -}}
         {%- if module.random.random() < 0.4 -%}
           {%- set ip = s.ip -%}
         {%- else -%}
           {%- set rest = namespace(a=[], w=[]) -%}
           {%- for j in range(user.addrs | length) if user.addrs[j] != s.ip -%}
-            {%- set rest.a = rest.a + [user.addrs[j]] -%}{%- set rest.w = rest.w + [user.aw[j]] -%}
+            {%- do rest.a.append(user.addrs[j]) -%}{%- do rest.w.append(user.aw[j]) -%}
           {%- endfor -%}
           {%- set ip = module.rand.weighted_choice(rest.a, rest.w) -%}
         {%- endif -%}
-        {{- connect(s.u, ip, now + g, none, [0.7, 0.45 * user.flaky] | min) -}}
+        {{- connect(s.u, ip, d + detect_gap(false) | int, none, [0.7, 0.45 * user.flaky] | min) -}}
       {%- elif r < roam_p + (1 - roam_p) * 0.78 -%}
-        {{- push(now, {'k': 'delayed', 's': s}) -}}
+        {{- push(d, {'k': 'delayed', 's': s}) -}}
       {%- else -%}
         {{- push(timeout_at, {'k': 'timeout', 's': s}) -}}
       {%- endif -%}
     {%- elif s.alive and s.ep -%}
-      {{- push(now if item.exit else now - module.random.randint(0, 10) + ping_restart,
-          {'k': 'delayed' if item.exit else 'timeout', 's': s}) -}}
+      {{- push(d if s.ep.exit else d - module.random.randint(0, 10) + ping_restart,
+          {'k': 'delayed' if s.ep.exit else 'timeout', 's': s}) -}}
     {%- endif -%}
-  {%- elif item.k == 'timeout' and not item.s.alive -%}
-    {#- Already replaced by a reconnect: nothing to log. -#}
+  {%- elif s.dead or (item.k == 'timeout' and not s.alive) -%}
+    {#- Replaced or closed already: nothing to log. -#}
   {%- else -%}
-    {%- set ns.item = item -%}{%- break -%}
+    {%- set ns.item = item -%}{%- set ns.t = [d, ctr.last] | max -%}{%- break -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if ns.item is none -%}{%- do dispatch.drop() -%}{%- endif -%}
+{%- if ns.item is none -%}
+  {#- Nothing due: an idle user connects. -#}
+  {%- set ns.t = now -%}
+  {%- set u = draw(now, false) | int -%}
+  {%- if u < 0 -%}{%- set u = draw(now + 1000000000, false) | int -%}{%- endif -%}
+  {%- set user = users[u] -%}
+  {%- do user.update({'busy': true}) -%}
+  {%- set ip = module.rand.weighted_choice(user.addrs, user.aw) -%}
+  {%- set ns.item = {'k': 'initial', 's': {'u': u, 'ip': ip, 'port': take_port(ip) | int,
+      'sid': '%08x %08x' | format(module.random.getrandbits(32), module.random.getrandbits(32)),
+      'ep': none, 'alive': false, 'dead': false, 'peer': none,
+      'short_p': [0.5, 0.1 * user.flaky] | min}} -%}
+{%- endif -%}
 
+{%- set t = ns.t -%}
+{%- do ctr.update({'last': t}) -%}
 {%- set item = ns.item -%}
 {%- set s = item.s -%}
 {%- set user = users[s.u] -%}
@@ -279,108 +320,120 @@
         would complete the chain on this CN comes from the address of
         the session it replaces instead (a client restart on the same
         network). Times are unchanged. -#}
-    {%- if completes(cn, s.ip, now) | int -%}
-      {%- set alt = [old.ip] + user.addrs -%}
-      {%- for a in alt if not completes(cn, a, now) | int -%}
-        {%- if loop.first -%}{%- do s.update({'ip': a}) -%}{%- endif -%}
+    {%- if completes(cn, s.ip, t) | int -%}
+      {%- set alt = namespace(ip=old.ip) -%}
+      {%- for a in [old.ip] + user.addrs if not completes(cn, a, t) | int -%}
+        {%- if loop.first -%}{%- set alt.ip = a -%}{%- endif -%}
       {%- endfor -%}
+      {%- if alt.ip != s.ip -%}
+        {%- do inuse.pop(s.ip ~ ':' ~ s.port, none) -%}
+        {%- do s.update({'ip': alt.ip, 'port': take_port(alt.ip) | int}) -%}
+      {%- endif -%}
       {%- set addr = s.ip ~ ':' ~ s.port -%}
       {%- set inst = cn ~ '/' ~ addr -%}
     {%- endif -%}
   {%- endif -%}
   {%- set message = addr ~ ' TLS: Initial packet from [AF_INET]' ~ addr ~ ', sid=' ~ s.sid -%}
   {%- set with_cn = false -%}
-  {{- push(now + module.rand.weighted_choice([0, 1], [3, 1]), {'k': 'verify_ca', 's': s}) -}}
+  {{- push(t + module.rand.weighted_choice([0, 1], [3, 1]), {'k': 'verify_ca', 's': s}) -}}
 {%- elif action == 'verify_ca' -%}
   {%- set message = addr ~ ' VERIFY OK: depth=1, CN=' ~ params.ca_common_name -%}
   {%- set with_cn = false -%}
-  {{- push(now, {'k': 'verify', 's': s}) -}}
+  {{- push(t, {'k': 'verify', 's': s}) -}}
 {%- elif action == 'verify' -%}
   {%- set message = addr ~ ' VERIFY OK: depth=0, CN=' ~ cn -%}
-  {{- push(now, {'k': 'control', 's': s}) -}}
+  {{- push(t, {'k': 'control', 's': s}) -}}
 {%- elif action == 'control' -%}
   {%- set message = addr ~ ' Control Channel: TLSv1.3, cipher TLSv1.3 TLS_AES_256_GCM_SHA384, peer certificate: 2048 bits RSA, signature: RSA-SHA256, peer temporary key: 253 bits X25519' -%}
   {%- set with_cn = false -%}
-  {{- push(now + module.rand.weighted_choice([0, 1], [1, 2]), {'k': 'peer', 's': s}) -}}
+  {{- push(t + module.rand.weighted_choice([0, 1], [1, 2]), {'k': 'peer', 's': s}) -}}
 {%- elif action == 'peer' -%}
   {%- set message = addr ~ ' [' ~ cn ~ '] Peer Connection Initiated with [AF_INET]' ~ addr -%}
   {%- if not s.ep and s.ip not in user.seen -%}{%- do user.seen.append(s.ip) -%}{%- endif -%}
   {%- set old = user.active -%}
   {%- if old is not none and old.alive -%}
-    {{- push(now, {'k': 'dup', 's': s}) -}}
+    {{- push(t, {'k': 'dup', 's': s}) -}}
   {%- else -%}
-    {{- push(now, {'k': 'sva', 's': s}) -}}
+    {{- push(t, {'k': 'sva', 's': s}) -}}
   {%- endif -%}
 {%- elif action == 'dup' -%}
   {%- set old = user.active -%}
-  {%- do old.update({'alive': false}) -%}
-  {%- do peers.remove(old.peer) if old.peer in peers -%}
+  {%- do old.update({'alive': false, 'dead': true}) -%}
+  {%- do inuse.pop(old.ip ~ ':' ~ old.port, none) -%}
+  {%- if old.peer is not none -%}{%- do module.heapq.heappush(free, old.peer) -%}{%- endif -%}
   {%- set message = inst ~ " MULTI: new connection by client '" ~ cn ~ "' will cause previous active sessions by this client to be dropped.  Remember to use the --duplicate-cn option if you want multiple clients using the same certificate or username to concurrently connect." -%}
-  {{- feed(cn, s.ip, now) -}}
-  {{- push(now, {'k': 'sva', 's': s}) -}}
+  {{- feed(cn, s.ip, t) -}}
+  {{- push(t, {'k': 'sva', 's': s}) -}}
+  {%- set p = s.ep -%}
+  {%- if p -%}
+    {#- The device this connection kicked notices when its own
+        ping-restart fires and reconnects, until four replacements. -#}
+    {%- do p.update({'d': p.d + 1}) -%}
+    {%- if p.d < p.k -%}
+      {{- connect(s.u, p.addrs[(p.d + 1) % 2], t + p.gaps[p.d - 1], p, 0) -}}
+    {%- endif -%}
+  {%- endif -%}
 {%- elif action == 'sva' -%}
-  {%- set pid = namespace(v=0) -%}
-  {%- for i in range(peers | length + 1) if i not in peers -%}
-    {%- if loop.first -%}{%- set pid.v = i -%}{%- endif -%}
-  {%- endfor -%}
-  {%- do peers.append(pid.v) -%}
-  {%- do s.update({'alive': true, 'peer': pid.v}) -%}
+  {#- peer-id: the lowest free slot. -#}
+  {%- if free -%}
+    {%- set pid = module.heapq.heappop(free) -%}
+  {%- else -%}
+    {%- set pid = ctr.peer -%}
+    {%- do ctr.update({'peer': pid + 1}) -%}
+  {%- endif -%}
+  {%- do s.update({'alive': true, 'peer': pid}) -%}
   {%- do user.update({'active': s}) -%}
   {%- set vip = user.vip -%}
   {%- set message = inst ~ ' MULTI_sva: pool returned IPv4=' ~ vip ~ ', IPv6=(Not enabled)' -%}
-  {{- push(now, {'k': 'learn', 's': s}) -}}
+  {{- push(t, {'k': 'learn', 's': s}) -}}
 {%- elif action == 'learn' -%}
   {%- set vip = user.vip -%}
   {%- set message = inst ~ ' MULTI: Learn: ' ~ vip ~ ' -> ' ~ inst -%}
-  {{- push(now, {'k': 'primary', 's': s}) -}}
+  {{- push(t, {'k': 'primary', 's': s}) -}}
 {%- elif action == 'primary' -%}
   {%- set vip = user.vip -%}
   {%- set message = inst ~ ' MULTI: primary virtual IP for ' ~ inst ~ ': ' ~ vip -%}
-  {{- push(now + module.rand.weighted_choice([0, 1], [1, 1]), {'k': 'push', 's': s}) -}}
+  {{- push(t + module.rand.weighted_choice([0, 1], [1, 1]), {'k': 'push', 's': s}) -}}
 {%- elif action == 'push' -%}
   {%- set message = inst ~ " PUSH: Received control message: 'PUSH_REQUEST'" -%}
-  {{- push(now, {'k': 'data', 's': s}) -}}
+  {{- push(t, {'k': 'data', 's': s}) -}}
 {%- elif action == 'data' -%}
   {%- set message = inst ~ " Data Channel: cipher 'AES-256-GCM', peer-id: " ~ s.peer -%}
-  {{- push(now, {'k': 'timers', 's': s}) -}}
+  {{- push(t, {'k': 'timers', 's': s}) -}}
 {%- elif action == 'timers' -%}
   {%- set message = inst ~ ' Timers: ping 10, ping-restart ' ~ ping_restart -%}
-  {{- push(now, {'k': 'protocol', 's': s}) -}}
+  {{- push(t, {'k': 'protocol', 's': s}) -}}
 {%- elif action == 'protocol' -%}
   {%- set message = inst ~ ' Protocol options: protocol-flags cc-exit tls-ekm dyn-tls-crypt' -%}
   {#- Plan how this session goes on. -#}
   {%- set p = s.ep -%}
   {%- if p -%}
-    {%- do p.update({'i': p.i + 1}) -%}
-    {%- if p.i >= 2 -%}
-      {#- The device this connection kicked reconnects when its own
-          ping-restart fires, until k replacements happened. -#}
-      {%- if p.i <= p.k -%}
-        {{- connect(s.u, p.addrs[p.i % 2], now + p.gaps[p.i - 2], p, 0) -}}
-      {%- else -%}
-        {{- push(now + p.tail, {'k': 'segend', 's': s, 'short': false, 'exit': p.exit}) -}}
-      {%- endif -%}
+    {%- if p.d == 0 -%}
+      {{- connect(s.u, p.addrs[1], t + p.first, p, 0) -}}
+    {%- elif p.d == p.k -%}
+      {{- push(t + p.tail, {'k': 'segend', 's': s}) -}}
     {%- endif -%}
   {%- else -%}
     {%- set short = module.random.random() < s.short_p -%}
-    {{- push(now + seg_len(1 if short else 0) | int, {'k': 'segend', 's': s, 'short': short}) -}}
+    {{- push(t + seg_len(1 if short else 0, user.w) | int, {'k': 'segend', 's': s, 'short': short}) -}}
   {%- endif -%}
 {%- elif action == 'delayed' -%}
   {%- set message = inst ~ ' Delayed exit in 5 seconds' -%}
-  {{- push(now + 5, {'k': 'exit', 's': s}) -}}
+  {{- push(t + 5, {'k': 'exit', 's': s}) -}}
 {%- elif action == 'exit' -%}
   {%- set message = inst ~ ' SIGTERM[soft,delayed-exit] received, client-instance exiting' -%}
 {%- elif action == 'timeout' -%}
   {%- set message = inst ~ ' [' ~ cn ~ '] Inactivity timeout (--ping-restart), restarting' -%}
-  {{- push(now, {'k': 'restart', 's': s}) -}}
+  {{- push(t, {'k': 'restart', 's': s}) -}}
 {%- elif action == 'restart' -%}
   {%- set message = inst ~ ' SIGUSR1[soft,ping-restart] received, client-instance restarting' -%}
 {%- endif -%}
 {%- if action in ['exit', 'restart'] and s.alive -%}
-  {%- do s.update({'alive': false}) -%}
-  {%- do peers.remove(s.peer) if s.peer in peers -%}
+  {%- do s.update({'alive': false, 'dead': true}) -%}
+  {%- do inuse.pop(s.ip ~ ':' ~ s.port, none) -%}
+  {%- do module.heapq.heappush(free, s.peer) -%}
   {%- if user.active is not none and user.active.sid == s.sid -%}{%- do user.update({'active': none}) -%}{%- endif -%}
-  {%- if not s.ep and not s.get('roam') -%}{{- idle(s.u, now) -}}{%- endif -%}
+  {%- if not s.get('roam') -%}{{- idle(s.u, t) -}}{%- endif -%}
 {%- endif -%}
 
 {%- set categories = {
@@ -411,14 +464,15 @@
     'protocol': 'protocol-options', 'delayed': 'exit-scheduled',
     'exit': 'client-exited', 'timeout': 'inactivity-timeout',
     'restart': 'client-restarted'} -%}
-{%- set clock = timestamp.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set stamp = module.datetime.datetime.fromtimestamp(t, module.datetime.timezone.utc) -%}
+{%- set clock = stamp.strftime('%Y-%m-%d %H:%M:%S') -%}
 {%- set event = {'kind': 'event', 'module': 'openvpn', 'dataset': 'openvpn.server',
     'action': actions[action], 'category': categories[action][0],
     'type': categories[action][1], 'original': clock ~ ' ' ~ message} -%}
 {%- if action == 'timeout' -%}{%- do event.update({'outcome': 'failure'}) -%}
 {%- elif action in ['verify_ca', 'verify', 'peer'] -%}{%- do event.update({'outcome': 'success'}) -%}{%- endif -%}
 {%- set related = {'ip': [s.ip] + ([vip] if vip else [])} -%}
-{%- set doc = {'@timestamp': timestamp.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
+{%- set doc = {'@timestamp': stamp.strftime('%Y-%m-%dT%H:%M:%S+00:00'),
     'ecs': {'version': '8.17.0'},
     'event': event,
     'message': message,
