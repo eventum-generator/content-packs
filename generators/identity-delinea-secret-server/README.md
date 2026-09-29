@@ -4,44 +4,47 @@ Generates the `SECRET - VIEW` audit records that one Delinea Secret Server 11.3 
 
 ## Event Types
 
-Every record is native event `SECRET - VIEW` (CEF class `10004`, ECS `iam` / `info`). Shares by folder (`cs3`), measured on the final default capture (108 h, `anomaly_mode: true`, 10,968 records):
+Every record is native event `SECRET - VIEW` (CEF class `10004`, ECS `iam` / `info`). Approximate shares by folder (`cs3`):
 
 | Folder (`cs3`) | Viewed by | Share | Category |
 |---|---|---:|---|
-| `Applications` | DevOps, DBAs, administrators, automation accounts | 27.27% (2991) | IAM |
-| Personal folders (one per person, named after the person) | the folder owner | 21.84% (2395) | IAM |
-| `Network Devices` | network engineers, administrators | 18.46% (2025) | IAM |
-| `Service Desk` | service desk, administrators | 12.79% (1403) | IAM |
-| `Tier 0 - Infrastructure` | administrators, occasionally network engineers | 12.16% (1334) | IAM |
-| `Databases` | DBAs, DevOps, administrators | 7.48% (820) | IAM |
+| `Service Desk` | service desk, administrators | 32% | IAM |
+| Personal folders (one per person, named after the person) | the folder owner | 25% | IAM |
+| `Applications` | DevOps, automation accounts, DBAs, administrators | 22% | IAM |
+| `Databases` | DBAs, DevOps, administrators, backup automation | 8% | IAM |
+| `Network Devices` | network engineers, administrators, configuration backup automation | 8% | IAM |
+| `Tier 0 - Infrastructure` | administrators, occasionally network engineers | 5% | IAM |
 
-Users, secret names, folder names, IDs and rates are an assumed mid-size organisation, not measured production data. Every user, source address, secret and folder the chain uses occurs in ordinary background in both modes. No field labels an episode.
+By account: service desk 42%, DevOps 24%, network engineers 11%, administrators 9%, DBAs 9%, automation accounts 5%.
 
-## Background Model
+Users, secret names, folder names, IDs and rates are an assumed large organisation, not measured production data. Every user, source address, secret and folder the chain uses occurs in ordinary activity in both modes. No field labels an episode.
 
-Each one-second tick emits at most one record: the earliest due view, otherwise nothing. People start sessions as one merged Poisson stream (0.009 per second, scaled by an office-hours factor: 07:00-17:00 UTC 1.80, 17:00-21:00 0.79, night 0.28); each session picks a person by a fixed random per-user weight (log-normal), so users act independently and some open secrets far more often than others. Automation accounts add a flat stream (0.002 per second, any hour). The organisation itself (30 accounts with fixed IDs and one workstation address each, 5 shared folders with 33 secrets, one personal folder per person, per-user activity and per-secret popularity) comes from a fixed seed, so every run models the same instance and only behaviour is random.
+## Volume and Activity
 
-- **Ordinary sessions**: 1-6 views, gaps log-normal (median 40 s); each view re-opens the previous secret (30%) or picks a folder by role (administrators, DBAs, network engineers, service desk, DevOps) and a secret by a fixed random popularity weight.
-- **Infrastructure work** (25% of administrator sessions): 2-9 views, gaps log-normal (median 35 s), 85% of them Tier 0 secrets, 25% re-opens. These sessions put several distinct Tier 0 secrets by one administrator into a few minutes.
-- **Automation** (`svc.ansible`, `svc.jenkins`): 1-6 application secrets seconds apart.
+About 12,700 views per day by 240 people and 4 automation accounts, each with a fixed ID and one workstation or server address.
+
+- **People** (about 12,000 per day) follow UTC office hours: about 0.25 views/s 07:00-17:00, 0.11/s 17:00-21:00 and 0.04/s at night, with ±3% day-to-day variation. Each session belongs to one person, chosen by a fixed per-person activity weight (0.4-2.5 times the average), so some people open secrets far more often than others; fewer people are active at night because fewer sessions start then.
+- **Ordinary sessions**: 1-6 views, a gap of about 40 s (log-normal) between views; each view re-opens the previous secret (30%) or picks a folder by role (administrators, DBAs, network engineers, service desk, DevOps) and a secret by its fixed popularity.
+- **Infrastructure work** (25% of administrator sessions): 2-9 views about 35 s apart, 85% of them Tier 0 secrets, 25% re-opens. These sessions put several distinct Tier 0 secrets by one administrator into a few minutes. An administrator views about 20-25 Tier 0 secrets per day on average; a day without any is rare.
+- **Automation** (about 660 per day, any hour, on fixed schedules): `svc.jenkins` 2 application secrets every 10 minutes, `svc.zabbix` its monitoring API credential every 5 minutes, `svc.ansible` 3 application secrets at minute 05 of every hour and 6 network device credentials at 01:30, `svc.backup` 3 database credentials at 22:00. Each run fetches its secrets in the same order within one second.
 
 The syslog header carries the send time: a log-normal delay (median 3 s) after the event time `rt`, as in the Elastic fixture, where the header is 9 s later than `rt`.
 
-In six 108 h `anomaly_mode: false` captures, counting from each Tier 0 view of a user, the fourth distinct Tier 0 secret came 20-25, 25-30, 30-35 and 35-40 minutes later 115, 155, 173 and 153 times, and the fifth distinct one 30-35, 35-40 and 40-45 minutes later 94, 77 and 118 times; no user reached five within 30 minutes by event time (`rt`, `thycotic_ss.event.time`); counted by syslog send time (`@timestamp`), send delay pulls 3 spans of 1803-1809 s under 30 minutes across the six captures.
+Outside episodes no user views five distinct Tier 0 secrets within 30 minutes of event time (`rt`, `thycotic_ss.event.time`): when a user viewed four distinct ones in the last 30 minutes, a further Tier 0 view re-opens the latest of them (about 30-50 such views per day). Four distinct Tier 0 secrets by one administrator within 30 minutes occur about 30-40 times per day.
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`. With `false` the generator emits the background only and the complete chain never occurs.
+`anomaly_mode` defaults to `true`. With `false` the generator emits ordinary activity only and the complete chain never occurs.
 
-Sequence, all by one administrator U from U's usual workstation address: `SECRET - VIEW` of five distinct secrets in folder `Tier 0 - Infrastructure` within 30 minutes, with occasional re-opens of an already viewed one in between (25% after each view).
+Sequence, all by one administrator U from U's usual workstation address: `SECRET - VIEW` of five distinct secrets in folder `Tier 0 - Infrastructure` within 30 minutes. The first four come within minutes, with occasional re-opens of the second to fourth (25% after each of them); the fifth follows alone 25-28 minutes after the first. The first secret is not viewed again in the episode.
 
 Linking fields: `suser` / `suid` and `src` in all steps; `cs3` is `Tier 0 - Infrastructure` and `fileId` differs across the five views.
 
-Recurrence: episodes recur every `anomaly_interval_hours` of source time (default 24, minimum 2). The first start is drawn within the first min(interval, 24 h) of generation, with clock-hour slots weighted by the background office-hours factor, so its hour follows the background rather than the moment generation started. Each later episode is due one interval after the previous episode's actual start; its start is drawn in a window of w = min(interval / 4, 6 h) centred on the due time, with clock-hour slots weighted by the office-hours factor squared plus a small floor, so the phase stays in busy hours instead of drifting. Starts are therefore interval ± w/2 apart (24 h ± 3 h by default), and a late episode never causes catch-up. At intervals of 8 h or less the episodes necessarily cover the whole clock, night included. The episode may overlap the administrator's own infrastructure work; then Tier 0 views of that work within the 30 minutes count toward the five, and the pattern completes at an earlier episode view. The detected start is then up to 30 minutes before the episode's first view. The administrator viewed Tier 0 secrets in the 30 minutes before the first of the five distinct views in 10 of 18 detected patterns, and before the first of four distinct views in 249 of 446 four-secret occurrences in the six `anomaly_mode: false` captures. In the final captures the default interval gave 5 detected patterns starting at 00:09, 01:28, 22:39, 20:03 and 19:22 UTC (gaps 21.2-25.3 h): the first start fell at night, and the window moves the phase toward busy hours by at most 3 h per episode. An 8 h interval gave 13 patterns at every time of day (gaps 7.1-9.3 h). Patterns spanned 1.3-27.7 minutes; 9-15% of background Tier 0 views fall into 21:00-07:00 UTC.
+Recurrence: episodes recur every `anomaly_interval_hours` of source time (default 24, minimum 2). The first start is drawn within the first min(interval, 24 h) of generation, with clock-hour slots weighted by the people volume of the hour, so its hour follows ordinary activity rather than the moment generation started. Each later episode is due one interval after the previous episode's actual start; its start is drawn in a window of w = min(interval / 4, 6 h) centred on the due time, with clock-hour slots weighted by the people volume squared plus a small floor, so the phase stays in busy hours instead of drifting. Starts are therefore interval ± w/2 apart (24 h ± 3 h by default), and a late episode never causes catch-up. At intervals of 8 h or less the episodes cover the whole clock, night included.
 
-Variation: the administrator differs from the previous episode's and is picked by the same per-user weights as the background, so active administrators are episode actors more often; the five secrets are a fresh random draw and the first one differs from the previous episode's first; gaps follow the infrastructure-session law. Viewing a secret changes no state, so there is nothing to restore.
+Variation: the administrator differs from the previous episode's and is picked by the same activity weights as ordinary sessions; the five secrets are drawn by the same popularity as ordinary views, and the first one differs from the previous episode's first; gaps follow the infrastructure-work law. Once the first view is more than 30 minutes old, U re-opens none to six of the other four (32% none), as infrastructure work goes on past its fourth distinct secret. The episode's views come on top of U's ordinary sessions, which keep their times. When those sessions add other Tier 0 secrets within the 30 minutes, the pattern completes at an earlier episode view and the detected start can be up to 30 minutes before the episode's first view.
 
-Detection idea: one account viewing five or more distinct Tier 0 credentials within half an hour (credential harvesting from the vault). Each fragment occurs in background: repeated Tier 0 views by the same administrator within minutes, two to four distinct Tier 0 secrets within 30 minutes, five distinct ones over slightly more than 30 minutes, and the same user|secret pairs (4-5 of each episode's five occur in the background of the same capture). Only the complete pattern is kept out of the background: in six 108 h `anomaly_mode: false` captures no user viewed five distinct Tier 0 secrets within 30 minutes. The generator counts, per user, the distinct Tier 0 secrets viewed in the last 30 minutes (a sliding window). An ordinary view that would be the fifth re-opens one of the four instead, at the same time. The fifth distinct secret of an episode completes the pattern and starts the count afresh; the episode's remaining views then count as ordinary ones.
+Detection idea: one account viewing five or more distinct Tier 0 credentials within half an hour (credential harvesting from the vault). Each fragment occurs in ordinary activity: repeated Tier 0 views by the same administrator within minutes, two to four distinct Tier 0 secrets within 30 minutes, five distinct ones over slightly more than 30 minutes, and every administrator with the same address.
 
 ## Parameters
 
@@ -51,11 +54,21 @@ Edit `event.template.params` in `generator.yml`:
 
 | Parameter | Default | Meaning |
 |---|---|---|
-| `anomaly_mode` | `true` | Add periodic episodes to the background |
+| `anomaly_mode` | `true` | Add periodic episodes to ordinary activity |
 | `anomaly_interval_hours` | `24` | Episode interval in source hours, 2-8760 |
 | `server_host` | `SECRET-SRV-01` | Syslog hostname, `host.name` and `observer.hostname` |
 | `device_version` | `11.3.000001` | Version in the CEF header; the layout is validated for this version only |
 | `domain` | `contoso` | Domain prefix in personal admin account and breakglass secret names |
+
+### Organisation
+
+The modelled organisation lives in `samples/`:
+
+- `users.csv`: accounts (`username`, `display_name`, `role`, `user_id`, `ip`, activity `weight`, personal secret and folder IDs). Roles are `admin`, `dba`, `network`, `helpdesk`, `devops` and `svc` (automation); episodes pick `admin` accounts.
+- `secrets.csv`: secrets per folder with IDs and `popularity`; `{domain}` in a name is replaced by the `domain` parameter. The chain needs at least five `Tier 0 - Infrastructure` secrets.
+- `jobs.csv`: the secrets each automation job fetches, in order. A job name is the tag of its `cron` input in `generator.yml`, whose `count` is the number of rows of that job.
+
+People volume and its hour curve are set in `patterns/*.yml` (`multiplier.ratio` is views per day).
 
 ### Output Parameters
 
@@ -81,25 +94,28 @@ Live mode:
 eventum generate --path generators/identity-delinea-secret-server/generator.yml --id delinea-ss --live-mode true
 ```
 
-Batch mode needs a bounded input: add `start` and `end` to the `cron` input, then run:
+Batch mode needs a finite window: set `oscillator.start` and `oscillator.end` in each file under `patterns/` (start at midnight UTC, so the office hours stay in place) and add the same `start` and `end` to every `cron` input, then run:
 
 ```bash
 eventum generate --path generators/identity-delinea-secret-server/generator.yml --id delinea-ss --live-mode false
 ```
+
+Performance: about 2,600 events per second in batch mode (14 days, 177,000 events, in 68 s).
 
 ## Limitations
 
 - Only `SECRET - VIEW` is generated. It is the one Secret Server 11.3 event class with a complete published raw record; the Delinea event list names the other classes (check-out, launch, password displayed, login) but their 11.3 message and extension layout is not published, and the only other raw fixture (`PASSWORD_DISPLAYED`) is from 11.7 with a different message wording.
 - The day in the syslog header is space-padded as in RFC 3164 and the day in `rt` is zero-padded; the fixture (day 10) cannot confirm either. `rt` uses the legacy "Syslog" DateTime format (`Jun 23 2022 11:22:33`); the ISO option of newer versions is not modelled. Clocks are UTC with second resolution.
 - The ECS envelope follows the integration's expected document and `sample_event.json`; agent, data stream and ingest fields added by Elastic Agent are omitted, and `cef.*` is omitted as the pipeline removes it by default.
-- One record per second at most; rates, roles and folder contents are training assumptions.
+- Views of one person are seconds to minutes apart (median about 50 s between consecutive views of one session), wider at night when the instance is quiet. Rates, roles, folder contents, schedules and the office-hours curve are training assumptions; weekends are not modelled.
+- With `anomaly_mode: true` each episode adds its own 5-14 Tier 0 views, so an episode day holds that many more Tier 0 views by administrators. From the fifth distinct view until the first of the five is 30 minutes old (usually 2-5 minutes), the administrator opens no Tier 0 secret; ordinary views in that time go to the administrator's other folders.
 
 ## Sample Output
 
-The view that completes the second episode, copied byte for byte from the final default capture (line 2395; the other views of the pattern are lines 2381, 2389, 2392, 2393 and 2394):
+The view that completes the second episode, copied byte for byte from a default output (the four other distinct Tier 0 views of the pattern by the same user are at 01:03:28-01:06:09 UTC, the first 25 minutes 46 seconds earlier):
 
 ```json
-{"@timestamp": "2026-09-27T01:32:25.000Z", "ecs": {"version": "8.11.0"}, "event": {"action": "view", "category": ["iam"], "code": "10004", "dataset": "thycotic_ss.logs", "kind": "event", "original": "Sep 27 01:32:25 SECRET-SRV-01 CEF:0|Thycotic Software|Secret Server|11.3.000001|10004|SECRET - VIEW|2|msg=[[SecretServer]] Event: [Secret] Action: [View] By User: D.Lee Item Name: SCCM Network Access Account (Item Id: 2670) Container Name: Tier 0 - Infrastructure (Container Id: 162)  suid=709 suser=D.Lee cs4=David Lee cs4Label=suser Display Name src=10.20.5.41 rt=Sep 27 2026 01:32:19 fname=SCCM Network Access Account fileType=Secret fileId=2670 cs3Label=Folder cs3=Tier 0 - Infrastructure", "provider": "secret", "type": ["info"]}, "host": {"name": "SECRET-SRV-01"}, "message": "[[SecretServer]] Event: [Secret] Action: [View] By User: D.Lee Item Name: SCCM Network Access Account (Item Id: 2670) Container Name: Tier 0 - Infrastructure (Container Id: 162)", "observer": {"hostname": "SECRET-SRV-01", "product": "Secret Server", "vendor": "Thycotic Software", "version": "11.3.000001"}, "related": {"hosts": ["SECRET-SRV-01"], "ip": ["10.20.5.41"], "user": ["D.Lee"]}, "source": {"ip": "10.20.5.41"}, "thycotic_ss": {"event": {"secret": {"folder": "Tier 0 - Infrastructure", "id": "2670", "name": "SCCM Network Access Account"}, "time": "2026-09-27T01:32:19.000Z"}}, "user": {"full_name": "David Lee", "id": "709", "name": "D.Lee"}}
+{"@timestamp": "2026-09-27T01:29:15.000Z", "ecs": {"version": "8.11.0"}, "event": {"action": "view", "category": ["iam"], "code": "10004", "dataset": "thycotic_ss.logs", "kind": "event", "original": "Sep 27 01:29:15 SECRET-SRV-01 CEF:0|Thycotic Software|Secret Server|11.3.000001|10004|SECRET - VIEW|2|msg=[[SecretServer]] Event: [Secret] Action: [View] By User: K.Peters Item Name: ESXi root - esx-cl01 (Item Id: 5781) Container Name: Tier 0 - Infrastructure (Container Id: 162)  suid=1600 suser=K.Peters cs4=Kiara Peters cs4Label=suser Display Name src=10.20.5.68 rt=Sep 27 2026 01:29:14 fname=ESXi root - esx-cl01 fileType=Secret fileId=5781 cs3Label=Folder cs3=Tier 0 - Infrastructure", "provider": "secret", "type": ["info"]}, "host": {"name": "SECRET-SRV-01"}, "message": "[[SecretServer]] Event: [Secret] Action: [View] By User: K.Peters Item Name: ESXi root - esx-cl01 (Item Id: 5781) Container Name: Tier 0 - Infrastructure (Container Id: 162)", "observer": {"hostname": "SECRET-SRV-01", "product": "Secret Server", "vendor": "Thycotic Software", "version": "11.3.000001"}, "related": {"hosts": ["SECRET-SRV-01"], "ip": ["10.20.5.68"], "user": ["K.Peters"]}, "source": {"ip": "10.20.5.68"}, "thycotic_ss": {"event": {"secret": {"folder": "Tier 0 - Infrastructure", "id": "5781", "name": "ESXi root - esx-cl01"}, "time": "2026-09-27T01:29:14.000Z"}}, "user": {"full_name": "Kiara Peters", "id": "1600", "name": "K.Peters"}}
 ```
 
 ## References
