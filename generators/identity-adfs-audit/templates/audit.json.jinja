@@ -1,15 +1,21 @@
 {#- AD FS (Windows Server 2016+, basic audit level) Security-log audit
     events 1200/1201/1202/1203 of one federation server, as NXLog
-    im_msvistalog JSON records wrapped in ECS. Each one-second tick
-    emits at most one record: the earliest due one. Every user is an
-    independent random process (idle gap, fresh sign-in with occasional
-    wrong passwords, SSO token requests); the anomaly episode only
-    queues its own records for one idle user and never touches the
-    background. -#}
-{%- set now = timestamp.timestamp() | int -%}
+    im_msvistalog JSON records wrapped in ECS. The input sets the rate
+    and the hour-of-day curve; every timestamp becomes exactly one
+    record. Each timestamp takes the earliest due step of an open
+    sign-in (wrong passwords, the validated credential and its first
+    token first, then SSO tokens) and, when none is due, starts a new
+    sign-in of an idle user picked by activity weight. The anomaly
+    episode is one more sign-in of an idle user and runs through the
+    same queues. -#}
+{%- set ts = timestamp.replace(microsecond=0) -%}
+{%- set now = ts.timestamp() | int -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set window = 900 -%}
 {%- set min_fails = 5 -%}
+{#- An SSO token due more than this long ago is abandoned: the user
+    has left and the session's remaining tokens never come. -#}
+{%- set stale_token = 1800 -%}
 {#- Mistyped-password bursts: 1-8 failures, each extra failure about
     a third as likely; the chance of finally getting the password right
     falls by a quarter per failure, so bursts of five or more that end
@@ -33,24 +39,17 @@
 {%- set desktop_w = [30, 20, 10, 8, 6, 6, 0, 0] -%}
 {%- set mobile_w = [0, 0, 0, 0, 0, 0, 55, 45] -%}
 
+{#- Hour-of-day load, relative to the office-hours peak. It repeats the
+    rates of the patterns/*.yml input files and only places episode
+    starts and shapes SSO session length; the input alone sets the
+    event rate. -#}
 {%- macro hload(t) -%}
   {%- set h = ((t | int) // 3600) % 24 -%}
-  {{- 1.0 if 7 <= h < 17 else (0.5 if 6 <= h < 7 or 17 <= h < 19 else (0.3 if 19 <= h < 22 else 0.1)) -}}
+  {{- 1.0 if 7 <= h < 17 else (0.5 if 6 <= h < 7 or 17 <= h < 19 else (0.3 if 19 <= h < 22 else 0.1667)) -}}
 {%- endmacro -%}
 
 {%- macro gap(median, sigma, lo, hi) -%}
   {{- [[module.random.lognormvariate(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
-{%- endmacro -%}
-
-{#- Next fresh sign-in of an idle user: lognormal idle gaps thinned by
-    the hour-of-day load, so users mostly sign in during office hours. -#}
-{%- macro next_attempt(t0, w) -%}
-  {%- set s = namespace(t=t0) -%}
-  {%- for i in range(80) -%}
-    {%- set s.t = s.t + gap(8000 / w, 1.0, 60, 400000) | int -%}
-    {%- if module.random.random() < hload(s.t) | float -%}{%- break -%}{%- endif -%}
-  {%- endfor -%}
-  {{- s.t -}}
 {%- endmacro -%}
 
 {%- if not shared.get('initialized', false) -%}
@@ -65,7 +64,8 @@
     {%- do rpw.append(samples.relying_parties[i].weight) -%}
   {%- endfor -%}
   {%- set actors = [] -%}
-  {%- set heap = [] -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
   {%- for i in range(samples.users | length) -%}
     {%- set row = samples.users[i] -%}
     {%- set mine = [] -%}{%- set mw = [] -%}
@@ -76,48 +76,47 @@
     {%- endfor -%}
     {%- if not mine -%}{%- do mine.append(rps[0]) -%}{%- do mw.append(1.0) -%}{%- endif -%}
     {%- set homes = [] -%}{%- set hw = [] -%}
-    {%- for ip in row.home_ips -%}{%- do homes.append(ip) -%}{%- do hw.append(rnd.lognormvariate(0, 0.8)) -%}{%- endfor -%}
-    {%- set w = rnd.lognormvariate(0, 0.6) -%}
-    {%- set wake = next_attempt(now, w) | int -%}
+    {%- for ip in row.home_ips -%}{%- do homes.append(ip) -%}{%- do hw.append(rnd.uniform(0.5, 1.5)) -%}{%- endfor -%}
+    {#- Activity weight: log-normal, bounded to 0.5-2 so every user
+        signs in several times a week. -#}
+    {%- set w = [[rnd.lognormvariate(0, 0.6), 0.5] | max, 2.0] | min -%}
+    {%- set acc.w = acc.w + w -%}
+    {%- do cum.append(acc.w) -%}
     {%- do actors.append({'sam': row.sam, 'upn': row.upn, 'ws': row.workstation_ip,
         'homes': homes, 'hw': hw, 'rps': mine, 'rpw': mw, 'w': w,
-        'ext': rnd.choice([0.05, 0.15, 0.3, 0.5]),
+        'ext': rnd.choice([0.2, 0.3, 0.4, 0.5]),
         'desk': rnd.choices(range(agents | length), desktop_w)[0],
         'mob': rnd.choices(range(agents | length), mobile_w)[0],
-        'busy': false, 'wake': wake}) -%}
-    {%- do module.heapq.heappush(heap, [wake, i, {'k': 'wake', 'a': i}]) -%}
+        'busy': false}) -%}
   {%- endfor -%}
-  {%- do shared.update({'initialized': true, 'actors': actors,
-      'heap': heap, 'seq': actors | length, 'hist': {},
+  {%- do shared.update({'initialized': true, 'actors': actors, 'cum': cum,
+      'total': acc.w, 'hq': [], 'lq': [], 'seq': 0, 'hist': {},
       'record': module.random.randint(4000000, 90000000),
-      'start_at': none, 'last_user': none}) -%}
+      'scheduled': false, 'start_at': none, 'last_user': none}) -%}
 {%- endif -%}
 {%- set actors = shared.get('actors') -%}
-{%- set heap = shared.get('heap') -%}
 {%- set hist = shared.get('hist') -%}
 
-{%- macro push(at, item) -%}
+{#- Two queues of due steps: tight steps (wrong passwords, the
+    validated credential and its first token) go before SSO tokens. -#}
+{%- macro push(at, item, tight) -%}
   {%- set n = shared.get('seq') + 1 -%}
   {%- do shared.set('seq', n) -%}
-  {%- do module.heapq.heappush(heap, [at | int, n, item]) -%}
-{%- endmacro -%}
-
-{%- macro idle(a, t0) -%}
-  {%- set actor = actors[a] -%}
-  {%- set wake = next_attempt(t0, actor.w) | int -%}
-  {%- do actor.update({'busy': false, 'wake': wake}) -%}
-  {{- push(wake, {'k': 'wake', 'a': a}) -}}
+  {%- do module.heapq.heappush(shared.get('hq') if tight else shared.get('lq'), [at | int, n, item]) -%}
 {%- endmacro -%}
 
 {#- A sign-in plan: k credential failures (1203), then a validated
     credential (1202) and its token (1200), or nothing when the user
     gives up. The web SSO session then serves more tokens for the
-    user's relying parties at lognormal gaps. Burst gaps are seconds (a
-    mistyped password); a stale saved password retries every few tens
-    of minutes. Remote sign-ins come through the Web Application Proxy
+    user's relying parties at lognormal gaps; sessions run longer in
+    busy hours. Gaps are minimum delays: each step takes the first free
+    timestamp after its due time. Burst gaps are seconds (a mistyped
+    password); a stale saved password retries every few tens of
+    minutes. Remote sign-ins come through the Web Application Proxy
     from one of the user's home addresses, on a desktop or a phone. -#}
 {%- macro plan(a, k, final, is_stale, ep) -%}
   {%- set actor = actors[a] -%}
+  {%- do actor.update({'busy': true}) -%}
   {%- set gaps = [] -%}
   {%- for i in range(k) -%}
     {%- do gaps.append(gap(1200, 0.5, 60, 14400) | int if is_stale else gap(10, 0.7, 1, 75) | int) -%}
@@ -127,12 +126,12 @@
   {%- if ext and module.random.random() < 0.4 -%}{%- set ua = actor.mob -%}{%- endif -%}
   {%- set tokens = [[module.rand.weighted_choice([0, 1, 2], [25, 55, 20]),
       module.rand.weighted_choice(actor.rps, actor.rpw)]] -%}
-  {%- set tl = namespace(t=0) -%}
+  {%- set tl = namespace(t0=now + gaps | sum, t=now + gaps | sum) -%}
   {%- for i in range(14) -%}
-    {%- if module.random.random() >= 0.6 -%}{%- break -%}{%- endif -%}
+    {%- if module.random.random() >= 0.5 + 0.3 * (hload(tl.t) | float) -%}{%- break -%}{%- endif -%}
     {%- set g = gap(900, 1.1, 5, 28800) | int -%}
     {%- set tl.t = tl.t + g -%}
-    {%- if tl.t > 28800 -%}{%- break -%}{%- endif -%}
+    {%- if tl.t > tl.t0 + 28800 -%}{%- break -%}{%- endif -%}
     {%- do tokens.append([g, module.rand.weighted_choice(actor.rps, actor.rpw)]) -%}
   {%- endfor -%}
   {%- do shared.set('plan', {'a': a, 'k': k, 'i': 0, 'gaps': gaps,
@@ -141,8 +140,37 @@
       'tokens': tokens, 'ti': 0, 'aid': none}) -%}
 {%- endmacro -%}
 
+{#- Start a background sign-in of an idle user drawn by activity weight
+    (binary search over cumulative weights, busy users redrawn). -#}
+{%- macro start_signin() -%}
+  {%- set s = namespace(a=none) -%}
+  {%- set cum = shared.get('cum') -%}
+  {%- for _ in range(40) -%}
+    {%- set i = module.bisect.bisect_right(cum, module.random.random() * shared.get('total')) -%}
+    {%- if i < actors | length and not actors[i].busy -%}{%- set s.a = i -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if s.a is none -%}
+    {%- set o = module.random.randrange(actors | length) -%}
+    {%- for j in range(actors | length) -%}
+      {%- set i = (o + j) % (actors | length) -%}
+      {%- if s.a is none and not actors[i].busy -%}{%- set s.a = i -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {#- 91% of sign-ins are clean, 8% start with mistyped passwords,
+      1% come from a device with a stale saved password. -#}
+  {%- set r = module.random.random() -%}
+  {%- if r < 0.01 -%}
+    {{- plan(s.a, module.rand.weighted_choice(stale, stale_w), 'ok', true, false) -}}
+  {%- elif r < 0.09 -%}
+    {%- set k = module.rand.weighted_choice(burst, burst_w) -%}
+    {{- plan(s.a, k, 'ok' if module.random.random() < 0.92 * 0.75 ** (k - 1) else 'giveup', false, false) -}}
+  {%- else -%}
+    {{- plan(s.a, 0, 'ok', false, false) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
 {#- 1. Episode scheduling, by source time. The first start falls within
-    min(interval, 24 h) of the first tick, its hour drawn from the
+    min(interval, 24 h) of the first timestamp, its hour drawn from the
     background hour-of-day curve. Each later start is due one interval
     after the actual previous start and falls in a window of
     w = min(interval / 4, 6 h) centred on the due time, weighted by the
@@ -162,46 +190,30 @@
   {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
   {{- module.random.randint(slot[0], slot[1] - 1) -}}
 {%- endmacro -%}
-{%- if params.anomaly_mode and not shared.get('scheduled', false) -%}
+{%- if params.anomaly_mode and not shared.get('scheduled') -%}
   {%- do shared.update({'scheduled': true, 'start_at':
       pick_start(now, now + ([interval, 24] | min * 3600) | int, false) | int}) -%}
 {%- endif -%}
 {%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
   {#- Password guessing that succeeds from one of a user's usual
-      addresses: at least five failures, a validated credential and
+      addresses: five to eight failures, a validated credential and
       ordinary SSO token traffic. The user is drawn with the background
-      activity weights among idle users whose next own sign-in comes
-      after the episode and its window, so the episode never overlaps
-      or moves the user's own traffic; the previous episode's user sits
-      this one out. -#}
-  {%- if shared.get('ep_plan') is none -%}
-    {%- set k = module.rand.weighted_choice(burst[4:], burst_w[4:]) -%}
-    {{- plan(0, k, 'ok', false, true) -}}
-    {%- do shared.set('ep_plan', shared.get('plan')) -%}
-  {%- endif -%}
-  {%- set p = shared.get('ep_plan') -%}
-  {%- set tsum = namespace(t=0) -%}
-  {%- for tk in p.tokens -%}{%- set tsum.t = tsum.t + tk[0] -%}{%- endfor -%}
-  {%- set end = now + p.gaps | sum + tsum.t + 2 * window + 60 -%}
+      activity weights among users with no sign-in of their own in
+      progress, and the previous episode's user sits this one out; the
+      episode then holds the user busy exactly as a background sign-in
+      does. Address, device and relying parties follow the user's own
+      laws. -#}
   {%- set ep = namespace(c=[], w=[]) -%}
   {%- for i in range(actors | length) -%}
     {%- set actor = actors[i] -%}
-    {%- if not actor.busy and actor.wake > end and actor.sam != shared.get('last_user') -%}
+    {%- if not actor.busy and actor.sam != shared.get('last_user') -%}
       {%- set ep.c = ep.c + [i] -%}{%- set ep.w = ep.w + [actor.w] -%}
     {%- endif -%}
   {%- endfor -%}
   {%- if ep.c -%}
     {%- set a = module.rand.weighted_choice(ep.c, ep.w) -%}
-    {%- set ep_p = shared.get('ep_plan') -%}
-    {{- plan(a, ep_p.k, 'ok', false, true) -}}
-    {%- set p = shared.get('plan') -%}
-    {%- set tokens = [] -%}
-    {%- for tk in ep_p.tokens -%}
-      {%- do tokens.append([tk[0], module.rand.weighted_choice(actors[a].rps, actors[a].rpw)]) -%}
-    {%- endfor -%}
-    {%- do p.update({'gaps': ep_p.gaps, 'tokens': tokens}) -%}
-    {%- do shared.set('ep_plan', none) -%}
-    {{- push(now, {'k': 'fail', 'p': p}) -}}
+    {{- plan(a, module.rand.weighted_choice(burst[4:], burst_w[4:]), 'ok', false, true) -}}
+    {{- push(now, {'k': 'fail', 'p': shared.get('plan')}, true) -}}
     {%- set due = now + (interval * 3600) | int -%}
     {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
     {%- do shared.update({'last_user': actors[a].sam,
@@ -209,93 +221,88 @@
   {%- endif -%}
 {%- endif -%}
 
-{#- 2. Pop the earliest due item. A wake starts a background sign-in of
-    an idle user and queues its first record. -#}
+{#- 2. Take the earliest due tight step, else the earliest due SSO
+    token, else start a sign-in. An SSO token more than stale_token
+    late ends its session instead (the user has gone). -#}
+{%- set hq = shared.get('hq') -%}
+{%- set lq = shared.get('lq') -%}
 {%- set ns = namespace(item=none) -%}
-{%- for i in range(60) -%}
-  {%- if not heap or heap[0][0] > now -%}{%- break -%}{%- endif -%}
-  {%- set entry = module.heapq.heappop(heap) -%}
-  {%- set item = entry[2] -%}
-  {%- if item.k == 'wake' -%}
-    {%- set a = item.a -%}
-    {%- do actors[a].update({'busy': true}) -%}
-    {%- set r = module.random.random() -%}
-    {%- if r < 0.02 -%}
-      {{- plan(a, module.rand.weighted_choice(stale, stale_w), 'ok', true, false) -}}
-    {%- elif r < 0.14 -%}
-      {%- set k = module.rand.weighted_choice(burst, burst_w) -%}
-      {{- plan(a, k, 'ok' if module.random.random() < 0.92 * 0.75 ** (k - 1) else 'giveup', false, false) -}}
-    {%- else -%}
-      {{- plan(a, 0, 'ok', false, false) -}}
-    {%- endif -%}
-    {%- set p = shared.get('plan') -%}
-    {{- push(now, {'k': 'fail' if p.k > 0 else 'cred', 'p': p}) -}}
-  {%- else -%}
+{%- for _ in range(64) -%}
+  {%- if hq and hq[0][0] <= now -%}
+    {%- set item = module.heapq.heappop(hq)[2] -%}
     {%- set ns.item = item -%}{%- break -%}
+  {%- elif lq and lq[0][0] <= now -%}
+    {%- set entry = module.heapq.heappop(lq) -%}
+    {%- if now - entry[0] > stale_token -%}
+      {%- do actors[entry[2].p.a].update({'busy': false}) -%}
+    {%- else -%}
+      {%- set ns.item = entry[2] -%}{%- break -%}
+    {%- endif -%}
+  {%- else -%}{%- break -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if ns.item is none -%}{%- do dispatch.drop() -%}{%- endif -%}
+{%- if ns.item is none -%}
+  {{- start_signin() -}}
+  {%- set p = shared.get('plan') -%}
+  {%- set ns.item = {'k': 'fail' if p.k > 0 else 'cred', 'p': p} -%}
+{%- endif -%}
 
 {%- set p = ns.item.p -%}
 {%- set actor = actors[p.a] -%}
 {%- set key = actor.sam ~ '|' ~ p.ip -%}
 {%- set step = ns.item.k -%}
-{%- set h = hist.get(key, {'f': [], 's': []}) -%}
-{%- set hf = [] -%}{%- set hs = [] -%}
-{%- for t in h.f if t >= now - window -%}{%- do hf.append(t) -%}{%- endfor -%}
-{%- for t in h.s if t >= now - window -%}{%- do hs.append(t) -%}{%- endfor -%}
+{#- Failures and validated credentials of this user|address inside the
+    chain window, in order; nothing older can take part in a chain. -#}
+{%- set h = [] -%}
+{%- for r in hist.get(key, []) if r[0] >= now - window -%}{%- do h.append(r) -%}{%- endfor -%}
 {%- set rp = none -%}
 {%- set outcome_ok = true -%}
 
 {#- 3. Emit and queue the next record of this sign-in. -#}
 {%- if step == 'fail' -%}
-  {%- do hf.append(now) -%}
+  {%- do h.append([now, 1203]) -%}
   {%- do p.update({'i': p.i + 1}) -%}
   {%- set outcome_ok = false -%}
   {%- if p.i < p.k -%}
-    {{- push(now + p.gaps[p.i - 1], {'k': 'fail', 'p': p}) -}}
+    {{- push(now + p.gaps[p.i - 1], {'k': 'fail', 'p': p}, true) -}}
   {%- elif p.final == 'ok' -%}
-    {{- push(now + p.gaps[p.k - 1], {'k': 'cred', 'p': p}) -}}
+    {{- push(now + p.gaps[p.k - 1], {'k': 'cred', 'p': p}, true) -}}
   {%- else -%}
-    {{- idle(p.a, now) -}}
+    {%- do actor.update({'busy': false}) -%}
   {%- endif -%}
 {%- elif step == 'cred' -%}
-  {%- do hs.append(now) -%}
+  {%- if h -%}{%- do h.append([now, 1202]) -%}{%- endif -%}
   {%- do p.update({'aid': module.rand.crypto.uuid4()}) -%}
-  {{- push(now + p.tokens[0][0], {'k': 'token', 'p': p}) -}}
+  {{- push(now + p.tokens[0][0], {'k': 'token', 'p': p}, true) -}}
 {%- else -%}
   {%- set rp = p.tokens[p.ti][1] -%}
   {%- set aid = p.aid if p.ti == 0 else module.rand.crypto.uuid4() -%}
-  {#- The chain's own token is the step that completes it; ordinary
-      token failures apply to every other token. -#}
-  {%- set outcome_ok = (p.ep and p.ti == 0) or module.random.random() >= 0.02 -%}
-  {#- Background guard on the chain's final step, at its own time and
-      for its own relying party: a token that would complete five
-      failures, a validated credential and a token of one user|address
-      within the chain window (anchored at the first failure, as a
-      detector's) is denied (1201) instead. Outside the window nothing
-      changes. -#}
-  {%- if not p.ep and outcome_ok and hs -%}
-    {%- set g = namespace(i=none) -%}
-    {%- for i in range((hf | length) - 4) -%}
-      {%- if hf[i + 4] < hs[-1] -%}{%- set g.i = i -%}{%- endif -%}
+  {#- The episode's first token is the step that completes its chain;
+      the ordinary 2% token failures apply to every other token. -#}
+  {%- set completes = p.ep and p.ti == 0 -%}
+  {%- set outcome_ok = completes or module.random.random() >= 0.02 -%}
+  {#- Guard on the chain's final step, at its own time and for its own
+      relying party: any other token that would complete five failures,
+      a validated credential and a token of one user|address within the
+      chain window (anchored at a failure, as a detector's) is denied
+      (1201) instead. It covers background sign-ins and the episode's
+      own later tokens alike; outside the window nothing changes. -#}
+  {%- if outcome_ok and not completes and h -%}
+    {%- set g = namespace(f=0, c=false) -%}
+    {%- for r in h | reverse -%}
+      {%- if g.c and r[1] == 1203 -%}{%- set g.f = g.f + 1 -%}{%- endif -%}
+      {%- if r[1] == 1202 -%}{%- set g.c = true -%}{%- endif -%}
     {%- endfor -%}
-    {%- if g.i is not none -%}
-      {%- if now - hf[g.i] <= window -%}{%- set outcome_ok = false -%}{%- endif -%}
-    {%- endif -%}
-  {%- endif -%}
-  {%- if p.ep and p.ti == 0 -%}
-    {#- The chain consumed its failures (a detector resets on completion). -#}
-    {%- do hf.clear() -%}{%- do hs.clear() -%}
+    {%- if g.f >= min_fails -%}{%- set outcome_ok = false -%}{%- endif -%}
   {%- endif -%}
   {%- do p.update({'ti': p.ti + 1, 'cur_aid': aid}) -%}
   {%- if p.ti < p.tokens | length -%}
-    {{- push(now + p.tokens[p.ti][0], {'k': 'token', 'p': p}) -}}
-  {%- elif not p.ep -%}
-    {{- idle(p.a, now) -}}
+    {{- push(now + p.tokens[p.ti][0], {'k': 'token', 'p': p}, false) -}}
+  {%- else -%}
+    {%- do actor.update({'busy': false}) -%}
   {%- endif -%}
 {%- endif -%}
-{%- if hf or hs -%}{%- do hist.update({key: {'f': hf, 's': hs}}) -%}{%- else -%}{%- do hist.pop(key, none) -%}{%- endif -%}
+{%- if h -%}{%- do hist.update({key: h}) -%}{%- else -%}{%- do hist.pop(key, none) -%}{%- endif -%}
 
 {#- 4. Render. Security-log record numbers advance by one plus the
     other Security events written in between. -#}
@@ -381,8 +388,8 @@
     ~ '  </ContextComponents>' ~ nl
     ~ '</AuditBase>' -%}
 {%- set message = text ~ ' ' ~ nl ~ nl ~ 'Activity ID: ' ~ aid ~ ' ' ~ nl ~ nl ~ 'Additional Data ' ~ nl ~ 'XML: ' ~ xml -%}
-{%- set event_time = timestamp.strftime('%Y-%m-%d %H:%M:%S') -%}
-{%- set received = (timestamp + module.datetime.timedelta(seconds=module.rand.weighted_choice([0, 1, 2, 3], [20, 50, 25, 5]))).strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set event_time = ts.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set received = (ts + module.datetime.timedelta(seconds=module.rand.weighted_choice([0, 1, 2, 3], [20, 50, 25, 5]))).strftime('%Y-%m-%d %H:%M:%S') -%}
 {%- set native = {'EventTime': event_time, 'Hostname': params.host_name,
     'Keywords': -9178336040581070848 if success else -9182839640208441344,
     'EventType': 'AUDIT_SUCCESS' if success else 'AUDIT_FAILURE',
@@ -402,7 +409,7 @@
 {%- if a.fwd -%}{%- do audit.update({'forwarded_ip_address': a.fwd}) -%}{%- endif -%}
 {%- set action = {1200: 'token-issued', 1201: 'token-issue-failed',
     1202: 'credential-validated', 1203: 'credential-validation-failed'}[code] -%}
-{{ module.json.dumps({'@timestamp': timestamp.isoformat(),
+{{ module.json.dumps({'@timestamp': ts.isoformat(),
     'ecs': {'version': '8.17.0'},
     'event': {'kind': 'event', 'module': 'adfs', 'dataset': 'adfs.audit',
         'code': code | string, 'action': action, 'category': ['authentication'],
