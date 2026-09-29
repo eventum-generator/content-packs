@@ -28,7 +28,7 @@ The administrators, their desks, VPN addresses and activity weights are fixed pe
 
 ## Anomaly Chain
 
-One administrator fails WebUI login four times from one client, a few seconds to about a minute apart, then logs in successfully from that client. Minutes later, with delays drawn from the same distribution as ordinary configuration changes (limited to what fits in 30 minutes), the account modifies the `Log Service Configuration` and adds an `SSH Public Key`. The pattern fits a guessed administrator password followed by weakened logging and persistent shell access. Episodes last about 3 to 20 minutes.
+One administrator fails WebUI login four times from one client, a few seconds to about a minute apart, then logs in successfully from that client. Minutes later, with delays drawn from the same distribution as ordinary configuration changes (limited to what fits in 30 minutes), the account modifies the `Log Service Configuration` and adds an `SSH Public Key`. The pattern fits a guessed administrator password followed by weakened logging and persistent shell access. Episodes last about 3 to 30 minutes.
 
 Correlate the login records by `user.name`, `source.ip` and `host.name`. Configuration-change records include native `User` but no client IP or login session ID, so their association to the login is only by user, node and time, not a proven session join.
 
