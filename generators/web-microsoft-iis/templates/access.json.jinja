@@ -1,23 +1,32 @@
-{#- IIS 10.0 W3C access rows, 15-field profile. The input fires five
-    renders every 5 s; each render writes the earliest request due
-    before the end of that window, or is dropped when none is due.
-    Clients run independent random processes; an anomaly episode is one
-    more request plan in the same queue and changes no client state. -#}
+{#- IIS 10.0 W3C access rows, 15-field profile. Every input timestamp
+    yields exactly one row at that time. A queue holds the rows still to
+    come of running browsing sessions, scanner bursts, sensitive-area
+    visits and anomaly episodes; once due, a queued row takes over the
+    next non-monitor timestamp (page resources first). Otherwise a
+    `base` or `office` timestamp starts a new browsing session or
+    scanner burst of one client, drawn by activity weight: `base`
+    timestamps cover the around-the-clock share, `office` timestamps
+    the office-hours share of browser clients. `sens` and `sens_office`
+    timestamps start a work session of two to four sensitive-area
+    visits (/backup/, /admin/, /exports/, export downloads) of the
+    client whose turn is next. `monitor` timestamps are the uptime
+    monitor's polls. Times are epoch seconds. -#}
 {%- macro invalid(message) -%}
   {%- do module.operator.getitem({}, message) -%}
 {%- endmacro -%}
-{%- macro push(out, t, ci, k, p, s, ss=0, w=0, r='-', u='-', q='-', ep=false, n=0) -%}
-  {%- do out.append({'t': t, 'c': ci, 'k': k, 'p': p, 's': s, 'ss': ss, 'w': w, 'r': r, 'u': u, 'q': q, 'ep': ep, 'n': n}) -%}
-{%- endmacro -%}
+{%- set hq = module.heapq -%}
 {%- set rand = module.rand -%}
 {%- set num = module.rand.number -%}
 {%- set math = module.math -%}
 {%- set tz = module.datetime.timezone.utc -%}
-{%- set utc = timestamp.astimezone(tz) -%}
-{%- set T = utc.timestamp() -%}
-{%- set W = T + 5 -%}
+{%- set tf = timestamp.timestamp() -%}
+{%- set T = module.builtins.int(tf) -%}
+{%- set tag = tags[0] if tags else 'base' -%}
 {%- set site = 'https://intranet.contoso.example' -%}
 {%- set browsers = ['records', 'it', 'staff', 'mobile'] -%}
+{#- Chain window: /backup/ 404, /admin/ 403, /exports/ 403 and an
+    export download 200 from one c-ip within this many seconds. -#}
+{%- set window = 900 -%}
 {%- set page_paths = ['/Default.htm', '/news.htm', '/policies/handbook.htm', '/reports.htm', '/apps/directory.htm', '/it/servicedesk.htm'] -%}
 {%- set page_weights = [32, 22, 14, 14, 10, 8] -%}
 {%- set legacy_pages = ['/news.htm', '/policies/handbook.htm'] -%}
@@ -35,33 +44,46 @@
     403.14, D authenticated export download, X mistyped export 404,
     R retried export that is not generated yet. -#}
 {%- set plans = {
-  'records': [['D', 'DD', 'ED', 'EDD', 'AED', 'AD', 'BD', 'BED', 'AE', 'BA', 'BAE', 'B', 'A', 'EA', 'AB', 'XD'], [30, 12, 18, 6, 24, 6, 4, 3, 5, 5, 22, 4, 4, 3, 3, 6]],
-  'script': [['D', 'DD', 'DDD', 'ED', 'EDD', 'R', 'B', 'A', 'BA', 'AE', 'AED', 'AD', 'BD', 'BAE'], [32, 22, 8, 14, 6, 20, 4, 3, 2, 2, 10, 3, 3, 8]],
+  'records': [['D', 'DD', 'ED', 'EDD', 'AED', 'AD', 'BD', 'BED', 'AE', 'BA', 'BAE', 'B', 'A', 'EA', 'AB', 'XD'], [30, 12, 18, 6, 22, 10, 10, 7, 5, 7, 12, 3, 3, 3, 3, 6]],
+  'script': [['D', 'DD', 'DDD', 'ED', 'EDD', 'R', 'B', 'A', 'BA', 'AE', 'AED', 'AD', 'BD', 'BAE'], [32, 22, 8, 14, 6, 20, 3, 3, 2, 2, 10, 5, 8, 7]],
   'it': [['A', 'AA', 'BA', 'B', 'AE', 'BAE', 'E', 'EA'], [30, 15, 15, 10, 12, 26, 5, 5]],
   'staff': [['B', 'A', 'E', 'BA'], [40, 30, 30, 10]],
   'mobile': [['B', 'A', 'E', 'BA'], [40, 30, 30, 10]]
 } -%}
+{#- Browser activity by hour of the generator timezone (peak 1): the
+    hourly rate of patterns/web-floor.yml's browser share plus
+    patterns/web-office.yml. Browser clients act at this rate, scripts
+    and the scanner around the clock; episode starts are placed by it. -#}
+{%- set curve = [0.154, 0.154, 0.154, 0.155, 0.159, 0.177, 0.233, 0.351, 0.539, 0.757, 0.935, 1.0, 0.925, 0.745, 0.531, 0.351, 0.237, 0.181, 0.16, 0.155, 0.154, 0.154, 0.154, 0.154] -%}
+{#- Share of browser actions that start on `base` timestamps (the
+    overnight floor of the curve); the rest start on `office` ones. -#}
+{%- set floor_share = 0.427 -%}
 {%- set ipv4 = '((25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])\\.){3}(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])' -%}
-{%- macro gap(rate, t, diurnal) -%}
-  {#- Exponential gap for `rate` events per day, thinned by office hours
-      (bell around 11:30 UTC) for interactive clients. -#}
-  {%- set mean = 86400 / rate -%}
-  {%- if diurnal -%}
-    {%- set h = (t % 86400) / 3600 -%}
-    {%- set f = 0.15 + 0.85 * math.exp(-(((h - 11.5) / 3.2) ** 2)) -%}
-    {%- set mean = mean * 0.351 / f -%}
+{#- Queued rows. Static assets, the favicon and touch icons that a page
+    view pulls in ride with that page's row and are queued in `tight`
+    only once the page is written, at the same offsets from it; they
+    take the next timestamps before any other due row. The rest go to
+    `queue`. -#}
+{%- macro push(t, ci, k, p, s, ss=0, w=0, r='-', u='-', q='-', ep=false, n=0) -%}
+  {%- if k in ['S', 'F', 'I'] -%}
+    {%- set page = shared.get('lastp') -%}
+    {%- do page.fu.append([t - page.t0, {'c': ci, 'k': k, 'p': p, 's': s, 'ss': ss, 'w': w, 'r': r, 'u': u, 'q': q, 'ep': ep, 'n': n, 'fu': []}]) -%}
+  {%- else -%}
+    {%- set seq = shared.get('seq') + 1 -%}
+    {%- set item = {'c': ci, 'k': k, 'p': p, 's': s, 'ss': ss, 'w': w, 'r': r, 'u': u, 'q': q, 'ep': ep, 'n': n, 'fu': [], 't0': t} -%}
+    {%- do shared.update({'seq': seq, 'lastp': item}) -%}
+    {%- do hq.heappush(shared.get('queue'), [t, seq, item]) -%}
   {%- endif -%}
-  {{- num.exponential(1 / mean) -}}
 {%- endmacro -%}
 {%- macro draw_start(a, b, squared) -%}
   {#- Episode start in [a, b) on a one-minute grid, weighted by the
-      office-hours curve (first start) or its square plus a floor
-      (later starts, centred on the due time). -#}
+      activity curve (first start) or its square plus a floor (later
+      starts, centred on the due time). -#}
   {%- set n = [((b - a) / 60) | int, 1] | max -%}
+  {%- set off = shared.get('tzoff') -%}
   {%- set weights = [] -%}
   {%- for i in range(n) -%}
-    {%- set h = ((a + i * 60 + 30) % 86400) / 3600 -%}
-    {%- set f = 0.15 + 0.85 * math.exp(-(((h - 11.5) / 3.2) ** 2)) -%}
+    {%- set f = curve[(((a + i * 60 + 30 + off) % 86400) / 3600) | int] -%}
     {%- do weights.append(f * f + 0.05 if squared else f) -%}
   {%- endfor -%}
   {%- set i = rand.weighted_choice(range(n) | list, weights) -%}
@@ -70,34 +92,76 @@
 {%- macro step_gap() -%}
   {{- 2 + num.lognormal(math.log(18), 0.8) -}}
 {%- endmacro -%}
-{%- macro sens(out, t, ci, c, ch, f, ep=false, n=0) -%}
+{%- macro sens(t, ci, c, ch, f, ep=false, n=0) -%}
   {%- if ch == 'B' -%}
-    {{- push(out, t, ci, 'B', '/backup/', 404, 0, 2, ep=ep, n=n) -}}
+    {{- push(t, ci, 'B', '/backup/', 404, 0, 2, ep=ep, n=n) -}}
   {%- elif ch == 'A' -%}
-    {{- push(out, t, ci, 'A', '/admin/', 403, 14, 0, ep=ep, n=n) -}}
+    {{- push(t, ci, 'A', '/admin/', 403, 14, 0, ep=ep, n=n) -}}
   {%- elif ch == 'E' -%}
-    {{- push(out, t, ci, 'E', '/exports/', 403, 14, 0, ep=ep, n=n) -}}
+    {{- push(t, ci, 'E', '/exports/', 403, 14, 0, ep=ep, n=n) -}}
   {%- elif ch == 'D' -%}
     {%- if c.role in browsers and rand.chance(0.6) -%}
       {#- A browser download follows the link on /reports.htm: the page
           view (and its revalidated assets) comes first, a few seconds
           before the download that names it as referer. -#}
-      {{- push(out, t, ci, 'P', '/reports.htm', 304 if rand.chance(0.3) else 200) -}}
+      {{- push(t, ci, 'P', '/reports.htm', 304 if rand.chance(0.3) else 200) -}}
       {%- for asset in assets -%}
         {%- if rand.chance(0.35) -%}
-          {{- push(out, t + num.floating(0.05, 1.8), ci, 'S', asset, 304 if rand.chance(0.8) else 200, r=site ~ '/reports.htm') -}}
+          {{- push(t + num.floating(0.05, 1.8), ci, 'S', asset, 304 if rand.chance(0.8) else 200, r=site ~ '/reports.htm') -}}
         {%- endif -%}
       {%- endfor -%}
-      {{- push(out, t + num.floating(3, 20), ci, 'D', '/exports/' ~ f, 200, 0, 0, site ~ '/reports.htm', c.user, ep=ep, n=n) -}}
+      {{- push(t + num.floating(3, 20), ci, 'D', '/exports/' ~ f, 200, 0, 0, site ~ '/reports.htm', c.user, ep=ep, n=n) -}}
     {%- else -%}
-      {{- push(out, t, ci, 'D', '/exports/' ~ f, 200, 0, 0, '-', c.user, ep=ep, n=n) -}}
+      {{- push(t, ci, 'D', '/exports/' ~ f, 200, 0, 0, '-', c.user, ep=ep, n=n) -}}
     {%- endif -%}
   {%- elif ch == 'X' -%}
     {%- set stem = f.rsplit('.', 1)[0] -%}
-    {{- push(out, t, ci, 'X', '/exports/' ~ rand.choice([stem, stem ~ '.txt', stem ~ '-old.' ~ f.rsplit('.', 1)[1]]), 404, 0, 2) -}}
+    {{- push(t, ci, 'X', '/exports/' ~ rand.choice([stem, stem ~ '.txt', stem ~ '-old.' ~ f.rsplit('.', 1)[1]]), 404, 0, 2) -}}
   {%- elif ch == 'M' -%}
-    {{- push(out, t, ci, 'M', '/exports/' ~ f, 404, 0, 2) -}}
+    {{- push(t, ci, 'M', '/exports/' ~ f, 404, 0, 2) -}}
   {%- endif -%}
+{%- endmacro -%}
+{%- macro visit(tf, ci, c) -%}
+  {#- One sensitive-area visit of client `ci` starting at `tf`: a plan
+      drawn from its role's pool, or a retry of an export that is not
+      generated yet. Records users and script hosts often start from
+      the old /backup/ location of the exports (a stale bookmark or a
+      script's legacy path first), which now answers 404; a visit that
+      goes through both /admin/ and /exports/ starts from the portal
+      link instead. -#}
+  {%- set pool = plans[c.role] -%}
+  {%- set plan = rand.weighted_choice(pool[0], pool[1]) -%}
+  {%- if c.role in ['records', 'script'] and plan != 'R' and 'B' not in plan and 'AE' not in plan and rand.chance(0.3) -%}
+    {%- set plan = 'B' ~ plan -%}
+  {%- endif -%}
+  {%- set st = namespace(t=tf, i=0, go=true) -%}
+  {%- set order = rand.shuffle(c.files) if c.files else [] -%}
+  {%- if plan == 'R' -%}
+    {%- set f = rand.choice(c.files) -%}
+    {%- for _ in range(5) if st.go -%}
+      {{- sens(st.t, ci, c, 'M', f) -}}
+      {%- set st.t = st.t + 20 + num.lognormal(math.log(60), 0.5) -%}
+      {%- set st.go = rand.chance(0.5) -%}
+    {%- endfor -%}
+    {%- if rand.chance(0.75) -%}
+      {{- sens(st.t, ci, c, 'D', f) -}}
+    {%- endif -%}
+  {%- else -%}
+    {%- for ch in plan -%}
+      {%- if not loop.first -%}
+        {%- set st.t = st.t + step_gap() | float -%}
+      {%- endif -%}
+      {%- if ch in 'DX' -%}
+        {{- sens(st.t, ci, c, ch, order[st.i % (order | length)]) -}}
+        {%- if ch == 'D' -%}
+          {%- set st.i = st.i + 1 -%}
+        {%- endif -%}
+      {%- else -%}
+        {{- sens(st.t, ci, c, ch, none) -}}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- do shared.set('vend', st.t) -%}
 {%- endmacro -%}
 {%- if shared.get('clients') is none -%}
   {%- if params.anomaly_mode is not boolean -%}
@@ -117,6 +181,13 @@
   {%- endif -%}
   {%- set clients = [] -%}
   {%- set eligible = [] -%}
+  {%- set monitors = [] -%}
+  {#- Action tables: [client, kind] entries with cumulative weights for
+      `base` and `office` timestamps (browsing sessions and scanner
+      bursts, kind b) and `sens` and `sens_office` timestamps
+      (sensitive-area visits, kind s). -#}
+  {%- set tables = {'base': [[], []], 'office': [[], []], 'sens': [[], []], 'sens_office': [[], []]} -%}
+  {%- set acc = {'base': 0, 'office': 0, 'sens': 0, 'sens_office': 0} -%}
   {%- for row in samples.clients -%}
     {%- if row.role not in ['monitor', 'scanner', 'script', 'records', 'it', 'staff', 'mobile'] -%}
       {{- invalid('client role is not supported') -}}
@@ -136,226 +207,234 @@
     {%- if (row.role in ['script', 'records']) != (files | length > 0) or (files and not module.re.fullmatch('[A-Z0-9]+\\\\[A-Za-z0-9._-]+', row.account)) -%}
       {{- invalid('script and records clients need export files and a DOMAIN\\user account') -}}
     {%- endif -%}
-    {%- set browse = row.sessions_per_day -%}
-    {%- set sensitive = row.sensitive_per_day -%}
+    {%- set ci = clients | length -%}
     {%- if files -%}
-      {%- do eligible.append(clients | length) -%}
+      {%- do eligible.append(ci) -%}
+    {%- endif -%}
+    {%- if row.role == 'monitor' -%}
+      {%- do monitors.append(ci) -%}
+    {%- else -%}
+      {%- for kind, rate in [['b', row.sessions_per_day], ['s', row.sensitive_per_day]] if rate > 0 -%}
+        {%- set floor_t, office_t = ('base', 'office') if kind == 'b' else ('sens', 'sens_office') -%}
+        {%- if row.role in browsers -%}
+          {%- do acc.update({floor_t: acc[floor_t] + rate * floor_share}) -%}
+          {%- do tables[floor_t][0].append([ci, kind]) -%}
+          {%- do tables[floor_t][1].append(acc[floor_t]) -%}
+          {%- do acc.update({office_t: acc[office_t] + rate * (1 - floor_share)}) -%}
+          {%- do tables[office_t][0].append([ci, kind]) -%}
+          {%- do tables[office_t][1].append(acc[office_t]) -%}
+        {%- else -%}
+          {%- do acc.update({floor_t: acc[floor_t] + rate}) -%}
+          {%- do tables[floor_t][0].append([ci, kind]) -%}
+          {%- do tables[floor_t][1].append(acc[floor_t]) -%}
+        {%- endif -%}
+      {%- endfor -%}
     {%- endif -%}
     {%- do clients.append({
       'ip': row.ip, 'ua': row.user_agent, 'user': row.account, 'role': row.role,
-      'files': files, 'browse': browse, 'sensitive': sensitive,
-      'nb': T + (gap(browse, T, row.role in browsers) | float if browse > 0 else 0),
-      'ns': T + (gap(sensitive, T, row.role in browsers) | float if sensitive > 0 else 0),
-      'parts': []
+      'files': files, 'sensitive': row.sensitive_per_day, 'parts': []
     }) -%}
   {%- endfor -%}
+  {%- if not tables.base[0] -%}
+    {{- invalid('the client roster needs at least one browsing or scanning client') -}}
+  {%- endif -%}
+  {%- if not tables.office[0] -%}
+    {%- do tables.update({'office': tables.base}) -%}
+  {%- endif -%}
+  {%- if not tables.sens_office[0] -%}
+    {%- do tables.update({'sens_office': tables.sens}) -%}
+  {%- endif -%}
+  {#- Work-session turns: each client's sessions on `sens` and
+      `sens_office` timestamps follow its own renewal process, a heap of
+      [next turn, client, weight] entries whose gaps are gamma
+      distributed (shape 4) in proportion to 1 / weight, so a client
+      works in the sensitive area at a steady pace with random gaps
+      rather than in Poisson clumps. -#}
+  {%- set turns = {} -%}
+  {%- for name in ['sens', 'sens_office'] -%}
+    {%- set heap = [] -%}
+    {%- set prev = namespace(acc=0) -%}
+    {%- for entry in tables[name][0] -%}
+      {%- set w = tables[name][1][loop.index0] - prev.acc -%}
+      {%- set prev.acc = tables[name][1][loop.index0] -%}
+      {%- if w > 0 -%}
+        {%- do hq.heappush(heap, [num.floating(0, 1) / w, entry[0], w]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do turns.update({name: heap}) -%}
+  {%- endfor -%}
+  {%- if not turns.sens_office -%}
+    {%- do turns.update({'sens_office': turns.sens}) -%}
+  {%- endif -%}
   {%- if params.anomaly_mode and eligible | length < 2 -%}
     {{- invalid('anomaly_mode needs at least two clients with export files') -}}
   {%- endif -%}
+  {%- set iv = ([params.anomaly_interval_hours, 3] | max) * 3600 -%}
   {%- do shared.update({
-    'clients': clients, 'eligible': eligible, 'queue': [], 'last_window': none,
-    'interval_s': ([params.anomaly_interval_hours, 3] | max) * 3600,
-    'ep_next': draw_start(T, T + ([[params.anomaly_interval_hours, 3] | max, 24] | min) * 3600, false) | float,
-    'ep': none, 'ep_client': none, 'ep_file': none
+    'clients': clients, 'eligible': eligible, 'monitors': monitors,
+    'tables': tables, 'turns': turns, 'queue': [], 'tight': [], 'seq': 0,
+    'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()),
+    'interval_s': iv, 'ep': none, 'ep_client': none, 'ep_file': none
   }) -%}
+  {%- do shared.set('ep_next', draw_start(T, T + ([iv, 86400] | min), false) | float) -%}
 {%- endif -%}
 {%- set clients = shared.get('clients') -%}
-{#- Planning happens once per window, before any row of it is written,
-    so rows stay in timestamp order. -#}
-{%- if shared.get('last_window') != T -%}
-  {%- do shared.set('last_window', T) -%}
-  {%- set new = [] -%}
-  {%- for c in clients -%}
-    {%- set ci = loop.index0 -%}
-    {%- set diurnal = c.role in browsers -%}
-    {%- if c.browse > 0 and c.nb < W -%}
-      {%- set start = [c.nb, T - 5] | max -%}
-      {%- if c.role == 'monitor' -%}
-        {{- push(new, start, ci, 'API', '/api/status', 200, q='site=main') -}}
-        {%- do c.update({'nb': start + num.lognormal(math.log(86400 / c.browse), 0.3)}) -%}
-      {%- elif c.role == 'scanner' -%}
-        {%- set st = namespace(t=start) -%}
+{%- set queue = shared.get('queue') -%}
+{%- set monitors = shared.get('monitors') -%}
+{%- if tag == 'monitor' and monitors -%}
+  {%- set it = {'c': rand.choice(monitors), 'k': 'API', 'p': '/api/status', 's': 200, 'ss': 0, 'w': 0, 'r': '-', 'u': '-', 'q': 'site=main', 'ep': false, 'n': 0, 'fu': []} -%}
+{%- else -%}
+  {#- A `sens` or `sens_office` timestamp starts a work session in the
+      sensitive area of the client whose turn is next: a user's sitting over
+      the reports area or one run of a script's job, with one or more
+      visits (two to four) a minute or a few apart. Its first row is
+      due at once and takes this timestamp unless page resources are due
+      first. -#}
+  {%- set heap = shared.get('turns')[tag] if tag in ['sens', 'sens_office'] else none -%}
+  {%- if heap -%}
+    {%- set turn = hq.heappop(heap) -%}
+    {%- do hq.heappush(heap, [turn[0] + module.random.gammavariate(4, 0.25) / turn[2], turn[1], turn[2]]) -%}
+    {%- set ci = turn[1] -%}
+    {%- set ws = namespace(t=tf) -%}
+    {%- for _ in range(num.integer(2, 4)) -%}
+      {{- visit(ws.t, ci, clients[ci]) -}}
+      {%- set ws.t = shared.get('vend') + 20 + num.lognormal(math.log(90), 0.9) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set tight = shared.get('tight') -%}
+  {%- if tight and tight[0][0] <= tf -%}
+    {%- set it = hq.heappop(tight)[2] -%}
+  {%- elif queue and queue[0][0] <= tf -%}
+    {%- set it = hq.heappop(queue)[2] -%}
+  {%- else -%}
+    {#- Nothing due: start a new action of a client drawn by activity
+        weight (binary search over the cumulative weights). -#}
+    {%- set go = namespace(done=false) -%}
+    {#- Episode: the first timestamp at or after its drawn start on
+        which nothing is due starts it instead of a background action;
+        its remaining rows take over timestamps like any other queued
+        row. The actor rotates among the clients with export files,
+        weighted by their current sensitive-area activity (browser
+        clients follow the curve, scripts do not); the file differs from
+        the previous episode's when possible. The episode adds to the
+        actor's ordinary traffic and takes nothing over from it. -#}
+    {%- if params.anomaly_mode and shared.get('ep') is none and tf >= shared.get('ep_next') -%}
+      {%- set last = shared.get('ep_client') -%}
+      {%- set candidates = shared.get('eligible') | reject('equalto', last) | list -%}
+      {%- set f_now = curve[(((T + shared.get('tzoff')) % 86400) / 3600) | int] / 0.361 -%}
+      {%- set weights = [] -%}
+      {%- for i in candidates -%}
+        {%- do weights.append(clients[i].sensitive * (f_now if clients[i].role in browsers else 1)) -%}
+      {%- endfor -%}
+      {%- set ci = rand.weighted_choice(candidates, weights) -%}
+      {%- set c = clients[ci] -%}
+      {%- set files = c.files | reject('equalto', shared.get('ep_file')) | list or c.files -%}
+      {%- set f = rand.choice(files) -%}
+      {%- set st = namespace(t=tf) -%}
+      {%- for ch in 'BAED' -%}
+        {%- if not loop.first -%}
+          {%- set st.t = st.t + step_gap() | float -%}
+        {%- endif -%}
+        {{- sens(st.t, ci, c, ch, f, true, loop.index) -}}
+      {%- endfor -%}
+      {%- do shared.update({'ep': ci, 'ep_client': ci, 'ep_file': f}) -%}
+      {%- set go.done = true -%}
+    {%- endif -%}
+    {%- if not go.done -%}
+      {%- set table = shared.get('tables').office if tag in ['office', 'sens_office'] else shared.get('tables').base -%}
+      {%- set pick = table[0][module.bisect.bisect_right(table[1], num.floating(0, table[1][-1]))] if table[1][-1] > 0 else table[0][0] -%}
+      {%- set ci = pick[0] -%}
+      {%- set c = clients[ci] -%}
+      {%- if pick[1] == 'b' and c.role == 'scanner' -%}
+        {%- set st = namespace(t=tf) -%}
         {%- for probe in rand.shuffle(probes)[:num.integer(8, 15)] -%}
-          {{- push(new, st.t, ci, 'Q', probe[0], probe[1], probe[2], probe[3]) -}}
+          {{- push(st.t, ci, 'Q', probe[0], probe[1], probe[2], probe[3]) -}}
           {%- set st.t = st.t + 0.3 + num.lognormal(math.log(2.5), 0.8) -%}
         {%- endfor -%}
-        {%- do c.update({'nb': st.t + gap(c.browse, st.t, false) | float}) -%}
-      {%- else -%}
-        {%- set st = namespace(t=start, go=true, first=true, prev=none) -%}
-        {%- for _ in range(12) -%}
-          {%- if st.go -%}
-            {%- set ref = site ~ st.prev if st.prev else '-' -%}
-            {%- if st.prev in legacy_pages and rand.chance(0.25) -%}
-              {#- A stale link on a legacy page: IIS answers with its
-                  static error page, which references no assets. -#}
-              {{- push(new, st.t, ci, 'L', rand.choice(broken_links), 404, 0, 2, ref) -}}
-            {%- else -%}
-              {%- set page = rand.weighted_choice(page_paths, page_weights) -%}
-              {{- push(new, st.t, ci, 'P', page, 304 if not st.first and rand.chance(0.2) else 200, r=ref) -}}
-              {%- for asset in assets -%}
-                {%- if rand.chance(0.9 if st.first else 0.2) -%}
-                  {{- push(new, st.t + num.floating(0.05, 1.8), ci, 'S', asset, 304 if rand.chance(0.35 if st.first else 0.8) else 200, r=site ~ page) -}}
-                {%- endif -%}
-              {%- endfor -%}
-              {%- if page in legacy_pages and rand.chance(0.8) -%}
-                {{- push(new, st.t + num.floating(0.3, 2.5), ci, 'F', '/favicon-old.ico', 404, 0, 2) -}}
-              {%- endif -%}
-              {%- if c.role == 'mobile' and rand.chance(0.6) -%}
-                {%- set icon_t = st.t + num.floating(0.5, 3.0) -%}
-                {{- push(new, icon_t, ci, 'I', '/apple-touch-icon-precomposed.png', 404, 0, 2) -}}
-                {{- push(new, icon_t + num.floating(0.1, 0.6), ci, 'I', '/apple-touch-icon.png', 404, 0, 2) -}}
-              {%- endif -%}
-              {%- set st.prev = page -%}
-            {%- endif -%}
-            {%- set st.first = false -%}
-            {%- set st.go = rand.chance(0.55) -%}
-            {%- if st.go -%}
-              {%- set st.t = st.t + 3 + num.lognormal(math.log(30), 1.0) -%}
-            {%- endif -%}
-          {%- endif -%}
-        {%- endfor -%}
-        {%- do c.update({'nb': st.t + 3 + gap(c.browse, st.t, diurnal) | float}) -%}
-      {%- endif -%}
-    {%- endif -%}
-    {%- if c.sensitive > 0 and c.ns < W -%}
-      {%- set start = [c.ns, T - 5] | max -%}
-      {%- set pool = plans[c.role] -%}
-      {%- set plan = rand.weighted_choice(pool[0], pool[1]) -%}
-      {%- set st = namespace(t=start, i=0) -%}
-      {%- set order = rand.shuffle(c.files) if c.files else [] -%}
-      {%- if plan == 'R' -%}
-        {%- set f = rand.choice(c.files) -%}
-        {%- set rt = namespace(go=true) -%}
-        {%- for _ in range(5) -%}
-          {%- if rt.go -%}
-            {{- sens(new, st.t, ci, c, 'M', f) -}}
-            {%- set st.t = st.t + 20 + num.lognormal(math.log(60), 0.5) -%}
-            {%- set rt.go = rand.chance(0.5) -%}
-          {%- endif -%}
-        {%- endfor -%}
-        {%- if rand.chance(0.75) -%}
-          {{- sens(new, st.t, ci, c, 'D', f) -}}
-        {%- endif -%}
-      {%- else -%}
-        {%- for ch in plan -%}
-          {%- if not loop.first -%}
-            {%- set st.t = st.t + step_gap() | float -%}
-          {%- endif -%}
-          {%- if ch in 'DX' -%}
-            {{- sens(new, st.t, ci, c, ch, order[st.i % (order | length)]) -}}
-            {%- if ch == 'D' -%}
-              {%- set st.i = st.i + 1 -%}
-            {%- endif -%}
+      {%- elif pick[1] == 'b' -%}
+        {%- set st = namespace(t=tf, go=true, first=true, prev=none) -%}
+        {%- for _ in range(12) if st.go -%}
+          {%- set ref = site ~ st.prev if st.prev else '-' -%}
+          {%- if st.prev in legacy_pages and rand.chance(0.25) -%}
+            {#- A stale link on a legacy page: IIS answers with its static
+                error page, which references no assets. -#}
+            {{- push(st.t, ci, 'L', rand.choice(broken_links), 404, 0, 2, ref) -}}
           {%- else -%}
-            {{- sens(new, st.t, ci, c, ch, none) -}}
-          {%- endif -%}
-        {%- endfor -%}
-      {%- endif -%}
-      {%- do c.update({'ns': st.t + gap(c.sensitive, st.t, diurnal) | float}) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {#- Episode: begins at its drawn start time (see draw_start), rotates
-      client and export file. -#}
-  {%- if params.anomaly_mode and shared.get('ep') is none and shared.get('ep_next') < W -%}
-    {%- set last = shared.get('ep_client') -%}
-    {%- set candidates = shared.get('eligible') | reject('equalto', last) | list -%}
-    {#- Actors are weighted by their current activity, so office-hours
-        clients rarely act at night and script hosts carry those
-        episodes, as in their ordinary traffic. -#}
-    {%- set h = (T % 86400) / 3600 -%}
-    {%- set f_now = 0.15 + 0.85 * math.exp(-(((h - 11.5) / 3.2) ** 2)) -%}
-    {%- set weights = [] -%}
-    {%- for i in candidates -%}
-      {%- do weights.append(clients[i].sensitive * (f_now / 0.351 if clients[i].role in browsers else 1)) -%}
-    {%- endfor -%}
-    {%- set ci = rand.weighted_choice(candidates, weights) -%}
-    {%- set c = clients[ci] -%}
-    {%- set files = c.files | reject('equalto', shared.get('ep_file')) | list or c.files -%}
-    {%- set f = rand.choice(files) -%}
-    {%- set st = namespace(t=[shared.get('ep_next'), T] | max) -%}
-    {%- for ch in 'BAED' -%}
-      {%- if not loop.first -%}
-        {%- set st.t = st.t + step_gap() | float -%}
-      {%- endif -%}
-      {{- sens(new, st.t, ci, c, ch, f, true, loop.index) -}}
-    {%- endfor -%}
-    {%- do shared.update({'ep': ci, 'ep_client': ci, 'ep_file': f}) -%}
-  {%- endif -%}
-  {%- if new -%}
-    {%- do shared.set('queue', (shared.get('queue') + new) | sort(attribute='t')) -%}
-  {%- endif -%}
-{%- endif -%}
-{#- Write the earliest due request. Each client carries the partial
-    /backup/ 404 -> /admin/ 403 -> /exports/ 403 sequences of its
-    written rows, as a sequence matcher keyed by c-ip sees them (every
-    row, episode rows included; a completion resets the client). An
-    ordinary download that would complete one within 15 minutes of its
-    /backup/ row is not written; nothing else changes. -#}
-{%- set queue = shared.get('queue') -%}
-{%- set out = namespace(item=none, sec=0) -%}
-{%- for _ in range(8) -%}
-  {%- if out.item is none and queue and queue[0].t < W -%}
-    {%- set it = queue.pop(0) -%}
-    {%- set sec = ([it.t, T] | max) | int -%}
-    {%- set c = clients[it.c] -%}
-    {%- if it.p == '/backup/' and it.s == 404 -%}
-      {%- set step = 0 -%}
-    {%- elif it.p == '/admin/' and it.s == 403 -%}
-      {%- set step = 1 -%}
-    {%- elif it.p == '/exports/' and it.s == 403 -%}
-      {%- set step = 2 -%}
-    {%- elif it.p.startswith('/exports/') and it.p | length > 9 and it.s == 200 -%}
-      {%- set step = 3 -%}
-    {%- else -%}
-      {%- set step = none -%}
-    {%- endif -%}
-    {%- set parts = c.parts | selectattr(1, 'ge', sec - 900) | list -%}
-    {%- if step == 3 and not it.ep and parts | selectattr(0, 'equalto', 3) | list -%}
-      {#- guard: the download is not written -#}
-    {%- else -%}
-      {%- if step is not none -%}
-        {%- set m = namespace(new=[], done=false) -%}
-        {%- for p in parts -%}
-          {%- if not m.done -%}
-            {%- if p[0] == step and step == 3 -%}
-              {%- set m.done = true -%}
-            {%- elif p[0] == step -%}
-              {%- do m.new.append([step + 1, p[1]]) -%}
-            {%- else -%}
-              {%- do m.new.append(p) -%}
+            {%- set page = rand.weighted_choice(page_paths, page_weights) -%}
+            {{- push(st.t, ci, 'P', page, 304 if not st.first and rand.chance(0.2) else 200, r=ref) -}}
+            {%- for asset in assets -%}
+              {%- if rand.chance(0.9 if st.first else 0.2) -%}
+                {{- push(st.t + num.floating(0.05, 1.8), ci, 'S', asset, 304 if rand.chance(0.35 if st.first else 0.8) else 200, r=site ~ page) -}}
+              {%- endif -%}
+            {%- endfor -%}
+            {%- if page in legacy_pages and rand.chance(0.8) -%}
+              {{- push(st.t + num.floating(0.3, 2.5), ci, 'F', '/favicon-old.ico', 404, 0, 2) -}}
             {%- endif -%}
+            {%- if c.role == 'mobile' and rand.chance(0.6) -%}
+              {%- set icon_t = st.t + num.floating(0.5, 3.0) -%}
+              {{- push(icon_t, ci, 'I', '/apple-touch-icon-precomposed.png', 404, 0, 2) -}}
+              {{- push(icon_t + num.floating(0.1, 0.6), ci, 'I', '/apple-touch-icon.png', 404, 0, 2) -}}
+            {%- endif -%}
+            {%- set st.prev = page -%}
+          {%- endif -%}
+          {%- set st.first = false -%}
+          {%- set st.go = rand.chance(0.55) -%}
+          {%- if st.go -%}
+            {%- set st.t = st.t + 3 + num.lognormal(math.log(30), 1.0) -%}
           {%- endif -%}
         {%- endfor -%}
-        {%- if m.done -%}
-          {%- do c.update({'parts': []}) -%}
-        {%- else -%}
-          {%- if step == 0 -%}
-            {%- do m.new.append([1, sec]) -%}
-          {%- endif -%}
-          {%- do c.update({'parts': m.new[-8:]}) -%}
-        {%- endif -%}
       {%- endif -%}
-      {%- set out.item = it -%}
-      {%- set out.sec = sec -%}
     {%- endif -%}
+    {%- set it = hq.heappop(queue)[2] -%}
   {%- endif -%}
-{%- endfor -%}
-{%- if out.item is none -%}
-  {%- do dispatch.drop() -%}
-{%- endif -%}
-{%- set it = out.item -%}
-{%- set c = clients[it.c] -%}
-{%- if it.ep -%}
-  {%- if it.n == 1 -%}
-    {#- Next due one interval after this actual start; the start is
-        drawn within [due - w/2, due + w/2], w = min(interval / 4, 6 h). -#}
+  {#- Guard. Each client keeps its partial /backup/ 404 -> /admin/ 403
+      -> /exports/ 403 sequences over every written row, episode rows
+      included, as a sequence matcher keyed by c-ip sees them; a
+      partial expires `window` seconds after its /backup/ row and a
+      completion does not reset it. An ordinary download that would
+      complete one is answered 404 0 2 instead (the export is not
+      there), at the same time and path; nothing else changes. -#}
+  {%- for dt, fu in it.fu -%}
+    {%- set seq = shared.get('seq') + 1 -%}
+    {%- do shared.set('seq', seq) -%}
+    {%- do hq.heappush(tight, [tf + dt, seq, fu]) -%}
+  {%- endfor -%}
+  {%- set c = clients[it.c] -%}
+  {%- if it.s == 404 and it.p == '/backup/' -%}
+    {%- set step = 0 -%}
+  {%- elif it.s == 403 and it.p == '/admin/' -%}
+    {%- set step = 1 -%}
+  {%- elif it.s == 403 and it.p == '/exports/' -%}
+    {%- set step = 2 -%}
+  {%- elif it.s == 200 and it.k == 'D' -%}
+    {%- set step = 3 -%}
+  {%- else -%}
+    {%- set step = none -%}
+  {%- endif -%}
+  {%- if step is not none -%}
+    {%- set parts = c.parts | selectattr(0, 'ge', T - window) | list -%}
+    {%- if step == 0 -%}
+      {%- do parts.append([T, 1]) -%}
+    {%- elif step < 3 -%}
+      {%- for p in parts if p[1] == step -%}
+        {%- do module.operator.setitem(p, 1, step + 1) -%}
+      {%- endfor -%}
+    {%- elif not it.ep and parts | selectattr(1, 'equalto', 3) | list | length -%}
+      {%- set it = dict(it, k='M', s=404, ss=0, w=2, u='-') -%}
+    {%- endif -%}
+    {%- do c.update({'parts': parts[-16:]}) -%}
+  {%- endif -%}
+  {%- if it.ep and it.n == 1 -%}
+    {#- Next due one interval after this actual start; the start is drawn
+        within [due - w/2, due + w/2], w = min(interval / 4, 6 h). -#}
     {%- set iv = shared.get('interval_s') -%}
     {%- set half = ([iv / 4, 21600] | min) / 2 -%}
-    {%- do shared.set('ep_next', draw_start(out.sec + iv - half, out.sec + iv + half, true) | float) -%}
-  {%- elif it.n == 4 -%}
+    {%- do shared.set('ep_next', draw_start(T + iv - half, T + iv + half, true) | float) -%}
+  {%- elif it.ep and it.n == 4 -%}
     {%- do shared.set('ep', none) -%}
   {%- endif -%}
 {%- endif -%}
+{%- set c = clients[it.c] -%}
 {%- set k = it.k -%}
 {%- if k == 'D' -%}
   {%- set tt_mu, tt_sigma = 160, 0.9 -%}
@@ -373,7 +452,7 @@
   {%- set tt_mu, tt_sigma = 1.8, 0.6 -%}
 {%- endif -%}
 {%- set time_taken = num.lognormal(math.log(tt_mu), tt_sigma) | round | int -%}
-{%- set when = module.datetime.datetime.fromtimestamp(out.sec, tz) -%}
+{%- set when = module.datetime.datetime.fromtimestamp(T, tz) -%}
 {%- set fields = [
   when.strftime('%Y-%m-%d'), when.strftime('%H:%M:%S'),
   params.server_ip, 'GET', it.p, it.q, params.server_port,

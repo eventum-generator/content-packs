@@ -18,36 +18,53 @@ The field selection is explicit. Microsoft documents that 2026 Windows updates a
 
 ## Traffic Model
 
-`samples/clients.json` lists 24 clients. Each one runs its own random processes; no client follows a fixed period, order or script:
+`samples/clients.json` lists 353 clients. Each one acts on its own random schedule; no client follows a fixed period, order or script:
 
-- **Monitor** `10.20.9.30` (curl) polls `/api/status?site=main` roughly once a minute with a random gap.
-- **Workstations** browse in sessions of one or more page views. A first view loads the page and most static assets within two seconds; later views mostly revalidate them with `304`. Later page views carry the previous page as referer. Two legacy pages link a missing `/favicon-old.ico` and stale URLs, which produce `404 0 2`. iPhone clients also request the two `apple-touch-icon` files, which do not exist.
-- **Records users** (HR, finance and two remote users) and **script hosts** (`CONTOSO\svc-reports` with curl, `CONTOSO\svc-etl` with PowerShell) download files from `/exports/` with their own Windows accounts. They also try the `/exports/` listing, `/admin/` and the old `/backup/` path in random combinations and orders. A browser download that carries `/reports.htm` as referer (about 60%) is preceded by a view of that page, and some of its assets, 3-20 seconds earlier; other downloads have no referer. Script hosts retry exports that are not generated yet (`404 0 2`, then `200`), and records users occasionally mistype a file name.
-- **IT staff** open `/admin/` and `/backup/`, sometimes followed by `/exports/`.
+- **Monitor** `10.20.9.30` (curl) polls `/api/status?site=main` once a minute, within about 15 seconds of the middle of the minute.
+- **Workstations** (280 office PCs and 60 iPhones) browse in sessions of one or more page views. A first view loads the page and most static assets; later views mostly revalidate them with `304`. Later page views carry the previous page as referer. Two legacy pages link a missing `/favicon-old.ico` and stale URLs, which produce `404 0 2`. iPhone clients also request the two `apple-touch-icon` files, which do not exist. Rarely a workstation tries `/backup/`, `/admin/` or `/exports/`.
+- **Records users** (seven HR and finance users, two of them remote) and **script hosts** (`CONTOSO\svc-reports` with curl, `CONTOSO\svc-etl` with PowerShell) download files from `/exports/` with their own Windows accounts. They also try the `/exports/` listing, `/admin/` and the old `/backup/` path in random combinations and orders; about a third of their visits that do not go through both `/admin/` and `/exports/` start at the old `/backup/` location (a stale bookmark, a script's legacy path). A browser download that carries `/reports.htm` as referer (about 60%) is preceded by a view of that page and some of its assets; other downloads have no referer. Script hosts retry exports that are not generated yet (`404 0 2`, then usually `200`), and records users occasionally mistype a file name.
+- **IT staff** (two) browse and open `/admin/` and `/backup/`, sometimes followed by `/exports/`.
 - **Scanner** `10.20.9.15` (Nmap Scripting Engine) runs a few bursts a day over a shuffled subset of common probe paths.
 
-Interactive clients follow office hours (peak around 11:30 UTC, about 15% of the peak rate at night); the monitor, scanner and script hosts do not. The input fires five renders every five seconds, so the site writes at most five requests in any five-second window. All weights and rates are synthetic workload values, not measured IIS traffic.
+Records users, script hosts and IT staff work in `/backup/`, `/admin/` and `/exports/` in sittings of two to four visits a minute or a few apart. Each client's sittings come at a steady pace with random gaps rather than in clumps: about 14 visits a day per records user, 36 per script host and 10 per IT staff member.
+
+All weights and rates are synthetic workload values, not measured IIS traffic.
+
+## Volume and Timing
+
+The site writes about 23,200 requests a day (21,900-24,400; each day varies by up to ±10%). Browser traffic follows one office-hours curve peaking around 11:30 UTC; the monitor, the scanner, the script hosts and part of the records users' work run around the clock. Mean request rate by hour of day, UTC:
+
+| Hours (UTC) | Requests per second |
+| --- | ---: |
+| 18:00-04:59 | 0.12-0.13 |
+| 05:00-07:59 | 0.14-0.26 |
+| 08:00-09:59 | 0.39-0.54 |
+| 10:00-12:59 | 0.66-0.71 |
+| 13:00-14:59 | 0.54-0.39 |
+| 15:00-17:59 | 0.26-0.15 |
+
+Sittings in the sensitive area (about 66 a day, two to four visits each) follow the same curve: about two thirds are spread evenly over the day, one third follows the office-hours bell. The monitor's polls are about 6% of all requests.
 
 ## Event Types
 
-Shares were measured over six 48-hour `anomaly_mode: false` runs with default parameters (2,596-2,907 requests per day). Every row is `event.category: web`, `event.type: access`; `event.outcome` is `failure` for status 400 and above.
+Shares over 14 days of `anomaly_mode: false` traffic with default parameters. Every row is `event.category: web`, `event.type: access`; `event.outcome` is `failure` for status 400 and above.
 
 | Request | Share | Status | Outcome |
 | --- | --- | --- | --- |
-| Monitor `/api/status?site=main` | 49.8% | `200 0 0` | success |
-| Page (`/Default.htm`, `/news.htm`, `/reports.htm`, ...) | 10.9% | `200 0 0` | success |
-| Static asset (`/DeptLogo.gif`, `/styles/site.css`, `/scripts/site.js`) | 10.2% | `200 0 0` | success |
-| Static asset revalidation | 9.1% | `304 0 0` | success |
-| Authenticated `/exports/<file>` download | 4.6% | `200 0 0` | success |
-| Legacy `/favicon-old.ico` | 3.2% | `404 0 2` | failure |
-| Scanner probe | 2.3% | `404 0 2`, `403 14 0` or `200 0 0` | mixed |
-| `/admin/` directory | 2.2% | `403 14 0` | failure |
-| `/exports/` directory | 2.1% | `403 14 0` | failure |
-| Page revalidation | 1.6% | `304 0 0` | success |
-| iPhone `apple-touch-icon` files | 1.3% | `404 0 2` | failure |
-| `/backup/` (removed path) | 1.2% | `404 0 2` | failure |
-| Export retry or mistyped file | 0.9% | `404 0 2` | failure |
-| Stale link from a legacy page | 0.6% | `404 0 2` | failure |
+| Static asset (`/DeptLogo.gif`, `/styles/site.css`, `/scripts/site.js`) | 26.7% | `200 0 0` | success |
+| Page (`/Default.htm`, `/news.htm`, `/reports.htm`, ...) | 26.7% | `200 0 0` | success |
+| Static asset revalidation | 20.9% | `304 0 0` | success |
+| Legacy `/favicon-old.ico` | 8.6% | `404 0 2` | failure |
+| Monitor `/api/status?site=main` | 6.2% | `200 0 0` | success |
+| iPhone `apple-touch-icon` files | 4.0% | `404 0 2` | failure |
+| Page revalidation | 3.2% | `304 0 0` | success |
+| Stale link from a legacy page | 1.7% | `404 0 2` | failure |
+| Authenticated `/exports/<file>` download | 0.62% | `200 0 0` | success |
+| `/backup/` (removed path) | 0.34% | `404 0 2` | failure |
+| `/admin/` directory | 0.33% | `403 14 0` | failure |
+| `/exports/` directory | 0.33% | `403 14 0` | failure |
+| Scanner probe | 0.28% | `404 0 2`, `403 14 0` or `200 0 0` | mixed |
+| Export not there yet, mistyped or withheld | 0.20% | `404 0 2` | failure |
 
 ## Anomaly Chain
 
@@ -58,15 +75,19 @@ Shares were measured over six 48-hour `anomaly_mode: false` runs with default pa
 3. `GET /exports/` returns `403 14 0`.
 4. `GET /exports/<file>` returns `200 0 0` with the client's Windows account in `cs-username`.
 
-The requests link through `c-ip` and time only; the chosen W3C profile has no request or session identifier. Gaps between the steps come from the same distribution as ordinary sensitive-area activity (a few seconds to a few minutes), and episodes are typically under three minutes: 21-139 s in the 20 validation episodes. The gaps have no upper bound, so a longer episode is possible.
+The requests link through `c-ip` and time only; the chosen W3C profile has no request or session identifier. Gaps between the steps follow the same distribution as ordinary sensitive-area visits, and a browser episode download that names `/reports.htm` as referer is preceded by that page view, as in ordinary traffic. An episode typically lasts one to three minutes; the gaps have no upper bound, so a longer one is possible.
 
-Recurrence runs on generated timestamps, so fast sample generation keeps the same event-time schedule. The first episode starts within the first `anomaly_interval_hours` (at most 24 hours) of generated time, at a moment drawn in proportion to the office-hours curve of the background. Each later episode is due one interval after the previous actual start and begins within a window centred on that due time, `w = min(interval / 4, 6 h)` wide (±45 minutes at the default 6 hours), at a moment weighted by the square of the office-hours curve plus a small floor, so episodes lean towards busy hours without a fixed clock time. There is no catch-up queue: at most one episode is pending, and an episode never overlaps the next. The default interval is 6 hours; values below 3 hours are treated as 3 hours. The floor exists because every episode adds four sensitive-area requests: at intervals of 1-2 hours they measurably raise the `/backup/` share and the night-time sensitive activity of the episode clients compared with the same background without episodes.
+The episode's requests come on top of the client's ordinary traffic: its sessions, downloads and sensitive-area sittings before and after an episode are the same as without it, and the daily request volume does not change with `anomaly_mode`.
 
-Each episode picks a records user or script host other than the previous episode's actor, weighted by that client's current activity, so office-hours users rarely act at night and script hosts carry most night episodes, and one of that client's own export files, different from the previous episode's file when the client has another. The episode uses that client's address, User-Agent and account, and it does not pause or shift the client's ordinary traffic.
+Recurrence follows event time. The first episode starts within the first `anomaly_interval_hours` (at most 24 hours), at a moment drawn in proportion to the browser hour curve. Each later episode is due one interval after the previous actual start and begins within a window centred on that due time, `w = min(interval / 4, 6 h)` wide (±45 minutes at the default 6 hours), at a moment weighted by the square of the hour curve plus a small floor, so episodes lean towards busy hours without a fixed clock time. Missed episodes are not made up and episodes never overlap. At the default interval of 6 hours consecutive starts are 5.3-6.8 hours apart. Values below 3 hours are treated as 3 hours: every episode adds four sensitive-area requests, and at intervals of 1-2 hours they visibly raise the `/backup/` share and the night-time sensitive activity of the episode clients.
 
-Every step, and every partial sequence of the chain, also occurs in ordinary traffic of both modes, from the same clients: over five 48-hour default runs the background held about 19 `/backup/` -> `/admin/` -> `/exports/` and 17 `/admin/` -> `/exports/` -> download sequences per day within 15 minutes, 186 same-client sensitive-area pairs under 10 minutes and 32 runs of three consecutive client errors. What background never contains is the complete ordered sequence ending in a download within 15 minutes of the `/backup/` request from one client. The generator tracks each client's own requests exactly as such a detection would (every row of that `c-ip`, episode rows included) and does not write an ordinary download that would complete the sequence inside that window; no other request is moved, delayed or given to another client. Across seven 48-hour off runs, complete ordinary sequences occurred 0 times within 15 minutes, 30 times between 15 and 30 minutes (shortest 903 s), 52 times between 30 and 60 minutes and 50 times between 1 and 2 hours. Downloads by other clients after such a partial sequence continue at the same rate on both sides of the 15-minute mark (about 5 per hour). A detection can therefore correlate `/backup/` 404, `/admin/` 403.14 and `/exports/` 403.14 followed by a successful export download from the same `c-ip` within 15 minutes. The access row does not show how the client obtained its access or how many bytes it downloaded. The correlation assumes IIS sees the client directly; behind a load balancer, `c-ip` can be the proxy address unless a forwarded-client field is logged.
+Each episode picks a records user or script host other than the previous episode's actor, weighted by that client's current sensitive-area activity, so office-hours users rarely act at night and script hosts carry most night episodes, and one of that client's own export files, different from the previous episode's file when the client has another. The episode uses that client's address, User-Agent and account.
 
-Set `anomaly_mode: false` to generate only background. The episode requests are omitted; the clients, accounts, paths, User-Agents and status combinations of the chain still occur independently.
+Every step, and every partial sequence of the chain, also occurs in ordinary traffic of both modes, from the same clients. Per day, ordinary traffic holds about 32 (21-40) `/backup/` -> `/admin/` -> `/exports/` sequences within 15 minutes from one client, about 45 `/admin/` -> download, 68 `/exports/` -> download and 71 `/backup/` -> download pairs within 15 minutes, and every records user and script host makes each step of the chain in its ordinary traffic; most of them also produce each step pair within two days, but for a given client a particular pair can be absent from a two-day period. With `anomaly_mode: true` each episode adds its own requests, so counts of the chain parts (each step, each step pair, the three-step opening) are about one per episode higher: about 8 more per 48 hours at the default interval and 12 more at a 4-hour interval. Runs of three or more failed requests from one client within 15 minutes rise by about 1.5 per episode.
+
+What ordinary traffic never contains is the complete ordered sequence ending in a successful download within 15 minutes of the `/backup/` request from one client. An ordinary download that would complete it returns `404 0 2` (the export is withheld), at the same time and path, about 27 times a day (19-38); a retry of the episode's own file right after an episode is answered the same way. A detection can therefore correlate `/backup/` 404, `/admin/` 403.14 and `/exports/` 403.14 followed by a successful export download from the same `c-ip` within 15 minutes. The access row does not show how the client obtained its access or how many bytes it downloaded. The correlation assumes IIS sees the client directly; behind a load balancer, `c-ip` can be the proxy address unless a forwarded-client field is logged.
+
+Set `anomaly_mode: false` to generate only ordinary traffic. The episode requests are omitted; the clients, accounts, paths, User-Agents and status combinations of the chain still occur independently.
 
 ## Parameters
 
@@ -82,7 +103,7 @@ Edit `event.template.params` in `generator.yml`:
 | `anomaly_interval_hours` | `6` | Hours between episode starts; values below 3 are treated as 3 |
 | `anomaly_mode` | `true` | Add the recurring four-request episodes |
 
-Clients, accounts, User-Agents, export files and per-client rates live in `samples/clients.json`. The template validates parameters and the roster on the first render; an invalid value aborts rendering with a message, visible with `-vv`, and produces no events.
+Clients, accounts, User-Agents, export files and each client's share of browsing sessions and sensitive-area visits live in `samples/clients.json`. Invalid parameters or roster entries stop generation with a message, visible with `-vv`, before any event is written.
 
 ### Output Parameters
 
@@ -102,33 +123,39 @@ output:
 
 ## Usage
 
-From the content-packs repository root:
+Live generation at the configured rate, from the content-packs repository root:
 
 ```bash
 eventum generate --path generators/web-microsoft-iis/generator.yml --id web-microsoft-iis --live-mode true
 ```
 
-For a fast finite sample, copy `generator.yml` to a file in the same directory, add `start` and `end` to its `input[0].cron` entry, and run the copy with `--live-mode false`. Stateful ordering relies on `--keep-order true`:
+Batch generation: set `start` and `end` of the `oscillator` in all five `patterns/*.yml` files to the same range, with `start` at 00:00 UTC so the office-hours curve stays in place (for example `start: "2026-09-01T00:00:00Z"` and `end: "2026-09-03T00:00:00Z"`), then run:
 
 ```bash
-eventum generate --path generators/web-microsoft-iis/finite.yml --id web-microsoft-iis --live-mode false --keep-order true
+eventum generate --path generators/web-microsoft-iis/generator.yml --id web-microsoft-iis --live-mode false --keep-order true
 ```
+
+To change the volume, scale the `ratio` of `patterns/web-floor.yml` and `patterns/web-office.yml` by the same factor; `patterns/sens-floor.yml` and `patterns/sens-office.yml` set the number of sensitive-area sittings a day. Lower ratios stretch the seconds between a page and its assets. Episode start hours follow the shipped office-hours curve even if the patterns are reshaped.
+
+Performance: about 3,800 events per second in batch mode on one core (14 days, 330,601 events, in 87 s on a shared, loaded machine).
 
 ## Limits
 
 - JSON events with one W3C data row each, not a native IIS file with `#Software`, `#Version`, `#Date` and `#Fields` headers. The chosen 15 fields must be configured on IIS; on some builds updated since February 2026 the default set includes `sc-bytes` and `cs-bytes`.
 - Timestamps have one-second resolution, as in the native row, so `@timestamp` never carries a fraction.
+- Requests a browser sends together are seconds apart instead of milliseconds: a page's static assets follow it after a median of 5-6 s (90% within about 23 s, up to about 2.5 minutes at night), and a referer download follows its `/reports.htm` view after a median of 12-16 s (90% within about 45 s).
 - Windows authentication is shown only as the account on successful export downloads; the anonymous `401 2 5` challenge that precedes it on a real server is not modeled, and directory probes are anonymous.
-- The monitor polls about once a minute with a random gap (16-204 s) rather than on an exact interval, and interactive rates follow one UTC office-hours curve.
-- The skipped-download rule covers exactly 15 minutes from the `/backup/` request: a detector with a longer window finds ordinary B-A-E-download sequences (about 2 per day between 15 and 30 minutes, about 4 per day between 30 and 60 minutes and about 4 per day between 1 and 2 hours).
+- The monitor polls on a one-minute schedule with a few seconds of jitter (gaps of about 43-78 s), and all interactive clients follow one UTC office-hours curve.
+- Within 15 minutes after a client's `/backup/` 404, `/admin/` 403 and `/exports/` 403, that client's ordinary export downloads return `404 0 2` (about 27 a day); later ones succeed, so a detection window longer than 15 minutes finds ordinary complete sequences (about 2-3 a day completed between 15 and 30 minutes).
+- With `anomaly_mode: true` each episode adds its own four requests, so counts of the chain parts are about one per episode higher than with `false`.
 - Clients, pages, files and rates are synthetic scenario assumptions rather than Microsoft-published traffic.
 
 ## Sample Output
 
-An episode download (step 4, without a referer), copied from a default-parameter validation run:
+An episode download (step 4, with the `/reports.htm` referer):
 
 ```json
-{"@timestamp": "2026-09-25T09:24:43+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": "success", "duration": 409000000, "original": "2026-09-25 09:24:43 10.20.0.10 GET /exports/payroll.csv - 443 CONTOSO\\svc-etl 10.20.5.22 Mozilla/5.0+(Windows+NT+10.0;+Microsoft+Windows+10.0.20348;+en-US)+PowerShell/7.4.6 - 200 0 0 409"}, "host": {"name": "WEB-IIS-01", "ip": "10.20.0.10"}, "source": {"ip": "10.20.5.22"}, "destination": {"ip": "10.20.0.10", "port": 443}, "http": {"request": {"method": "GET"}, "response": {"status_code": 200}}, "url": {"path": "/exports/payroll.csv"}, "user_agent": {"original": "Mozilla/5.0 (Windows NT 10.0; Microsoft Windows 10.0.20348; en-US) PowerShell/7.4.6"}, "iis": {"access": {"sub_status": 0, "win32_status": 0}}, "user": {"name": "CONTOSO\\svc-etl"}}
+{"@timestamp": "2026-09-02T09:21:15+00:00", "ecs": {"version": "8.17.0"}, "event": {"kind": "event", "module": "iis", "dataset": "iis.access", "category": ["web"], "type": ["access"], "action": "http_request", "outcome": "success", "duration": 223000000, "original": "2026-09-02 09:21:15 10.20.0.10 GET /exports/ap-aging.csv - 443 CONTOSO\\tgarcia 10.20.2.44 Mozilla/5.0+(Windows+NT+10.0;+Win64;+x64;+rv:152.0)+Gecko/20100101+Firefox/152.0 https://intranet.contoso.example/reports.htm 200 0 0 223"}, "host": {"name": "WEB-IIS-01", "ip": "10.20.0.10"}, "source": {"ip": "10.20.2.44"}, "destination": {"ip": "10.20.0.10", "port": 443}, "http": {"request": {"method": "GET"}, "response": {"status_code": 200}}, "url": {"path": "/exports/ap-aging.csv"}, "user_agent": {"original": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:152.0) Gecko/20100101 Firefox/152.0"}, "iis": {"access": {"sub_status": 0, "win32_status": 0}}, "user": {"name": "CONTOSO\\tgarcia"}}
 ```
 
 ## References
