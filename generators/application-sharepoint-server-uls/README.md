@@ -68,7 +68,7 @@ Edit `event.template.params` in `generator.yml`:
 | --- | --- | --- |
 | `anomaly_mode` | `true` | Include the anomaly chain; `false` produces ordinary traffic only |
 | `anomaly_interval_hours` | `24` | Hours from one episode start to the next due time (6 to 8760) |
-| `web_app_url` | `https://portal.contoso.test` | Web application URL (scheme and host) in request names and ECS `url.*` |
+| `web_app_url` | `https://portal.contoso.test` | HTTPS web application URL (scheme and host) in request names and ECS `url.*`; requests always carry port 443 |
 | `wfe_hosts` | `[sp-wfe-01, sp-wfe-02]` | The two web front ends that run `w3wp.exe` |
 | `app_host` | `sp-app-01` | Application server that runs `OWSTIMER.EXE` |
 
