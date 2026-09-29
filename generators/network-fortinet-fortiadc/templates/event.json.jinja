@@ -1,31 +1,38 @@
 {#- One FortiADC HTTP virtual server balancing a web application over
-    a pool of real servers. Every one-second tick emits at most one
-    traffic/slb_http record: the earliest due request of any open
-    client session, otherwise nothing. Clients start sessions as
-    independent random processes; the anomaly episode is one extra
-    session built by the same code. -#}
-{%- set now = timestamp.timestamp() | int -%}
+    a pool of real servers. Every input timestamp emits one
+    traffic/slb_http record. Timestamps come in two populations
+    (tags): `users` for the browser sessions of office users and
+    administrators, `services` for the service scripts. A timestamp
+    emits the earliest due request of a running session of its
+    population; when none is due it starts the anomaly episode (users
+    only, when one is due) or a new session of a random idle client of
+    the population and emits its first request. A session's next
+    request is due a drawn gap after its previous one was logged; a
+    due /admin reload or retry goes before other due requests. -#}
+{%- set now = timestamp.timestamp() -%}
+{%- set now_s = now | int -%}
+{%- set pop = 'services' if 'services' in tags else 'users' -%}
+{%- set heapq = module.heapq -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set servers = params.real_servers -%}
 {#- Detector window of the chain (first /admin 404 to the /admin 200),
     shared by the background guard on the final step. -#}
 {%- set chain_s = 900 -%}
-{#- Relative request load by UTC hour; the mean over a day is 0.9. -#}
-{%- set curve = [0.25, 0.2, 0.2, 0.2, 0.25, 0.35, 0.6, 1.1, 1.6, 1.8, 1.8, 1.7,
-    1.5, 1.7, 1.8, 1.7, 1.5, 1.1, 0.7, 0.5, 0.4, 0.35, 0.3, 0.28] -%}
-{%- set lmax = 1.8 -%}
-{%- set load = curve[timestamp.astimezone(utc).hour] -%}
+{#- Relative request rate of the users population by UTC hour, the
+    sum of the bands in patterns/users-*.yml (episode placement). -#}
+{%- set curve = [0.2, 0.2, 0.2, 0.2, 0.2, 0.2, 0.6, 1.2, 1.8, 1.8, 1.8, 1.8,
+    1.8, 1.8, 1.8, 1.8, 1.8, 1.2, 0.6, 0.6, 0.2, 0.2, 0.2, 0.2] -%}
 {%- set paths = ['/', '/index.html', '/assets/app.js', '/assets/app.css',
     '/assets/logo.png', '/favicon.ico', '/api/items', '/api/items/search',
     '/api/orders', '/login', '/logout', '/admin'] -%}
 {%- set path_weights = {
     'user': [6, 3, 12, 10, 7, 3, 18, 8, 9, 4, 1.5, 0.8],
-    'admin': [6, 3, 12, 10, 7, 3, 18, 8, 9, 4, 1.5, 7],
+    'admin': [6, 3, 12, 10, 7, 3, 18, 8, 9, 4, 1.5, 25],
     'service': [3, 0, 0, 0, 0, 0, 40, 20, 25, 5, 0, 1]} -%}
 {%- set admin_status = {
     'user': ([200, 302, 403, 404], [8, 7, 45, 40]),
-    'admin': ([200, 302, 403, 404], [70, 12, 9, 9]),
+    'admin': ([200, 302, 403, 404], [64, 12, 12, 12]),
     'service': ([200, 403, 404], [5, 50, 45])} -%}
 {%- set search_terms = ['cable', 'adapter', 'monitor', 'laptop', 'toner',
     'headset', 'dock', 'keyboard', 'router', 'ssd'] -%}
@@ -52,40 +59,12 @@
 {{- [[module.rand.number.lognormal(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
 {%- endmacro -%}
 
-{%- if not shared.get('initialized', false) -%}
-  {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- set clients = [] -%}
-  {%- for i in range(samples.clients | length) -%}
-    {%- set row = samples.clients[i] -%}
-    {%- do clients.append({'ip': row.ip, 'role': row.role, 'ua': row.agent,
-        'next': now + module.rand.number.exponential(params.sessions_per_client_day * lmax / 86400) | int}) -%}
-  {%- endfor -%}
-  {%- do shared.update({'initialized': true, 'clients': clients, 'queue': [],
-      'q_min': none, 'a_min': clients | map(attribute='next') | min,
-      'busy': {}, 'partial': {}, 'seq': 0,
-      'msg_id': module.rand.number.integer(8890000000000000, 8899999999999999),
-      'start_at': pick_time(now, now + ([interval, 24] | min * 3600) | int, false) | int,
-      'last_chain_client': none}) -%}
-{%- endif -%}
-{%- set queue = shared.get('queue') -%}
-{%- set busy = shared.get('busy') -%}
-
-{%- macro add(rec) -%}
-  {%- do shared.set('seq', shared.get('seq') + 1) -%}
-  {%- do rec.update({'n': shared.get('seq')}) -%}
-  {%- do queue.append(rec) -%}
-  {%- if shared.get('q_min') is none or rec.due < shared.get('q_min') -%}
-    {%- do shared.set('q_min', rec.due) -%}
-  {%- endif -%}
-{%- endmacro -%}
-
-{#- A complete client session planned at its start. Every /admin
-    request is followed by another one with probability 0.3 (a
-    reload or retry). The episode inserts one such run with fixed
-    outcomes 404, 403, 200 on three different real servers. -#}
-{%- macro plan(ci, t0, ep=false) -%}
-  {%- set cl = shared.get('clients')[ci] -%}
-  {%- set browser = cl.role != 'service' -%}
+{#- A client session of the role: its requests (/admin followed by
+    another /admin, a reload or retry, with probability 0.3) and the
+    gap before each, left in shared `_items`. An episode session
+    turns one /admin run into the chain: outcomes 404, 403, 200 on
+    three different real servers. -#}
+{%- macro draw(role, ep=false) -%}
   {#- Sessions come from one model. An episode redraws the session
       until it holds an /admin request (a session of the client that
       touches /admin anyway), then turns one of its /admin runs,
@@ -97,7 +76,7 @@
       {%- set n = [[module.rand.number.lognormal(module.math.log(9), 1.0) | int, 1] | max, 150] | min -%}
       {%- set items = [] -%}
       {%- for i in range(n) -%}
-        {%- set p = module.rand.weighted_choice(paths, path_weights[cl.role]) -%}
+        {%- set p = module.rand.weighted_choice(paths, path_weights[role]) -%}
         {%- do items.append({'path': p, 'retry': false}) -%}
         {%- if p == '/admin' -%}
           {%- set run = namespace(go=true) -%}
@@ -119,9 +98,9 @@
   {%- set items = sess.items -%}
   {%- if ep -%}
     {%- set order = module.random.sample(range(servers | length), 3) -%}
-    {%- set forced = [{'path': '/admin', 'retry': false, 'status': 404, 'rs': order[0]},
+    {%- set forced = [{'path': '/admin', 'retry': false, 'status': 404, 'rs': order[0], 'head': true},
         {'path': '/admin', 'retry': true, 'status': 403, 'rs': order[1]},
-        {'path': '/admin', 'retry': true, 'status': 200, 'rs': order[2]}] -%}
+        {'path': '/admin', 'retry': true, 'status': 200, 'rs': order[2], 'final': true}] -%}
     {%- if module.rand.chance(0.3) -%}
       {%- do forced.append({'path': '/admin', 'retry': true}) -%}
     {%- endif -%}
@@ -140,20 +119,76 @@
     {%- endif -%}
     {%- for f in forced | reverse -%}{%- do items.insert(j, f) -%}{%- endfor -%}
   {%- endif -%}
-  {%- set s = namespace(t=t0, port=module.rand.number.integer(49152, 65535),
+  {%- for it in items -%}
+    {%- if loop.first -%}
+      {%- do it.update({'gap': 0}) -%}
+    {%- elif it.retry -%}
+      {%- do it.update({'gap': logn(25, 1.0, 1, 400) | int}) -%}
+    {%- else -%}
+      {%- do it.update({'gap': logn(5, 1.5, 0, 900) | int}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('_items', items) -%}
+{%- endmacro -%}
+
+{#- Arms the next episode: its session drawn now for an administrator,
+    started early enough that the chain's first request falls near
+    `target`: the drawn gaps before it plus the usual wait of a
+    request at that hour (measured from the request curve; a retry
+    waits less). -#}
+{%- macro arm(target) -%}
+  {{- draw('admin', true) -}}
+  {%- set items = shared.get('_items') -%}
+  {%- set pre = namespace(t=target, j=0) -%}
+  {%- for it in items -%}
+    {%- if it.get('head') -%}{%- set pre.j = loop.index0 -%}{%- endif -%}
+  {%- endfor -%}
+  {%- for it in items[1:pre.j + 1] | reverse -%}
+    {%- set c = curve[(pre.t | int // 3600) % 24] -%}
+    {%- set wait = 34 if c >= 1.8 else (50 if c >= 1.2 else (80 if c >= 0.6 else 210)) -%}
+    {%- set pre.t = pre.t - it.gap - (wait / 3 if it.retry else wait) -%}
+  {%- endfor -%}
+  {%- do shared.set('episode', {'session': items, 'start': pre.t}) -%}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set clients = [] -%}
+  {%- set members = {'users': [], 'services': [], 'admins': []} -%}
+  {%- for i in range(samples.clients | length) -%}
+    {%- set row = samples.clients[i] -%}
+    {%- do clients.append({'ip': row.ip, 'role': row.role, 'ua': row.agent}) -%}
+    {%- do members[('services' if row.role == 'service' else 'users')].append(i) -%}
+    {%- if row.role == 'admin' -%}{%- do members.admins.append(i) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'clients': clients,
+      'members': members, 'queues': {'users': [], 'services': []},
+      'retries': {'users': [], 'services': []},
+      'busy': {}, 'hist': {}, 'seq': 0,
+      'msg_id': module.rand.number.integer(8890000000000000, 8899999999999999),
+      'episode': none, 'last_chain_client': none}) -%}
+  {%- if params.anomaly_mode -%}
+    {{- arm(pick_time(now_s, now_s + ([interval, 24] | min * 3600) | int, false) | int) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set clients = shared.get('clients') -%}
+{%- set members = shared.get('members') -%}
+{%- set queue = shared.get('queues')[pop] -%}
+{%- set rq = shared.get('retries')[pop] -%}
+{%- set busy = shared.get('busy') -%}
+
+{#- A session of client ci from drawn items; its first request is
+    queued in the client's population, due at once. -#}
+{%- macro plan(ci, t0, items) -%}
+  {%- set cl = clients[ci] -%}
+  {%- set browser = cl.role != 'service' -%}
+  {%- set s = namespace(port=module.rand.number.integer(49152, 65535),
       tport=module.rand.number.integer(10000, 60999),
       rs=module.rand.number.integer(0, servers | length - 1)) -%}
   {%- set cookie = 'sessionid=' ~ module.rand.string.hex(32) | lower -%}
   {%- do busy.update({ci: true}) -%}
   {%- set recs = [] -%}
   {%- for it in items -%}
-    {%- if not loop.first -%}
-      {%- if it.retry -%}
-        {%- set s.t = s.t + logn(25, 1.0, 1, 400) | int -%}
-      {%- else -%}
-        {%- set s.t = s.t + logn(5, 1.5, 0, 900) | int -%}
-      {%- endif -%}
-    {%- endif -%}
     {%- if loop.first or 'rs' in it or module.rand.chance(0.6) -%}
       {%- set s.port = module.rand.number.integer(49152, 65535) -%}
       {%- set s.tport = module.rand.number.integer(10000, 60999) -%}
@@ -189,103 +224,111 @@
     {%- else -%}
       {%- set qry = 'none' -%}
     {%- endif -%}
-    {%- do recs.append({'c': ci, 'due': s.t, 'ep': ep, 'path': p, 'status': st,
-        'method': method, 'qry': qry, 'port': s.port, 'tport': s.tport, 'rs': s.rs,
+    {%- do recs.append({'c': ci, 'gap': it.gap, 'retry': it.retry,
+        'head': it.get('head', false), 'final': it.get('final', false),
+        'path': p, 'status': st, 'method': method, 'qry': qry,
+        'port': s.port, 'tport': s.tport, 'rs': s.rs,
         'referer': ('http://' ~ params.http_host ~ '/') if browser and not loop.first else 'none',
         'cookie': cookie if browser and not loop.first else 'none'}) -%}
   {%- endfor -%}
-  {%- do recs[-1].update({'last': true}) -%}
-  {%- for r in recs -%}{{- add(r) -}}{%- endfor -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do heapq.heappush(queue, (t0, shared.get('seq'), {'recs': recs, 'i': 0})) -%}
 {%- endmacro -%}
 
-{#- 1. Client session arrivals (thinned Poisson process per client). -#}
-{%- if now >= shared.get('a_min') -%}
-  {%- set clients = shared.get('clients') -%}
-  {%- for cl in clients -%}
-    {%- if now >= cl.next -%}
-      {%- if not busy.get(loop.index0, false) and module.rand.chance(load / lmax) -%}
-        {{- plan(loop.index0, now) -}}
-      {%- endif -%}
-      {%- do cl.update({'next': now + [module.rand.number.exponential(params.sessions_per_client_day * lmax / 86400) | int, 1] | max}) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- do shared.set('a_min', clients | map(attribute='next') | min) -%}
-{%- endif -%}
-
-{#- 2. Episode: the first starts within min(interval, 24 h), its time
-    drawn from the load curve; each later one in a window of
-    min(interval / 4, 6 h) centred on its due time (previous start
-    plus the interval), weighted by the squared load curve. An idle
-    client other than the previous episode's, uniformly. -#}
-{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+{#- 1. The episode session starts on the first users timestamp after
+    its start time, for an idle administrator other than the previous
+    episode's, uniformly; its chain's first request is aimed at a
+    target time: the first within min(interval, 24 h) drawn from the
+    load curve, each later one in a window of min(interval / 4, 6 h)
+    centred on its due time (the previous chain's first request plus
+    the interval), weighted by the squared load curve. Otherwise,
+    when nothing is due, a new session of a random idle client of the
+    population starts. -#}
+{%- set started = namespace(ok=false) -%}
+{%- set ep = shared.get('episode') -%}
+{%- if pop == 'users' and params.anomaly_mode and ep and now >= ep.start -%}
   {%- set free = [] -%}
-  {%- for cl in shared.get('clients') -%}
-    {%- if not busy.get(loop.index0, false) and loop.index0 != shared.get('last_chain_client') -%}
-      {%- do free.append(loop.index0) -%}
+  {%- for ci in members.admins -%}
+    {%- if not busy.get(ci, false) and ci != shared.get('last_chain_client') -%}
+      {%- do free.append(ci) -%}
     {%- endif -%}
   {%- endfor -%}
   {%- if free -%}
     {%- set ci = module.rand.choice(free) -%}
-    {{- plan(ci, now, true) -}}
-    {%- set due = now + (interval * 3600) | int -%}
-    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
-    {%- do shared.update({'last_chain_client': ci,
-        'start_at': pick_time(due - half, due + half, true) | int}) -%}
+    {{- plan(ci, 0, ep.session) -}}
+    {%- set started.ok = true -%}
+    {%- do shared.update({'last_chain_client': ci, 'episode': none}) -%}
   {%- endif -%}
 {%- endif -%}
-
-{#- 3. Emit the earliest due request, or nothing. -#}
-{%- if shared.get('q_min') is none or now < shared.get('q_min') -%}
-  {{- dispatch.drop() -}}
-{%- endif -%}
-{%- set best = namespace(i=0) -%}
-{%- for r in queue -%}
-  {%- if r.due < queue[best.i].due or (r.due == queue[best.i].due and r.n < queue[best.i].n) -%}
-    {%- set best.i = loop.index0 -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- set r = queue.pop(best.i) -%}
-{%- do shared.set('q_min', (queue | map(attribute='due') | min) if queue else none) -%}
-{%- if r.get('last') -%}{%- do busy.update({r.c: false}) -%}{%- endif -%}
-{%- set cl = shared.get('clients')[r.c] -%}
-{%- set status = r.status -%}
-
-{#- Per-client replica of the chain detector over /admin requests:
-    partial matches [next step, first 404 time, server A, server B].
-    Steps: 404, then 403 on another server, then 200 on a third,
-    the first 404 at most chain_s before the current request;
-    completion starts over. -#}
-{%- if r.path == '/admin' -%}
-  {%- set pm = shared.get('partial') -%}
-  {%- set parts = pm.get(r.c, []) | selectattr('1', 'ge', now - chain_s) | list -%}
-  {%- set ready = namespace(hit=false) -%}
-  {%- for p in parts -%}
-    {%- if p[0] == 2 and r.rs != p[2] and r.rs != p[3] -%}{%- set ready.hit = true -%}{%- endif -%}
-  {%- endfor -%}
-  {%- if status == 200 and ready.hit and not r.ep -%}
-    {#- Guard on the final chain step: an ordinary request that would
-        complete the chain is refused instead. -#}
-    {%- set status = 403 -%}
-  {%- endif -%}
-  {%- set st = namespace(done=false, new=[]) -%}
-  {%- for p in parts -%}
-    {%- if st.done -%}
-    {%- elif p[0] == 1 and status == 403 and r.rs != p[2] -%}
-      {%- do st.new.append([2, p[1], p[2], r.rs]) -%}
-    {%- elif p[0] == 2 and status == 200 and r.rs != p[2] and r.rs != p[3] -%}
-      {%- set st.done = true -%}
-    {%- else -%}
-      {%- do st.new.append(p) -%}
+{%- if not started.ok and not (rq and rq[0][0] <= now or queue and queue[0][0] <= now) -%}
+  {%- set pool = members[pop] -%}
+  {%- for k in range(40) -%}
+    {%- if not started.ok -%}
+      {%- set ci = module.rand.choice(pool) -%}
+      {%- if not busy.get(ci, false) -%}
+        {{- draw(clients[ci].role) -}}
+        {{- plan(ci, now, shared.get('_items')) -}}
+        {%- set started.ok = true -%}
+      {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- if not st.done and status == 404 -%}
-    {%- do st.new.append([1, now, r.rs, none]) -%}
+{%- endif -%}
+
+{#- 2. Emit the first request of a session started now, else a due
+    retry, else the earliest due request of the population (or the
+    next one when every client of the population is busy). -#}
+{%- if started.ok -%}
+  {%- set ss = heapq.heappop(queue)[2] -%}
+{%- elif rq and rq[0][0] <= now -%}
+  {%- set ss = heapq.heappop(rq)[2] -%}
+{%- elif not rq or queue and queue[0][0] <= rq[0][0] -%}
+  {%- set ss = heapq.heappop(queue)[2] -%}
+{%- else -%}
+  {%- set ss = heapq.heappop(rq)[2] -%}
+{%- endif -%}
+{%- set r = ss.recs[ss.i] -%}
+{%- do ss.update({'i': ss.i + 1}) -%}
+{%- if ss.i < ss.recs | length -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do heapq.heappush(rq if ss.recs[ss.i].retry else queue,
+      (now + ss.recs[ss.i].gap, shared.get('seq'), ss)) -%}
+{%- else -%}
+  {%- do busy.update({r.c: false}) -%}
+{%- endif -%}
+{%- set cl = clients[r.c] -%}
+{%- set status = r.status -%}
+{%- if r.head -%}
+  {%- set due = now_s + (interval * 3600) | int -%}
+  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+  {{- arm(pick_time(due - half, due + half, true) | int) -}}
+{%- endif -%}
+
+{#- Per-client replica of the chain detector over /admin requests:
+    404 on server A, later 403 on server B != A, then 200 on a server
+    that is neither, the 404 at most chain_s before the 200. Every
+    /admin 404 and 403 of the last chain_s seconds stays in the
+    history, episode rows included, and a completion resets nothing.
+    Guard on the final chain step: an ordinary request that would
+    complete the chain gets another answer the role receives for
+    /admin, at the same time. -#}
+{%- if r.path == '/admin' -%}
+  {%- set hist = shared.get('hist') -%}
+  {%- set h = hist.get(r.c, []) | selectattr('0', 'ge', now_s - chain_s) | list -%}
+  {%- if status == 200 and not r.final -%}
+    {%- set g = namespace(hit=false) -%}
+    {%- for x in h -%}
+      {%- if x[1] == 404 and x[2] != r.rs -%}
+        {%- for y in h[loop.index:] -%}
+          {%- if y[1] == 403 and y[2] != x[2] and y[2] != r.rs -%}{%- set g.hit = true -%}{%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if g.hit -%}
+      {%- set status = module.rand.weighted_choice(admin_status[cl.role][0][1:], admin_status[cl.role][1][1:]) -%}
+    {%- endif -%}
   {%- endif -%}
-  {%- if st.done or not st.new -%}
-    {%- do pm.pop(r.c, none) -%}
-  {%- else -%}
-    {%- do pm.update({r.c: st.new[-8:]}) -%}
-  {%- endif -%}
+  {%- if status in [403, 404] -%}{%- do h.append([now_s, status, r.rs]) -%}{%- endif -%}
+  {%- if h -%}{%- do hist.update({r.c: h}) -%}{%- else -%}{%- do hist.pop(r.c, none) -%}{%- endif -%}
 {%- endif -%}
 
 {%- set rs = servers[r.rs] -%}
@@ -328,7 +371,7 @@
 {%- for key, value in native.items() -%}{%- do kv.append(key ~ '=' ~ value | string) -%}{%- endfor -%}
 {%- set url = {'path': p} -%}
 {%- if r.qry != 'none' -%}{%- do url.update({'query': r.qry}) -%}{%- endif -%}
-{%- set doc = {'@timestamp': timestamp.astimezone(utc).isoformat(),
+{%- set doc = {'@timestamp': timestamp.astimezone(utc).strftime('%Y-%m-%dT%H:%M:%S+00:00'),
     'ecs': {'version': '8.17.0'},
     'event': {'action': 'slb-http-response', 'category': ['web'], 'type': ['access'],
         'code': '0101008001', 'dataset': 'fortinet_fortiadc.log', 'kind': 'event',
