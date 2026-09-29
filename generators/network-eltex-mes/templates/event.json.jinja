@@ -1,8 +1,15 @@
 {#- Eltex MES5324 syslog message bodies (MES23xx/33xx/35xx/MES5324 catalog)
-    wrapped in ECS JSON. One input tick per second; each tick emits the
-    earliest due source event, stamped with its own millisecond time, or
-    drops. Every entity (endpoint, port, administrator) runs its own
-    independent random schedule. Durations are in milliseconds. -#}
+    wrapped in ECS JSON. Every input timestamp yields exactly one event,
+    stamped with the input time. Two queues decide which one:
+    - tight: steps that must not run early (MAC flush after a Down,
+      relearning after an Up, link flaps and speed-induced drops, server
+      MAC aging, administrator logins, typos, session operations, episode
+      steps); the earliest one whose time has come takes the timestamp;
+    - flex: MAC aging of the access endpoints (lognormal present and
+      absent times); when no tight step is due the endpoint whose change
+      is nearest takes the timestamp, early or late by the difference
+      between the input rate and the aging rate.
+    Durations are in milliseconds. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
 {%- macro d(lo, med, sig, hi) -%}
@@ -15,7 +22,41 @@
 {%- endmacro -%}
 {%- macro typo_gap() -%}{{- d(2, 10, 0.7, 120) -}}{%- endmacro -%}
 {%- macro op_gap() -%}{{- d(3, 40, 1.0, 900) -}}{%- endmacro -%}
-{%- macro absence() -%}{{- d(0, 12000, 1.1, 172800) -}}{%- endmacro -%}
+{#- Administrator habits. Shared accounts (admin, noc-duty) are used by
+    several NOC engineers, not all of whom keep the current password at
+    hand: frequent short logins and most mistyped passwords, on any day,
+    runs of three or four included. Personal accounts log in a few times
+    a day and seldom mistype. Runs of failures thin out with length: one
+    failure is more common than two, two than three, three than four,
+    and four stay below the lockout. An ordinary session changes
+    something only now and then. Absence medians are in seconds. -#}
+{%- set ROLE = {
+    true: {'abs': 4500, 'p_fail': 0.18, 'fail_w': [34, 26, 22, 18]},
+    false: {'abs': 24000, 'p_fail': 0.05, 'fail_w': [80, 20, 0, 0]}} -%}
+{#- Automation accounts (a `period` in seconds, e.g. an hourly
+    configuration backup and a ten-minute status poll) log in on their own
+    cycle with a few percent jitter, change nothing and almost never fail.
+    Every account logs in over HTTPS: the catalog gives the CONNECT and
+    DISCONNECT forms for http, https and snmp only, an SSH session has no
+    CONNECT line. -#}
+{%- set AUTO = {'p_fail': 0.002, 'fail_w': [100, 0, 0, 0], 'jitter': 0.08} -%}
+{%- set P_OPS = 0.25 -%}
+{%- set P_MORE = 0.3 -%}
+{%- set OP_KINDS = ['speed', 'bounce', 'clear', 'rdel'] -%}
+{%- set OP_W = [20, 40, 4, 3] -%}
+{#- Change days: about three days in ten (drawn per UTC day) carry planned
+    work. On such a day most shared-account sessions are change sessions,
+    on other days a few. The shared password has just been rotated for
+    the change, so a change session often starts with mistyped passwords
+    (none to four, weights below, fewer the longer the run); it forces a
+    server port speed, clears the logging file and removes the auxiliary
+    receiver, usually in that order, among its ordinary operations, and
+    restores them later like any change. -#}
+{%- set P_CHANGE_DAY = 0.3 -%}
+{%- set P_CHANGE = {true: 0.8, false: 0.05} -%}
+{%- set CHANGE_TYPO_W = [30, 24, 20, 16, 10] -%}
+{%- set P_CHANGE_ORDER = 0.7 -%}
+{%- macro absence(med) -%}{{- d(0, med, 1.1, 172800) -}}{%- endmacro -%}
 {%- macro retry_gap() -%}{{- d(20, 300, 0.9, 7200) -}}{%- endmacro -%}
 {%- macro down_delay() -%}{{- d(0.05, 0.4, 0.6, 3) -}}{%- endmacro -%}
 {%- macro reneg() -%}{{- d(1, 4, 0.6, 30) -}}{%- endmacro -%}
@@ -25,7 +66,8 @@
 {%- macro relearn(role) -%}{{- d(0.5, 20, 1.0, 1800) if role == 'access' else d(0.5, 5, 0.8, 600) -}}{%- endmacro -%}
 {%- macro present_len(role) -%}{{- d(1, 5400, 1.0, 172800) if role == 'access' else d(1, 57600, 0.8, 604800) -}}{%- endmacro -%}
 {%- macro absent_len(role) -%}{{- d(1, 1500, 1.1, 86400) if role == 'access' else d(1, 480, 0.8, 21600) -}}{%- endmacro -%}
-{%- if shared.get('queue') is none -%}
+{%- set heapq = module.heapq -%}
+{%- if shared.get('tight') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
@@ -34,113 +76,181 @@
     'syslog_server_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^(\\d{1,3}\\.){3}\\d{1,3}$'}}
   }} -%}
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set ctr = module.itertools.count() -%}
   {%- set eps = [] -%}
   {%- set ports = {} -%}
-  {%- set queue = [] -%}
+  {%- set tight = [] -%}
+  {%- set flex = [] -%}
   {%- for row in samples.endpoints -%}
     {%- set i = loop.index0 -%}
     {%- set mp = 5400 * 1.65 if row.role == 'access' else 57600 * 1.38 -%}
     {%- set ma = 1500 * 1.83 if row.role == 'access' else 480 * 1.38 -%}
     {%- set up = module.rand.chance(mp / (mp + ma)) -%}
-    {%- do eps.append({'mac': row.mac, 'vlan': row.vlan, 'port': row.port, 'role': row.role, 'present': up, 'waiting': false}) -%}
-    {%- set span = (present_len(row.role) if up else absent_len(row.role)) | float -%}
-    {%- do queue.append({'due': now + module.builtins.int(module.rand.number.floating(0, 1) * span), 'k': 'ep', 'i': i}) -%}
+    {%- do eps.append({'mac': row.mac, 'vlan': row.vlan, 'port': row.port, 'role': row.role, 'present': up, 'waiting': false, 'v': 0}) -%}
     {%- if row.port not in ports -%}
-      {%- do ports.update({row.port: {'up': true, 'speed': '10G', 'hold': none, 'server': row.role == 'server'}}) -%}
-      {%- do queue.append({'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (flap_gap() | float)), 'k': 'flap', 'p': row.port}) -%}
+      {%- do ports.update({row.port: {'up': true, 'speed': '10G', 'hold': none, 'server': row.role == 'server', 'n': 0, 'eps': [], 'flush_end': 0}}) -%}
+      {%- do tight.append([now + module.builtins.int(module.rand.number.floating(0, 1) * (flap_gap() | float)), module.builtins.next(ctr), 'flap', row.port, none]) -%}
+    {%- endif -%}
+    {%- do ports[row.port].eps.append(i) -%}
+    {%- if up -%}{%- do ports[row.port].update({'n': ports[row.port].n + 1}) -%}{%- endif -%}
+    {%- set span = (present_len(row.role) if up else absent_len(row.role)) | float -%}
+    {%- set due = now + module.builtins.int(module.rand.number.floating(0, 1) * span) -%}
+    {%- if row.role == 'server' -%}
+      {%- do tight.append([due, module.builtins.next(ctr), 'ep', i, 0]) -%}
+    {%- else -%}
+      {%- do flex.append([due, module.builtins.next(ctr), i, 0]) -%}
     {%- endif -%}
   {%- endfor -%}
   {%- set admins = [] -%}
   {%- for row in samples.admins -%}
-    {%- set due = now + module.builtins.int(module.rand.number.floating(0, 1) * (absence() | float)) -%}
-    {%- do admins.append({'user': row.user, 'ip': row.ip, 'stage': 'idle', 'fails': 0, 'rej_left': 0, 'give_up': false, 'ops': [], 'episode': false, 'resume': none, 'ep_port': none, 'due': due}) -%}
-    {%- do queue.append({'due': due, 'k': 'adm', 'a': loop.index0}) -%}
+    {%- set role = AUTO if row.period else ROLE[row.shared] -%}
+    {%- set due = now + module.builtins.int(module.rand.number.floating(0, 1) * ((row.period * 1000) if row.period else (absence(role.abs) | float))) -%}
+    {%- do admins.append({'user': row.user, 'ip': row.ip, 'shared': row.shared, 'period': row.period, 'med': role.get('abs'), 'p_fail': role.p_fail, 'fail_w': role.fail_w, 'stage': 'idle', 'fails': 0, 'rej_left': 0, 'give_up': false, 'ops': [], 'episode': false, 'resume': none, 'ep_port': none, 'due': due, 'v': 0}) -%}
+    {%- do tight.append([due, module.builtins.next(ctr), 'adm', loop.index0, 0]) -%}
   {%- endfor -%}
+  {%- do heapq.heapify(tight) -%}
+  {%- do heapq.heapify(flex) -%}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
-  {%- do shared.update({'queue': queue, 'eps': eps, 'ports': ports, 'admins': admins, 'receiver': true, 'repairs': [], 'recent': [], 'last_ms': now - 1, 'next_due': queue | map(attribute='due') | min, 't_init': now, 'ep_active': false, 'ep_last_admin': none, 'ep_last_port': none, 'ep_start': now + module.builtins.int(module.rand.number.floating(0, 1) * ([interval, 86400000] | min)), 'ep_end': now + ([interval, 86400000] | min)}) -%}
+  {%- do shared.update({'tight': tight, 'flex': flex, 'ctr': ctr, 'eps': eps, 'ports': ports, 'admins': admins, 'receiver': true, 'repairs': [], 'recent': [], 'touch': {}, 'last_now': now, 't_init': now, 'ep_active': false, 'ep_last_admin': none, 'ep_last_port': none, 'ep_start': now + module.builtins.int(module.rand.number.floating(0, 1) * (([interval, 86400000] | min) - 120000)), 'ep_end': now + ([interval, 86400000] | min)}) -%}
 {%- endif -%}
-{%- set queue = shared.get('queue') -%}
+{%- set tight = shared.get('tight') -%}
+{%- set flex = shared.get('flex') -%}
+{%- set ctr = shared.get('ctr') -%}
 {%- set eps = shared.get('eps') -%}
 {%- set ports = shared.get('ports') -%}
 {%- set admins = shared.get('admins') -%}
 {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
-{#- Episode start: the first tick at or after the drawn start time with an
-    idle administrator (not the previous episode's, next own login more
-    than an hour away, at most one pending failure) and a server port (not
-    the previous episode's) that is up at 10G with a present MAC. The first
-    start is uniform over the first min(interval, 24 h); the next one is
-    due one interval after the actual start and is drawn uniformly from a
-    window of width min(interval / 4, 6 h) centred on that due time. The
-    episode takes no ordinary slot: the administrator's own schedule
-    resumes unchanged afterwards. Among free administrators the episode
-    login arrives as an ordinary login would: each fires with intensity
-    proportional to f(e) / S(e + 1 h), e the time since its last logout,
-    f and S the density and survival of the ordinary absence, so the time
-    from logout to the episode login follows the ordinary absence despite
-    the one-hour condition. -#}
+{%- set dt = [now - shared.get('last_now'), 0] | max -%}
+{%- set day = now // 86400000 -%}
+{%- if shared.get('day') != day -%}
+  {%- do shared.update({'day': day, 'change_day': module.rand.chance(P_CHANGE_DAY)}) -%}
+{%- endif -%}
+{%- do shared.set('last_now', now) -%}
+{%- macro tpush(due, kind, a, b=none) -%}
+  {%- do heapq.heappush(tight, [module.builtins.int(due), module.builtins.next(ctr), kind, a, b]) -%}
+{%- endmacro -%}
+{%- macro mpush(due, ei) -%}
+  {#- Server MACs age on their own schedule (tight); access MACs fill the
+      remaining timestamps (flex). -#}
+  {%- if eps[ei].role == 'server' -%}
+    {{- tpush(due, 'ep', ei, eps[ei].v) -}}
+  {%- else -%}
+    {%- do heapq.heappush(flex, [module.builtins.int(due), module.builtins.next(ctr), ei, eps[ei].v]) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro set_present(ei, val) -%}
+  {%- set p = ports[eps[ei].port] -%}
+  {%- do eps[ei].update({'present': val}) -%}
+  {%- do p.update({'n': p.n + (1 if val else -1)}) -%}
+{%- endmacro -%}
+{#- Episode start. The first start is uniform over the first
+    min(interval, 24 h); the next one is due one interval after the actual
+    start and lies in a window of width min(interval / 4, 6 h) centred on
+    that due time. From a start time drawn uniformly in the window (at
+    least two minutes before its end), each free shared account (idle,
+    next own login more than 20 minutes away, at most one pending
+    failure, not the previous episode's) opens the episode with intensity
+    proportional to f(e) / S(e + 20 min), e the time since its last
+    logout, f and S the density and survival of its ordinary absence, so
+    the time from logout to the episode login follows the ordinary
+    absence. The episode picks an up 10G server port with a present MAC,
+    not the previous episode's, preferring one the account itself changed
+    in the last three days. The intensity rises over the window's last
+    hour, when an account whose own login is due soon is allowed too (that
+    login then follows the episode); within its last minute a start is
+    taken on the first timestamp with any admissible shared account (the
+    previous one, and the previous port, only if nothing else is free), so
+    every start lies inside the window; with no admissible account or port
+    at all the episode is skipped. The speed-change gate below applies
+    until the window's last hour. The episode's first failure takes the
+    timestamp that starts it. The episode takes no ordinary slot: the
+    account's own schedule resumes unchanged afterwards. -#}
 {%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') -%}
-  {#- The last tick of the window forces a start, so every start lies in
-      the window; the administrator is then drawn with the same weights. -#}
-  {%- set forced = now + 1000 > shared.get('ep_end') -%}
-  {#- The rate rises over the last hour of the window, the same for every
-      administrator, so late starts spread over its last minutes instead
-      of piling up on the final tick. -#}
-  {%- set ramp = [1, 3600000 / ([shared.get('ep_end') - now, 1000] | max)] | max -%}
+  {%- set left = shared.get('ep_end') - now -%}
+  {%- set final = left < 60000 -%}
+  {%- set late = left < 3600000 -%}
+  {%- set ramp = [1, 3600000 / ([left, 1000] | max)] | max -%}
   {%- set m = module.math -%}
-  {%- set zmax = (m.log(172800) - m.log(12000)) / 1.1 -%}
-  {%- set pool = namespace(idx=[], w=[]) -%}
-  {%- for a in admins -%}
-    {%- if a.stage == 'idle' and a.fails <= 1 and loop.index0 != shared.get('ep_last_admin') and a.due > now + 3600000 -%}
-      {%- set e = [(now - (a.get('out') or shared.get('t_init'))) / 1000, 1] | max -%}
-      {%- set z = (m.log(e) - m.log(12000)) / 1.1 -%}
-      {%- set zl = (m.log(e + 3600) - m.log(12000)) / 1.1 -%}
-      {%- set dens = m.exp(-z * z / 2) / m.sqrt(2 * m.pi) / (e * 1.1) -%}
-      {%- set surv = [0.5 * (m.erfc(zl / m.sqrt(2)) - m.erfc(zmax / m.sqrt(2))), 1e-9] | max -%}
-      {%- if forced -%}
-        {%- do pool.idx.append(loop.index0) -%}{%- do pool.w.append(dens / surv) -%}
-      {%- elif module.rand.chance([20 * ramp * dens / surv, 1] | min) -%}
-        {%- do pool.idx.append(loop.index0) -%}{%- do pool.w.append(1) -%}
-      {%- endif -%}
+  {%- set tiers = [[], [], [], []] -%}
+  {%- for i in range(admins | length) if admins[i].stage == 'idle' and admins[i].fails <= 1 and not admins[i].period -%}
+    {%- set a = admins[i] -%}
+    {%- set e = [(now - (a.get('out') or shared.get('t_init'))) / 1000, 1] | max -%}
+    {%- set z = (m.log(e) - m.log(a.med)) / 1.1 -%}
+    {%- set zl = (m.log(e + 1200) - m.log(a.med)) / 1.1 -%}
+    {%- set zmax = (m.log(172800) - m.log(a.med)) / 1.1 -%}
+    {%- set dens = m.exp(-z * z / 2) / m.sqrt(2 * m.pi) / (e * 1.1) -%}
+    {%- set surv = [0.5 * (m.erfc(zl / m.sqrt(2)) - m.erfc(zmax / m.sqrt(2))), 1e-9] | max -%}
+    {%- set w = [dens / surv, 1e-12] | max -%}
+    {%- if a.shared and i != shared.get('ep_last_admin') and a.due > now + 1200000 -%}
+      {%- do tiers[0].append([i, w]) -%}
+    {%- elif a.shared and i != shared.get('ep_last_admin') -%}
+      {%- do tiers[1].append([i, w]) -%}
+    {%- elif a.shared -%}
+      {%- do tiers[2].append([i, w]) -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- if forced and not pool.idx -%}
-    {#- Fallback at the last tick: the previous episode's administrator
-        is allowed too. -#}
-    {%- for a in admins -%}
-      {%- if a.stage == 'idle' and a.fails <= 1 and a.due > now + 3600000 -%}
-        {%- set e = [(now - (a.get('out') or shared.get('t_init'))) / 1000, 1] | max -%}
-        {%- set z = (m.log(e) - m.log(12000)) / 1.1 -%}
-        {%- set zl = (m.log(e + 3600) - m.log(12000)) / 1.1 -%}
-        {%- set dens = m.exp(-z * z / 2) / m.sqrt(2 * m.pi) / (e * 1.1) -%}
-        {%- set surv = [0.5 * (m.erfc(zl / m.sqrt(2)) - m.erfc(zmax / m.sqrt(2))), 1e-9] | max -%}
-        {%- do pool.idx.append(loop.index0) -%}{%- do pool.w.append(dens / surv) -%}
-      {%- endif -%}
+  {%- set pool = namespace(c=tiers[0]) -%}
+  {%- if late and not pool.c -%}{%- set pool.c = tiers[1] -%}{%- endif -%}
+  {%- if final and not pool.c -%}{%- set pool.c = tiers[2] -%}{%- endif -%}
+  {#- Until the window's last hour the episode starts only when no other
+      speed change happened in the last hour and none is pending (open
+      change sessions, speed changes or reverts queued in sessions or
+      owed repairs), so its receiver removal usually completes its own
+      sequence and no other. -#}
+  {%- set qn = namespace(ok=true) -%}
+  {%- for x in shared.get('recent') if x[1] == 'S' -%}{%- set qn.ok = false -%}{%- endfor -%}
+  {%- for r in shared.get('repairs') if r[0] in ['speed', 'revert'] -%}{%- set qn.ok = false -%}{%- endfor -%}
+  {%- for ad in admins -%}
+    {%- if ad.stage != 'idle' and ad.get('change') -%}{%- set qn.ok = false -%}{%- endif -%}
+    {%- for o in ad.ops + (ad.get('owed') or []) if o[0] in ['speed', 'revert'] -%}{%- set qn.ok = false -%}{%- endfor -%}
+  {%- endfor -%}
+  {%- set fire = namespace(c=[]) -%}
+  {%- if not qn.ok and not late -%}
+  {%- elif final -%}
+    {%- set fire.c = pool.c -%}
+  {%- else -%}
+    {%- for c in pool.c if module.rand.chance(1 - m.exp(-20 * ramp * c[1] * dt / 1000)) -%}
+      {%- do fire.c.append([c[0], 1]) -%}
     {%- endfor -%}
   {%- endif -%}
   {%- set cp = [] -%}
   {%- for name, p in ports | dictsort -%}
-    {%- if p.server and p.up and p.speed == '10G' and p.hold is none and name != shared.get('ep_last_port') and eps | selectattr('port', 'equalto', name) | selectattr('present') | list -%}{%- do cp.append(name) -%}{%- endif -%}
+    {%- if p.server and p.up and p.speed == '10G' and p.hold is none and p.n > 0 and name != shared.get('ep_last_port') -%}{%- do cp.append(name) -%}{%- endif -%}
   {%- endfor -%}
-  {%- if forced and not cp -%}
-    {%- for name, p in ports | dictsort -%}
-      {%- if p.server and p.up and p.hold is none and eps | selectattr('port', 'equalto', name) | selectattr('present') | list -%}{%- do cp.append(name) -%}{%- endif -%}
-    {%- endfor -%}
+  {%- if final and not cp and shared.get('ep_last_port') in ports -%}
+    {%- set lp = ports[shared.get('ep_last_port')] -%}
+    {%- if lp.up and lp.speed == '10G' and lp.hold is none and lp.n > 0 -%}{%- do cp.append(shared.get('ep_last_port')) -%}{%- endif -%}
   {%- endif -%}
-  {%- if pool.idx and cp -%}
-    {%- set ai = module.rand.weighted_choice(pool.idx, pool.w) -%}
-    {%- set pn = module.rand.choice(cp) -%}
+  {%- if fire.c and cp -%}
+    {%- set ids = [] -%}{%- set ws = [] -%}
+    {%- for c in fire.c -%}{%- do ids.append(c[0]) -%}{%- do ws.append(c[1]) -%}{%- endfor -%}
+    {%- set ai = module.rand.weighted_choice(ids, ws) -%}
     {%- set a = admins[ai] -%}
-    {%- set start = [now + module.rand.number.integer(0, 999), shared.get('ep_end')] | min -%}
-    {%- do a.update({'episode': true, 'resume': a.due, 'ep_port': pn, 'due': start}) -%}
-    {%- for item in queue if item.k == 'adm' and item.a == ai -%}{%- do item.update({'due': start}) -%}{%- endfor -%}
+    {#- Prefer a port this account itself changed in the last three days,
+        as the account's own work would. -#}
+    {%- set own = [] -%}
+    {%- set touched = shared.get('touch').get(a.user, {}) -%}
+    {%- for name in cp if touched.get(name, -1) > now - 259200000 -%}{%- do own.append(name) -%}{%- endfor -%}
+    {%- set pn = module.rand.choice(own if own else cp) -%}
+    {%- do shared.set('ep_tier', shared.get('ep_tier', []) + [0 if pool.c is sameas tiers[0] else (1 if pool.c is sameas tiers[1] else (2 if pool.c is sameas tiers[2] else 3))]) -%}
+    {%- do a.update({'episode': true, 'resume': a.due, 'ep_port': pn, 'due': now, 'v': a.v + 1}) -%}
+    {#- Due 0 puts the first failure ahead of every queued step. -#}
+    {%- do heapq.heappush(tight, [0, module.builtins.next(ctr), 'adm', ai, a.v]) -%}
     {%- do ports[pn].update({'hold': 'ep'}) -%}
     {%- set half = module.builtins.int([interval / 4, 21600000] | min / 2) -%}
-    {%- do shared.update({'ep_active': true, 'ep_last_admin': ai, 'ep_last_port': pn, 'ep_start': start + interval - half + module.builtins.int(module.rand.number.floating(0, 1) * 2 * half), 'ep_end': start + interval + half, 'next_due': [shared.get('next_due'), start] | min}) -%}
-  {%- elif forced -%}
+    {%- do shared.update({'ep_active': true, 'ep_last_admin': ai, 'ep_last_port': pn, 'ep_start': now + interval - half + module.builtins.int(module.rand.number.floating(0, 1) * (2 * half - 120000)), 'ep_end': now + interval + half}) -%}
+  {%- elif final -%}
     {%- do shared.update({'ep_miss': shared.get('ep_miss', 0) + 1}) -%}
+    {%- if left <= 0 -%}
+      {#- No admissible shared account or port within the window: this
+          episode is skipped and the next one is due one interval after
+          this window's centre. -#}
+      {%- set half = module.builtins.int([interval / 4, 21600000] | min / 2) -%}
+      {%- set centre = shared.get('ep_end') - half + interval -%}
+      {%- do shared.update({'ep_start': centre - half + module.builtins.int(module.rand.number.floating(0, 1) * (2 * half - 120000)), 'ep_end': centre + half}) -%}
+    {%- endif -%}
   {%- endif -%}
 {%- endif -%}
-{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- macro prefix_live(t) -%}
   {#- True when the recent rows already hold the chain up to the logging
       file clear with its first rejection at most 3600 s before t (the
@@ -172,229 +282,269 @@
   {%- endfor -%}
   {{- 'y' if ns.found else '' -}}
 {%- endmacro -%}
-{%- set out = namespace(frame=none, rec=0) -%}
-{%- for _ in range(24) if out.frame is none and queue and (queue | map(attribute='due') | min) <= now -%}
-  {%- set pick = namespace(item=none) -%}
-  {%- for item in queue if pick.item is none or item.due < pick.item.due -%}{%- set pick.item = item -%}{%- endfor -%}
-  {%- set item = pick.item -%}
-  {%- do queue.remove(item) -%}
-  {%- set rec = [item.due, shared.get('last_ms') + 1] | max -%}
-  {%- set new = [] -%}
+{#- Link transitions shared by every cause: Down removes the port's present
+    MACs one by one; Up lets waiting endpoints relearn. -#}
+{%- macro link_down(pn, t) -%}
+  {%- set p = ports[pn] -%}
+  {%- do p.update({'up': false}) -%}
+  {%- set acc = namespace(t=t) -%}
+  {%- for ei in p.eps if eps[ei].present -%}
+    {%- do eps[ei].update({'v': eps[ei].v + 1}) -%}
+    {%- set acc.t = acc.t + module.builtins.int(rm_jitter() | float) -%}
+    {{- tpush(acc.t, 'rm', ei) -}}
+  {%- endfor -%}
+  {%- do p.update({'flush_end': acc.t}) -%}
+{%- endmacro -%}
+{%- macro link_up(pn, t) -%}
+  {%- do ports[pn].update({'up': true}) -%}
+  {%- for ei in ports[pn].eps if eps[ei].waiting -%}
+    {%- do eps[ei].update({'waiting': false}) -%}
+    {{- tpush(t + (relearn(eps[ei].role) | float), 'rl', ei) -}}
+  {%- endfor -%}
+{%- endmacro -%}
+{#- One MAC aging step of an endpoint: a present MAC is removed, an absent
+    one is learnt when its port is up, otherwise it waits for the Up. -#}
+{%- macro mac_step(ei, frame) -%}
+  {%- set e = eps[ei] -%}
+  {%- if e.present -%}
+    {{- set_present(ei, false) -}}
+    {%- set frame.op = 'remove' -%}{%- set frame.i = ei -%}
+    {{- mpush(now + (absent_len(e.role) | float), ei) -}}
+  {%- elif ports[e.port].up -%}
+    {{- set_present(ei, true) -}}
+    {%- set frame.op = 'learn' -%}{%- set frame.i = ei -%}
+    {{- mpush(now + (present_len(e.role) | float), ei) -}}
+  {%- else -%}
+    {%- do e.update({'waiting': true}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro later(a, entry, prob) -%}
+  {#- In-session restoration at a random later position, otherwise a
+      repair for whichever administrator logs in next; episodes follow
+      the same law. -#}
+  {%- if module.rand.chance(prob) -%}
+    {%- do a.ops.insert(module.rand.number.integer(0, a.ops | length), entry) -%}
+  {%- else -%}
+    {%- do a.update({'owed': (a.get('owed') or []) + [entry]}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- set out = namespace(frame=none) -%}
+{%- for _ in range(64) if out.frame is none and ((tight and tight[0][0] <= now) or flex) -%}
   {%- set frame = namespace(op=none, i=none, p=none, a=none, speed=none) -%}
-  {#- Link transitions shared by every cause: Down removes the port's present
-      MACs one by one; Up lets waiting endpoints relearn. -#}
-  {%- macro link_down(pn, t) -%}
-    {%- do ports[pn].update({'up': false}) -%}
-    {%- set acc = namespace(t=t) -%}
-    {%- for ei in range(eps | length) if eps[ei].port == pn -%}
-      {%- set e = eps[ei] -%}
-      {%- if e.present -%}
-        {%- for it in queue if it.k == 'ep' and it.i == ei -%}{%- do queue.remove(it) -%}{%- endfor -%}
-        {%- set acc.t = acc.t + module.builtins.int(rm_jitter() | float) -%}
-        {%- do new.append({'due': acc.t, 'k': 'rm', 'i': ei}) -%}
+  {%- if tight and tight[0][0] <= now -%}
+    {%- set item = heapq.heappop(tight) -%}
+    {%- set lt = item[0] if item[0] > 0 else now -%}
+    {%- set kind = item[2] -%}
+    {%- if kind == 'rl' or (kind == 'ep' and item[4] == eps[item[3]].v) -%}
+      {{- mac_step(item[3], frame) -}}
+    {%- elif kind == 'rm' -%}
+      {%- if eps[item[3]].present -%}
+        {{- set_present(item[3], false) -}}
+        {%- do eps[item[3]].update({'waiting': true}) -%}
+        {%- set frame.op = 'remove' -%}{%- set frame.i = item[3] -%}
       {%- endif -%}
-    {%- endfor -%}
-    {%- do ports[pn].update({'flush_end': acc.t}) -%}
-  {%- endmacro -%}
-  {%- macro link_up(pn, t) -%}
-    {%- do ports[pn].update({'up': true}) -%}
-    {%- for ei in range(eps | length) if eps[ei].port == pn and eps[ei].waiting -%}
-      {%- do eps[ei].update({'waiting': false}) -%}
-      {%- do new.append({'due': t + module.builtins.int(relearn(eps[ei].role) | float), 'k': 'ep', 'i': ei}) -%}
-    {%- endfor -%}
-  {%- endmacro -%}
-  {%- if item.k == 'ep' -%}
-    {%- set e = eps[item.i] -%}
-    {%- if e.present -%}
-      {%- do e.update({'present': false}) -%}
-      {%- set frame.op = 'remove' -%}{%- set frame.i = item.i -%}
-      {%- do new.append({'due': rec + module.builtins.int(absent_len(e.role) | float), 'k': 'ep', 'i': item.i}) -%}
-    {%- elif ports[e.port].up -%}
-      {%- do e.update({'present': true}) -%}
-      {%- set frame.op = 'learn' -%}{%- set frame.i = item.i -%}
-      {%- do new.append({'due': rec + module.builtins.int(present_len(e.role) | float), 'k': 'ep', 'i': item.i}) -%}
-    {%- else -%}
-      {%- do e.update({'waiting': true}) -%}
-    {%- endif -%}
-  {%- elif item.k == 'rm' -%}
-    {%- set e = eps[item.i] -%}
-    {%- if e.present -%}
-      {%- do e.update({'present': false, 'waiting': true}) -%}
-      {%- set frame.op = 'remove' -%}{%- set frame.i = item.i -%}
-    {%- endif -%}
-  {%- elif item.k == 'flap' -%}
-    {%- set p = ports[item.p] -%}
-    {%- if p.up and p.hold is none -%}
-      {%- do p.update({'hold': 'flap'}) -%}
-      {%- set frame.op = 'down' -%}{%- set frame.p = item.p -%}
-      {{- link_down(item.p, rec) -}}
-      {%- do new.append({'due': rec + module.builtins.int(flap_len() | float), 'k': 'up', 'p': item.p, 'release': 'flap'}) -%}
-    {%- endif -%}
-    {%- do new.append({'due': rec + module.builtins.int(flap_gap() | float), 'k': 'flap', 'p': item.p}) -%}
-  {%- elif item.k == 'down' -%}
-    {%- if ports[item.p].up -%}
-      {%- set frame.op = 'down' -%}{%- set frame.p = item.p -%}
-      {{- link_down(item.p, rec) -}}
-      {%- if item.then_up -%}{%- do new.append({'due': rec + module.builtins.int(reneg() | float), 'k': 'up', 'p': item.p, 'release': none}) -%}{%- endif -%}
-    {%- endif -%}
-  {%- elif item.k == 'up' and rec <= ports[item.p].get('flush_end', 0) -%}
-    {#- The link returns only after the flush notifications of its Down. -#}
-    {%- do new.append(dict(item, due=ports[item.p].flush_end + module.builtins.int(rm_jitter() | float))) -%}
-  {%- elif item.k == 'up' -%}
-    {%- if item.release is not none and ports[item.p].hold == item.release -%}{%- do ports[item.p].update({'hold': none}) -%}{%- endif -%}
-    {%- if not ports[item.p].up -%}
-      {%- set frame.op = 'up' -%}{%- set frame.p = item.p -%}
-      {{- link_up(item.p, rec) -}}
-    {%- endif -%}
-  {%- elif item.k == 'adm' -%}
-    {%- set a = admins[item.a] -%}
-    {%- set frame.a = item.a -%}
-    {%- set nxt = namespace(due=none) -%}
-    {%- if a.stage == 'idle' -%}
-      {%- if a.episode -%}
-        {%- set k = 3 -%}{%- do a.update({'give_up': false}) -%}
-      {%- else -%}
-        {%- set cap = 4 - a.fails -%}
-        {%- set k = [module.rand.weighted_choice([1, 2, 3, 4], [35, 25, 22, 18]), cap] | min if module.rand.chance(0.35) else 0 -%}
-        {%- do a.update({'give_up': module.rand.chance(0.12)}) -%}
+    {%- elif kind == 'flap' -%}
+      {%- set p = ports[item[3]] -%}
+      {%- if p.up and p.hold is none -%}
+        {%- do p.update({'hold': 'flap'}) -%}
+        {%- set frame.op = 'down' -%}{%- set frame.p = item[3] -%}
+        {{- link_down(item[3], lt) -}}
+        {{- tpush(lt + (flap_len() | float), 'up', item[3], 'flap') -}}
       {%- endif -%}
-      {%- if k > 0 -%}
-        {%- do a.update({'stage': 'rej', 'rej_left': k}) -%}
-      {%- else -%}
-        {%- do a.update({'stage': 'acc'}) -%}
+      {{- tpush(lt + (flap_gap() | float), 'flap', item[3]) -}}
+    {%- elif kind == 'down' -%}
+      {%- if ports[item[3]].up -%}
+        {%- set frame.op = 'down' -%}{%- set frame.p = item[3] -%}
+        {{- link_down(item[3], lt) -}}
+        {%- if item[4] -%}{{- tpush(lt + (reneg() | float), 'up', item[3]) -}}{%- endif -%}
       {%- endif -%}
-    {%- endif -%}
-    {%- if a.stage == 'rej' -%}
-      {%- set frame.op = 'reject' -%}
-      {%- do a.update({'fails': a.fails + 1, 'rej_left': a.rej_left - 1}) -%}
-      {%- if a.rej_left > 0 -%}
-        {%- set nxt.due = rec + module.builtins.int(typo_gap() | float) -%}
-      {%- elif a.give_up -%}
-        {%- do a.update({'stage': 'idle'}) -%}
-        {%- set nxt.due = rec + module.builtins.int(retry_gap() | float) -%}
-      {%- else -%}
-        {%- do a.update({'stage': 'acc'}) -%}
-        {%- set nxt.due = rec + module.builtins.int(typo_gap() | float) -%}
+    {%- elif kind == 'up' and lt <= ports[item[3]].flush_end -%}
+      {#- The link returns only after the flush notifications of its Down. -#}
+      {{- tpush(ports[item[3]].flush_end + (rm_jitter() | float), 'up', item[3], item[4]) -}}
+    {%- elif kind == 'up' -%}
+      {%- if item[4] is not none and ports[item[3]].hold == item[4] -%}{%- do ports[item[3]].update({'hold': none}) -%}{%- endif -%}
+      {%- if not ports[item[3]].up -%}
+        {%- set frame.op = 'up' -%}{%- set frame.p = item[3] -%}
+        {{- link_up(item[3], lt) -}}
       {%- endif -%}
-    {%- elif a.stage == 'acc' -%}
-      {%- set frame.op = 'accept' -%}
-      {%- set ops = [] -%}
-      {%- if a.episode -%}
-        {%- do ops.extend([['speed', a.ep_port], ['clear', none], ['rdel', none]]) -%}
-      {%- else -%}
-        {%- do ops.extend(shared.get('repairs')) -%}
-        {%- do shared.set('repairs', []) -%}
-        {%- if module.rand.chance(0.8) -%}
-          {%- set cnt = namespace(n=1, go=true) -%}
-          {%- for _ in range(7) if cnt.go -%}
-            {%- if module.rand.chance(0.55) -%}{%- set cnt.n = cnt.n + 1 -%}{%- else -%}{%- set cnt.go = false -%}{%- endif -%}
-          {%- endfor -%}
-          {%- for _ in range(cnt.n) -%}
-            {%- do ops.append([module.rand.weighted_choice(['speed', 'bounce', 'clear', 'rdel'], [20, 20, 30, 30]), none]) -%}
-          {%- endfor -%}
-        {%- endif -%}
-      {%- endif -%}
-      {%- do a.update({'stage': 'sess', 'fails': 0, 'ops': ops}) -%}
-      {%- set nxt.due = rec + module.builtins.int(op_gap() | float) -%}
-    {%- elif a.stage == 'sess' and a.ops -%}
-      {%- set op = a.ops.pop(0) -%}
-      {%- set kind = op[0] -%}
-      {%- macro later(entry, prob) -%}
-        {#- In-session restoration at a random later position, otherwise a
-            repair for whichever administrator logs in next. -#}
-        {%- if not a.episode and module.rand.chance(prob) -%}
-          {%- do a.ops.insert(module.rand.number.integer(0, a.ops | length), entry) -%}
+    {%- elif kind == 'adm' and item[4] == admins[item[3]].v -%}
+      {%- set ai = item[3] -%}
+      {%- set a = admins[ai] -%}
+      {%- set frame.a = ai -%}
+      {%- set nxt = namespace(due=none) -%}
+      {%- if a.stage == 'idle' -%}
+        {%- if a.episode -%}
+          {%- set k = 3 -%}{%- do a.update({'give_up': false}) -%}
         {%- else -%}
-          {%- do a.update({'owed': (a.get('owed') or []) + [entry]}) -%}
+          {%- set cap = 4 - a.fails -%}
+          {%- set chg = a.shared and module.rand.chance(P_CHANGE[shared.get('change_day')]) -%}
+          {%- do a.update({'change': chg}) -%}
+          {%- if chg -%}
+            {%- set k = [module.rand.weighted_choice([0, 1, 2, 3, 4], CHANGE_TYPO_W), cap] | min -%}
+          {%- else -%}
+            {%- set k = [module.rand.weighted_choice([1, 2, 3, 4], a.fail_w), cap] | min if module.rand.chance(a.p_fail) else 0 -%}
+          {%- endif -%}
+          {%- do a.update({'give_up': module.rand.chance(0.12)}) -%}
         {%- endif -%}
-      {%- endmacro -%}
-      {%- if kind == 'speed' -%}
-        {%- set cand = [] -%}
-        {%- for name, p in ports | dictsort if p.server and p.up and p.speed == '10G' and p.hold is none -%}{%- do cand.append(name) -%}{%- endfor -%}
-        {%- set pn = op[1] if op[1] is not none else (module.rand.choice(cand) if cand else none) -%}
-        {%- if pn is not none -%}
-          {%- do ports[pn].update({'speed': '1G', 'hold': 'adm'}) -%}
-          {%- set frame.op = 'speed' -%}{%- set frame.p = pn -%}{%- set frame.speed = '1G' -%}
-          {%- do new.append({'due': rec + module.builtins.int(down_delay() | float), 'k': 'down', 'p': pn, 'then_up': module.rand.chance(0.5)}) -%}
-          {{- later(['revert', pn], 0.6) -}}
-        {%- endif -%}
-      {%- elif kind == 'revert' -%}
-        {%- set pn = op[1] -%}
-        {%- do ports[pn].update({'speed': '10G', 'hold': none}) -%}
-        {%- set frame.op = 'speed' -%}{%- set frame.p = pn -%}{%- set frame.speed = '10G' -%}
-        {%- if ports[pn].up -%}
-          {%- do new.append({'due': rec + module.builtins.int(down_delay() | float), 'k': 'down', 'p': pn, 'then_up': true}) -%}
+        {%- if k > 0 -%}
+          {%- do a.update({'stage': 'rej', 'rej_left': k}) -%}
         {%- else -%}
-          {%- do new.append({'due': rec + module.builtins.int(reneg() | float), 'k': 'up', 'p': pn, 'release': none}) -%}
-        {%- endif -%}
-      {%- elif kind == 'bounce' -%}
-        {%- set cand = [] -%}
-        {%- for name, p in ports | dictsort if p.up and p.hold is none -%}{%- do cand.append(name) -%}{%- endfor -%}
-        {%- if cand -%}
-          {%- set pn = module.rand.choice(cand) -%}
-          {%- do ports[pn].update({'hold': 'adm'}) -%}
-          {%- set frame.op = 'down' -%}{%- set frame.p = pn -%}
-          {{- link_down(pn, rec) -}}
-          {{- later(['unshut', pn], 0.9) -}}
-        {%- endif -%}
-      {%- elif kind == 'unshut' -%}
-        {%- set pn = op[1] -%}
-        {%- do ports[pn].update({'hold': none}) -%}
-        {%- if not ports[pn].up and rec > ports[pn].get('flush_end', 0) -%}
-          {%- set frame.op = 'up' -%}{%- set frame.p = pn -%}
-          {{- link_up(pn, rec) -}}
-        {%- elif not ports[pn].up -%}
-          {%- do new.append({'due': ports[pn].flush_end + module.builtins.int(rm_jitter() | float), 'k': 'up', 'p': pn, 'release': none}) -%}
-        {%- endif -%}
-      {%- elif kind == 'clear' -%}
-        {%- set frame.op = 'clear' -%}
-      {%- elif kind == 'rdel' -%}
-        {%- if a.episode and not shared.get('receiver') -%}
-          {#- Another administrator deleted the receiver meanwhile: the
-              episode administrator re-adds it, then deletes it. -#}
-          {%- do shared.set('receiver', true) -%}
-          {%- set frame.op = 'radd' -%}
-          {%- do a.ops.insert(0, ['rdel', none]) -%}
-        {%- elif shared.get('receiver') and (a.episode or not prefix_live(rec)) -%}
-          {%- do shared.set('receiver', false) -%}
-          {%- set frame.op = 'rdel' -%}
-          {{- later(['radd', none], 0.7) -}}
-        {%- endif -%}
-      {%- elif kind == 'radd' -%}
-        {%- if not shared.get('receiver') -%}
-          {%- do shared.set('receiver', true) -%}
-          {%- set frame.op = 'radd' -%}
+          {%- do a.update({'stage': 'acc'}) -%}
         {%- endif -%}
       {%- endif -%}
-      {%- set nxt.due = rec + module.builtins.int(op_gap() | float) -%}
-    {%- elif a.stage == 'sess' -%}
-      {%- set frame.op = 'disconnect' -%}
-      {%- do shared.set('repairs', shared.get('repairs') + (a.get('owed') or [])) -%}
-      {%- do a.update({'owed': [], 'stage': 'idle', 'out': rec}) -%}
-      {%- if a.episode -%}
-        {%- do a.update({'episode': false, 'ep_port': none}) -%}
-        {%- do shared.set('ep_active', false) -%}
-        {%- set nxt.due = [a.resume, rec + 1] | max -%}
-      {%- else -%}
-        {%- set nxt.due = rec + module.builtins.int(absence() | float) -%}
+      {%- if a.stage == 'rej' -%}
+        {%- set frame.op = 'reject' -%}
+        {%- do a.update({'fails': a.fails + 1, 'rej_left': a.rej_left - 1}) -%}
+        {%- if a.rej_left > 0 -%}
+          {%- set nxt.due = lt + (typo_gap() | float) -%}
+        {%- elif a.give_up -%}
+          {%- do a.update({'stage': 'idle'}) -%}
+          {%- set nxt.due = lt + (retry_gap() | float) -%}
+        {%- else -%}
+          {%- do a.update({'stage': 'acc'}) -%}
+          {%- set nxt.due = lt + (typo_gap() | float) -%}
+        {%- endif -%}
+      {%- elif a.stage == 'acc' -%}
+        {%- set frame.op = 'accept' -%}
+        {%- set ops = [] -%}
+        {%- if a.episode -%}
+          {%- do ops.extend([['speed', a.ep_port], ['clear', none], ['rdel', none]]) -%}
+        {%- elif a.period -%}
+          {#- Automation reads and leaves. -#}
+        {%- else -%}
+          {%- do ops.extend(shared.get('repairs')) -%}
+          {%- do shared.set('repairs', []) -%}
+          {%- if module.rand.chance(P_OPS) -%}
+            {%- set cnt = namespace(n=1, go=true) -%}
+            {%- for _ in range(7) if cnt.go -%}
+              {%- if module.rand.chance(P_MORE) -%}{%- set cnt.n = cnt.n + 1 -%}{%- else -%}{%- set cnt.go = false -%}{%- endif -%}
+            {%- endfor -%}
+            {%- for _ in range(cnt.n) -%}
+              {%- do ops.append([module.rand.weighted_choice(OP_KINDS, OP_W), none]) -%}
+            {%- endfor -%}
+          {%- endif -%}
+          {%- if a.get('change') -%}
+            {%- set mops = ['speed', 'clear', 'rdel'] if module.rand.chance(P_CHANGE_ORDER) else module.rand.shuffle(['speed', 'clear', 'rdel']) -%}
+            {%- set pos = namespace(i=0) -%}
+            {%- for k in mops -%}
+              {%- set pos.i = module.rand.number.integer(pos.i, ops | length) -%}
+              {%- do ops.insert(pos.i, [k, none]) -%}
+              {%- set pos.i = pos.i + 1 -%}
+            {%- endfor -%}
+          {%- endif -%}
+        {%- endif -%}
+        {%- do a.update({'stage': 'sess', 'fails': 0, 'ops': ops}) -%}
+        {%- set nxt.due = lt + (op_gap() | float) -%}
+      {%- elif a.stage == 'sess' and a.ops -%}
+        {%- set op = a.ops.pop(0) -%}
+        {%- set kind = op[0] -%}
+        {%- if kind == 'speed' -%}
+          {%- set cand = [] -%}
+          {%- for name, p in ports | dictsort if p.server and p.up and p.speed == '10G' and p.hold is none -%}{%- do cand.append(name) -%}{%- endfor -%}
+          {%- set pn = op[1] if op[1] is not none else (module.rand.choice(cand) if cand else none) -%}
+          {%- if op[1] is not none and not (ports[pn].up and ports[pn].speed == '10G' and ports[pn].n > 0) -%}
+            {#- The episode's port lost its link or its last MAC meanwhile:
+                the episode takes another up 10G server port with a
+                present MAC, so its own rows complete the sequence. -#}
+            {%- set alt = [] -%}
+            {%- for name in cand if ports[name].n > 0 -%}{%- do alt.append(name) -%}{%- endfor -%}
+            {%- do ports[pn].update({'hold': none}) if ports[pn].hold == 'ep' else none -%}
+            {%- set pn = module.rand.choice(alt) if alt else pn -%}
+            {%- do a.update({'ep_port': pn}) -%}{%- do shared.set('ep_last_port', pn) -%}
+            {%- do shared.set('ep_port_switch', shared.get('ep_port_switch', 0) + 1) -%}
+          {%- endif -%}
+          {%- if pn is not none -%}
+            {%- do ports[pn].update({'speed': '1G', 'hold': 'adm'}) -%}
+            {%- if not a.episode -%}
+              {%- set tch = shared.get('touch') -%}
+              {%- if a.user not in tch -%}{%- do tch.update({a.user: {}}) -%}{%- endif -%}
+              {%- do tch[a.user].update({pn: lt}) -%}
+            {%- endif -%}
+            {%- set frame.op = 'speed' -%}{%- set frame.p = pn -%}{%- set frame.speed = '1G' -%}
+            {{- tpush(lt + (down_delay() | float), 'down', pn, module.rand.chance(0.5)) -}}
+            {{- later(a, ['revert', pn], 0.6) -}}
+          {%- endif -%}
+        {%- elif kind == 'revert' -%}
+          {%- set pn = op[1] -%}
+          {%- do ports[pn].update({'speed': '10G', 'hold': none}) -%}
+          {%- set frame.op = 'speed' -%}{%- set frame.p = pn -%}{%- set frame.speed = '10G' -%}
+          {%- if ports[pn].up -%}
+            {{- tpush(lt + (down_delay() | float), 'down', pn, true) -}}
+          {%- else -%}
+            {{- tpush(lt + (reneg() | float), 'up', pn) -}}
+          {%- endif -%}
+        {%- elif kind == 'bounce' -%}
+          {%- set cand = [] -%}
+          {%- for name, p in ports | dictsort if p.up and p.hold is none -%}{%- do cand.append(name) -%}{%- endfor -%}
+          {%- if cand -%}
+            {%- set pn = module.rand.choice(cand) -%}
+            {%- do ports[pn].update({'hold': 'adm'}) -%}
+            {%- set frame.op = 'down' -%}{%- set frame.p = pn -%}
+            {{- link_down(pn, lt) -}}
+            {{- later(a, ['unshut', pn], 0.9) -}}
+          {%- endif -%}
+        {%- elif kind == 'unshut' -%}
+          {%- set pn = op[1] -%}
+          {%- do ports[pn].update({'hold': none}) -%}
+          {%- if not ports[pn].up and lt > ports[pn].flush_end -%}
+            {%- set frame.op = 'up' -%}{%- set frame.p = pn -%}
+            {{- link_up(pn, lt) -}}
+          {%- elif not ports[pn].up -%}
+            {{- tpush(ports[pn].flush_end + (rm_jitter() | float), 'up', pn) -}}
+          {%- endif -%}
+        {%- elif kind == 'clear' -%}
+          {%- set frame.op = 'clear' -%}
+        {%- elif kind == 'rdel' -%}
+          {%- if a.episode and not shared.get('receiver') -%}
+            {#- Another administrator deleted the receiver meanwhile: the
+                episode administrator re-adds it, then deletes it. -#}
+            {%- do shared.set('receiver', true) -%}
+            {%- set frame.op = 'radd' -%}
+            {%- do a.ops.insert(0, ['rdel', none]) -%}
+          {%- elif shared.get('receiver') and (a.episode or not prefix_live(now)) -%}
+            {%- do shared.set('receiver', false) -%}
+            {%- set frame.op = 'rdel' -%}
+            {{- later(a, ['radd', none], 0.7) -}}
+          {%- endif -%}
+        {%- elif kind == 'radd' -%}
+          {%- if not shared.get('receiver') -%}
+            {%- do shared.set('receiver', true) -%}
+            {%- set frame.op = 'radd' -%}
+          {%- endif -%}
+        {%- endif -%}
+        {%- set nxt.due = lt + (op_gap() | float) -%}
+      {%- elif a.stage == 'sess' -%}
+        {%- set frame.op = 'disconnect' -%}
+        {%- do shared.set('repairs', shared.get('repairs') + (a.get('owed') or [])) -%}
+        {%- do a.update({'owed': [], 'stage': 'idle', 'out': now}) -%}
+        {%- if a.episode -%}
+          {%- do a.update({'episode': false, 'ep_port': none}) -%}
+          {%- do shared.set('ep_active', false) -%}
+          {%- set nxt.due = [a.resume, lt + 1] | max -%}
+        {%- else -%}
+          {%- set nxt.due = lt + (a.period * 1000 * (1 + module.rand.number.floating(-AUTO.jitter, AUTO.jitter)) if a.period else (absence(a.med) | float)) -%}
+        {%- endif -%}
       {%- endif -%}
+      {%- do a.update({'due': module.builtins.int(nxt.due)}) -%}
+      {{- tpush(nxt.due, 'adm', ai, a.v) -}}
     {%- endif -%}
-    {%- do a.update({'due': nxt.due}) -%}
-    {%- do new.append({'due': nxt.due, 'k': 'adm', 'a': item.a}) -%}
+  {%- else -%}
+    {%- set item = heapq.heappop(flex) -%}
+    {%- if item[3] == eps[item[2]].v -%}
+      {{- mac_step(item[2], frame) -}}
+    {%- endif -%}
   {%- endif -%}
-  {%- do queue.extend(new) -%}
-  {%- if frame.op is not none -%}
-    {%- set out.frame = frame -%}
-    {%- set out.rec = rec -%}
-    {%- do shared.set('last_ms', rec) -%}
-  {%- endif -%}
+  {%- if frame.op is not none -%}{%- set out.frame = frame -%}{%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', (queue | map(attribute='due') | min) if queue else now + 1000) -%}
-{%- if out.frame is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- if out.frame is none -%}
+  {#- Unreachable with the shipped inventory (hundreds of MACs keep an
+      aging step pending); counted so a test run can prove it. -#}
+  {%- do shared.set('empty_ticks', shared.get('empty_ticks', 0) + 1) -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
 {%- set frame = out.frame -%}
 {%- set op = frame.op -%}
-{%- set rec = out.rec -%}
-{%- set moment = ts + module.datetime.timedelta(milliseconds=rec - now) -%}
+{%- set rec = now -%}
 {%- set extra = {} -%}
 {%- set details = {} -%}
 {%- set category = ['network'] -%}
@@ -428,7 +578,9 @@
   {%- set mnemonic = 'MAC_CHANGED' -%}
   {%- set body = state ~ ' Mac ' ~ endpoint.mac ~ ' on VLAN ' ~ endpoint.vlan ~ ' Port ' ~ endpoint.port -%}
   {%- set action = 'mac_learned' if op == 'learn' else 'mac_removed' -%}
-  {%- if op == 'remove' -%}{%- do recent.append([rec, 'M', none, endpoint.port]) -%}{%- endif -%}
+  {#- Guard memory keeps server-port rows only: speed changes, and so the
+      chain's port, are server ports. -#}
+  {%- if op == 'remove' and ports[endpoint.port].server -%}{%- do recent.append([rec, 'M', none, endpoint.port]) -%}{%- endif -%}
   {%- do extra.update({'interface': {'name': endpoint.port}, 'source': {'mac': endpoint.mac | upper | replace(':', '-')}}) -%}
   {%- do details.update({'mac_state': state | lower, 'vlan': {'id': endpoint.vlan}}) -%}
 {%- elif op in ['speed', 'down', 'up'] -%}
@@ -449,7 +601,7 @@
     {%- set body = frame.p -%}
     {%- set action = 'interface_down' if op == 'down' else 'interface_up' -%}
     {%- do details.update({'interface': {'state': op}}) -%}
-    {%- if op == 'down' -%}{%- do recent.append([rec, 'D', none, frame.p]) -%}{%- endif -%}
+    {%- if op == 'down' and ports[frame.p].server -%}{%- do recent.append([rec, 'D', none, frame.p]) -%}{%- endif -%}
   {%- endif -%}
 {%- else -%}
   {%- set component = 'SYSLOG' -%}
@@ -473,7 +625,7 @@
 {#- Bounded guard memory: chain-relevant rows of the last 60 minutes. -#}
 {%- for _ in range(recent | length) if recent and rec - recent[0][0] > 3600000 -%}{%- do recent.pop(0) -%}{%- endfor -%}
 {%- set raw = component ~ '-' ~ severity ~ '-' ~ mnemonic ~ ': ' ~ body -%}
-{%- set event = {'@timestamp': moment.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'},
+{%- set event = {'@timestamp': ts.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'},
     'event': {'action': action, 'category': category, 'dataset': 'eltex.mes.syslog', 'kind': 'event', 'module': 'eltex', 'original': raw, 'outcome': outcome, 'type': event_type},
     'message': raw,
     'log': {'level': {'W': 'warning', 'I': 'info', 'N': 'notice'}[severity]},
