@@ -1,18 +1,24 @@
-{#- One F5 BIG-IP ASM request log message per one-second tick at most,
-    in the ASM 11.3 ArcSight CEF layout sent over syslog. Background is
-    a superposition of independent random processes - browsing
-    sessions with occasional false-positive violations and retries,
-    automated attack bursts against application URIs and forceful
-    browsing. The anomaly episode only adds requests for one client and
-    never touches the background queue. -#}
+{#- One F5 BIG-IP ASM request log message per input timestamp, in the
+    ASM 11.3 ArcSight CEF layout sent over syslog. The input sets the
+    rate: `web` timestamps follow the daily browsing curve, `scan`
+    timestamps are a flat stream for automated attack traffic. Each
+    timestamp emits the earliest due queued request (a later request of
+    a browsing session or attack burst, a retry after a block, an
+    episode step); when nothing is due, a `web` timestamp opens a new
+    browsing session and a `scan` timestamp a new attack burst, and the
+    first request of it is emitted. Nothing is discarded. -#}
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set window_s = 1800 -%}
-{#- Relative request load by UTC hour, shared by browsing sessions and
-    by episode scheduling. -#}
-{%- set curve = [0.30, 0.24, 0.20, 0.19, 0.21, 0.30, 0.48, 0.75, 1.02, 1.22, 1.33, 1.38,
-    1.36, 1.34, 1.38, 1.36, 1.28, 1.18, 1.08, 0.98, 0.86, 0.70, 0.52, 0.38] -%}
+{#- Relative request rate by UTC hour (peak 1.0) of all three input
+    patterns together (browsing floor + beta day curve + flat attack
+    stream), used for episode placement. -#}
+{%- set curve = [0.264, 0.210, 0.174, 0.157, 0.188, 0.298, 0.432, 0.566, 0.691, 0.799, 0.885, 0.948,
+    0.986, 1.000, 0.991, 0.961, 0.912, 0.848, 0.770, 0.685, 0.594, 0.502, 0.414, 0.334] -%}
+{#- Browsing sessions a day with the shipped patterns; sizes the busy
+    tier episodes draw their client and URI from. -#}
+{%- set sessions_per_day = 1750 -%}
 {%- set attacks = [
     {'code': '200002273', 'name': 'SQL-INJ exec()', 'type': 'SQL-Injection', 'sev': 5},
     {'code': '200000098', 'name': 'XSS script tag (Parameter)', 'type': 'Cross Site Scripting (XSS)', 'sev': 5},
@@ -26,16 +32,6 @@
     'type': 'Information Leakage', 'sev': 2} -%}
 {%- set by_code = {} -%}
 {%- for a in attacks + [forceful, bad_status] -%}{%- do by_code.update({a.code: a}) -%}{%- endfor -%}
-{%- set browsers = [
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36 Edg/128.0.0.0',
-    'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:130.0) Gecko/20100101 Firefox/130.0',
-    'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Safari/605.1.15',
-    'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1',
-    'Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Mobile Safari/537.36'] -%}
-{%- set browser_w = [34, 12, 12, 14, 16, 12] -%}
-{%- set geos = ['US', 'DE', 'GB', 'FR', 'NL', 'IN', 'BR', 'CA', 'PL', 'N/A'] -%}
-{%- set geo_w = [30, 11, 9, 7, 6, 6, 5, 5, 4, 17] -%}
 {%- set servers = params.virtual_servers -%}
 
 {%- macro gap(median, sigma) -%}
@@ -46,7 +42,7 @@
     when power is 2), by rejection. -#}
 {%- macro draw_start(lo, hi, power) -%}
   {%- set ns = namespace(t=lo, done=false) -%}
-  {%- set top = 1.38 ** power + (0.05 if power == 2 else 0) -%}
+  {%- set top = 1.0 + (0.05 if power == 2 else 0) -%}
   {%- for n in range(600) -%}
     {%- if not ns.done -%}
       {%- set t = module.rand.number.integer(lo, [hi - 1, lo] | max) -%}
@@ -61,31 +57,63 @@
 
 {%- if not shared.get('initialized', false) -%}
   {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- if params.client_count < 50 or params.client_count > 480 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- Clients (address, request weight, browser, country) from the
+      sample file. -#}
   {%- set clients = [] -%}
-  {%- set seen = [] -%}
-  {%- for n in range(params.client_count * 6) -%}
-    {%- if clients | length < params.client_count -%}
-      {%- set ip = module.rand.weighted_choice(['198.51.100.', '192.0.2.'], [60, 40])
-          ~ module.rand.number.integer(1, 254) -%}
-      {%- if ip not in seen -%}
-        {%- do seen.append(ip) -%}
-        {%- do clients.append({'ip': ip, 'w': module.rand.number.lognormal(0, 0.8),
-            'ua': module.rand.weighted_choice(browsers, browser_w),
-            'geo': module.rand.weighted_choice(geos, geo_w)}) -%}
-      {%- endif -%}
-    {%- endif -%}
+  {%- for i in range(samples.clients | length) -%}
+    {%- set row = samples.clients[i] -%}
+    {%- do clients.append({'ip': row.ip, 'w': row.weight | float, 'ua': row.user_agent, 'geo': row.geo}) -%}
   {%- endfor -%}
+  {%- if clients | length < 50 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- set client_cum = [] -%}
+  {%- for cl in clients -%}{%- set acc.w = acc.w + cl.w -%}{%- do client_cum.append(acc.w) -%}{%- endfor -%}
+  {%- set client_total = acc.w -%}
+  {#- Per application URI pools: all URIs for browsing, URIs with a
+      query for attack payloads. -#}
   {%- set apply_dates = [] -%}
+  {%- set pools = [] -%}
+  {%- set app_total = servers | map(attribute='weight') | sum -%}
   {%- for vs in servers -%}
     {%- set checked = module.ipaddress.IPv4Address(vs.address) -%}
     {%- if vs.port not in [80, 443] or not vs.uris -%}{{ module.math.sqrt(-1) }}{%- endif -%}
     {%- do apply_dates.append(now - module.rand.number.integer(3 * 86400, 60 * 86400)) -%}
+    {%- set pool = {'all': [], 'all_w': [], 'dyn': [], 'dyn_w': []} -%}
+    {%- for u in vs.uris -%}
+      {%- do pool.all.append(loop.index0) -%}{%- do pool.all_w.append(u.weight) -%}
+      {%- if u.query -%}{%- do pool.dyn.append(loop.index0) -%}{%- do pool.dyn_w.append(u.weight) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if not pool.dyn -%}{%- do pool.update({'dyn': pool.all, 'dyn_w': pool.all_w}) -%}{%- endif -%}
+    {%- do pools.append(pool) -%}
   {%- endfor -%}
+  {#- Busy tier for episodes: (client, server, URI with a query) triples
+      that at least 3 browsing sessions a day are expected to contain
+      (counting a session as 5 requests), weighted by that expectation
+      (the top 8 when none reaches it). -#}
+  {%- set cands = [] -%}
+  {%- for cl in clients -%}
+    {%- set ci = loop.index0 -%}
+    {%- for vs in servers -%}
+      {%- set ai = loop.index0 -%}
+      {%- set uw_total = pools[ai].all_w | sum -%}
+      {%- for ui in pools[ai].dyn -%}
+        {%- set x = sessions_per_day * cl.w / client_total * vs.weight / app_total
+            * (1 - (1 - vs.uris[ui].weight / uw_total) ** 5) -%}
+        {%- do cands.append([x, ci, ai, ui]) -%}
+      {%- endfor -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set cands = cands | sort(attribute='0', reverse=true) | list -%}
+  {%- set busy = cands | selectattr('0', 'ge', 3) | list -%}
+  {%- if busy | length < 8 -%}{%- set busy = cands[:8] -%}{%- endif -%}
+  {%- set tacc = namespace(w=0.0) -%}
+  {%- set busy_cum = [] -%}
+  {%- for b in busy -%}{%- set tacc.w = tacc.w + b[0] -%}{%- do busy_cum.append(tacc.w) -%}{%- endfor -%}
   {%- do shared.update({'initialized': true, 'clients': clients,
-      'client_w': clients | map(attribute='w') | list,
-      'app_w': servers | map(attribute='weight') | list,
-      'apply_dates': apply_dates, 'q': [], 'hist': {}, 'ring': [],
+      'client_cum': client_cum, 'client_total': client_total,
+      'app_w': servers | map(attribute='weight') | list, 'pools': pools,
+      'busy': busy, 'busy_cum': busy_cum, 'busy_total': tacc.w,
+      'apply_dates': apply_dates, 'q': [], 'seq': 0, 'hist': {}, 'renders': 0,
       'support_id': module.rand.number.integer(10000000000000000000, 18000000000000000000),
       'last_client': none, 'last_target': none}) -%}
   {%- if params.anomaly_mode -%}
@@ -95,22 +123,21 @@
 {%- set q = shared.get('q') -%}
 {%- set hist = shared.get('hist') -%}
 {%- set clients = shared.get('clients') -%}
-{%- set load = curve[(now // 3600) % 24] -%}
+{%- set pools = shared.get('pools') -%}
+{%- set app_idx = range(servers | length) | list -%}
 
 {%- macro uri_pick(a, dynamic) -%}
-  {%- set pool = namespace(i=[], w=[]) -%}
-  {%- for u in servers[a].uris -%}
-    {%- if not dynamic or u.query -%}
-      {%- do pool.i.append(loop.index0) -%}{%- do pool.w.append(u.weight) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {{- module.rand.weighted_choice(pool.i, pool.w) -}}
+  {%- set p = pools[a] -%}
+  {{- module.rand.weighted_choice(p.dyn, p.dyn_w) if dynamic else module.rand.weighted_choice(p.all, p.all_w) -}}
 {%- endmacro -%}
 
+{#- Queue of future requests ordered by due time, then by push order. -#}
 {%- macro push(c, a, u, role, code, t, suid, episode=false, fpath='') -%}
   {%- if q | length < 4000 -%}
-    {%- do q.append({'due': t, 'c': c, 'a': a, 'u': u, 'role': role, 'code': code,
-        'suid': suid, 'episode': episode, 'fpath': fpath}) -%}
+    {%- set n = shared.get('seq') + 1 -%}
+    {%- do shared.set('seq', n) -%}
+    {%- do module.heapq.heappush(q, [t, n, {'c': c, 'a': a, 'u': u, 'role': role, 'code': code,
+        'suid': suid, 'episode': episode, 'fpath': fpath}]) -%}
   {%- endif -%}
 {%- endmacro -%}
 
@@ -130,24 +157,26 @@
   {{- t.v -}}
 {%- endmacro -%}
 
-{#- 1. Background arrivals, independent Poisson streams. -#}
-{%- if module.rand.chance(0.0105 * load) -%}
-  {#- Browsing session of one client on one application. -#}
-  {%- set c = module.rand.weighted_choice(range(clients | length) | list, shared.get('client_w')) -%}
-  {%- set a = module.rand.weighted_choice(range(servers | length) | list, shared.get('app_w')) -%}
+{#- Browsing session of one client, drawn by request weight, on one
+    application: 1-60 URIs with lognormal gaps. -#}
+{%- macro start_session() -%}
+  {%- set c = [module.bisect.bisect_right(shared.get('client_cum'), module.random.random() * shared.get('client_total')),
+      clients | length - 1] | min -%}
+  {%- set a = module.rand.weighted_choice(app_idx, shared.get('app_w')) -%}
   {%- set suid = module.rand.string.hex(16) -%}
   {%- set t = namespace(v=now) -%}
   {%- for n in range([1 + module.rand.number.lognormal(module.math.log(5), 0.9) | int, 60] | min) -%}
     {%- if not loop.first -%}{%- set t.v = t.v + gap(9, 1.2) | int -%}{%- endif -%}
     {{- push(c, a, uri_pick(a, false) | int, 'human', none, t.v, suid) -}}
   {%- endfor -%}
-{%- endif -%}
-{%- if module.rand.chance((0.55 + 0.45 * load) / 900) -%}
-  {#- Automated attack burst: payloads against one or more URIs and
-      probes for files that do not exist, sometimes mixed with plain
-      requests. -#}
+{%- endmacro -%}
+
+{#- Automated attack burst of a random client: payloads against one or
+    more URIs and probes for files that do not exist, sometimes mixed
+    with plain requests. -#}
+{%- macro start_burst() -%}
   {%- set c = module.rand.number.integer(0, clients | length - 1) -%}
-  {%- set a = module.rand.weighted_choice(range(servers | length) | list, shared.get('app_w')) -%}
+  {%- set a = module.rand.weighted_choice(app_idx, shared.get('app_w')) -%}
   {%- set suid = module.rand.string.hex(16) -%}
   {%- set t = namespace(v=now) -%}
   {%- for k in range(module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [34, 24, 16, 11, 8, 7])) -%}
@@ -171,26 +200,26 @@
       {%- set t.v = attack_uri(c, a, uri_pick(a, true) | int, codes, plain_at, t.v, suid) | int -%}
     {%- endif -%}
   {%- endfor -%}
-{%- endif -%}
+{%- endmacro -%}
 
-{#- 2. Episode: starts drawn by source time (see README), next due
-    from the actual start, never catching up. The target is a recent
-    background client, application and URI. -#}
+{#- 1. Episode: starts drawn by source time (see README), next due
+    from the actual start, never catching up. The target is a busy-tier
+    client, application and URI, different from the previous episode.
+    Its requests join the queue on top of ordinary traffic. -#}
 {%- if params.anomaly_mode and now >= shared.get('next_start') -%}
-  {%- set pool = [] -%}
-  {%- for r in shared.get('ring') -%}
-    {%- if r[0] != shared.get('last_client') and (r[1] ~ '|' ~ r[2]) != shared.get('last_target') -%}
-      {%- do pool.append(r) -%}
+  {%- set busy = shared.get('busy') -%}
+  {%- set pick = namespace(b=none) -%}
+  {%- for n in range(64) -%}
+    {%- if pick.b is none -%}
+      {%- set b = busy[[module.bisect.bisect_right(shared.get('busy_cum'), module.random.random() * shared.get('busy_total')),
+          busy | length - 1] | min] -%}
+      {%- if b[1] != shared.get('last_client') and (b[2] ~ '|' ~ b[3]) != shared.get('last_target') -%}
+        {%- set pick.b = b -%}
+      {%- endif -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- if pool -%}
-    {%- set pick = module.rand.choice(pool) -%}
-    {%- set c = pick[0] -%}{%- set a = pick[1] -%}{%- set u = pick[2] -%}
-  {%- else -%}
-    {%- set c = module.rand.weighted_choice(range(clients | length) | list, shared.get('client_w')) -%}
-    {%- set a = module.rand.weighted_choice(range(servers | length) | list, shared.get('app_w')) -%}
-    {%- set u = uri_pick(a, true) | int -%}
-  {%- endif -%}
+  {%- if pick.b is none -%}{%- set pick.b = module.rand.choice(busy) -%}{%- endif -%}
+  {%- set c = pick.b[1] -%}{%- set a = pick.b[2] -%}{%- set u = pick.b[3] -%}
   {#- Three or four distinct violations, drawn with the background
       weights without replacement, plus up to two repeats. -#}
   {%- set left = namespace(c=attacks | map(attribute='code') | list, w=attack_w | list) -%}
@@ -211,20 +240,22 @@
       'next_start': draw_start([due - w // 2, now + 1] | max, due + w // 2, 2) | int}) -%}
 {%- endif -%}
 
-{#- 3. Emit the earliest due request, otherwise nothing. -#}
-{%- set sel = namespace(i=-1, due=now + 1) -%}
-{%- for e in q -%}
-  {%- if e.due <= now and e.due < sel.due -%}
-    {%- set sel.i = loop.index0 -%}{%- set sel.due = e.due -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- if sel.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set e = q.pop(sel.i) -%}
+{#- 2. Emit the earliest due request; when nothing is due, open a
+    session or burst by the timestamp's tag and emit its first request. -#}
+{%- if not (q and q[0][0] <= now) -%}
+  {%- if 'scan' in tags -%}{{- start_burst() -}}{%- else -%}{{- start_session() -}}{%- endif -%}
+{%- endif -%}
+{%- set e = module.heapq.heappop(q)[2] -%}
 
-{%- for k in hist | list -%}
-  {%- set kept = hist[k] | selectattr('0', 'ge', now - window_s) | list -%}
-  {%- if kept -%}{%- do hist.update({k: kept}) -%}{%- else -%}{%- do hist.pop(k) -%}{%- endif -%}
-{%- endfor -%}
+{#- Blocked-violation history per client|server|URI, trimmed to the
+    chain window on use and swept every 5000 requests. -#}
+{%- set renders = shared.get('renders') + 1 -%}
+{%- do shared.set('renders', renders) -%}
+{%- if renders % 5000 == 0 -%}
+  {%- for k in hist | list -%}
+    {%- if hist[k][-1][0] < now - window_s -%}{%- do hist.pop(k) -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
 
 {%- set vs = servers[e.a] -%}
 {%- set cl = clients[e.c] -%}
@@ -264,14 +295,16 @@
   {%- endif -%}
 {%- endif -%}
 
+{%- set key = e.c ~ '|' ~ e.a ~ '|' ~ r.u -%}
+{%- set recent = hist.get(key, []) | selectattr('0', 'ge', now - window_s) | list if e.role != 'forceful' else [] -%}
+
 {#- Guard on the final chain step only: the rare ordinary passed
     request that would follow blocked requests with three or more
     distinct violations by the same client on the same URI within the
     chain window keeps its URI and time and trips one of those
     violations again, blocked at the ordinary attack block share. -#}
 {%- if r.act == 'passed' and not e.episode -%}
-  {%- set key = e.c ~ '|' ~ e.a ~ '|' ~ r.u -%}
-  {%- set seen = hist.get(key, []) | map(attribute='1') | unique | list -%}
+  {%- set seen = recent | map(attribute='1') | unique | list -%}
   {%- if seen | length >= 3 -%}
     {%- set r.code = module.rand.choice(seen) -%}
     {%- set r.act = 'blocked' if module.rand.chance(0.88) else 'alerted' -%}
@@ -281,20 +314,14 @@
 {%- if r.act == 'blocked' -%}
   {%- set r.status = 0 -%}
   {%- if e.role != 'forceful' -%}
-    {%- set key = e.c ~ '|' ~ e.a ~ '|' ~ r.u -%}
-    {%- do hist.update({key: (hist.get(key, []) + [[now, r.code]])[-32:]}) -%}
+    {%- do hist.update({key: (recent + [[now, r.code]])[-32:]}) -%}
     {%- if e.role == 'human' and module.rand.chance(0.6) -%}
       {{- push(e.c, e.a, r.u, 'retry', r.code, now + gap(20, 1.0) | int, e.suid) -}}
     {%- endif -%}
   {%- endif -%}
 {%- endif -%}
-{%- if not e.episode and e.role != 'forceful' and vs.uris[r.u].query -%}
-  {%- set ring = shared.get('ring') -%}
-  {%- do ring.append([e.c, e.a, r.u]) -%}
-  {%- if ring | length > 240 -%}{%- do ring.pop(0) -%}{%- endif -%}
-{%- endif -%}
 
-{#- 4. The request line, headers and URI. -#}
+{#- 3. The request line, headers and URI. -#}
 {%- if e.role == 'forceful' -%}
   {%- set method = 'GET' -%}{%- set path = e.fpath -%}{%- set query = '' -%}
 {%- else -%}
@@ -331,7 +358,7 @@
 {%- endif -%}
 {%- set full_request = method ~ ' ' ~ uri ~ ' ' ~ proto ~ '\\r\\n' ~ head_lines | join('\\r\\n') ~ '\\r\\n\\r\\n' -%}
 
-{#- 5. The CEF message, key order as in the F5 ASM 11.3.0 examples. -#}
+{#- 4. The CEF message, key order as in the F5 ASM 11.3.0 examples. -#}
 {%- set sid = shared.get('support_id') + 1 + module.rand.number.lognormal(module.math.log(2), 1.0) | int -%}
 {%- do shared.set('support_id', sid) -%}
 {%- set rt = module.datetime.datetime.fromtimestamp(now, utc) -%}
@@ -364,7 +391,7 @@
 {%- for k, v in ext -%}{%- do parts.append(k ~ '=' ~ (v | string | replace('=', '\\='))) -%}{%- endfor -%}
 {%- set raw = head ~ parts | join(' ') -%}
 
-{#- 6. ECS document. -#}
+{#- 5. ECS document. -#}
 {%- set violation = r.code is not none -%}
 {%- set event = {'kind': 'alert' if violation else 'event',
     'category': ['web', 'intrusion_detection'] if violation else ['web'],
