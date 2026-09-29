@@ -44,7 +44,7 @@ An episode usually spans about 2 to 20 minutes and up to about 40 minutes at nig
 
 **Linking fields**: the sender MAC (`smac`, `source.mac`), equal to `ownerMac` of step 1 and `challengerMac` of step 2; the claimed IP (`src`, `source.ip`), equal to `ownerIp` of steps 1 and 2 and `substitutedIpAddress` of step 3.
 
-**Recurrence**: the first episode starts within `anomaly_interval_hours` (at most 24 hours) of the start of the data, at an hour drawn from the working-day curve. Each next episode is due `anomaly_interval_hours` (default 24, minimum 3) after the actual start of the previous one and starts within one eighth of the interval (at most three hours) before or after that time, favouring working hours. A missed episode is not caught up.
+**Recurrence**: the first episode starts within `anomaly_interval_hours` (at most 24 hours) of the start of the data, at an hour drawn from the working-day curve. Each next episode is due `anomaly_interval_hours` (default 24, minimum 3) after the actual start of the previous one and starts within about one eighth of the interval (at most three hours) before or after that time, favouring working hours. A missed episode is not caught up.
 
 **Variation**: each episode uses another commissioning laptop and another IP than the previous one; the IP is the laptop's main service IP and the target is that device's peer, the same combination the laptop's ordinary ARP spoofing signs usually have. Episode records take the place of ordinary records at the same moments, so the daily volume and hour curve are the same in both modes, and the laptop's ordinary activity continues during the episode. KICS registers no event when a conflict or ARP spoofing ends, so the episode has no closing record.
 
