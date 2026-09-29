@@ -10,19 +10,19 @@ The modeled deployment has five full-access GUI administrators, each with an own
 | --- | --- | ---: | --- |
 | 51001 | Administrator login succeeded | 48.4% | `iam`, `authentication` |
 | 51002 | Administrator logged off | 48.4% | `iam`, `authentication` |
-| 51000 | Administrator login failed | 2.3% | - |
+| 51000 | Administrator login failed | 2.2% | - |
 | 52001 | Configuration changed: logging category (`UPSCategory`) - severity change, disable, enable | 0.85% | `iam`, `configuration` |
 | 52001 | Configuration changed: remote target (`UPSLogTarget`) - status `ENABLED`/`DISABLED` | 0.06% | `iam`, `configuration` |
 
-Shares are those of 30 days of default output (79,063 records). They are scenario rates, not measured Cisco rates.
+Shares are typical of 30 days of default output (about 79,000 records). They are scenario rates, not measured Cisco rates.
 
 ## Volume and Timing
 
 The node writes about 2,640 records per day on a fixed daily curve (UTC): 30 per hour round the clock (night shift), 60 per hour at 06-07 and 18-21, 120 per hour at 07-08 and 17-18, and 210 per hour at 08-17. Weekdays and weekends look the same.
 
-Sessions of different accounts interleave; each account has at most one session at a time. The five administrators open about 4.5% of sessions (about 47 logins per day together, weighted `admin_weights`); operators share the rest with random weights between 0.7 and 1.3. Operators sign in from their workstation or, in 10% of sessions, from the jump host; administrators use the jump host for 15% of ordinary sessions and 80% of logging-maintenance sessions.
+Sessions of different accounts interleave; each account has at most one session at a time. The five administrators open about 4% of sessions (about 47 logins per day together, weighted `admin_weights`); operators share the rest with random weights between 0.7 and 1.3. Operators sign in from their workstation or, in 10% of sessions, from the jump host; administrators use the jump host for 15% of ordinary sessions and 80% of logging-maintenance sessions.
 
-A session may begin with one to four mistyped passwords; one failure is more common than two, two than three. Administrators mistype the local ISE password more often on the shared jump host (8.5% of sessions start with failures) than on their own workstation (2.8%); operators 3%. After failures the account sometimes gives up without logging in. Consecutive failures stay below the lockout threshold. Failed logins are about 4% of all login attempts (administrators about 7%, operators about 4%). A logged-in session lasts a log-normally distributed time (median about 14 minutes for administrators, 6 minutes for operators).
+A session may begin with one to four mistyped passwords; one failure is more common than two, two than three. Administrators mistype the local ISE password more often on the shared jump host (8.5% of sessions start with failures) than on their own workstation (2.8%); operators 3%. After failures the account sometimes gives up without logging in. Consecutive failures stay below the lockout threshold. Failed logins are about 4% of all login attempts (administrators about 7%, operators about 4%). A logged-in session lasts a log-normally distributed time (median about 15 minutes for administrators, 7 minutes for operators).
 
 Ordinary administrator sessions hold zero to three logging-category edits at random moments before the logout (a severity change, a disable with targets cleared, or re-enabling a disabled category). About 6% of administrator sessions are logging maintenance: the administrator disables a category (85%), in a quarter of them then detaches a remote target, and re-enables each object before logging out in 60% of cases. Remote targets change only in these sessions, about five target disables per week. Objects left disabled are re-enabled by later ordinary edits: a disabled remote target usually within minutes to an hour during working hours (median about 4 minutes), a category within hours.
 
