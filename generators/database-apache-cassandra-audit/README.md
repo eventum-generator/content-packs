@@ -15,7 +15,7 @@ About 38,000 records a day, on UTC clock hours:
 
 ## Event Types
 
-Shares are measured on a 96-hour default `anomaly_mode: true` output (152,801 records).
+Shares of default output (`anomaly_mode: true`).
 
 | Audit type | Category | Share | Produced by |
 | --- | --- | ---: | --- |
@@ -102,7 +102,7 @@ Performance: about 4,500 records/s in batch mode (14 days, 535,437 records, in 1
 
 ## Sample Output
 
-The `GRANT` step of the first episode in the measured default output:
+The `GRANT` step of an episode in default output:
 
 ```json
 {"@timestamp": "2026-09-01T14:45:54.889Z", "cassandra": {"audit": {"category": "DCL", "host": "/10.20.30.10:7000", "keyspace": "finance", "operation": "GRANT SELECT ON TABLE finance.payroll TO migration_ro;", "port": 54667, "source": "/10.20.10.5", "timestamp": 1788273954889, "type": "GRANT", "user": "ops_admin"}}, "ecs": {"version": "8.17.0"}, "event": {"action": "grant", "category": ["iam"], "created": "2026-09-01T14:45:54.889Z", "kind": "event", "original": "INFO  [Native-Transport-Requests-7] 2026-09-01 14:45:54,889 FileAuditLogger.java:51 - user:ops_admin|host:/10.20.30.10:7000|source:/10.20.10.5|port:54667|timestamp:1788273954889|type:GRANT|category:DCL|ks:finance|operation:GRANT SELECT ON TABLE finance.payroll TO migration_ro;", "outcome": "success", "type": ["user", "change"]}, "host": {"ip": ["10.20.30.10"], "name": "cassandra-01.example.test"}, "log": {"level": "INFO", "logger": "org.apache.cassandra.audit.FileAuditLogger", "origin": {"file": {"line": 51, "name": "FileAuditLogger.java"}}}, "message": "user:ops_admin|host:/10.20.30.10:7000|source:/10.20.10.5|port:54667|timestamp:1788273954889|type:GRANT|category:DCL|ks:finance|operation:GRANT SELECT ON TABLE finance.payroll TO migration_ro;", "process": {"thread": {"name": "Native-Transport-Requests-7"}}, "related": {"ip": ["10.20.10.5", "10.20.30.10"], "user": ["ops_admin", "migration_ro"]}, "source": {"ip": "10.20.10.5", "port": 54667}, "user": {"name": "ops_admin", "target": {"name": "migration_ro"}}}
