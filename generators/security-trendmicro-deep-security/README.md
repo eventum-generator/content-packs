@@ -32,7 +32,7 @@ Sequence, all for one source S (`src` / `source.ip`) and one protected web serve
 
 1. Deny firewall event (signature `21`, `act=Deny`, TCP SYN) from S to H on blocked port P1.
 2. Deny from S to H on a second blocked port P2.
-3. Deny from S to H on a third blocked port P3 (four or five ports in about four episodes in ten); each port gets one to three attempts.
+3. Deny from S to H on a third blocked port P3 (four or five ports in about half of episodes); each port gets one to three attempts.
 4. One intrusion prevention event (`act=IDS:Reset`) from S to H on HTTP or HTTPS: a port scan followed by an exploit attempt against the service it found.
 
 Linking fields: `src` / `source.ip`, `cn1` / `host.id`, `dvchost` / `host.name` and `dst` / `destination.ip` in all steps; distinct `dpt` / `destination.port` in steps 1-3. An episode spans about one to ten minutes, occasionally up to half an hour, from the first deny to the intrusion prevention event.
