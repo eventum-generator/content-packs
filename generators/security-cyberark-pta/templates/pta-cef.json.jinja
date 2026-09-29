@@ -1,12 +1,11 @@
 {#- CyberArk PTA security-event CEF records (syslog_outbound, format
     CEF), wrapped in ECS JSON as the Elastic cyberark_pta integration
-    parses them. One input tick per second; each tick emits the earliest
-    due alert stamped with its own detection second, or drops. Every
-    Vault user and every theft source machine runs its own incident
-    process with lognormal gaps; incidents are thinned by an hour-of-day
-    profile of their kind. -#}
+    parses them. Every input timestamp is one alert stamped with that
+    timestamp: the earliest due follow-up alert of an incident already
+    under way (a repeat, the next alert of a two-alert incident, an
+    episode step), otherwise the first alert of a new incident of the
+    timestamp's population ("irregular" or "office"). -#}
 {%- set now = module.builtins.int(timestamp.timestamp()) -%}
-{%- if shared.get('queue') is not none and (not shared.get('queue') or shared.get('queue')[0][0] > now) -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set hq = module.heapq -%}
 {%- set hour = 3600 -%}
 {#- A background credential-theft alert on an account is not raised
@@ -16,30 +15,55 @@
     irregular hours" on that account: the full chain stays
     episode-only. -#}
 {%- set guard = 4 * hour -%}
-{%- set vault_incidents_per_day = 150 -%}
-{%- set theft_incidents_per_day = 55 -%}
-{#- Hour-of-day acceptance (UTC). off: nights and weekends (irregular
-    hours); biz: working hours; any: mild daytime lean. -#}
-{%- set profiles = {
-  'off': {'wd': [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.4, 0.15, 0.06, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.06, 0.15, 0.4, 0.7, 0.9, 1.0, 1.0, 1.0], 'we': 0.8},
-  'biz': {'wd': [0.08, 0.08, 0.08, 0.08, 0.08, 0.1, 0.2, 0.5, 0.9, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.9, 0.5, 0.3, 0.2, 0.1, 0.08, 0.08], 'we': 0.15},
-  'any': {'wd': [0.4, 0.4, 0.4, 0.4, 0.4, 0.45, 0.6, 0.8, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.8, 0.6, 0.5, 0.45, 0.4, 0.4], 'we': 0.4}} -%}
-{#- Vault-user incident kinds: weight and hour profile. -#}
-{%- set vkinds = ['irr', 'dorm', 'dorm_irr', 'irr_theft', 'dorm_theft'] -%}
-{%- set vweights = [60, 10, 8, 12, 4] -%}
-{%- set vprof = {'irr': 'off', 'dorm': 'biz', 'dorm_irr': 'off', 'irr_theft': 'off', 'dorm_theft': 'biz'} -%}
+{#- Incident kinds per population and their weights. -#}
+{#- Hour (UTC) and weekday (0 = Monday) of this timestamp. -#}
+{%- set hr = (now // hour) % 24 -%}
+{%- set wday = (now // 86400 + 3) % 7 -%}
+{#- A dormant user who comes back at an irregular hour does so in the
+    evening or at night, not in the early morning before work. -#}
+{%- set irr_kinds = ['irr', 'dorm_irr', 'irr_theft'] -%}
+{%- set irr_weights = [68, 14, 18] if hr >= 12 or hr < 4 else [82, 0, 18] -%}
+{#- Irregular-hours activity per Vault user is capped: the busiest
+    users (on call) at 4.5, and at 2.5 in the daytime, when these
+    alerts come from users on other shifts. -#}
+{%- set cap_irr = 4.5 -%}
+{%- set cap_day = 2.5 -%}
+{%- set off_kinds = ['theft', 'irr', 'dorm', 'dorm_theft'] -%}
+{%- set off_weights = [40, 30, 22, 8] -%}
+{#- Expected "irregular" alerts per UTC hour (patterns/irregular-*) in
+    the hours that start dormant-then-irregular incidents, weekdays and
+    weekend days: the curve of those incidents, which episode starts
+    follow. -#}
+{%- set irr_wd = [3.0, 3.0, 3.0, 3.0, 0, 0, 0, 0, 0, 0, 0, 0, 3.0, 3.0, 3.0, 3.0, 3.0, 7.5, 16.5, 25.4, 32.2, 25.4, 16.5, 7.5] -%}
+{%- set irr_we = [3.0, 3.0, 3.0, 3.0, 0, 0, 0, 0, 0, 0, 0, 0, 11.0, 11.0, 11.0, 11.0, 11.0, 15.5, 24.5, 33.4, 40.2, 33.4, 16.5, 7.5] -%}
+{#- Episode actors are limited to pairs that background carries often
+    enough to occur in any four days. Alerts in the quietest four days
+    of the shipped rates: 590 irregular-hours alerts of lone and
+    theft-followed irregular incidents, 68 of dormant-then-irregular
+    ones, 233 daytime ones (by users on other shifts), 199 dormant-user
+    alerts and 291 theft alerts of workstation incidents. Needed: 5.5
+    dormant-user alerts of the Vault user, 10 alerts of the Vault user
+    on the account and 10 theft alerts of the workstation on it. -#}
+{%- set n_irr = 590 -%}
+{%- set n_dirr = 68 -%}
+{%- set n_day = 233 -%}
+{%- set n_dorm = 199 -%}
+{%- set n_theft = 291 -%}
 {%- macro ln(med, sig) -%}
   {{- module.builtins.max(1, module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig))) -}}
-{%- endmacro -%}
-{%- macro accept(prof, t) -%}
-  {%- set d = module.datetime.datetime.fromtimestamp(t, module.datetime.timezone.utc) -%}
-  {%- set p = profiles[prof] -%}
-  {{- 'y' if module.rand.chance(p.we if d.weekday() >= 5 else p.wd[d.hour]) else '' -}}
 {%- endmacro -%}
 {%- macro push(due, item) -%}
   {%- set s = shared.get('seq') + 1 -%}
   {%- do shared.set('seq', s) -%}
   {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro put(cur, due, item) -%}
+  {#- The row due now is this timestamp's alert; later rows queue. -#}
+  {%- if due <= now and not cur -%}{%- do cur.update(item) -%}{%- else -%}{{- push(due, item) -}}{%- endif -%}
+{%- endmacro -%}
+{%- macro pick(cum) -%}
+  {%- set i = module.bisect.bisect(cum, module.rand.number.floating(0, cum[-1])) -%}
+  {{- [i, cum | length - 1] | min -}}
 {%- endmacro -%}
 {%- macro vacct(v) -%}
   {%- set vu = shared.get('vault')[v] -%}
@@ -49,61 +73,92 @@
   {%- set ac = shared.get('accounts')[a] -%}
   {{- module.rand.weighted_choice(ac.src, ac.srcw) -}}
 {%- endmacro -%}
-{%- macro vrows(c, v, a, t0, ep) -%}
+{%- macro vrows(cur, c, v, a, t0, ep) -%}
   {#- A Vault alert and its repeats (the same user on the same or
       another of its accounts minutes later); returns the last time. -#}
   {%- set t = namespace(v=t0, a=a, go=true) -%}
-  {{- push(t0, {'k': 'row', 'c': c, 'v': v, 'a': a, 's': none, 'ep': ep}) -}}
+  {{- put(cur, t0, {'c': c, 'v': v, 'a': a, 's': none, 'ep': ep}) -}}
   {%- for _ in range(3) if t.go and c == '23' -%}
     {%- if module.rand.chance(0.35) -%}
       {%- set t.v = t.v + (ln(150, 1.0) | int) -%}
       {%- if module.rand.chance(0.4) -%}{%- set t.a = vacct(v) | int -%}{%- endif -%}
-      {{- push(t.v, {'k': 'row', 'c': c, 'v': v, 'a': t.a, 's': none, 'ep': ep}) -}}
+      {{- push(t.v, {'c': c, 'v': v, 'a': t.a, 's': none, 'ep': ep}) -}}
     {%- else -%}{%- set t.go = false -%}{%- endif -%}
   {%- endfor -%}
   {{- t.v -}}
 {%- endmacro -%}
-{%- macro trows(s, a, t0, ep) -%}
+{%- macro trows(cur, s, a, t0) -%}
   {#- A credential-theft alert and its repeats (the same source reusing
       the account minutes later). -#}
   {%- set t = namespace(v=t0, go=true) -%}
-  {{- push(t0, {'k': 'row', 'c': '1', 'v': none, 'a': a, 's': s, 'ep': ep}) -}}
+  {{- put(cur, t0, {'c': '1', 'v': none, 'a': a, 's': s, 'ep': false}) -}}
   {%- for _ in range(3) if t.go -%}
     {%- if module.rand.chance(0.3) -%}
       {%- set t.v = t.v + (ln(420, 1.1) | int) -%}
-      {{- push(t.v, {'k': 'row', 'c': '1', 'v': none, 'a': a, 's': s, 'ep': ep}) -}}
+      {{- push(t.v, {'c': '1', 'v': none, 'a': a, 's': s, 'ep': false}) -}}
     {%- else -%}{%- set t.go = false -%}{%- endif -%}
   {%- endfor -%}
 {%- endmacro -%}
-{%- macro vincident(kind, v, t0) -%}
-  {%- set a = vacct(v) | int -%}
-  {%- if kind == 'irr' -%}
-    {%- set _ = vrows('23', v, a, t0, false) -%}
-  {%- elif kind == 'dorm' -%}
-    {%- set _ = vrows('26', v, a, t0, false) -%}
-  {%- elif kind == 'dorm_irr' -%}
-    {%- set _ = vrows('26', v, a, t0, false) -%}
-    {%- set _ = vrows('23', v, a, t0 + (ln(90, 0.8) | int), false) -%}
-  {%- elif kind == 'irr_theft' -%}
-    {%- set t = vrows('23', v, a, t0, false) | int -%}
-    {{- trows(vsrc(a) | int, a, t + (ln(900, 0.7) | int), false) -}}
+{%- macro incident(cur, kind) -%}
+  {%- if kind == 'theft' -%}
+    {%- set s = pick(shared.get('scum')) | int -%}
+    {%- set src = shared.get('sources')[s] -%}
+    {{- trows(cur, s, module.rand.weighted_choice(src.acc, src.accw), now) -}}
   {%- else -%}
-    {%- set t = vrows('26', v, a, t0, false) | int -%}
-    {{- trows(vsrc(a) | int, a, t + (ln(900, 0.7) | int), false) -}}
+    {%- if kind in ['irr', 'irr_theft'] -%}
+      {%- set v = pick(shared.get('vcum_day' if wday < 5 and 8 <= hr < 17 or 'office' in tags else 'vcum_irr')) | int -%}
+    {%- else -%}
+      {%- set v = pick(shared.get('vcum')) | int -%}
+    {%- endif -%}
+    {%- set a = vacct(v) | int -%}
+    {%- if kind == 'irr' -%}
+      {%- set _ = vrows(cur, '23', v, a, now, false) -%}
+    {%- elif kind == 'dorm' -%}
+      {%- set _ = vrows(cur, '26', v, a, now, false) -%}
+    {%- elif kind == 'dorm_irr' -%}
+      {%- set _ = vrows(cur, '26', v, a, now, false) -%}
+      {%- set _ = vrows(cur, '23', v, a, now + (ln(90, 0.8) | int), false) -%}
+    {%- elif kind == 'irr_theft' -%}
+      {%- set t = vrows(cur, '23', v, a, now, false) | int -%}
+      {{- trows(cur, vsrc(a) | int, a, t + (ln(900, 0.7) | int)) -}}
+    {%- else -%}
+      {%- set t = vrows(cur, '26', v, a, now, false) | int -%}
+      {{- trows(cur, vsrc(a) | int, a, t + (ln(900, 0.7) | int)) -}}
+    {%- endif -%}
   {%- endif -%}
 {%- endmacro -%}
 {%- macro ep_start(lo, hi, pw) -%}
   {#- Episode start in [lo, hi], drawn by rejection with the hour-of-day
-      profile of background dormant-then-irregular incidents ('off'):
-      weight p for the first episode, p^2 + 0.02 for the next ones. -#}
+      curve of irregular-hours activity: weight p for the first
+      episode, p^2 + 0.02 for the next ones. -#}
   {%- set w = namespace(t=none, x=lo) -%}
   {%- for _ in range(400) if w.t is none -%}
     {%- set w.x = lo + module.rand.number.integer(0, hi - lo) -%}
     {%- set d = module.datetime.datetime.fromtimestamp(w.x, module.datetime.timezone.utc) -%}
-    {%- set p = profiles.off.we if d.weekday() >= 5 else profiles.off.wd[d.hour] -%}
+    {%- set p = (irr_we if d.weekday() >= 5 else irr_wd)[d.hour] / 40.2 -%}
     {%- if module.rand.chance(p if pw == 1 else (p * p + 0.02) / 1.02) -%}{%- set w.t = w.x -%}{%- endif -%}
   {%- endfor -%}
   {{- w.t if w.t is not none else w.x -}}
+{%- endmacro -%}
+{%- macro episode(cur) -%}
+  {#- A Vault user V raises 26 and 23 on one of its accounts A, then a
+      workstation that uses A raises a single credential-theft alert on
+      it. The triple is drawn by background frequency among the
+      frequent ones; V and A rotate. -#}
+  {%- set pool = namespace(t=[], w=[]) -%}
+  {%- for e in shared.get('eligible') if e[0] != shared.get('ep_last_v') and e[1] != shared.get('ep_last_a') -%}
+    {%- do pool.t.append(e) -%}{%- do pool.w.append(e[3]) -%}
+  {%- endfor -%}
+  {%- if not pool.t -%}{%- set pool.t = shared.get('eligible') -%}{%- set pool.w = pool.t | map(attribute=3) | list -%}{%- endif -%}
+  {%- set e = module.rand.weighted_choice(pool.t, pool.w) -%}
+  {%- set _ = vrows(cur, '26', e[0], e[1], now, true) -%}
+  {%- set t = vrows(cur, '23', e[0], e[1], now + (ln(90, 0.8) | int), true) | int -%}
+  {{- push(t + (ln(900, 0.7) | int), {'c': '1', 'v': none, 'a': e[1], 's': e[2], 'ep': true}) -}}
+  {%- do shared.update({'ep_last_v': e[0], 'ep_last_a': e[1]}) -%}
+  {%- set iv = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- set win = [iv // 4, 6 * hour] | min -%}
+  {#- The upper end leaves 20 minutes for the next alert timestamp. -#}
+  {{- push(ep_start(now + iv - win // 2, now + iv + win // 2 - 1200, 2) | int, {'k': 'eps'}) -}}
 {%- endmacro -%}
 {%- macro armed(hist) -%}
   {#- 'y' when one Vault user raised 26 and later 23 in this history. -#}
@@ -113,6 +168,10 @@
     {%- elif e[1] == '23' and e[2] in st.dorm -%}{%- set st.hit = true -%}{%- endif -%}
   {%- endfor -%}
   {{- 'y' if st.hit else '' -}}
+{%- endmacro -%}
+{%- macro bw() -%}
+  {#- A bounded per-link weight: no link dominates or goes silent. -#}
+  {{- [[module.rand.number.lognormal(0, 0.5), 0.6] | max, 1.7] | min -}}
 {%- endmacro -%}
 {%- if shared.get('queue') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
@@ -135,9 +194,9 @@
     {%- set accw = [] -%}
     {%- for name in r.accounts.split(' ') -%}
       {%- do acc.append(index[name]) -%}
-      {%- do accw.append(module.rand.number.lognormal(0, 0.7)) -%}
+      {%- do accw.append(bw() | float) -%}
       {%- do accounts[index[name]].src.append(sources | length) -%}
-      {%- do accounts[index[name]].srcw.append(module.rand.number.lognormal(0, 0.7)) -%}
+      {%- do accounts[index[name]].srcw.append(bw() | float) -%}
     {%- endfor -%}
     {%- do sources.append({'user': r.user, 'host': r.host, 'ip': r.ip, 'w': r.weight | float, 'acc': acc, 'accw': accw}) -%}
   {%- endfor -%}
@@ -145,118 +204,90 @@
   {%- for r in samples.vault_users -%}
     {%- set acc = [] -%}
     {%- set accw = [] -%}
-    {%- for name in r.accounts.split(' ') -%}{%- do acc.append(index[name]) -%}{%- do accw.append(module.rand.number.lognormal(0, 0.7)) -%}{%- endfor -%}
+    {%- for name in r.accounts.split(' ') -%}{%- do acc.append(index[name]) -%}{%- do accw.append(bw() | float) -%}{%- endfor -%}
     {%- do vault.append({'user': r.user, 'w': r.weight | float, 'acc': acc, 'accw': accw}) -%}
   {%- endfor -%}
+  {%- set cum = namespace(v=[], i=[], d=[], s=[], x=0.0) -%}
+  {%- for u in vault -%}{%- set cum.x = cum.x + u.w -%}{%- do cum.v.append(cum.x) -%}{%- endfor -%}
+  {%- set cum.x = 0.0 -%}
+  {%- for u in vault -%}{%- set cum.x = cum.x + ([u.w, cap_irr] | min) -%}{%- do cum.i.append(cum.x) -%}{%- endfor -%}
+  {%- set cum.x = 0.0 -%}
+  {%- for u in vault -%}{%- set cum.x = cum.x + ([u.w, cap_day] | min) -%}{%- do cum.d.append(cum.x) -%}{%- endfor -%}
+  {%- set cum.x = 0.0 -%}
+  {%- for u in sources -%}{%- set cum.x = cum.x + u.w -%}{%- do cum.s.append(cum.x) -%}{%- endfor -%}
+  {#- Episode triples [V, A, S, weight, score]; score >= 1 when all
+      three are frequent enough. Should fewer than three accounts pass
+      (edited samples), the best-scored ones fill up to three. -#}
+  {%- set cands = [] -%}
+  {%- for v in range(vault | length) -%}
+    {%- set vu = vault[v] -%}
+    {%- set n26 = n_dorm * vu.w / cum.v[-1] -%}
+    {%- set nv = n_irr * ([vu.w, cap_irr] | min) / cum.i[-1] + n_day * ([vu.w, cap_day] | min) / cum.d[-1] + (n_dirr + n_dorm) * vu.w / cum.v[-1] -%}
+    {%- for j in range(vu.acc | length) -%}
+      {%- set a = vu.acc[j] -%}
+      {%- set nva = nv * vu.accw[j] / (vu.accw | sum) -%}
+      {%- for k in range(accounts[a].src | length) -%}
+        {%- set sr = sources[accounts[a].src[k]] -%}
+        {%- set nsa = n_theft * sr.w / cum.s[-1] * sr.accw[sr.acc.index(a)] / (sr.accw | sum) -%}
+        {%- do cands.append([v, a, accounts[a].src[k], nva * nsa, [n26 / 5.5, nva / 10, nsa / 10] | min]) -%}
+      {%- endfor -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set elig = cands | selectattr(4, 'ge', 1) | list -%}
+  {%- set got = namespace(a=elig | map(attribute=1) | unique | list) -%}
+  {%- for c in cands | sort(attribute=4, reverse=true) if got.a | length < 3 and c[4] < 1 -%}
+    {%- do elig.append(c) -%}
+    {%- if c[1] not in got.a -%}{%- do got.a.append(c[1]) -%}{%- endif -%}
+  {%- endfor -%}
   {%- do shared.update({'accounts': accounts, 'sources': sources, 'vault': vault,
-    'vault_idx': range(vault | length) | list, 'vault_w': vault | map(attribute='w') | list,
-    'ep_last_v': none, 'ep_last_a': none, 'r23': [], 's26': {}, 'r1': {},
+    'vcum': cum.v, 'vcum_irr': cum.i, 'vcum_day': cum.d, 'scum': cum.s, 'eligible': elig,
+    'ep_last_v': none, 'ep_last_a': none,
     'oid_proc': module.rand.string.hex(10) | lower,
     'oid_ctr': module.rand.number.integer(0, 16777215)}) -%}
-  {#- Mean gap from the actor's share; lognormal sigma 1.1. The first
-      opportunity is a uniform point of a length-biased gap, so the run
-      starts stationary. -#}
-  {%- set vw = vault | sum(attribute='w') -%}
-  {%- for v in range(vault | length) -%}
-    {%- set med = 86400 * vw / (vault_incidents_per_day * vault[v].w) * module.math.exp(-0.605) -%}
-    {%- do vault[v].update({'med': med}) -%}
-    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(med * module.math.exp(1.21), 1.1) | int)), {'k': 'vo', 'i': v}) -}}
-  {%- endfor -%}
-  {%- set sw = sources | sum(attribute='w') -%}
-  {%- for s in range(sources | length) -%}
-    {%- set med = 86400 * sw / (theft_incidents_per_day * sources[s].w) * module.math.exp(-0.605) -%}
-    {%- do sources[s].update({'med': med}) -%}
-    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(med * module.math.exp(1.21), 1.1) | int)), {'k': 'so', 'i': s}) -}}
-  {%- endfor -%}
-  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
   {%- if params.anomaly_mode -%}
-    {{- push(ep_start(now, now + ([interval, 24 * hour] | min), 1) | int, {'k': 'eps'}) -}}
+    {%- set iv = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+    {{- push(ep_start(now, now + ([iv, 24 * hour] | min) - 1200, 1) | int, {'k': 'eps'}) -}}
   {%- endif -%}
 {%- endif -%}
 {%- set q = shared.get('queue') -%}
 {%- set vault = shared.get('vault') -%}
 {%- set sources = shared.get('sources') -%}
 {%- set accounts = shared.get('accounts') -%}
-{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{%- set out = namespace(due=none, item=none) -%}
-{%- for _ in range(500) if out.item is none and q and q[0][0] <= now -%}
-  {%- set top = hq.heappop(q) -%}
-  {%- set it = top[2] -%}
-  {%- if it.k == 'vo' -%}
-    {%- set kind = module.rand.weighted_choice(vkinds, vweights) -%}
-    {%- if accept(vprof[kind], top[0]) -%}{{- vincident(kind, it.i, top[0]) -}}{%- endif -%}
-    {{- push(top[0] + (ln(vault[it.i].med, 1.1) | int), it) -}}
-  {%- elif it.k == 'so' -%}
-    {%- if accept('any', top[0]) -%}
-      {%- set s = sources[it.i] -%}
-      {{- trows(it.i, module.rand.weighted_choice(s.acc, s.accw), top[0], false) -}}
-    {%- endif -%}
-    {{- push(top[0] + (ln(sources[it.i].med, 1.1) | int), it) -}}
-  {%- elif it.k == 'eps' -%}
-    {#- Episode: a Vault user raises 26 and 23 on one of its accounts,
-        then a source machine that uses that account raises a
-        credential-theft alert on it. User, account and source are
-        drawn from recent background alerts (so by background
-        frequency, and every pair also occurs there); user and account
-        rotate. -#}
-    {%- set start = top[0] -%}
-    {%- set r23 = shared.get('r23') -%}
-    {%- set s26 = shared.get('s26') -%}
-    {%- set r1 = shared.get('r1') -%}
-    {%- set pick = namespace(v=none, a=none, s=none) -%}
-    {%- for _ in range(200) if pick.v is none and r23 -%}
-      {%- set c = module.rand.choice(r23) -%}
-      {%- if c[0] != shared.get('ep_last_v') and c[1] != shared.get('ep_last_a') and c[0] in s26 and r1.get(c[1] | string) -%}
-        {%- set pick.v = c[0] -%}{%- set pick.a = c[1] -%}{%- set pick.s = module.rand.choice(r1[c[1] | string]) -%}
-      {%- endif -%}
-    {%- endfor -%}
-    {%- if pick.v is none -%}
-      {%- set pick.v = module.rand.weighted_choice(shared.get('vault_idx'), shared.get('vault_w')) -%}
-      {%- set pick.a = vacct(pick.v) | int -%}
-      {%- set pick.s = vsrc(pick.a) | int -%}
-    {%- endif -%}
-    {%- set _ = vrows('26', pick.v, pick.a, start, true) -%}
-    {%- set t = vrows('23', pick.v, pick.a, start + (ln(90, 0.8) | int), true) | int -%}
-    {{- trows(pick.s, pick.a, t + (ln(900, 0.7) | int), true) -}}
-    {%- do shared.update({'ep_last_v': pick.v, 'ep_last_a': pick.a}) -%}
-    {%- set win = [interval // 4, 6 * hour] | min -%}
-    {{- push(ep_start(start + interval - win // 2, start + interval + win // 2, 2) | int, {'k': 'eps'}) -}}
+{%- set it = {} -%}
+{%- for _ in range(8) if not it -%}
+  {%- if q and q[0][0] <= now -%}
+    {%- set top = hq.heappop(q) -%}
+    {%- if top[2].get('k') == 'eps' -%}{{- episode(it) -}}{%- else -%}{%- do it.update(top[2]) -%}{%- endif -%}
+  {%- elif 'office' in tags -%}
+    {{- incident(it, module.rand.weighted_choice(off_kinds, off_weights)) -}}
   {%- else -%}
-    {%- set out.due = top[0] -%}
-    {%- set out.item = it -%}
+    {{- incident(it, module.rand.weighted_choice(irr_kinds, irr_weights)) -}}
   {%- endif -%}
 {%- endfor -%}
-{%- if out.item is none -%}{{- dispatch.drop() -}}{%- endif -%}
-{%- set it = out.item -%}
 {%- set a = namespace(v=it.a, s=it.s) -%}
+{%- set keep = accounts[a.v].hist | selectattr(0, 'ge', now - guard) | list -%}
+{%- do accounts[a.v].update({'hist': keep}) -%}
+{%- if it.c == '1' and not it.ep and armed(keep) -%}
+  {#- Guarded, final chain step only: this background theft alert
+      would complete the chain on its account. The workstation's
+      connection goes to another of its accounts instead, drawn by its
+      usual weights among those it would not complete the chain on;
+      with none left, the alert is not raised. Time and workstation
+      stay. -#}
+  {%- set sr = sources[a.s] -%}
+  {%- set alt = namespace(a=[], w=[]) -%}
+  {%- for j in range(sr.acc | length) if sr.acc[j] != a.v -%}
+    {%- set h = accounts[sr.acc[j]].hist | selectattr(0, 'ge', now - guard) | list -%}
+    {%- if not armed(h) -%}{%- do alt.a.append(sr.acc[j]) -%}{%- do alt.w.append(sr.accw[j]) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if not alt.a -%}{{- dispatch.drop() -}}{%- endif -%}
+  {%- set a.v = module.rand.weighted_choice(alt.a, alt.w) -%}
+  {%- set keep = accounts[a.v].hist | selectattr(0, 'ge', now - guard) | list -%}
+{%- endif -%}
+{%- do keep.append([now, it.c, it.v]) -%}
 {%- set ac = accounts[a.v] -%}
-{%- set keep = ac.hist | selectattr(0, 'ge', out.due - guard) | list -%}
 {%- do ac.update({'hist': keep}) -%}
-{%- if it.c == '1' and armed(keep) -%}
-  {%- if it.ep -%}
-    {#- The episode's theft alert completes the chain: like the
-        matcher, forget the account's earlier alerts. -#}
-    {%- do ac.update({'hist': []}) -%}
-  {%- else -%}
-    {#- Guarded, final chain step only: this background theft alert
-        would complete the chain on its account, so it is not raised.
-        Its time, account and source are not reused elsewhere. -#}
-    {{- dispatch.drop() -}}
-  {%- endif -%}
-{%- endif -%}
-{%- do ac.hist.append([out.due, it.c, it.v]) -%}
-{#- Recent background alerts, bounded: the pool episodes draw from. -#}
-{%- if not it.ep -%}
-  {%- if it.c == '23' -%}
-    {%- do shared.get('r23').append([it.v, a.v]) -%}
-    {%- if shared.get('r23') | length > 400 -%}{%- do shared.set('r23', shared.get('r23')[-300:]) -%}{%- endif -%}
-  {%- elif it.c == '26' -%}
-    {%- do shared.get('s26').update({it.v: out.due}) -%}
-  {%- else -%}
-    {%- set lst = shared.get('r1').get(a.v | string, []) + [a.s] -%}
-    {%- do shared.get('r1').update({a.v | string: lst[-8:]}) -%}
-  {%- endif -%}
-{%- endif -%}
+{%- set out = namespace(due=now) -%}
 {#- EventID is a MongoDB ObjectId: detection second, a per-process
     random part, and a counter shared with PTA's other documents. -#}
 {%- set ctr = (shared.get('oid_ctr') + 1 + (module.rand.number.lognormal(module.math.log(40), 1.2) | int)) % 16777216 -%}
