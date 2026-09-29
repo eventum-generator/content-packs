@@ -1,12 +1,12 @@
 {#- One Solar webProxy 4.3.1 filtering node writing siem-log syslog
     messages for an office user subnet (forward mode, TLS inspection).
 
-    Each one-second tick emits at most one message, taken from a
-    due-queue fed by independent per-user random processes (merged
-    Poisson, each user thinned by its own working hours, shifted per
-    user and jittered per day). The anomaly episode only adds
-    its own requests to the queue; it never suspends, delays or
-    reshapes background traffic.
+    Every input timestamp becomes exactly one message; the input sets
+    the volume and its hour curve. A timestamp first serves the earliest
+    queued request that is due (embedded objects, retries, follow-up
+    uploads, episode steps); otherwise a user drawn by activity weight
+    and its own working hours starts a new action, whose first request
+    takes this timestamp and whose later requests are queued.
 
     Native line (installation manual 4.3.1, table 9.2 and its raw
     example; key meanings from appendix F.1):
@@ -14,21 +14,20 @@
     flt-rules and flt-codes carry one entry per applied rule, as in the
     vendor examples (decryption rule 11, layer transitions 0, blocking
     rule 2). -#}
-{%- set now = timestamp.timestamp() | int -%}
+{%- set now_s = timestamp.timestamp() | int -%}
+{%- set ms = timestamp.microsecond // 1000 -%}
+{%- set now = now_s + ms / 1000 -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set within = 1800 -%}
-
-{#- Activity factor of one user at a local hour: busy inside its own
-    working hours (start, length), evening for 4 h after, night. -#}
-{%- macro factor(start, length, local_hour) -%}
-{%- set into = (local_hour - start) % 24 -%}
-{{- (1.7 if into < length else (0.7 if into < length + 4 else 0.2)) / 0.9 -}}
-{%- endmacro -%}
+{#- Relative request volume per UTC hour, as set by the input patterns
+    (120 to 2000 requests an hour). -#}
+{%- set hour_curve = [0.06, 0.06, 0.06, 0.06, 0.1325, 0.4075, 0.6825,
+    1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.6825, 0.4075, 0.1325, 0.06,
+    0.06, 0.06, 0.06, 0.06, 0.06, 0.06] -%}
 
 {#- Draw an episode start in [a, b): 10-minute slots weighted by the
-    background hour curve (sq: curve^2 + 0.05, curve max 1), uniform
-    within a slot. -#}
+    hour curve (sq: curve^2 + 0.05), uniform within a slot. -#}
 {%- macro draw_start(a, b, sq) -%}
   {%- set base = (a // 600) * 600 -%}
   {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
@@ -36,7 +35,7 @@
     {%- set lo = [a, base + i * 600] | max -%}
     {%- set hi = [b, base + (i + 1) * 600] | min -%}
     {%- if hi > lo -%}
-      {%- set c = shared.get('curve')[((base + i * 600) % 86400) // 600] -%}
+      {%- set c = hour_curve[((base + i * 600) % 86400) // 3600] -%}
       {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
       {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
     {%- endif -%}
@@ -56,65 +55,136 @@
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 YaBrowser/24.7.0.0 Safari/537.36',
       'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:128.0) Gecko/20100101 Firefox/128.0',
       'Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0'] -%}
+  {#- The user population (activity weights, working hours, group,
+      browser) is fixed for a given user list, so the same users are
+      the busy ones in every run. -#}
+  {%- set rng = module.random.Random('solar-users|' ~ params.users | join(',')) -%}
   {%- set users = [] -%}
   {%- set weights = [] -%}
+  {%- set shifts = {} -%}
+  {%- set gw = range(params.groups | length, 0, -1) | list -%}
   {%- for name in params.users -%}
     {%- set ip = params.client_prefix ~ (params.client_first + loop.index0) -%}
     {%- set checked = module.ipaddress.IPv4Address(ip) -%}
-    {%- do users.append({'name': name, 'ip': ip,
-        'group': module.rand.weighted_choice(params.groups, range(params.groups | length, 0, -1) | list),
-        'ua': module.rand.weighted_choice(agents, [46, 30, 16, 8])}) -%}
-    {%- do weights.append(module.rand.number.lognormal(0, 1.0)) -%}
+    {%- do users.append({'name': name, 'ip': ip, 'i': loop.index0,
+        'group': rng.choices(params.groups, gw)[0],
+        'ua': rng.choices(agents, [46, 30, 16, 8])[0]}) -%}
+    {#- Skewed but bounded activity weight: no single user carries a
+        quarter of the traffic, none stays silent. -#}
+    {%- set w = [[rng.lognormvariate(0, 0.9), 0.2] | max, 3.5] | min -%}
+    {%- do weights.append(w) -%}
+    {#- Own working hours (local start, length); the day's start
+        jitter, day off, late stay and overnight session are drawn when
+        the user's local day changes. -#}
+    {%- do shifts.update({name: [rng.uniform(7.0, 10.0), rng.uniform(8.0, 10.0),
+        -1, 0.0, false, 0.0, false]}) -%}
   {%- endfor -%}
-  {#- Own working hours per user (local start, length), a per-day
-      jitter of the start and a day off (about 1 day in 10), redrawn
-      when the user's local day changes. -#}
-  {%- set shifts = {} -%}
+  {#- Busy tier: the most active fifth of the users. -#}
+  {%- set ranked = weights | sort(reverse=true) -%}
+  {%- set cut = ranked[[users | length // 5, 2] | max - 1] -%}
+  {%- set busy = [] -%}
   {%- for u in users -%}
-    {%- do shifts.update({u.name: [module.rand.number.floating(6.0, 11.5),
-        module.rand.number.floating(7.0, 10.5), -1, 0.0, false]}) -%}
+    {%- if weights[loop.index0] >= cut -%}{%- do busy.append(u.name) -%}{%- endif -%}
   {%- endfor -%}
-  {#- Background hour curve per 10-minute UTC slot: weighted sum of the
-      users' factors, max 1 (for episode start times only). -#}
-  {%- set wsum = weights | sum -%}
-  {%- set curve = [] -%}
-  {%- for k in range(144) -%}
-    {%- set lh = ((k + 0.5) / 6 + params.syslog_utc_offset_hours) % 24 -%}
-    {%- set acc = namespace(v=0) -%}
-    {%- for u in users -%}
-      {%- set sh = shifts[u.name] -%}
-      {%- set acc.v = acc.v + weights[loop.index0] * (factor(sh[0], sh[1], lh) | float) -%}
+  {#- Habitual file-sharing site of every user (index into
+      sharing_sites); the busy tier is spread evenly over the sites. -#}
+  {%- set order = busy | list -%}
+  {%- do rng.shuffle(order) -%}
+  {%- for u in users -%}
+    {%- if u.name in order -%}
+      {%- do u.update({'fav': order.index(u.name) % params.sharing_sites | length}) -%}
+    {%- else -%}
+      {%- do u.update({'fav': rng.randrange(params.sharing_sites | length)}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- Application endpoints that logged-on workstations poll. -#}
+  {%- set polls = [] -%}
+  {%- for site in params.sites -%}
+    {%- for pg in site.pages -%}
+      {%- if pg.startswith('/api') -%}{%- do polls.append([site, pg]) -%}{%- endif -%}
     {%- endfor -%}
-    {%- do curve.append(acc.v / wsum) -%}
   {%- endfor -%}
-  {%- set cmax = curve | max -%}
-  {%- set norm = [] -%}
-  {%- for v in curve -%}{%- do norm.append(v / cmax) -%}{%- endfor -%}
-  {%- do shared.update({'initialized': true, 'users': users, 'weights': weights,
-      'shifts': shifts, 'curve': norm, 'q': [], 'm': {}, 'start_at': none,
-      'last_user': none, 'last_share': none}) -%}
+  {%- if not polls -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'polls': polls,
+      'weights': weights, 'busy': busy, 'slot': none, 'shifts': shifts, 'q': [], 'seq': 0, 'm': {},
+      'start_at': none, 'last_user': none, 'last_share': none, 'pause': {}}) -%}
   {#- First episode inside the first min(interval, 24 h), its time of
-      day drawn from the background hour curve. -#}
+      day drawn from the hour curve. -#}
   {%- if params.anomaly_mode -%}
-    {{- draw_start(now, now + ([interval, 24] | min * 3600) | int, false) -}}
+    {{- draw_start(now_s, now_s + ([interval, 24] | min * 3600) | int, false) -}}
   {%- endif -%}
 {%- endif -%}
 
 {%- set users = shared.get('users') -%}
 {%- set q = shared.get('q') -%}
 {%- set mstate = shared.get('m') -%}
-{%- set local_hour = ((now % 86400) / 3600 + params.syslog_utc_offset_hours) % 24 -%}
-{%- set day_no = ((now + params.syslog_utc_offset_hours * 3600) // 86400) | int -%}
+{%- set pause = shared.get('pause') -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
 {%- endmacro -%}
 
-{#- Queue one request. kind: page, asset, api, deny, upload, share,
-    download. -#}
+{#- Queue one request. kind: page, asset, poll, api, deny, upload,
+    share, download. -#}
 {%- macro enq(u, kind, site, path, at, referer='', ep=false) -%}
-  {%- do q.append({'due': at, 'u': u, 'kind': kind, 'site': site,
-      'path': path, 'referer': referer, 'ep': ep}) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do module.heapq.heappush(q, [at, shared.get('seq'), {'u': u,
+      'kind': kind, 'site': site, 'path': path, 'referer': referer,
+      'ep': ep}]) -%}
+{%- endmacro -%}
+
+{#- Activity of every user in the current 10-minute slot, from its
+    working hours: 1 at work, 0.4 while staying late (about 1 day in
+    3, for 0.5-3 h), 0.05 for a workstation left logged on overnight
+    (about 1 day in 8), otherwise and on a day off (about 1 day in 10)
+    next to nothing (0.0001). The day's draws are made when the user's local
+    day changes. Also keeps the cumulative weight * activity used to
+    draw the user of a new action. -#}
+{%- set slot = now_s // 600 -%}
+{%- if shared.get('slot') != slot -%}
+  {%- set mid = slot * 600 + 300 -%}
+  {%- set lh = ((mid % 86400) / 3600 + params.syslog_utc_offset_hours) % 24 -%}
+  {%- set dn = ((mid + params.syslog_utc_offset_hours * 3600) // 86400) | int -%}
+  {%- set shifts = shared.get('shifts') -%}
+  {%- set weights = shared.get('weights') -%}
+  {%- set acts = [] -%}
+  {%- set scum = [] -%}
+  {%- set acc = namespace(v=0) -%}
+  {%- for u in users -%}
+    {%- set sh = shifts[u.name] -%}
+    {%- if sh[2] != dn -%}
+      {%- set sh = [sh[0], sh[1], dn, module.rand.number.gauss(0, 0.6), module.rand.chance(0.1),
+          module.rand.number.floating(0.5, 3.0) if module.rand.chance(0.35) else 0.0,
+          module.rand.chance(0.12)] -%}
+      {%- do shifts.update({u.name: sh}) -%}
+    {%- endif -%}
+    {%- set into = (lh - sh[0] - sh[3]) % 24 -%}
+    {%- set a = 0.0001 if sh[4] else (1.0 if into < sh[1] else (0.4 if into < sh[1] + sh[5]
+        else (0.05 if sh[6] else 0.0001))) -%}
+    {%- do acts.append(a) -%}
+    {%- set acc.v = acc.v + weights[loop.index0] * a -%}
+    {%- do scum.append(acc.v) -%}
+  {%- endfor -%}
+  {%- do shared.update({'slot': slot, 'acts': acts, 'scum': scum}) -%}
+{%- endif -%}
+
+{#- Draw a user with probability proportional to weight * activity;
+    `pool` limits the candidates to these names. -#}
+{%- macro pick_user(pool, avoid) -%}
+  {%- if pool is none -%}
+    {%- set scum = shared.get('scum') -%}
+    {%- set k = module.bisect.bisect_right(scum, module.rand.number.floating(0, scum[-1])) -%}
+    {%- do shared.set('picked', users[[k, users | length - 1] | min]) -%}
+  {%- else -%}
+    {%- set cand = [] -%}{%- set cw = [] -%}
+    {%- for u in users -%}
+      {%- if u.name in pool and u.name != avoid -%}
+        {%- do cand.append(u) -%}
+        {%- do cw.append(shared.get('weights')[loop.index0] * shared.get('acts')[loop.index0]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do shared.set('picked', module.rand.weighted_choice(cand, cw)) -%}
+  {%- endif -%}
 {%- endmacro -%}
 
 {%- set assets = ['/static/app.js', '/static/vendor.js', '/static/site.css',
@@ -132,6 +202,11 @@
   {%- endfor -%}
 {%- endmacro -%}
 
+{#- Attempts of one blocked upload: usually one, a retry now and then
+    (at most five). -#}
+{%- set tries = [1, 2, 3, 4, 5] -%}
+{%- set try_weights = [84, 11, 3, 1.5, 0.5] -%}
+
 {#- Denied upload attempts, retried by the user; t.v advances to the
     time after the last attempt. -#}
 {%- macro share_attempt(u, s, t, n, ep) -%}
@@ -141,20 +216,30 @@
   {%- endfor -%}
 {%- endmacro -%}
 
-{#- 1. Background: one merged Poisson stream of independent users. -#}
-{%- set u = module.rand.weighted_choice(users, shared.get('weights')) -%}
-{%- set sh = shared.get('shifts')[u.name] -%}
-{%- if sh[2] != day_no -%}
-  {%- set sh = [sh[0], sh[1], day_no, module.rand.number.gauss(0, 0.6),
-      module.rand.chance(0.1)] -%}
-  {%- do shared.get('shifts').update({u.name: sh}) -%}
-{%- endif -%}
-{%- set f = 0.2 / 0.9 if sh[4] else factor(sh[0] + sh[3], sh[1], local_hour) | float -%}
-{%- if module.rand.chance(0.06 * f) -%}
-  {%- set profile = module.rand.weighted_choice(
-      ['browse', 'api', 'blocked', 'upload', 'share', 'download'],
-      [63, 9, 8, 8, 6, 6]) -%}
-  {%- if profile == 'browse' -%}
+{#- A user drawn by weight and working hours starts a new action; its
+    first request is due now. Outside working hours a logged-on
+    workstation mostly polls business applications. Blocked uploads
+    come mostly from the busy tier. A user refused twice or more on one
+    file-sharing site gives up uploading for a while (`pause`) and does
+    something else instead. -#}
+{%- macro start_action() -%}
+  {{- pick_user(none, none) -}}
+  {%- set u = shared.get('picked') -%}
+  {%- if shared.get('acts')[u.i] < 0.1 and module.rand.chance(0.95) -%}
+    {%- set profile = 'poll' -%}
+  {%- else -%}
+    {%- set profile = module.rand.weighted_choice(
+        ['browse', 'api', 'blocked', 'upload', 'share', 'download', 'poll'],
+        [66, 9, 8, 8, 2.0 if u.name in shared.get('busy') else 0.3, 6, 6]) -%}
+    {%- if profile in ['upload', 'share'] and pause.get(u.name, 0) > now -%}
+      {%- set profile = module.rand.weighted_choice(
+          ['browse', 'api', 'blocked', 'download', 'poll'], [66, 9, 8, 6, 6]) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if profile == 'poll' -%}
+    {%- set pp = module.rand.choice(shared.get('polls')) -%}
+    {{- enq(u, 'poll', pp[0], pp[1], now, 'https://' ~ pp[0].host ~ '/') -}}
+  {%- elif profile == 'browse' -%}
     {%- set site = module.rand.choice(params.sites) -%}
     {{- page_view(u, site, now) -}}
     {%- if module.rand.chance(0.35) -%}
@@ -182,82 +267,104 @@
       {%- set t.v = t.v + gap(90, 1.2) | int -%}
     {%- endfor -%}
   {%- elif profile == 'share' -%}
-    {#- Upload attempts on a blocked file-sharing site with retries;
-        afterwards the user may give up or use sanctioned storage. -#}
-    {%- set s = module.rand.choice(params.sharing_sites) -%}
-    {%- set n = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+    {#- Upload attempts on a blocked file-sharing site, mostly the
+        user's habitual one, with retries. After a single refusal the
+        user may switch to sanctioned storage; after repeated refusals
+        the user gives up. -#}
+    {%- set s = params.sharing_sites[u.fav] if module.rand.chance(0.9)
+        else module.rand.choice(params.sharing_sites) -%}
+    {%- set n = module.rand.weighted_choice(tries, try_weights) -%}
     {%- set t = namespace(v=now) -%}
-    {{- share_attempt(u, s, t, [n, 10] | min, false) -}}
-    {%- if module.rand.chance(0.45) -%}
-      {%- set at = t.v + gap(180, 0.8) | int -%}
+    {{- share_attempt(u, s, t, n, false) -}}
+    {%- if n == 1 and module.rand.chance(0.45) -%}
       {%- set g = module.rand.choice(params.storage_sites) -%}
-      {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/') -}}
+      {{- enq(u, 'upload', g, g.path, t.v + gap(180, 0.8) | int, 'https://' ~ g.host ~ '/') -}}
     {%- endif -%}
   {%- else -%}
     {%- set s = module.rand.choice(params.storage_sites) -%}
     {{- enq(u, 'download', s, s.path | replace('upload', 'download'), now, 'https://' ~ s.host ~ '/') -}}
   {%- endif -%}
-{%- endif -%}
+{%- endmacro -%}
 
-{#- 2. Episode: a rotated user is denied two or more uploads to a
-    rotated blocked file-sharing site, then uploads to sanctioned cloud
-    storage. The next start is drawn in a window of
-    w = min(interval / 4, 6 h) centred on due = this start + interval,
-    weighted by the hour curve squared plus a floor. -#}
-{%- if params.anomaly_mode -%}
-  {%- if now >= shared.get('start_at') -%}
-    {%- set u = module.rand.choice(users | rejectattr('name', 'equalto', shared.get('last_user')) | list) -%}
-    {%- set s = module.rand.choice(params.sharing_sites | rejectattr('host', 'equalto', shared.get('last_share')) | list) -%}
-    {%- set g = module.rand.choice(params.storage_sites) -%}
-    {%- set n = namespace(v=1) -%}
-    {%- for i in range(20) -%}
-      {%- if n.v < 2 -%}
-        {%- set n.v = [(module.rand.number.lognormal(module.math.log(1.6), 0.7)) | round | int, 1] | max -%}
+{#- Guard on the final chain step: an allowed upload completes a chain
+    when its user had two or more denied POSTs to one other host in the
+    preceding `within` s. Such an ordinary upload is not logged (every
+    upload to any other host would complete the chain, so there is no
+    harmless target). The history covers every denied POST, episode
+    ones included, is pruned to the window and never resets. A second
+    or later refusal on one host starts or extends the user's pause
+    (lognormal, median 75 min, about 40 min to 2 h). Prints 1 when the
+    request may be logged. -#}
+{%- macro guard(e) -%}
+  {%- set ok = namespace(v=true) -%}
+  {%- if e.kind in ['share', 'upload'] -%}
+    {%- set recent = mstate.get(e.u.name, []) | selectattr('0', 'ge', now - within) | list -%}
+    {%- if e.kind == 'upload' -%}
+      {%- if not e.ep -%}
+        {%- set hosts = recent | map(attribute='1') | reject('equalto', e.site.host) | list -%}
+        {%- for h in hosts | unique -%}
+          {%- if hosts | select('equalto', h) | list | length >= 2 -%}{%- set ok.v = false -%}{%- endif -%}
+        {%- endfor -%}
       {%- endif -%}
-    {%- endfor -%}
-    {%- set n = [[n.v, 2] | max, 10] | min -%}
-    {%- set t = namespace(v=now) -%}
-    {{- share_attempt(u, s, t, n, true) -}}
-    {%- set at = t.v + [gap(180, 0.8) | int, 1200] | min -%}
-    {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/', true) -}}
-    {%- do shared.update({'last_user': u.name, 'last_share': s.host}) -%}
-    {%- set due = now + (interval * 3600) | int -%}
-    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
-    {{- draw_start(due - half, due + half, true) -}}
+    {%- else -%}
+      {%- do recent.append([now, e.site.host]) -%}
+      {%- if recent | selectattr('1', 'equalto', e.site.host) | list | length >= 2 -%}
+        {%- do pause.update({e.u.name: [pause.get(e.u.name, 0),
+            now + module.rand.number.lognormal(module.math.log(4500), 0.35)] | max}) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- do mstate.update({e.u.name: recent}) -%}
   {%- endif -%}
+  {{- '1' if ok.v else '0' -}}
+{%- endmacro -%}
+
+{#- 1. Episode: a user of the busy tier (by weight and working hours,
+    not the previous one) is denied two or more uploads to the user's
+    habitual file-sharing site (not the previous one), then uploads to
+    sanctioned cloud storage. The next start is drawn in a window of
+    w = min(interval / 4, 6 h) centred on due = this start + interval,
+    weighted by the hour curve squared plus a floor. Its requests are
+    queued like any other and take the timestamps at which they are
+    due. -#}
+{%- if params.anomaly_mode and now_s >= shared.get('start_at') -%}
+  {%- set pool = [] -%}
+  {%- for c in users -%}
+    {%- if c.name in shared.get('busy') and params.sharing_sites[c.fav].host != shared.get('last_share') -%}
+      {%- do pool.append(c.name) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- pick_user(pool, shared.get('last_user')) -}}
+  {%- set u = shared.get('picked') -%}
+  {%- set s = params.sharing_sites[u.fav] -%}
+  {%- set g = module.rand.choice(params.storage_sites) -%}
+  {%- set n = module.rand.weighted_choice(tries[1:], try_weights[1:]) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for i in range(n) -%}
+    {%- if t.v < now + 900 -%}
+      {{- enq(u, 'share', s, s.path, t.v, 'https://' ~ s.host ~ '/', true) -}}
+      {%- set t.v = t.v + gap(25, 0.9) | int -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set at = [t.v + gap(180, 0.8) | int, now + 1500] | min -%}
+  {{- enq(u, 'upload', g, g.path, at, 'https://' ~ g.host ~ '/', true) -}}
+  {%- do shared.update({'last_user': u.name, 'last_share': s.host}) -%}
+  {%- set due = now_s + (interval * 3600) | int -%}
+  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+  {{- draw_start(due - half, due + half, true) -}}
 {%- endif -%}
 
-{#- 3. Emit the earliest due request, otherwise nothing. -#}
-{%- set pick = namespace(i=-1, due=now + 1) -%}
-{%- for e in q -%}
-  {%- if e.due <= now and e.due < pick.due -%}
-    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
+{#- 2. Emit the earliest due request; when nothing is due, a new action
+    starts. A request the guard withholds hands the timestamp on. -#}
+{%- set pick = namespace(e=none) -%}
+{%- for attempt in range(8) -%}
+  {%- if pick.e is none -%}
+    {%- if not q or q[0][0] > now -%}{{- start_action() -}}{%- endif -%}
+    {%- set cand = module.heapq.heappop(q)[2] -%}
+    {%- if guard(cand) | trim == '1' -%}{%- set pick.e = cand -%}{%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set e = q.pop(pick.i) -%}
-{%- set ms = module.rand.number.integer(0, 999) -%}
-
-{#- Guard on the final chain step over every binding: an allowed
-    upload completes a chain when its user had two or more denied POSTs
-    to one other host in the preceding `within` s (no cap, no reset). A
-    background upload that would complete one is dropped; episode rows
-    never are. -#}
-{%- if e.kind in ['share', 'upload'] -%}
-  {%- set tt = now + ms / 1000 -%}
-  {%- set recent = mstate.get(e.u.name, []) | selectattr('0', 'ge', tt - within) | list -%}
-  {%- if e.kind == 'upload' -%}
-    {%- if not e.ep -%}
-      {%- set hosts = recent | map(attribute='1') | reject('equalto', e.site.host) | list -%}
-      {%- for h in hosts | unique -%}
-        {%- if hosts | select('equalto', h) | list | length >= 2 -%}{{ dispatch.drop() }}{%- endif -%}
-      {%- endfor -%}
-    {%- endif -%}
-  {%- else -%}
-    {%- do recent.append([tt, e.site.host]) -%}
-  {%- endif -%}
-  {%- do mstate.update({e.u.name: recent}) -%}
-{%- endif -%}
+{%- if pick.e is none -%}{{ dispatch.drop() }}{%- endif -%}
+{%- set e = pick.e -%}
 
 {#- Request outcome. -#}
 {%- set u = e.u -%}
@@ -287,6 +394,10 @@
     {%- set status = module.rand.weighted_choice([200, 304, 302, 404], [88, 6, 4, 2]) -%}
     {%- set body_in = (module.rand.number.lognormal(module.math.log(14000), 1.1)) | int -%}
     {%- set mime = 'application/json' if e.path.startswith('/api') else 'text/html' -%}
+  {%- elif e.kind == 'poll' -%}
+    {%- set status = module.rand.weighted_choice([200, 304], [94, 6]) -%}
+    {%- set body_in = (module.rand.number.lognormal(module.math.log(1500), 0.8)) | int -%}
+    {%- set mime = 'application/json' -%}
   {%- elif e.kind == 'asset' -%}
     {%- set status = module.rand.weighted_choice([200, 304, 404], [80, 18, 2]) -%}
     {%- set body_in = (module.rand.number.lognormal(module.math.log(9000), 1.2)) | int -%}
@@ -333,7 +444,7 @@
 {%- set port = 443 if proto == 'https' else 80 -%}
 {%- set acc_port = module.rand.number.integer(49152, 65535) -%}
 
-{%- set req_dt = module.datetime.datetime.fromtimestamp(now, utc) + module.datetime.timedelta(milliseconds=ms) -%}
+{%- set req_dt = module.datetime.datetime.fromtimestamp(now_s, utc) + module.datetime.timedelta(milliseconds=ms) -%}
 {%- set req_time = req_dt.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d' | format(ms) ~ 'Z' -%}
 {%- set log_dt = req_dt + module.datetime.timedelta(milliseconds=ftime, hours=params.syslog_utc_offset_hours) -%}
 {%- set syslog_time = log_dt.strftime('%b ') ~ log_dt.day ~ log_dt.strftime(' %H:%M:%S') -%}
