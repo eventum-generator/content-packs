@@ -12,7 +12,7 @@ About 57,000 records a day, varying by about ±3% from day to day, following an 
 | 06-08, 17-20 | 0.54 |
 | 20-06 | 0.24 |
 
-A 257 or 259 follows its 256 after a median of 1.1 s (99th percentile 17 s, at most about 80 s at night). A retransmission of a dropped query follows the previous attempt after a median of 1.2 s (90th percentile 5-6 s). Episodes add their own records on top of this traffic and never pause or shift client lookups or administrator sessions.
+A 257 or 259 follows its 256 after a median of 1.1 s (99th percentile 17 s, at most about 80 s at night). A retransmission of a dropped query follows the previous attempt after a median of 1.2 s (90th percentile 5-6 s). Episode records are interleaved with this traffic, taking the place of a few dozen client lookups per episode; they never pause or shift administrator sessions.
 
 ## Event Types
 
@@ -21,7 +21,7 @@ Shares over 15 days with `anomaly_mode: true` and the default interval, and the 
 | Native ID | Channel | Category | Share | Range without episodes | Meaning |
 | --- | --- | --- | ---: | ---: | --- |
 | 256 `QUERY_RECEIVED` | Analytical | network | 50.00% | 50.00% | Incoming A query: source IP and port, XID, RD and DNS packet bytes |
-| 257 `RESPONSE_SUCCESS` | Analytical | network | 49.17% | 48.69-49.07% | Authoritative A answer with the same client, port, XID and GUID |
+| 257 `RESPONSE_SUCCESS` | Analytical | network | 49.17% | 46.9-49.1% | Authoritative A answer with the same client, port, XID and GUID |
 | 259 `IGNORED_QUERY` | Analytical | network | 0.82% | 0.6-3.1% | A query dropped by an `Ignore` policy; no 257 follows |
 | 577 `POLICY_OP` | Audit | - | 0.004% | 0.003% | An administrator creates a server-level `Ignore` query policy |
 | 580 `POLICY_OP` | Audit | - | 0.004% | 0.003% | An administrator deletes a policy |
