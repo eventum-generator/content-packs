@@ -1,95 +1,124 @@
-{%- set step = vars.step -%}
 {%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set interval = module.datetime.timedelta(hours=[params.anomaly_interval_hours|float, 0.5]|max) -%}
-{%- set export_path = module.urllib.parse.quote(params.anomaly_path, safe='/-._~') -%}
 {%- set now_s = utc.timestamp() -%}
-{%- set interval_s = interval.total_seconds() -%}
+{%- set interval_s = [params.anomaly_interval_hours|float, 0.5]|max * 3600 -%}
+{%- set export_path = module.urllib.parse.quote(params.anomaly_path, safe='/-._~') -%}
 {%- set chain_window_s = 300 -%}
-{%- if step == 'routine' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- if params.anomaly_mode -%}
-    {#- Recurrence: the first start is uniform over the first
-        min(interval, 24 h) of the run; each next one is uniform in a
-        window of width min(interval / 4, 6 h) centred on the actual
-        start plus the interval. -#}
-    {%- set due = shared.get('next_episode_at', none) -%}
-    {%- if due is none -%}
-      {%- do shared.set('next_episode_at', now_s + module.rand.number.floating(0, [interval_s, 86400] | min)) -%}
-    {%- elif now_s >= due -%}
-      {%- set half = ([interval_s / 4, 21600] | min) / 2 -%}
-      {%- do shared.set('to_attack', true) -%}
-      {%- do shared.set('next_episode_at', now_s + interval_s + module.rand.number.floating(-half, half)) -%}
-      {%- set ports = module.random.sample(range(40000, 62001), 6) -%}
-      {%- if ports[0] == shared.get('last_first_port', none) -%}
-        {%- do ports.reverse() -%}
-      {%- endif -%}
-      {%- do shared.set('last_first_port', ports[0]) -%}
-      {%- do shared.set('episode_ports', ports) -%}
-    {%- endif -%}
-  {%- endif -%}
+{%- set heapq = module.heapq -%}
+{%- set num = module.rand.number -%}
+{#- Background workload. A timestamp that no queued record claims
+    starts a login session with probability session_p, otherwise it
+    carries one request drawn from the ordinary pool. A session is
+    zero or more denied logins (fail_p of sessions, length law
+    fail_len), a 302 login (after failures with probability
+    fail_then_ok), the browser's GET of the redirect target (the
+    admin export with probability export_redirect_p, otherwise a
+    catalog page) and zero to three further requests. The failure
+    and export-redirect rates vary by day (lognormal factors). The
+    address in anomaly_ip is one more ordinary client, a remote-access
+    address whose users fail logins anomaly_fail_factor times as
+    often. -#}
+{%- set session_p = 0.12 -%}
+{%- set fail_p = 0.018 -%}
+{%- set fail_len = [[1, 2, 3, 4, 5, 6, 7], [39, 20, 18, 9, 6, 4.5, 3.5]] -%}
+{%- set fail_then_ok = 0.75 -%}
+{%- set export_redirect_p = 0.25 -%}
+{%- set anomaly_fail_factor = 5 -%}
+{%- set nclients = samples.clients | length -%}
+{%- set nreq = samples.requests | length -%}
+{%- set idx = shared.get('pool_index') -%}
+{%- if idx is none -%}
+  {%- set idx = {'export': [], 'catalog': [], 'other': []} -%}
+  {%- for i in range(nreq) -%}
+    {%- set r = samples.requests[i] -%}
+    {%- if r.path == '/admin/export' -%}{%- do idx.export.append(i) -%}{%- else -%}{%- do idx.other.append(i) -%}{%- endif -%}
+    {%- if r.path.startswith('/catalog/') -%}{%- do idx.catalog.append(i) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('pool_index', idx) -%}
 {%- endif -%}
-{%- set req = samples.requests.pick() -%}
-{%- set method = req.method -%}
-{%- set path = export_path if req.path == '/admin/export' else req.path -%}
-{%- set status = req.status -%}
-{%- set bytes = req.bytes -%}
-{%- set server = req.backend -%}
-{%- set src = params.anomaly_ip if module.rand.number.integer(1, 50) == 1 else samples.clients.pick().ip -%}
-{#- Background retry bursts: an ordinary 401 login starts, with a small
-    probability, one to six more 401 logins from the same client on the
-    next ticks, followed by a 302 login in 70% of bursts. -#}
-{%- if step == 'routine' -%}
-  {%- set burst = shared.get('burst', none) -%}
-  {%- if burst is not none -%}
-    {%- set src = burst.ip -%}
-    {%- set method = 'POST' -%}
-    {%- set path = '/login' -%}
-    {%- set server = 'app1' -%}
-    {%- if burst.fails > 0 -%}
-      {%- set status = 401 -%}
-      {%- set bytes = 310 -%}
-      {%- do burst.update({'fails': burst.fails - 1}) -%}
-      {%- if burst.fails == 0 and not burst.ok -%}{%- set burst = none -%}{%- endif -%}
+{%- set day = utc.strftime('%Y-%m-%d') -%}
+{%- set dayf = shared.get('day_factors') -%}
+{%- if dayf is none or dayf[0] != day -%}
+  {%- set dayf = [day, num.clamp(num.lognormal(0, 0.35), 0.45, 2.2), num.clamp(num.lognormal(0, 0.35), 0.45, 2.2)] -%}
+  {%- do shared.set('day_factors', dayf) -%}
+{%- endif -%}
+{%- set bgq = shared.get('bg_queue') -%}
+{%- if bgq is none -%}{%- set bgq = [] -%}{%- do shared.set('bg_queue', bgq) -%}{%- endif -%}
+{%- set epq = shared.get('ep_queue') -%}
+{%- if epq is none -%}{%- set epq = [] -%}{%- do shared.set('ep_queue', epq) -%}{%- endif -%}
+{%- set bg_due = bgq and bgq[0][0] <= now_s -%}
+{%- set ep_due = epq and epq[0][0] <= now_s -%}
+{%- set ns = namespace(row=none, plan=none) -%}
+{%- if not bg_due and not ep_due -%}
+  {#- A free timestamp. Recurrence: the first episode starts uniformly
+      within the first min(interval, 24 h) of the run; each next one is
+      due the interval after the actual start, drawn uniformly within
+      a window of width min(interval / 4, 6 h) centred on that time. An
+      episode starts on the first free timestamp at or after its due
+      time, so it never claims a timestamp of a queued record. -#}
+  {%- set due = shared.get('next_episode_at', none) if params.anomaly_mode else none -%}
+  {%- if params.anomaly_mode and due is none -%}
+    {%- do shared.set('next_episode_at', now_s + num.floating(0, [interval_s, 86400] | min)) -%}
+  {%- endif -%}
+  {%- if due is not none and now_s >= due -%}
+    {%- set half = ([interval_s / 4, 21600] | min) / 2 -%}
+    {%- do shared.set('next_episode_at', now_s + interval_s + num.floating(-half, half)) -%}
+    {%- set ns.plan = {'q': epq, 'ip': params.anomaly_ip, 'fails': 4, 'ok': true, 'target': module.rand.choice(idx.export), 'ep': true} -%}
+  {%- else -%}
+    {%- set src = params.anomaly_ip if num.integer(0, nclients) == 0 else samples.clients.pick().ip -%}
+    {%- if module.rand.chance(session_p) -%}
+      {%- set fails = module.rand.weighted_choice(fail_len[0], fail_len[1]) if module.rand.chance(fail_p * dayf[1] * (anomaly_fail_factor if src == params.anomaly_ip else 1)) else 0 -%}
+      {%- set target = module.rand.choice(idx.export) if module.rand.chance(export_redirect_p * dayf[2]) else module.rand.choice(idx.catalog) -%}
+      {%- set ns.plan = {'q': bgq, 'ip': src, 'fails': fails, 'ok': fails == 0 or module.rand.chance(fail_then_ok), 'target': target, 'ep': false} -%}
     {%- else -%}
-      {%- set status = 302 -%}
-      {%- set bytes = 196 -%}
-      {%- set burst = none -%}
+      {%- set ns.row = {'ip': src, 'kind': 'pool', 'arg': num.integer(0, nreq - 1), 'ep': false} -%}
     {%- endif -%}
-  {%- elif path == '/login' and status == 401 and module.rand.chance(0.02) -%}
-    {%- set burst = {'ip': src, 'fails': module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [45, 25, 14, 8, 5, 3]), 'ok': module.rand.chance(0.7)} -%}
-  {%- endif -%}
-  {%- do shared.set('burst', burst) -%}
-{%- endif -%}
-{%- if step.startswith('fail_') -%}
-  {%- set method = 'POST' -%}
-  {%- set path = '/login' -%}
-  {%- set status = 401 -%}
-  {%- set bytes = 310 -%}
-  {%- set server = 'app1' -%}
-  {%- set src = params.anomaly_ip -%}
-{%- elif step == 'login_success' -%}
-  {%- set method = 'POST' -%}
-  {%- set path = '/login' -%}
-  {%- set status = 302 -%}
-  {%- set bytes = 196 -%}
-  {%- set server = 'app1' -%}
-  {%- set src = params.anomaly_ip -%}
-{%- elif step == 'admin_export' -%}
-  {%- set method = 'GET' -%}
-  {%- set path = export_path -%}
-  {%- set status = 200 -%}
-  {%- set bytes = 843220 -%}
-  {%- set server = 'app1' -%}
-  {%- set src = params.anomaly_ip -%}
-{%- endif -%}
-{%- set src_port = module.rand.number.integer(40000, 62000) -%}
-{%- if step != 'routine' -%}
-  {%- set port_index = {'fail_1':0, 'fail_2':1, 'fail_3':2, 'fail_4':3, 'login_success':4, 'admin_export':5}[step] -%}
-  {%- set src_port = shared.get('episode_ports')[port_index] -%}
-  {%- if step == 'admin_export' -%}
-    {%- do shared.pop('episode_ports', none) -%}
   {%- endif -%}
 {%- endif -%}
+{%- if ns.plan is not none -%}
+  {#- Queue the whole session; its first record takes this timestamp.
+      Retry pauses: 2 s plus a lognormal wait (median 5 s, at most
+      45 s); the redirect is followed on the next second; later
+      requests after 3 s plus a lognormal pause (median 15 s, at most
+      180 s). An episode is a session of the same law with four
+      denied logins, a 302 and the export as its redirect target; the
+      requests after its export are ordinary ones. -#}
+  {%- set pl = ns.plan -%}
+  {%- set st = namespace(t=now_s, seq=shared.get('seq', 0)) -%}
+  {%- for i in range(pl.fails) -%}
+    {%- if i > 0 -%}{%- set st.t = st.t + 2 + (num.clamp(num.lognormal(1.609, 0.6), 0, 43) | round | int) -%}{%- endif -%}
+    {%- do heapq.heappush(pl.q, [st.t, st.seq, {'ip': pl.ip, 'kind': 'fail', 'arg': none, 'ep': pl.ep}]) -%}
+    {%- set st.seq = st.seq + 1 -%}
+  {%- endfor -%}
+  {%- if pl.ok -%}
+    {%- if pl.fails > 0 -%}{%- set st.t = st.t + 2 + (num.clamp(num.lognormal(1.609, 0.6), 0, 43) | round | int) -%}{%- endif -%}
+    {%- do heapq.heappush(pl.q, [st.t, st.seq, {'ip': pl.ip, 'kind': 'ok', 'arg': none, 'ep': pl.ep}]) -%}
+    {%- do heapq.heappush(pl.q, [st.t + 1, st.seq + 1, {'ip': pl.ip, 'kind': 'pool', 'arg': pl.target, 'ep': pl.ep}]) -%}
+    {%- set st.t = st.t + 1 -%}
+    {%- set st.seq = st.seq + 2 -%}
+    {%- for j in range(num.integer(0, 3)) -%}
+      {%- set st.t = st.t + 3 + (num.clamp(num.lognormal(2.708, 0.8), 0, 177) | round | int) -%}
+      {%- do heapq.heappush(pl.q, [st.t, st.seq, {'ip': pl.ip, 'kind': 'pool', 'arg': num.integer(0, nreq - 1), 'ep': false}]) -%}
+      {%- set st.seq = st.seq + 1 -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- do shared.set('seq', st.seq) -%}
+  {%- set bg_due = bgq and bgq[0][0] <= now_s -%}
+{%- endif -%}
+{%- if ns.row is none -%}
+  {%- set ns.row = heapq.heappop(bgq)[2] if bg_due else heapq.heappop(epq)[2] -%}
+{%- endif -%}
+{%- set row = ns.row -%}
+{%- set src = row.ip -%}
+{%- if row.kind == 'fail' -%}
+  {%- set method, path, status, bytes, server = 'POST', '/login', 401, 310, 'app1' -%}
+{%- elif row.kind == 'ok' -%}
+  {%- set method, path, status, bytes, server = 'POST', '/login', 302, 196, 'app1' -%}
+{%- else -%}
+  {%- set req = samples.requests[row.arg] -%}
+  {%- set method, path, status, bytes, server = req.method, req.path, req.status, req.bytes, req.backend -%}
+  {%- if path == '/admin/export' -%}{%- set path = export_path -%}{%- endif -%}
+{%- endif -%}
+{%- set src_port = num.integer(40000, 62000) -%}
 {#- Guard: an ordinary export that would complete four 401 logins, a
     302 login and the export from one client, the first 401 at most
     chain_window_s before the export request, is replaced by another
@@ -101,15 +130,12 @@
     the episode's own logins either. -#}
 {%- set history = shared.get('login_history', {}) -%}
 {%- set pre = none -%}
-{%- if step == 'routine' and path == export_path and history.get(src, {}).get('armed') is not none -%}
-  {%- set pre = {'tr_request': module.rand.number.integer(0, 2), 'tc_connect': module.rand.number.integer(0, 4), 'tr_response': module.rand.number.integer(80, 240), 'transfer': module.rand.number.integer(300, 700)} -%}
+{%- if not row.ep and path == export_path and history.get(src, {}).get('armed') is not none -%}
+  {%- set pre = {'tr_request': num.integer(0, 2), 'tc_connect': num.integer(0, 4), 'tr_response': num.integer(80, 240), 'transfer': num.integer(300, 700)} -%}
   {%- set pre_request_s = now_s - (pre.tr_request + pre.tc_connect + pre.tr_response + pre.transfer) / 1000 -%}
   {%- if history[src].armed >= pre_request_s - chain_window_s -%}
-    {%- set other = [] -%}
-    {%- for i in range(samples.requests | length) if samples.requests[i].path != '/admin/export' -%}{%- do other.append(samples.requests[i]) -%}{%- endfor -%}
-    {%- set req = module.rand.choice(other) -%}
-    {%- set method = req.method -%}{%- set path = req.path -%}{%- set status = req.status -%}
-    {%- set bytes = req.bytes -%}{%- set server = req.backend -%}
+    {%- set req = samples.requests[module.rand.choice(idx.other)] -%}
+    {%- set method, path, status, bytes, server = req.method, req.path, req.status, req.bytes, req.backend -%}
     {%- set pre = none -%}
   {%- endif -%}
 {%- endif -%}
