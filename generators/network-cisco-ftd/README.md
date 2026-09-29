@@ -24,7 +24,7 @@ Signatures: `1:17279` (from the Elastic fixture) and nine Snort 3 `http_inspect`
 
 Volume is about 29,800 records a day. Visitor traffic follows a daily curve peaking around 12:00 UTC; scanners and probing clients are flat over the day. The device logs about 740 records an hour around midnight UTC and about 1,680 an hour at midday.
 
-- **Visits** (about 6,000 a day, following the daily curve): a client opens 1-4 connections to one server (weights 55/30/15) with log-normal gaps, 82% HTTPS. An HTTP connection triggers a generate-only signature with probability 5% and a dropping one with 1.2%.
+- **Visits** (about 6,000 a day, following the daily curve): a client opens 1-4 connections to one server (servers weighted 55/30/15) with log-normal gaps, 82% HTTPS. An HTTP connection triggers a generate-only signature with probability 5% and a dropping one with 1.2%.
 - **Probing** (flat, about 600 bursts a day): a client sends HTTP requests to one server that trigger 1-5 distinct signatures of all ten, 1-3 connections per signature, gaps log-normal with median 25 s (at most 10 minutes); then it opens an ordinary HTTPS (30%) or HTTP (20%) connection to that server 20 s to 10 minutes after the burst's last intrusion event (median 90 s), or stops (50%).
 - **Closed ports** (flat, about 2,000 a day): 1-3 attempts from a client to a closed port of one server, blocked by `Block-Inbound-Other`.
 
