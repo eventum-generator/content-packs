@@ -1,40 +1,58 @@
 # Cisco Catalyst 9800 wireless client state syslog
 
-Synthetic client-state records using the named-client, no-channel message examples published in Cisco Catalyst 9800 IOS XE 17.11 documentation. The pack preserves controller console/buffer-format text in `event.original` and supplies a declared ECS mapping. It models client associations and address learning, not authentication results.
+Synthetic client-state records of one Cisco Catalyst 9800 wireless controller, using the named-client, no-channel message examples published in the Cisco Catalyst 9800 IOS XE 17.11 documentation. The pack preserves controller console/buffer-format text in `event.original` and supplies a declared ECS mapping. It models client associations and address learning, not authentication results.
 
 ## Event Types
 
 | Native mnemonic | Meaning | Share of records | ECS category/type |
 | --- | --- | --- | --- |
-| `CLIENT_MOVED_TO_RUN_STATE` | Client enters RUN on the named AP | 31.5-31.8% | `network` / `connection`, `start` |
-| `CLIENT_IP_UPDATED` | RUN client's address list gains a learned address on the same AP | 36.5-37.0% | `network` / `connection`, `info` |
-| `CLIENT_MOVED_TO_DELETE_STATE` | RUN client is deleted from its current AP | 31.5-31.7% | `network` / `connection`, `end` |
+| `CLIENT_MOVED_TO_RUN_STATE` | Client enters RUN on the named AP | 31.7% | `network` / `connection`, `start` |
+| `CLIENT_IP_UPDATED` | RUN client's address list gains a learned address on the same AP | 36.6% | `network` / `connection`, `info` |
+| `CLIENT_MOVED_TO_DELETE_STATE` | RUN client is deleted from its current AP | 31.7% | `network` / `connection`, `end` |
 
-Shares are the range measured over the five final 97-hour validation runs described under Usage, in both modes.
+Shares are the same in both modes.
 
-One controller serves 48 fixed named stations across 12 pre-existing APs, three per floor. Each station follows its own lifecycle: absence, RUN on one AP of its floor, address learning, DELETE from the same AP with the same addresses, then absence again. Sessions mix a lognormal body (35-minute median, at most 12 hours) with a 12% short tail of about 10 seconds to 3 minutes, which stands for sleep/wake, band steering and re-authentication; the only same-client session in the Cisco examples lasts 130 seconds. Absences mix a lognormal body (10-minute median, at most 8 hours) with a 12% quick-reconnect tail of about 1..60 seconds. Tails start at a small offset and fade out below it, so no length has a hard floor. Each association picks the station's home AP with 50% probability and each other AP on its floor with 25%. At the first input timestamp some stations are already associated, so the stream starts in steady state and a station's first record may be its DELETE.
+## Clients and Volume
 
-Address learning follows the 17.11 examples. Both RUN examples carry one IPv4 address. In the open-authentication example, the same client's IP update comes 645 ms after RUN and lists the IPv4 address followed by a new link-local address; its DELETE two minutes later lists link-local first, two global IPv6 addresses, and IPv4 last. The 802.1X RUN and IP-update examples belong to different clients. Accordingly, RUN carries the station's IPv4 address, IP updates append in learning order, and DELETE lists link-local, then global IPv6, then IPv4. An IP update 5 ms..3 s later adds the IPv6 link-local address, and dual-stack stations add a global IPv6 address with a second update 0.5..15 s later. A session that ends before learning completes deletes the client with the addresses learned so far. Besides slot 0, the inventory holds 27 IPv4 plus link-local stations, 12 dual-stack stations, 4 IPv4-only stations that emit no IP update, and 4 IPv6-only stations; slot 0 is IPv4 plus link-local or IPv6-only, depending on `suspicious_ip`. Cisco shows no IPv6-only RUN record, so starting those at the link-local address and adding the global address by update is a synthetic assumption. About half of the link-local addresses are modified EUI-64 derived from the MAC, as in the 802.1X example; the rest use random interface identifiers, as in the open-authentication example. Slot 0 always derives EUI-64 from the configured MAC. Mid-session renumbering, DHCP renewal to a new lease and roaming without DELETE are not modeled.
+One controller serves 600 fixed named stations across 30 pre-existing APs on 10 floors, three APs per floor. The `presence` field of the inventory splits them into 540 office stations, carried by employees, and 60 always-on devices (phones left on chargers, scanners, sensors) spread over all floors. Times of day below are UTC, the controller's clock.
 
-The input ticks every second (`* * * * * *`, `count: 1`). A tick produces a record only when some station's next step is due, and other ticks are dropped. The record rate therefore varies: final runs measured 3,186-3,283 records a day, 82-197 per hour, and 21-45 concurrently associated stations with a median of 35-36, never zero. Each record carries its scheduled millisecond and is never later than the input tick that emits it. After an input gap longer than one minute, overdue stations get fresh schedules instead of a backdated burst.
+Office stations follow a working day. Each employee comes in on about 9 of 10 days, arrives around 08:45 (standard deviation about 35 minutes, between 07:00 and 11:00) and leaves about 9 hours later (6.5 to 11.5 hours); during the day the station associates, roams and reconnects, and its last association ends when the employee leaves. Always-on devices stay associated around the clock apart from short sleep/wake gaps. As a result about 50 stations are associated at night (42-60 on the hour between 20:00 and 07:00); the count climbs from 07:00, holds at about 410 (370-440) between 10:00 and 16:00, falls to about 65 in the 19:00 hour and is back at the night level from 20:00.
+
+The controller logs about 24,300 records a day (plus or minus 3% from day to day), following the same curve:
+
+| Hours (UTC) | Records per hour | Associated stations (hourly mean) |
+| --- | --- | --- |
+| 20:00-07:00 | about 435 | 50 |
+| 07:00-08:00 | about 595 | 62 |
+| 08:00-09:00 | about 1,510 | 190 |
+| 09:00-10:00 | about 2,050 | 370 |
+| 10:00-16:00 | about 1,800 | 410 |
+| 16:00-17:00 | about 1,710 | 375 |
+| 17:00-18:00 | about 1,385 | 270 |
+| 18:00-19:00 | about 840 | 135 |
+| 19:00-20:00 | about 530 | 64 |
+
+Records come at irregular intervals: about 2 seconds apart on average in working hours (median 1.4 s, 90th percentile 4.6 s) and about 8 seconds apart at night (median 5.7 s, 90th percentile 19 s).
+
+Each station follows its own lifecycle: absence, RUN on one AP of its floor, address learning, DELETE from the same AP with the same addresses, then absence again. Sessions mix a lognormal body (35-minute median for office stations, 15 minutes for always-on devices, at most 12 hours) with a 12% short tail of about 10 seconds to 3 minutes, which stands for sleep/wake, band steering and re-authentication; the only same-client session in the Cisco examples lasts 130 seconds. Absences mix a lognormal body (10-minute median for office stations, 3 minutes for always-on devices, at most 8 hours) with a 12% quick-reconnect tail of about 1..60 seconds. The resulting median session is about 28 minutes for office stations and 12.5 minutes for always-on devices; the median absence within a working day is about 8 minutes, and 2.5 minutes for always-on devices. Tails start at a small offset and fade out below it, so no length has a hard floor. Each association picks the station's home AP with 50% probability and each other AP on its floor with 25%. At the first record some stations are already associated, so the stream starts in steady state and a station's first record may be its DELETE.
+
+Address learning follows the 17.11 examples. Both RUN examples carry one IPv4 address. In the open-authentication example, the same client's IP update comes 645 ms after RUN and lists the IPv4 address followed by a new link-local address; its DELETE two minutes later lists link-local first, two global IPv6 addresses, and IPv4 last. The 802.1X RUN and IP-update examples belong to different clients. Accordingly, RUN carries the station's IPv4 address, IP updates append in learning order, and DELETE lists link-local, then global IPv6, then IPv4. An IP update adds the IPv6 link-local address shortly after RUN, and dual-stack stations add a global IPv6 address with a second update seconds later. Counting both updates, an IP update comes a median 2.2 seconds after RUN in working hours and about 7.5 seconds at night; the 90th percentile is 14 seconds, and the longest delays reach about 1 minute in working hours and about 3 minutes at night. The inventory holds 350 IPv4 plus link-local stations (including slot 0), 150 dual-stack stations, 50 IPv4-only stations that emit no IP update, and 50 IPv6-only stations; slot 0 is IPv4 plus link-local or IPv6-only, depending on `suspicious_ip`. Cisco shows no IPv6-only RUN record, so starting those at the link-local address and adding the global address by update is a synthetic assumption. About half of the link-local addresses are modified EUI-64 derived from the MAC, as in the 802.1X example; the rest use random interface identifiers, as in the open-authentication example. Slot 0 always derives EUI-64 from the configured MAC. Mid-session renumbering, DHCP renewal to a new lease and roaming without DELETE are not modeled.
 
 ## Source Profile
 
 The selected text follows the 17.11 configuration guide's `%CLIENT_ORCH_LOG-7-...` examples: source timestamp, `Chassis 1 R0/0`, `wncd`, username, dotted MAC, space-separated IP values, AP and SSID. `wireless client syslog-detailed` enables these detailed messages. If forwarding to a syslog server, its filter must include severity 7, for example `logging trap debugging`; an informational filter excludes them. This pack uses synchronized UTC source time, millisecond datetime timestamps with timezone display, and disabled native sequence numbering. The documented timestamp options include `service timestamps log datetime msec show-timezone`.
 
-`event.original` is the source console/buffer record, not a fabricated RFC3164/5424 UDP/TCP envelope. There is no native PRI, hostname, transport peer or message sequence in this selected variant. `host.name` is configured controller context, and the minimal `agent` fields identify a synthetic Eventum reader. They do not describe a tested live collector. Input instants are converted to UTC before native and ECS rendering, so a non-UTC `--timezone` changes nothing in the output; the custom validation runs used `--timezone Europe/Moscow`. The native timestamp omits a year, so the full year in `@timestamp` comes from the simulation/collector context.
+`event.original` is the source console/buffer record, not a fabricated RFC3164/5424 UDP/TCP envelope. There is no native PRI, hostname, transport peer or message sequence in this selected variant. `host.name` is configured controller context, and the minimal `agent` fields identify a synthetic Eventum reader. They do not describe a tested live collector. All times are rendered in UTC whatever time zone the generator runs in. The native timestamp omits a year, so the full year in `@timestamp` comes from the simulation/collector context.
 
 `client.ip` and `client.address` carry one primary address: the IPv4 address when present, otherwise the first global IPv6 address, otherwise the link-local address. The complete list is retained in `related.ip` and `cisco_wlc.client_ips`. `cisco_wlc.client_mac` and native text retain dotted Cisco notation, while ECS `client.mac` uses uppercase hyphen-separated octets. `log.level` is `debugging`, the Cisco keyword for severity 7. `cisco_wlc.client_state` and ECS actions/types are derived from the mnemonic. Neither the RUN message nor its username proves an AAA outcome, authentication method or malicious activity.
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`. An episode is due every `anomaly_interval_hours`, default 24 hours, with the first due time one interval after the first input timestamp. It starts on the first input tick at or after the due time, once the selected station has finished address learning, any current association of it is at least three minutes old, and any last DELETE of it is at least 90 seconds old. Measured starts came 0-1 seconds after the due tick, or up to 76 seconds later while waiting for those conditions. The next episode is due one interval after the actual start. When the input has a gap, one episode starts at the first tick after the gap and the next follows one interval later; no overdue episodes are queued. Each episode selects the next station from the same 48-station inventory and rotates the order of its floor's three APs. There are no fabricated native session IDs or emitted episode/mode markers.
+`anomaly_mode` defaults to `true`. The first episode starts within the first `anomaly_interval_hours` (default 24 hours), and within the first 24 hours for longer intervals, at an hour drawn in proportion to the hourly record volume. Each later episode starts within a window of min(interval / 4, 6 hours) centred one interval after the actual start of the previous one: 21-27 hours apart at the default interval. Within that window the start is weighted by the square of the hourly volume plus a small floor, so episodes fall mostly in working hours; at short intervals the window regularly reaches the night, and night episodes are carried by always-on devices, the only stations present then. Missed episodes are never made up, and at most one episode runs at a time.
 
-If the station is associated, the controller first logs DELETE with its actual current AP and complete address list. The station then makes three associations on AP-A, AP-B and AP-C. Each RUN is followed by the station's normal address learning. The first two associations take their lengths from the same short-session tail as ordinary traffic, limited to 100 seconds, and each reassociation takes its delay from the ordinary quick-reconnect tail, limited to 30 seconds. The third association continues as an ordinary session and ends with an ordinary DELETE. The final paired runs measured short associations of 12.9-89.8 seconds, reconnects of 2.1-27.4 seconds and 55-148 seconds from RUN-A to RUN-C; additional independent runs reached 186 seconds from RUN-A to RUN-C. The same MAC, username and SSID link the episode. At most one episode exists at a time.
+An episode is a station's own next association after an ordinary absence. The station makes three associations on AP-A, AP-B and AP-C of its floor, and each RUN is followed by the station's normal address learning. The first two associations take their lengths from the same short-session tail as ordinary traffic, and each reassociation takes its delay from the ordinary quick-reconnect tail. The third association continues as an ordinary session and ends with an ordinary DELETE, followed by the station's ordinary absence. In an episode the two short associations last 1-165 seconds (most 20-110 s), the reconnects 0-45 seconds, and RUN-A to the IP update on AP-C takes 57-285 seconds. The same MAC, username and SSID link the episode. Episodes use the stations that learn one address by update (IPv4 plus link-local, IPv6-only), preferring stations that have not yet taken part, and rotate the order of the floor's three APs. An office station takes part only while its working day has at least 30 more minutes to run. There are no fabricated native session IDs or emitted episode/mode markers.
 
-Set `anomaly_mode: false` for ordinary traffic only. Short sessions and quick reconnects are frequent in both modes: about 13% (12.8-13.9% across measured runs) of sessions last under 3 minutes and 12.1-12.6% of absences under 20 seconds, with the same low quantiles and minima in paired runs. A single short session or quick reconnect therefore identifies an episode with 1.5-2.4% precision in the default 24-hour run, 3.0-4.2% in the 12-hour run and 5.6-8.8% in the 6-hour runs. A detection can group by native MAC plus SSID and look for three consecutive associations on three distinct APs, where the first two last at most two minutes and each reassociation comes within one minute. Ordinary traffic may repeat quick reconnects, but after two such short associations on two APs it returns to one of those two APs, so this exact shape occurs only in episodes. A looser predicate, any three distinct-AP RUNs of one MAC within 15 minutes, matched 4-9 times per run outside episodes in both modes. The pattern signals rapid reassociation or instability. It does not establish seamless roaming, an authentication failure, a deauthentication attack, an AP outage, a cloned client or an intrusion.
-
-Every episode record, including the leading and closing DELETEs, matches an ordinary record with the same action, MAC, AP and address list, both in the same run and in the paired false-mode run. The configured slot-0 station takes part in ordinary traffic in both modes. In paired true and false runs, the event mix, concurrent-station counts, per-station record spacing, same-mnemonic run lengths, hourly counts, and the shares, low quantiles and minima of short sessions and quick reconnects differ by no more than between two independent false-mode runs.
+Set `anomaly_mode: false` for ordinary traffic only. Short sessions and quick reconnects are frequent in both modes: about 14% of sessions last under 3 minutes and about 11% of absences under 20 seconds, and every action, station and station-AP pair of the episodes also occurs in ordinary traffic. A detection can group by native MAC plus SSID and look for RUN on three distinct APs, each earlier association closed by DELETE, where the IP update on the third AP comes within 400 seconds of the first RUN. Ordinary traffic reaches three distinct APs within 400 seconds about seven times a day, but then the station logs no IP update in that association and keeps only its RUN address until DELETE, so the complete shape occurs only in episodes. With `anomaly_mode: true` each episode adds its own two short associations, so counts of short sessions and quick reconnects are about two per episode higher. The pattern signals rapid reassociation or instability. It does not establish seamless roaming, an authentication failure, a deauthentication attack, an AP outage, a cloned client or an intrusion.
 
 ## Parameters
 
@@ -48,11 +66,11 @@ Edit `event.template.params` in a local configuration copy.
 | `anomaly_interval_hours` | `24` | Recurrence in hours, numeric 6..8760, measured from the actual start of the previous episode |
 | `controller_name` | `wlc9800-01.corp.example` | Controller identity supplied as source context |
 | `ssid` | `corp-wifi` | Shared WLAN SSID; selected ASCII subset, 1..32 characters, without parentheses or newlines |
-| `suspicious_user` | `visitor01` | Inventory slot 0 username, used by ordinary traffic in both modes and the first episode; 1..64 letters/digits or `._@+-` |
+| `suspicious_user` | `visitor01` | Inventory slot 0 username, used by ordinary traffic in both modes and eligible for episodes like any other station; 1..64 letters/digits or `._@+-` |
 | `suspicious_mac` | `02aa.bbcc.ddee` | Inventory slot 0 dotted MAC, unique, nonzero and unicast; source text is lowercase, ECS notation is normalized, and the slot's link-local address is derived from it |
 | `suspicious_ip` | `192.0.2.91` | Inventory slot 0 primary address; IPv4 gives an IPv4 plus link-local station, IPv6 an IPv6-only station |
 
-The legacy `suspicious_*` names do not reserve an anomaly-only actor. The configured MAC and address must not collide with other inventory rows, including their derived or sampled link-local and global IPv6 addresses. Multicast, unspecified, loopback, link-local, reserved, IPv4 zero-network and IPv4 last-octet 0/255 addresses are rejected. Parameter guards run before any event is emitted. Inventories are intentionally finite; changing their size or the input rate requires adapting the model and validation.
+The legacy `suspicious_*` names do not reserve an anomaly-only actor. The configured MAC and address must not collide with other inventory rows, including their derived or sampled link-local and global IPv6 addresses. Multicast, unspecified, loopback, link-local, reserved, IPv4 zero-network and IPv4 last-octet 0/255 addresses are rejected before any record is written. The station inventory is `samples/clients.json`, with the `presence` class of each station. The files in `patterns/` set the volume per hour of day; together they match the record rate of those 540 office stations and 60 always-on devices, so a changed inventory size or class mix needs a matching change of their `ratio` values.
 
 ### Output Parameters
 
@@ -60,77 +78,68 @@ The shipped output writes `output/events.json` with the JSON formatter and requi
 
 ## Usage
 
-```bash
-# Live mode (about two records per minute)
-eventum generate \
-  --path generators/network-cisco-wlc-9800/generator.yml \
-  --id cisco-wlc-9800 \
-  --live-mode true
-```
-
-For a finite batch run, add a window to `input[0].cron` in a local copy of `generator.yml` without changing the expression or count, then generate as fast as possible:
-
-```yaml
-start: '2026-09-25T00:00:00+00:00'
-end: '2026-09-29T01:15:00+00:00'
-```
+From the content-packs repository root, live (about 7 records a minute at night and 30 in working hours):
 
 ```bash
-eventum generate \
-  --path generators/network-cisco-wlc-9800/generator.yml \
-  --id cisco-wlc-9800 \
-  --live-mode false \
-  --keep-order true
+eventum generate --path generators/network-cisco-wlc-9800/generator.yml --id cisco-wlc-9800 --live-mode true
 ```
 
-`--keep-order true` keeps records in chronological order in the output file.
+The files in `patterns/` set the volume per hour of day; each starts at midnight of the current day and never ends. For a finite batch, set the same `start` and `end` in every file, with `start` at midnight UTC so the hours stay in place (for example `start: "2026-09-01T00:00:00Z"`, `end: "+4d"`), and generate as fast as possible:
 
-With that 97-hour-15-minute window, the final validation runs wrote 12,909-13,305 records each. Default enabled/disabled runs contained 4/0 episodes, custom 12-hour enabled/disabled runs 8/0, and the minimum 6-hour enabled run 16; every episode's final association was closed by DELETE inside the window. Custom runs changed controller identity, quoted ASCII SSID, username, MAC and the configured address to IPv6. A separate run with a 35-hour input gap and a 6-hour interval produced one episode right after the gap and the next one 6 hours later. Native state checks, paired ordinary overlap and paired statistics passed. Seven native/ECS-consistent mutations, a catch-up variant of the template run over the gap and the superseded lockstep captures were rejected, and fifteen parameter-guard cases stopped before the first event with a diagnostic.
+```bash
+eventum generate --path generators/network-cisco-wlc-9800/generator.yml --id cisco-wlc-9800 --live-mode false --keep-order true
+```
+
+`--keep-order true` keeps records in chronological order in the output file. The second episode can start up to 51 hours after the start of the window at the default interval, so use at least 52 hours to see two.
+
+## Performance
+
+About 2,400 records per second in batch mode; 14 days (340,000 records) take about 2.5 minutes.
 
 ## Sample Output
 
-Actual record 3129 of the final default-enabled run: the DELETE that ends the first episode's association with AP-A. Native source text is copied unchanged from that capture. Controller/reader context is synthetic enrichment.
+An IP update on AP-C that completes an episode, copied unchanged from a default-mode run. Controller and reader context is synthetic enrichment.
 
 ```json
 {
-  "@timestamp": "2026-09-26T00:01:22.207+00:00",
+  "@timestamp": "2026-09-01T12:36:55.168+00:00",
   "agent": {
     "name": "synthetic-wlc-reader",
     "type": "eventum"
   },
   "cisco_wlc": {
-    "ap_name": "AP-Floor1-A",
+    "ap_name": "AP-Floor7-C",
     "chassis": "1 R0/0",
     "client_ips": [
-      "fe80::aa:bbff:fecc:ddee",
-      "192.0.2.91"
+      "10.20.30.115",
+      "fe80::5eff:fe10:254"
     ],
-    "client_mac": "02aa.bbcc.ddee",
-    "client_state": "delete",
+    "client_mac": "0200.5e10.0254",
+    "client_state": "ip_update",
     "ssid": "corp-wifi"
   },
   "client": {
-    "address": "192.0.2.91",
-    "ip": "192.0.2.91",
-    "mac": "02-AA-BB-CC-DD-EE"
+    "address": "10.20.30.115",
+    "ip": "10.20.30.115",
+    "mac": "02-00-5E-10-02-54"
   },
   "ecs": {
     "version": "8.17.0"
   },
   "event": {
-    "action": "delete",
+    "action": "ip-update",
     "category": [
       "network"
     ],
-    "code": "CLIENT_MOVED_TO_DELETE_STATE",
+    "code": "CLIENT_IP_UPDATED",
     "kind": "event",
-    "original": "Sep 26 00:01:22.207 UTC: %CLIENT_ORCH_LOG-7-CLIENT_MOVED_TO_DELETE_STATE: Chassis 1 R0/0: wncd: Username (visitor01), MAC: 02aa.bbcc.ddee, IP fe80::aa:bbff:fecc:ddee 192.0.2.91 disconnected from AP (AP-Floor1-A) with SSID (corp-wifi)",
+    "original": "Sep  1 12:36:55.168 UTC: %CLIENT_ORCH_LOG-7-CLIENT_IP_UPDATED: Chassis 1 R0/0: wncd: Username (employee-596), MAC: 0200.5e10.0254, IP 10.20.30.115 fe80::5eff:fe10:254 IP address updated, associated to AP (AP-Floor7-C) with SSID (corp-wifi)",
     "provider": "CLIENT_ORCH_LOG",
     "severity": 7,
     "timezone": "+00:00",
     "type": [
       "connection",
-      "end"
+      "info"
     ]
   },
   "host": {
@@ -144,28 +153,28 @@ Actual record 3129 of the final default-enabled run: the DELETE that ends the fi
   },
   "related": {
     "ip": [
-      "fe80::aa:bbff:fecc:ddee",
-      "192.0.2.91"
+      "10.20.30.115",
+      "fe80::5eff:fe10:254"
     ],
     "user": [
-      "visitor01"
+      "employee-596"
     ]
   },
   "user": {
-    "name": "visitor01"
+    "name": "employee-596"
   }
 }
 ```
 
 ## Coverage and Limits
 
-All eleven source elements in the chosen guide examples are represented: timestamp, facility, severity, mnemonic, chassis, process, username, MAC, complete address list, AP and SSID. This 11/11 accounting covers the selected elements, not all possible source values or a complete same-version unredacted wire fixture. Address lists hold one to three addresses; the seven-address list of the 802.1X example is not reproduced, and the list order is a single rule fitted to the one same-client example sequence. The documented open-auth/null usernames and temporary username gaps following AP reconnect are omitted by the named-client subset.
+All eleven source elements in the chosen guide examples are represented: timestamp, facility, severity, mnemonic, chassis, process, username, MAC, complete address list, AP and SSID. This covers the selected elements, not all possible source values or a complete same-version unredacted wire capture. Address lists hold one to three addresses; the seven-address list of the 802.1X example is not reproduced, and the list order is a single rule fitted to the one same-client example sequence. The documented open-auth/null usernames and temporary username gaps following AP reconnect are omitted by the named-client subset.
 
-The 17.11 configuration-guide RUN example has no channel suffix. The 17.12 system-message catalog adds `on channel (...)`; this generator deliberately preserves the published 17.11 example variant. The exact 17.11 system catalog could not be inspected after a bounded search: browser size caps and direct HTTP403 prevented retrieval. No claim is made that every 17.11 build emits this exact variant. Published MAC/IP values are redacted, so this pack supplies synthetic complete values and does not assert byte parity with a live capture. Native wire evidence and live collector/normalizer parsing remain `BLOCKED_RAW_EVIDENCE`.
+The 17.11 configuration-guide RUN example has no channel suffix. The 17.12 system-message catalog adds `on channel (...)`; this generator deliberately preserves the published 17.11 example variant. The exact 17.11 system-message catalog could not be retrieved, so no claim is made that every 17.11 build emits this exact variant. Published MAC/IP values are redacted, so this pack supplies synthetic complete values; no unredacted capture from a live controller was available to compare byte for byte, and parsing by a live collector or normalizer is untested.
 
-The maintained Elastic Aironet package's compatibility list describes AireOS, although its tests also contain another IOS-XE class, severity 6 `CLIENT_ADDED_TO_RUN_STATE`, with different fields. Those records and the package's SISF normalized sample are not references for these three severity 7 classes. Compatibility with AireOS-oriented Elastic/KUMA normalizers or Smart Monitor parsers has not been tested. AP connectivity, WLAN policy, packet forwarding, radio/channel details, session/authentication IDs, AAA decisions and delete reasons are outside this selected output. Session, absence and address-learning distributions are synthetic training choices, not measured production workload; rates are stationary, with no working-day cycle.
+The maintained Elastic Aironet package's compatibility list describes AireOS, although its tests also contain another IOS-XE class, severity 6 `CLIENT_ADDED_TO_RUN_STATE`, with different fields. Those records and the package's SISF normalized sample are not references for these three severity 7 classes. Compatibility with AireOS-oriented Elastic/KUMA normalizers or Smart Monitor parsers has not been tested. AP connectivity, WLAN policy, packet forwarding, radio/channel details, session/authentication IDs, AAA decisions and delete reasons are outside this selected output.
 
-State consists of 48 finite station records, fixed sample/AP sets, scalar cursors and timestamps, and at most one active episode. Nothing grows with run length. Ordinary stations, and the last episode's final association, may legitimately remain associated at the end of a finite window.
+Session, absence, attendance and address-learning distributions are synthetic choices, not measured production workload. Every day is a working day: there are no weekends or holidays, the working day is fixed to the controller's UTC clock, and the record rate steps from hour to hour rather than changing smoothly within an hour. The controller logs its records one at a time, about 2 seconds apart in working hours and 8 seconds at night. Consequently the IP update follows its RUN after seconds (median 2.2 s in working hours, 7.5 s at night, at most about 3 minutes) rather than the sub-second delay of the Cisco example, and the length of very short sessions and reconnects follows the spacing of neighbouring records, so some are shorter or longer than their nominal range, most of all at night. About seven times a day an ordinary association has no IP update although its station normally learns an address, whenever it is the station's third distinct AP within 400 seconds. Ordinary stations and the last episode's final association may remain associated at the end of a finite window.
 
 ## References
 
