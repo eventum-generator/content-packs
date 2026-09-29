@@ -25,7 +25,7 @@ About 8,600 records per weekday and 1,300 per weekend day. Hours are UTC on the 
 | 07-08 | about 140 | about 31 |
 | 08-09, 13-14, 18-19 | about 500 | about 78 |
 | 09-13, 14-18 | about 790 | about 78 |
-| 19-21 | 80-180 | 31-78 |
+| 19-21 | 80-190 | 31-78 |
 
 Each employee has a personal working day shifted by up to 1.5 hours, so who is active follows the curve, not only how much is logged. Screenshots of one bout are a median of about one minute apart in office hours and about three minutes apart at night, when little else happens.
 
