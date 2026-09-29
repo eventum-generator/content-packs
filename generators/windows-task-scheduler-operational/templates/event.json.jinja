@@ -1,353 +1,154 @@
-{#- Microsoft-Windows-TaskScheduler/Operational records as Winlogbeat-style
-    ECS JSON with the raw event XML. One input tick per second; each tick
-    emits the earliest due record, stamped with its own microsecond time,
-    or drops. Three independent background processes run per host or per
-    admin: scheduled runs of recurring tasks, admin sessions that register,
-    run, update and delete ad-hoc tasks, and Group Policy refreshes that
-    replace a policy task. Times are in microseconds. -#}
+{# Input timestamps carry source records. A failed final deletion has no
+   success record in this selected source profile (rare guard drop).
+   Every task also has an independent 2-3 hour SYSTEM cleanup deadline. #}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
-{%- set hq = module.heapq -%}
-{#- Chain window: a background deletion by the registrant of a task that
-    has run is dropped when it falls within this window after the
-    registration (plus 2 ms of timestamp rounding; see chain_guard). -#}
-{%- set window = 3600000000 -%}
-{%- set hour = 3600000000 -%}
-{%- set system_gpo = 'NT AUTHORITY\\System' -%}
-{%- set fail_codes = [1, 2, 2147942402, 2147942405, 3221225786] -%}
-{%- macro ln(med, sig) -%}
-  {#- Lognormal seconds with median med; returns microseconds. -#}
-  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- set now = ts.timestamp() -%}
+{%- set hour = 3600 -%}
+{%- set curve = [0.04] * 8 + [1.0] * 10 + [0.04] * 6 -%}
+{%- macro push(due, row) -%}
+  {%- set serial = shared.get('serial', 0) + 1 -%}
+  {%- do shared.set('serial', serial) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, serial, row]) -%}
 {%- endmacro -%}
-{%- macro push(due, item) -%}
-  {%- set s = shared.get('seq') + 1 -%}
-  {%- do shared.set('seq', s) -%}
-  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
-{%- endmacro -%}
-{%- macro gen_name() -%}
-  {#- Ad-hoc task names share one generator in background and episodes. -#}
-  {%- set r = module.rand.number.floating(0, 1) -%}
-  {%- if r < 0.2 -%}
-    {{- '\\{' ~ (module.rand.crypto.uuid4() | upper) ~ '}' -}}
-  {%- elif r < 0.55 -%}
-    {{- '\\' ~ samples.adhoc_names.pick().stem ~ '_' ~ module.rand.number.integer(1, 999) -}}
-  {%- else -%}
-    {{- '\\' ~ samples.adhoc_names.pick().stem ~ '-' ~ module.rand.string.hex(4) -}}
-  {%- endif -%}
-{%- endmacro -%}
-{%- macro fresh_name(host) -%}
-  {#- A name not used on the host by a registered or recent ad-hoc task. -#}
-  {%- set n = namespace(v=gen_name()) -%}
-  {%- for _ in range(8) if n.v in host.temp or n.v in host.recent -%}{%- set n.v = gen_name() -%}{%- endfor -%}
-  {%- do host.recent.append(n.v) -%}
-  {%- if host.recent | length > 200 -%}{%- do host.recent.pop(0) -%}{%- endif -%}
-  {{- n.v -}}
-{%- endmacro -%}
-{%- macro run_as(admin) -%}
-  {%- set r = module.rand.number.floating(0, 1) -%}
-  {{- 'NT AUTHORITY\\SYSTEM' if r < 0.6 else (admin if r < 0.9 else 'CORP\\svc_deploy') -}}
-{%- endmacro -%}
-{%- macro run(h, name, action, path, user, t0, prio, p_fail, dur) -%}
-  {#- One task instance: 129, 100, 200, 201, 102. Returns the end time.
-      The 129 row carries one record-number skip for the trigger record
-      (107 or 110) that is not modeled. -#}
-  {%- set inst = '{' ~ (module.rand.crypto.uuid4() | upper) ~ '}' -%}
-  {%- set pid = 4 * module.rand.number.integer(300, 16000) -%}
-  {%- set t = namespace(v=t0) -%}
-  {{- push(t.v, {'k': 'row', 'h': h, 'code': 129, 'task': name, 'path': path, 'pid': pid, 'prio': prio, 'trig': true}) -}}
-  {%- set t.v = t.v + (ln(0.004, 0.8) | int) -%}
-  {%- do shared.set('r100', t.v) -%}
-  {{- push(t.v, {'k': 'row', 'h': h, 'code': 100, 'task': name, 'user': user, 'inst': inst}) -}}
-  {%- set t.v = t.v + (ln(0.003, 0.8) | int) -%}
-  {{- push(t.v, {'k': 'row', 'h': h, 'code': 200, 'task': name, 'action': action, 'path': path, 'inst': inst, 'pid': pid}) -}}
-  {%- set t.v = t.v + (ln(dur, 1.1) | int) -%}
-  {%- set rc = module.rand.choice(fail_codes) if module.rand.chance(p_fail) else 0 -%}
-  {{- push(t.v, {'k': 'row', 'h': h, 'code': 201, 'task': name, 'action': action, 'path': path, 'inst': inst, 'pid': pid, 'rc': rc}) -}}
-  {%- set t.v = t.v + (ln(0.004, 0.8) | int) -%}
-  {{- push(t.v, {'k': 'row', 'h': h, 'code': 102, 'task': name, 'user': user, 'inst': inst}) -}}
-  {{- t.v -}}
-{%- endmacro -%}
-{%- macro pick_start(lo, span) -%}
-  {#- Time in [lo, lo + span) with its UTC hour weighted by the admin
-      activity curve squared plus a small floor. -#}
-  {%- set curve = shared.get('curve') -%}
-  {%- set top = (curve | max) ** 2 + 0.02 -%}
-  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+{%- macro pick_start(lo, span, first=false) -%}
+  {%- set r = namespace(v=lo, ok=false) -%}
   {%- for _ in range(500) if not r.ok -%}
-    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
-    {%- if module.rand.number.floating(0, top) < curve[(c // 3600000000) % 24] ** 2 + 0.02 -%}
-      {%- set r.v = c -%}
-      {%- set r.ok = true -%}
+    {%- set c = lo + module.rand.number.floating(0, span) -%}
+    {%- if module.rand.number.floating(0, 1.02) < (curve[(c // hour) | int % 24] if first else curve[(c // hour) | int % 24] ** 2 + 0.02) -%}
+      {%- set r.v = c -%}{%- set r.ok = true -%}
     {%- endif -%}
   {%- endfor -%}
   {{- r.v -}}
 {%- endmacro -%}
-{%- macro chain_guard(host, tname, by, t) -%}
-  {#- 'drop' when deleting tname at t by `by` would complete the chain:
-      registered by the same account within the window before t, with
-      a run started in between. -#}
-  {%- set e = host.temp.get(tname) -%}
-  {{- 'drop' if e and e.by == by and e.r100 is not none and e.r100 < t and t - e.reg <= 3600002000 else 'ok' -}}
+{%- macro run(h, name, action, path, user, start, priority, p_fail, duration, recurring=none) -%}
+  {%- set inst = '{' ~ (module.rand.crypto.uuid4() | upper) ~ '}' -%}
+  {%- set pid = 4 * module.rand.number.integer(300, 16000) -%}
+  {%- set end = start + [module.rand.number.lognormal(module.math.log(duration), 0.8), 1800] | min -%}
+  {{- push(start, {'h': h, 'code': 129, 'task': name, 'path': path, 'pid': pid, 'prio': priority, 'trig': true}) -}}
+  {{- push(start + 0.004, {'h': h, 'code': 100, 'task': name, 'user': user, 'inst': inst}) -}}
+  {{- push(start + 0.007, {'h': h, 'code': 200, 'task': name, 'action': action, 'path': path, 'inst': inst, 'pid': pid}) -}}
+  {%- set rc = module.rand.choice([1, 2, 2147942402, 2147942405]) if module.rand.chance(p_fail) else 0 -%}
+  {{- push(end, {'h': h, 'code': 201, 'task': name, 'action': action, 'path': path, 'inst': inst, 'pid': pid, 'rc': rc}) -}}
+  {{- push(end + 0.004, {'h': h, 'code': 102, 'task': name, 'user': user, 'inst': inst, 'recurring': recurring}) -}}
+  {{- end + 0.004 -}}
 {%- endmacro -%}
-{%- if shared.get('queue') is none -%}
-  {%- set schema = {'type': 'typed-dict', 'fields': {
+{%- macro create(ai, episode, quick=false) -%}
+  {%- set admin = samples.admins[ai] -%}
+  {%- set h = admin.host -%}
+  {%- set host = shared.get('hosts')[h] -%}
+  {%- set name = '\\' ~ samples.adhoc_names.pick().stem ~ '-' ~ module.rand.crypto.uuid4() -%}
+  {%- set by = admin.user -%}
+  {%- do host.temp.update({name: {'by': by, 'reg': now, 'ran': false, 'episode': episode, 'actor': ai}}) -%}
+  {{- push(now, {'h': h, 'code': 106, 'task': name, 'user': by}) -}}
+  {%- set last = now -%}
+  {%- if not quick -%}
+    {%- set action = samples.adhoc_actions.pick().action -%}
+    {%- set user = module.rand.weighted_choice(['NT AUTHORITY\\SYSTEM', by, 'CORP\\svc_deploy'], [6, 3, 1]) -%}
+    {%- set last = run(h, name, action, action, user, now + module.rand.number.floating(15, 60), 7, 0.03, 8) | float -%}
+  {%- endif -%}
+  {%- set deleter = by if episode or module.rand.chance(0.65) else 'NT AUTHORITY\\SYSTEM' -%}
+  {%- set delay = [module.rand.number.lognormal(module.math.log(900), 0.65), 2400] | min -%}
+  {{- push(last + delay, {'h': h, 'code': 141, 'task': name, 'user': deleter, 'episode': episode}) -}}
+  {# An independent retention cleanup exists for every temporary task,
+     including tasks whose own deletion succeeds earlier. #}
+  {{- push(now + module.rand.number.floating(7200, 10800), {'h': h, 'code': 141, 'task': name, 'user': 'NT AUTHORITY\\SYSTEM', 'cleanup': true}) -}}
+{%- endmacro -%}
+{%- if shared.get('hosts') is none -%}
+  {%- do module.pydantic_core.SchemaValidator({'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}}
-  }} -%}
-  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
-  {#- Admin activity by UTC hour (relative rate, peak 1): admin sessions
-      are thinned by it and episode starts are weighted by its square. -#}
-  {%- do shared.update({'queue': [], 'seq': 0, 'curve': [0.12, 0.1, 0.1, 0.1, 0.12, 0.2, 0.4, 0.7, 0.95, 1.0, 1.0, 0.95, 0.85, 0.95, 1.0, 1.0, 0.9, 0.7, 0.5, 0.35, 0.25, 0.2, 0.16, 0.14]}) -%}
-  {%- set hosts = [] -%}
-  {%- for row in samples.hosts -%}
+  }}).validate_python(params) -%}
+  {%- do shared.update({'queue': [], 'serial': 0, 'hosts': [], 'recurring': [], 'active': {}, 'last': now, 'last_admin': -1}) -%}
+  {%- for h in samples.hosts -%}
     {%- set hi = loop.index0 -%}
-    {%- set threads = [] -%}
-    {%- for _ in range(module.rand.number.integer(8, 16)) -%}{%- do threads.append(4 * module.rand.number.integer(100, 3000)) -%}{%- endfor -%}
-    {%- set own = [] -%}
-    {%- for ti in range(samples.tasks | length) if samples.tasks[ti].roles == '*' or samples.tasks[ti].roles == row.role -%}
-      {%- do own.append(ti) -%}
-      {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * samples.tasks[ti].hours * hour), {'k': 'rec', 'h': hi, 't': ti}) -}}
+    {%- set tasks = [] -%}
+    {%- for task in samples.tasks if task.roles == '*' or task.roles == h.role -%}
+      {%- do tasks.append(task) -%}
+      {%- do module.heapq.heappush(shared.get('recurring'), [now + module.rand.number.floating(0, task.hours * hour), hi, loop.index0, task]) -%}
     {%- endfor -%}
-    {%- do hosts.append({'name': row.name, 'ip': row.ip, 'gpo_task': row.gpo_task, 'pid': 4 * module.rand.number.integer(200, 1200), 'threads': threads, 'record': module.rand.number.integer(5000, 900000), 'tasks': own, 'temp': {}, 'recent': []}) -%}
-    {%- if row.gpo_task -%}
-      {{- push(now + module.builtins.int(module.rand.number.floating(0, 5400) * 1000000), {'k': 'gpo', 'h': hi}) -}}
-    {%- endif -%}
+    {%- do shared.get('hosts').append({'name': h.name, 'ip': h.ip, 'pid': 4 * module.rand.number.integer(200, 1200), 'threads': [400, 404, 408, 412], 'record': module.rand.number.integer(5000, 900000), 'temp': {}, 'tasks': tasks, 'gpo_task': h.gpo_task, 'gpo_due': now + module.rand.number.floating(0, 7200)}) -%}
   {%- endfor -%}
-  {%- set admins = [] -%}
-  {%- for row in samples.admins -%}
-    {%- do admins.append({'user': row.user, 'busy': false}) -%}
-    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(15000, 1.0) | int)), {'k': 'adm', 'a': loop.index0}) -}}
-  {%- endfor -%}
-  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-  {%- do shared.update({'hosts': hosts, 'admins': admins, 'last_us': now - 1, 'ep_last_admin': none, 'ep_last_host': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
+  {%- do shared.set('episode_due', pick_start(now, [params.anomaly_interval_hours * hour, 86400] | min, true) | float) -%}
 {%- endif -%}
-{%- set queue = shared.get('queue') -%}
 {%- set hosts = shared.get('hosts') -%}
-{%- set admins = shared.get('admins') -%}
-{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{#- Episode: at the first tick at or after its drawn start, an admin who
-    differs from the previous episode's admin registers an ad-hoc task on
-    a host other than the previous episode's host, runs it and deletes it
-    again within the chain window. Name, action, run-as account and every
-    delay come from the background generators; only the deletion delay is
-    drawn so that the deletion stays inside the window. The episode task
-    is never offered to background operations, and the background keeps
-    its own schedule. The first start falls within the first
-    min(interval, 24 h); each later start within a window of
-    min(interval / 4, 6 h) centred one interval after the actual start,
-    both weighted by the admin curve squared. Missed episodes are not
-    replayed. -#}
-{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
-  {%- set ai = module.rand.choice(range(admins | length) | reject('equalto', shared.get('ep_last_admin')) | list) -%}
-  {%- set hi = module.rand.choice(range(hosts | length) | reject('equalto', shared.get('ep_last_host')) | list) -%}
-  {%- set admin = admins[ai].user -%}
-  {%- set start = now + module.rand.number.integer(0, 999999) -%}
-  {%- set name = fresh_name(hosts[hi]) -%}
-  {%- set act = samples.adhoc_actions.pick().action -%}
-  {%- set as_user = run_as(admin) -%}
-  {{- push(start, {'k': 'row', 'h': hi, 'code': 106, 'task': name, 'user': admin}) -}}
-  {%- set end = namespace(v=run(hi, name, act, act, as_user, start + (ln(25, 1.0) | int), 7, 0.08, 8) | int) -%}
-  {%- if module.rand.chance(0.2) -%}
-    {%- set end.v = run(hi, name, act, act, as_user, end.v + (ln(300, 1.0) | int), 7, 0.08, 8) | int -%}
+{%- set queue = shared.get('queue') -%}
+{%- set dt = [now - shared.get('last'), 0] | max -%}
+{%- do shared.set('last', now) -%}
+{%- set interval = params.anomaly_interval_hours * hour -%}
+{%- if queue | length < 450 -%}
+  {%- if params.anomaly_mode and now >= shared.get('episode_due') -%}
+    {%- set candidates = [] -%}
+    {%- for ai in range(samples.admins | length) if ai != shared.get('last_admin') and hosts[samples.admins[ai].host].temp | length < 30 -%}{%- do candidates.append(ai) -%}{%- endfor -%}
+    {%- if candidates -%}
+      {%- set ai = module.rand.choice(candidates) -%}
+      {{- create(ai, true) -}}
+      {%- do shared.update({'last_admin': ai, 'episode_due': now + interval + 86400}) -%}
+    {%- endif -%}
   {%- endif -%}
-  {%- set limit = start + window - 120000000 -%}
-  {%- set d = namespace(v=end.v + (ln(900, 1.6) | int)) -%}
-  {%- for _ in range(60) if d.v > limit -%}{%- set d.v = end.v + (ln(900, 1.6) | int) -%}{%- endfor -%}
-  {%- if d.v > limit -%}{%- set d.v = end.v + module.rand.number.integer(1000000, [2000000, limit - end.v] | max) -%}{%- endif -%}
-  {{- push(d.v, {'k': 'row', 'h': hi, 'code': 141, 'task': name, 'user': admin}) -}}
-  {%- set w = [interval // 4, 6 * hour] | min -%}
-  {%- do shared.update({'ep_last_admin': ai, 'ep_last_host': hi, 'ep_due': pick_start(start + interval - w // 2, w) | int}) -%}
-{%- endif -%}
-{%- if now < queue[0][0] -%}
-  {%- do shared.set('next_due', queue[0][0]) -%}
-  {{- dispatch.drop() -}}
-{%- endif -%}
-{%- set out = namespace(row=none, rec=0) -%}
-{%- for _ in range(32) if out.row is none and queue and queue[0][0] <= now -%}
-  {%- set top = hq.heappop(queue) -%}
-  {%- set due = top[0] -%}
-  {%- set item = top[2] -%}
-  {%- if item.k == 'row' -%}
-    {%- set out.row = item -%}
-    {%- set out.rec = [due, shared.get('last_us') + 1] | max -%}
-    {%- do shared.set('last_us', out.rec) -%}
-  {%- elif item.k == 'rec' -%}
-    {#- Scheduled run of a recurring task; trigger random delay and
-        schedule drift give each run its own gap. -#}
-    {%- set task = samples.tasks[item.t] -%}
-    {%- set _ = run(item.h, task.task, task.action, task.path, task.user, due, task.priority, task.p_fail, task.dur_s) -%}
-    {{- push(due + module.builtins.int(task.hours * hour * module.rand.number.lognormal(0, 0.25)), item) -}}
-  {%- elif item.k == 'gpo' -%}
-    {#- Group Policy Preferences task with the Replace action: every
-        refresh (90 minutes plus a random offset of up to 30) deletes and
-        re-registers the task as SYSTEM. -#}
-    {%- set host = hosts[item.h] -%}
-    {{- push(due, {'k': 'row', 'h': item.h, 'code': 141, 'task': host.gpo_task, 'user': system_gpo}) -}}
-    {{- push(due + (ln(0.03, 0.6) | int), {'k': 'row', 'h': item.h, 'code': 106, 'task': host.gpo_task, 'user': system_gpo}) -}}
-    {{- push(due + 5400000000 + module.rand.number.integer(0, 1800000000), item) -}}
-  {%- elif item.k == 'adm' -%}
-    {#- Admin session arrival, thinned by the admin activity curve of its
-        UTC hour; an arrival during a running session is skipped. -#}
-    {{- push(due + (ln(15000, 1.0) | int), item) -}}
-    {%- set adm = admins[item.a] -%}
-    {%- if not adm.busy and module.rand.chance(shared.get('curve')[(due // hour) % 24]) -%}
-      {%- do adm.update({'busy': true}) -%}
-      {%- set n = namespace(v=1, go=true) -%}
-      {%- for _ in range(7) if n.go -%}
-        {%- if module.rand.chance(0.55) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
-      {%- endfor -%}
-      {{- push(due, {'k': 'op', 'a': item.a, 'h': module.rand.number.integer(0, (hosts | length) - 1), 'left': n.v}) -}}
-    {%- endif -%}
-  {%- elif item.k == 'del' -%}
-    {#- Planned deletion of an ad-hoc task, unless an admin removed it
-        earlier. A deletion that would complete the chain is dropped at
-        its own time and the task stays registered. -#}
-    {%- set host = hosts[item.h] -%}
-    {%- if item.task in host.temp and chain_guard(host, item.task, item.by, due) == 'ok' -%}
-      {%- do host.temp.pop(item.task) -%}
-      {{- push(due, {'k': 'row', 'h': item.h, 'code': 141, 'task': item.task, 'user': item.by}) -}}
-    {%- endif -%}
-  {%- elif item.k == 'op' -%}
-    {%- set adm = admins[item.a] -%}
-    {%- set admin = adm.user -%}
-    {%- set h = item.h -%}
-    {%- set host = hosts[h] -%}
-    {%- set r = module.rand.number.floating(0, 1) -%}
-    {%- set op = 'create' if r < 0.45 else ('update' if r < 0.65 else ('delete' if r < 0.8 else ('quick' if r < 0.9 else 'run'))) -%}
-    {%- if op == 'create' and host.temp | length >= 30 -%}{%- set op = 'delete' -%}{%- endif -%}
-    {%- set idle = [] -%}
-    {%- for tname, entry in host.temp.items() if entry.end < due -%}{%- do idle.append(tname) -%}{%- endfor -%}
-    {%- if op == 'delete' and not idle -%}{%- set op = 'update' -%}{%- endif -%}
-    {%- if op == 'delete' -%}
-      {#- Delete an ad-hoc task on the host whose runs have finished; a
-          deletion that would complete the chain is dropped and the task
-          stays registered. -#}
-      {%- set tname = module.rand.choice(idle) -%}
-      {%- if chain_guard(host, tname, admin, due) == 'ok' -%}
-        {%- do host.temp.pop(tname) -%}
-        {{- push(due, {'k': 'row', 'h': h, 'code': 141, 'task': tname, 'user': admin}) -}}
-      {%- endif -%}
-    {%- endif -%}
-    {%- if op == 'create' -%}
-      {#- Register an ad-hoc task, maybe run it now (once or twice), and
-          maybe plan its deletion by the registrant, another admin or
-          SYSTEM after a lognormal delay. -#}
-      {%- set name = fresh_name(host) -%}
-      {%- set act = samples.adhoc_actions.pick().action -%}
-      {%- set as_user = run_as(admin) -%}
-      {{- push(due, {'k': 'row', 'h': h, 'code': 106, 'task': name, 'user': admin}) -}}
-      {%- set last = namespace(v=due, r100=none) -%}
-      {%- if module.rand.chance(0.55) -%}
-        {%- set last.v = run(h, name, act, act, as_user, due + (ln(25, 1.0) | int), 7, 0.08, 8) | int -%}
-        {%- set last.r100 = shared.get('r100') -%}
-        {%- if module.rand.chance(0.2) -%}
-          {%- set last.v = run(h, name, act, act, as_user, last.v + (ln(300, 1.0) | int), 7, 0.08, 8) | int -%}
-        {%- endif -%}
-      {%- endif -%}
-      {%- do host.temp.update({name: {'by': admin, 'reg': due, 'r100': last.r100, 'end': last.v}}) -%}
-      {%- if module.rand.chance(0.65) -%}
-        {%- set r2 = module.rand.number.floating(0, 1) -%}
-        {%- set others = admins | map(attribute='user') | reject('equalto', admin) | list -%}
-        {%- set by = admin if r2 < 0.65 else (system_gpo if r2 < 0.75 else module.rand.choice(others)) -%}
-        {{- push(last.v + (ln(900, 1.6) | int), {'k': 'del', 'h': h, 'task': name, 'by': by}) -}}
-      {%- endif -%}
-    {%- elif op == 'update' -%}
-      {%- set cand = host.temp.keys() | list -%}
-      {%- for ti in host.tasks if samples.tasks[ti].task.startswith('\\Corp\\') -%}{%- do cand.append(samples.tasks[ti].task) -%}{%- endfor -%}
-      {{- push(due, {'k': 'row', 'h': h, 'code': 140, 'task': module.rand.choice(cand), 'user': admin}) -}}
-    {%- elif op == 'quick' -%}
-      {#- Register and delete again without a run (wrong trigger, wrong
-          account, test). -#}
-      {%- set name = fresh_name(host) -%}
-      {{- push(due, {'k': 'row', 'h': h, 'code': 106, 'task': name, 'user': admin}) -}}
-      {{- push(due + (ln(120, 1.0) | int), {'k': 'row', 'h': h, 'code': 141, 'task': name, 'user': admin}) -}}
-    {%- elif op == 'run' -%}
-      {#- Manual run of a recurring task; it runs as the task principal. -#}
-      {%- set task = samples.tasks[module.rand.choice(host.tasks)] -%}
-      {%- set _ = run(h, task.task, task.action, task.path, task.user, due, task.priority, task.p_fail, task.dur_s) -%}
-    {%- endif -%}
-    {%- if item.left > 1 -%}
-      {{- push(due + (ln(90, 1.1) | int), {'k': 'op', 'a': item.a, 'h': h if module.rand.chance(0.7) else module.rand.number.integer(0, (hosts | length) - 1), 'left': item.left - 1}) -}}
+  {%- if module.rand.chance(1 - module.math.exp(-36 / 38016 * curve[ts.hour] * dt)) -%}
+    {%- set ai = module.rand.number.integer(0, samples.admins | length - 1) -%}
+    {%- set admin = samples.admins[ai] -%}
+    {%- set host = hosts[admin.host] -%}
+    {%- if module.rand.chance(0.65) and host.temp | length < 30 -%}
+      {{- create(ai, false, module.rand.chance(0.3)) -}}
     {%- else -%}
-      {%- do adm.update({'busy': false}) -%}
+      {%- set task = module.rand.choice(host.tasks) -%}
+      {{- push(now, {'h': admin.host, 'code': 140, 'task': task.task, 'user': admin.user}) -}}
     {%- endif -%}
   {%- endif -%}
-{%- endfor -%}
-{%- do shared.set('next_due', queue[0][0] if queue else now + 1000000) -%}
-{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+  {%- for host in hosts if host.gpo_task and now >= host.gpo_due -%}
+    {%- set hi = loop.index0 -%}
+    {# loop.index0 is scoped to the filtered loop; resolve host index. #}
+    {%- set hi = hosts.index(host) -%}
+    {{- push(now, {'h': hi, 'code': 141, 'task': host.gpo_task, 'user': 'NT AUTHORITY\\System', 'gpo': true}) -}}
+    {{- push(now + 0.03, {'h': hi, 'code': 106, 'task': host.gpo_task, 'user': 'NT AUTHORITY\\System', 'gpo': true}) -}}
+    {%- do host.update({'gpo_due': now + module.rand.number.floating(5400, 7200)}) -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- set out = namespace(row=none) -%}
+{# Due rows take precedence. Stale independent cleanups are removed when
+   the successful earlier deletion is rendered, rather than accumulated. #}
+{%- if queue and queue[0][0] <= now -%}
+  {%- set out.row = module.heapq.heappop(queue)[2] -%}
+{%- elif queue | length < 450 -%}
+  {%- set rec = module.heapq.heappop(shared.get('recurring')) -%}
+  {%- set task = rec[3] -%}
+  {%- set key = rec[1] ~ '|' ~ task.task -%}
+  {%- if key not in shared.get('active') -%}
+    {%- do shared.get('active').update({key: true}) -%}
+    {%- set _ = run(rec[1], task.task, task.action, task.path, task.user, now, task.priority, task.p_fail, task.dur_s, key) -%}
+    {%- set out.row = module.heapq.heappop(queue)[2] -%}
+  {%- endif -%}
+  {%- do module.heapq.heappush(shared.get('recurring'), [now + task.hours * hour * module.rand.number.lognormal(0, 0.25), rec[1], rec[2], task]) -%}
+{%- endif -%}
+{%- if out.row is none -%}
+  {%- set ai = module.rand.number.integer(0, samples.admins | length - 1) -%}
+  {%- set admin = samples.admins[ai] -%}
+  {%- set task = module.rand.choice(hosts[admin.host].tasks) -%}
+  {%- set out.row = {'h': admin.host, 'code': 140, 'task': task.task, 'user': 'NT AUTHORITY\\SYSTEM'} -%}
+{%- endif -%}
 {%- set row = out.row -%}
 {%- set host = hosts[row.h] -%}
-{#- Records of other Operational events (not modeled) take record numbers
-    in between. -#}
-{%- set record_id = host.record + 1 + (1 if row.get('trig') else 0) + (module.rand.number.integer(1, 3) if module.rand.chance(0.04) else 0) -%}
-{%- do host.update({'record': record_id}) -%}
-{%- set moment = ts + module.datetime.timedelta(microseconds=out.rec - now) -%}
-{%- set system_time = moment.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ module.rand.number.integer(0, 9) ~ 'Z' -%}
-{%- set code = row.code -%}
-{%- set name = row.task -%}
-{%- set inst = row.get('inst') -%}
-{%- set inst_msg = inst | lower if inst else none -%}
-{%- if code == 106 -%}
-  {%- set meta = {'version': 0, 'opcode': 0, 'kw': '0x8000000000000000', 'ed': 'TaskRegisteredEvent', 'action': 'task-registered', 'category': ['configuration'], 'type': ['creation']} -%}
-  {%- set data = [['TaskName', name], ['UserContext', row.user]] -%}
-  {%- set message = 'User "' ~ row.user ~ '"  registered Task Scheduler task "' ~ name ~ '"' -%}
-{%- elif code == 140 -%}
-  {%- set meta = {'version': 0, 'opcode': 0, 'kw': '0x8000000000000000', 'ed': 'TaskUpdated', 'action': 'task-updated', 'category': ['configuration'], 'type': ['change']} -%}
-  {%- set data = [['TaskName', name], ['UserName', row.user]] -%}
-  {%- set message = 'User "' ~ row.user ~ '"  updated Task Scheduler task "' ~ name ~ '"' -%}
-{%- elif code == 141 -%}
-  {%- set meta = {'version': 0, 'opcode': 0, 'kw': '0x8000000000000000', 'ed': 'TaskDeleted', 'action': 'task-deleted', 'category': ['configuration'], 'type': ['deletion']} -%}
-  {%- set data = [['TaskName', name], ['UserName', row.user]] -%}
-  {%- set message = 'User "' ~ row.user ~ '"  deleted Task Scheduler task "' ~ name ~ '"' -%}
-{%- elif code == 129 -%}
-  {%- set meta = {'version': 0, 'opcode': 0, 'kw': '0x8000000000000000', 'ed': 'CreatedTaskProcess', 'action': 'task-process-created', 'category': ['process'], 'type': ['start']} -%}
-  {%- set data = [['TaskName', name], ['Path', row.path], ['ProcessID', row.pid], ['Priority', row.prio]] -%}
-  {%- set message = 'Task Scheduler launch task "' ~ name ~ '" , instance "' ~ row.path ~ '"  with process ID ' ~ row.pid ~ '.' -%}
-{%- elif code == 100 -%}
-  {%- set meta = {'version': 0, 'opcode': 1, 'kw': '0x8000000000000001', 'ed': 'TaskStartEvent', 'action': 'task-started', 'category': ['process'], 'type': ['start']} -%}
-  {%- set data = [['TaskName', name], ['UserContext', row.user], ['InstanceId', inst]] -%}
-  {%- set message = 'Task Scheduler started "' ~ inst_msg ~ '" instance of the "' ~ name ~ '" task for user "' ~ row.user ~ '".' -%}
-{%- elif code == 200 -%}
-  {%- set meta = {'version': 1, 'opcode': 1, 'kw': '0x8000000000000000', 'ed': 'ActionStart', 'action': 'action-started', 'category': ['process'], 'type': ['start']} -%}
-  {%- set data = [['TaskName', name], ['ActionName', row.action], ['TaskInstanceId', inst], ['EnginePID', row.pid]] -%}
-  {%- set message = 'Task Scheduler launched action "' ~ row.action ~ '" in instance "' ~ inst_msg ~ '" of task "' ~ name ~ '".' -%}
-{%- elif code == 201 -%}
-  {%- set meta = {'version': 2, 'opcode': 2, 'kw': '0x8000000000000000', 'ed': 'ActionSuccess', 'action': 'action-completed', 'category': ['process'], 'type': ['end']} -%}
-  {%- set data = [['TaskName', name], ['TaskInstanceId', inst], ['ActionName', row.action], ['ResultCode', row.rc], ['EnginePID', row.pid]] -%}
-  {%- set message = 'Task Scheduler successfully completed task "' ~ name ~ '" , instance "' ~ inst_msg ~ '" , action "' ~ row.action ~ '" with return code ' ~ row.rc ~ '.' -%}
-{%- else -%}
-  {%- set meta = {'version': 0, 'opcode': 2, 'kw': '0x8000000000000001', 'ed': 'TaskSuccessEvent', 'action': 'task-completed', 'category': ['process'], 'type': ['end']} -%}
-  {%- set data = [['TaskName', name], ['UserContext', row.user], ['InstanceId', inst]] -%}
-  {%- set message = 'Task Scheduler successfully finished "' ~ inst_msg ~ '" instance of the "' ~ name ~ '" task for user "' ~ row.user ~ '".' -%}
+{%- set entry = host.temp.get(row.task) -%}
+{%- if row.code == 106 and entry -%}
+  {%- do entry.update({'reg': now}) -%}
+  {%- if entry.episode -%}
+    {%- set ai = entry.actor -%}
+    {%- set w = [interval / 4, 21600] | min -%}
+    {%- do shared.set('episode_due', pick_start(now + interval - w / 2, w) | float) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set thread = module.rand.choice(host.threads) -%}
-{%- set xml = namespace(v='<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-TaskScheduler" Guid="{DE7B24EA-73C8-4A09-985D-5BDADCFA9017}"/><EventID>' ~ code ~ '</EventID><Version>' ~ meta.version ~ '</Version><Level>4</Level><Task>' ~ code ~ '</Task><Opcode>' ~ meta.opcode ~ '</Opcode><Keywords>' ~ meta.kw ~ '</Keywords><TimeCreated SystemTime="' ~ system_time ~ '"/><EventRecordID>' ~ record_id ~ '</EventRecordID>' ~ ('<Correlation ActivityID="' ~ inst ~ '"/>' if inst else '<Correlation/>') ~ '<Execution ProcessID="' ~ host.pid ~ '" ThreadID="' ~ thread ~ '"/><Channel>Microsoft-Windows-TaskScheduler/Operational</Channel><Computer>' ~ host.name ~ '</Computer><Security UserID="S-1-5-18"/></System><EventData Name="' ~ meta.ed ~ '">') -%}
-{%- set event_data = {} -%}
-{%- for key, value in data -%}
-  {%- set xml.v = xml.v ~ '<Data Name="' ~ key ~ '">' ~ (value | string | e) ~ '</Data>' -%}
-  {%- do event_data.update({key: value | string}) -%}
-{%- endfor -%}
-{%- set xml.v = xml.v ~ '</EventData></Event>' -%}
-{%- set evt = {'kind': 'event', 'category': meta.category, 'type': meta.type, 'action': meta.action, 'code': code | string, 'provider': 'Microsoft-Windows-TaskScheduler', 'original': xml.v} -%}
-{%- if code == 201 -%}{%- do evt.update({'outcome': 'success' if row.rc == 0 else 'failure'}) -%}{%- endif -%}
-{%- set winlog = {'channel': 'Microsoft-Windows-TaskScheduler/Operational', 'computer_name': host.name, 'event_id': code | string, 'provider_guid': '{DE7B24EA-73C8-4A09-985D-5BDADCFA9017}', 'provider_name': 'Microsoft-Windows-TaskScheduler', 'record_id': record_id, 'process': {'pid': host.pid, 'thread': {'id': thread}}, 'user': {'identifier': 'S-1-5-18'}, 'event_data': event_data, 'version': meta.version} -%}
-{%- if inst -%}{%- do winlog.update({'activity_id': inst}) -%}{%- endif -%}
-{%- set event = {
-  '@timestamp': moment.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
-  'ecs': {'version': '8.17.0'},
-  'event': evt,
-  'host': {'name': host.name, 'ip': [host.ip]},
-  'log': {'level': 'information'},
-  'message': message,
-  'winlog': winlog
-} -%}
-{%- if row.get('user') -%}
-  {%- set parts = row.user.split('\\', 1) -%}
-  {%- do event.update({'related': {'user': [parts[1]]}}) -%}
-  {%- if code in [106, 140, 141] -%}{%- do event.update({'user': {'domain': parts[0], 'name': parts[1]}}) -%}{%- endif -%}
+{%- if row.code == 100 and entry -%}{%- do entry.update({'ran': true}) -%}{%- endif -%}
+{%- if row.code == 102 and row.get('recurring') -%}{%- do shared.get('active').pop(row.recurring) -%}{%- endif -%}
+{%- if row.code == 141 and entry -%}
+  {%- if not row.get('episode', false) and entry.by == row.user and entry.ran and now - entry.reg <= 3600.002 -%}
+    {# The source has no successful deletion record for this request.
+       The independent SYSTEM cleanup remains on its original schedule. #}
+    {{- dispatch.drop() -}}
+  {%- endif -%}
+  {%- do host.temp.pop(row.task) -%}
+  {%- set keep = [] -%}
+  {%- for queued in queue if not (queued[2].h == row.h and queued[2].task == row.task and queued[2].get('cleanup', false)) -%}{%- do keep.append(queued) -%}{%- endfor -%}
+  {%- do queue.clear() -%}{%- do queue.extend(keep) -%}{%- do module.heapq.heapify(queue) -%}
 {%- endif -%}
-{%- if code in [129, 200, 201] -%}
-  {%- do event.update({'process': {'executable': row.get('path') or row.action, 'pid': row.pid}}) -%}
-{%- endif -%}
-{{- event | tojson -}}
+{%- include 'templates/_render.json.jinja' -%}

@@ -1,106 +1,80 @@
 # Windows Task Scheduler Operational
 
-Synthetic `Microsoft-Windows-TaskScheduler/Operational` records from ten Windows servers, for testing detections on scheduled-task persistence and remote execution. Each record is Winlogbeat-style ECS JSON with the raw Windows event XML in `event.original`. Event IDs, versions, opcodes, keywords and message text follow the TaskScheduler provider manifest (build 17763, Windows Server 2019 base); the XML shape and EventData fields follow Event Viewer XML published on Microsoft Q&A and real examples in the EvtxECmd maps.
+Synthetic `Microsoft-Windows-TaskScheduler/Operational` records from ten Windows servers. Each event is Winlogbeat-style ECS JSON with native Windows event XML in `event.original`. The selected provider profile follows build 17763, the Windows Server 2019 base.
 
 ## Event Types
 
-| Event ID | Action (`event.action`) | Share | Category |
-| --- | --- | ---: | --- |
-| `129` | Created task process (`task-process-created`) | 18.9% | process |
-| `100` | Task started (`task-started`) | 18.9% | process |
-| `200` | Action started (`action-started`) | 18.9% | process |
-| `201` | Action completed, with return code (`action-completed`) | 18.9% | process |
-| `102` | Task completed (`task-completed`) | 18.9% | process |
-| `106` | Task registered (`task-registered`) | 2.6% | configuration |
-| `141` | Task registration deleted (`task-deleted`) | 2.4% | configuration |
-| `140` | Task registration updated (`task-updated`) | 0.2% | configuration |
+About 2,600 records occur per day, with a small office-hours increase from 08:00 to 18:00 UTC and approximately 3% daily volume variation. Most records describe successful recurring maintenance, backups and monitoring.
 
-Shares were measured on the default `anomaly_mode: true` capture (10,700 records in 96 hours, about 2,700 per day).
+| Event ID | Action | Typical frequency | Category |
+|---|---|---|---|
+| 129 | Task process created | One per run | process |
+| 100 | Task started | One per run | process |
+| 200 | Action started | One per run | process |
+| 201 | Action completed | One per run, usually return code 0 | process |
+| 102 | Task completed | One per run | process |
+| 106 | Task registered | Temporary work and policy replacements | configuration |
+| 141 | Task deleted | Temporary cleanup and policy replacements | configuration |
+| 140 | Task updated | Occasional administrative changes | configuration |
 
-Background, per host and per admin, each on its own random schedule:
+Each server carries the recurring tasks appropriate to its role. Hourly backup and monitoring work is more common than daily scans or weekly maintenance. One run has a single instance GUID, and ProcessID in 129 equals EnginePID in 200/201. Action durations vary by task; approximately 1-6% return a nonzero code. Event 201 still describes completion when the action's return code is nonzero.
 
-- **Scheduled runs.** Every host runs 13 to 14 recurring tasks from `samples/tasks.json` (Windows maintenance tasks and corporate agents), each with its own gap around its nominal interval (1 hour to 1 week, lognormal jitter). A run logs `129`, `100`, `200`, `201` and `102` with one instance GUID; `129` ProcessID equals `200`/`201` EnginePID. Durations are lognormal around each task's typical duration; 1-8% of runs return a nonzero code in `201`, which Task Scheduler still reports as completed.
-- **Admin sessions.** Six admins open sessions at lognormal gaps (median about 4 hours), thinned by an hour-of-day activity curve (UTC; full rate 08:00-16:00, about a tenth at night), so a session starts about twice a day per admin, mostly in working hours. A session performs one to eight operations within minutes on one or more hosts: register an ad-hoc task (`106`), often run it at once, once or twice (`129` to `102`, running as SYSTEM, the admin or `CORP\svc_deploy`); update a task (`140`); delete an ad-hoc task (`141`); register and delete a task again without running it; or run a recurring task by hand. About 65% of ad-hoc tasks get a planned deletion, by the registrant, another admin or SYSTEM, after a lognormal delay (median 15 minutes, long tail) counted from the end of their last run; an admin deletes only tasks whose runs have finished. Because a registrant's deletion within the hour after a run is dropped (see Anomaly Chain), about 53% of ad-hoc tasks that ran are never deleted, against about 20% of those that did not run.
-- **Group Policy.** Four hosts carry a Group Policy Preferences task with the Replace action, so each policy refresh (every 90 minutes plus a random offset of up to 30) logs `141` and `106` for that task by `NT AUTHORITY\System`.
+Six administrators manage assigned servers. Together they perform about 36 operations per day, mainly in office hours: register temporary tasks, run them, remove unused registrations, or update recurring tasks. About 30% of temporary registrations are checks that are deleted without a run. Other temporary tasks run once as SYSTEM, their registrant or `CORP\svc_deploy`. Names and executables come from common pools in both modes.
 
-Record numbers rise per host and skip one number before each run for the trigger record (`107` or `110`) that is not modeled, plus occasional random gaps.
+Temporary tasks have an independent SYSTEM cleanup after about two to three hours. Successful earlier deletion removes the task immediately. Some registrant deletion attempts after a run have no successful 141 record; those tasks remain until SYSTEM cleanup. At most 30 temporary tasks can be registered on one server. Four servers also show Group Policy Preferences replacement, a 141/106 pair by `NT AUTHORITY\System` approximately every 90-120 minutes. Record numbers increase per host, with gaps for omitted trigger events and other unmodeled records.
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`. With `false` the generator emits only the background above, which never holds the complete chain. Every step and every value the chain uses occur in the background across captures (a single 96-hour capture may lack a given admin, host or admin-host combination): per 96 hours of background (mean of six captures), about 18 ad-hoc tasks registered and deleted by the same admin within an hour without a run, 5 tasks registered, run and deleted within an hour by a different account, 3 tasks registered, run and deleted by their registrant after more than an hour, about 20 ad-hoc tasks left registered, and about 54 pairs of configuration changes by one admin within 5 minutes. Episode admins, hosts, task names, actions and run-as accounts are drawn from the same pools and generators as the background.
+`anomaly_mode` defaults to `true`. An episode registers a temporary task (106), runs it (129, 100, 200, 201, 102), then successfully deletes it (141) using the registering account within one hour. The deletion restores the task list. Episode administrators, server assignments, names, executables, run-as accounts, failure rates and task limits are shared with ordinary activity. Existing work continues during the episode.
 
-Sequence, one episode (an ad-hoc task used for one-shot remote execution, as schtasks or atexec do):
+Link the lifecycle by `host.name` and `winlog.event_data.TaskName`; the 106 `UserContext` must equal the 141 `UserName`. Join records of one run by `InstanceId`/`TaskInstanceId` and `winlog.activity_id`. Task names and instance GUIDs identify individual objects and runs, rather than persistent actors.
 
-1. `106`: an admin account registers a new task on a server.
-2. `129`, `100`, `200`, `201`, `102`: the task runs once (in 20% of episodes twice), with the same run-now delay and duration distributions as the background.
-3. `141`: the same account deletes the task, restoring the host's task list.
+With `anomaly_mode: false`, no complete registration/run/deletion chain by one account occurs within an hour. Individual registrations, runs, deletions and administrator/server pairs still occur. Ordinary tasks may be deleted without running, removed by SYSTEM after running, or removed by their registrant later.
 
-Linking fields: `host.name` and `winlog.event_data.TaskName` across all steps; `UserContext` of `106` equals `UserName` of `141`; `InstanceId`/`TaskInstanceId` (and `winlog.activity_id`) join the rows of one run. Measured chain spans: 1 to 30 minutes (default), 5 to 45 minutes (12-hour interval); the deletion is always inside one hour of the registration.
-
-Recurrence: episodes are scheduled by event time. The first starts within the first `min(anomaly_interval_hours, 24)` hours of the run; each later one within a window of `min(anomaly_interval_hours / 4, 6)` hours centred one interval after the actual start of the previous episode (default interval 24 hours, minimum 6). Inside both windows the start hour is weighted by the square of the admin activity curve plus a small floor, so episodes fall mostly in working hours, somewhat more concentrated than background admin activity; at intervals below 24 hours some episodes necessarily fall in quiet hours (at 12 hours every second one lands near night), and at 8 hours or less the start phase moves around the clock. Missed episodes are not replayed. Each episode uses a different admin and a different host than the previous one. Background schedules continue unchanged during episodes. Measured: 4 episodes in 96 hours at the default 24 hours (first start 15.1 hours into the run, start gaps 26.1 to 26.7 hours, starts between 15:06 and 22:27 UTC) and 8 at 12 hours (first start 8.6 hours in, gaps 10.6 to 13.4 hours, starts alternating around 14:00-16:00 and 01:00-03:00 UTC).
-
-Detection idea: on one host and task, a registration, at least one run and a deletion by the registering account within one hour. Registration and deletion without a run, a run followed by a deletion by another account, or a registrant's cleanup hours later are ordinary here. In the background, a deletion by the registrant that would fall within the hour after registering a task that has run is dropped: no `141` is written at that time and the task stays registered until another account or a later operation removes it. Other deletions keep their times, so deletions by other accounts and the registrant's own deletions after the hour follow the unmodified delay distribution on both sides of the one-hour mark. In six background captures of 96 hours no registrant deletion after a run fell within the hour; 6 fell between 60 and 100 minutes, and deletions of run tasks by other accounts were 29 within the hour and 3 between 60 and 120 minutes, the tail of the same delay distribution.
+The first episode starts within `min(anomaly_interval_hours, 24)` hours, following the administrator activity curve. Later starts lie within a window of `min(interval/4, 6 hours)` centered one interval after the preceding actual registration, with hour weights proportional to the squared activity curve plus a small floor. Administrators and their servers rotate between episodes. Missed episodes are not replayed. Short intervals can place episodes in quiet hours. Each enabled episode contributes its own records.
 
 ## Parameters
 
-### Event Parameters
+Edit `event.template.params` in `generator.yml`.
 
-Edit `event.template.params` in `generator.yml`:
+| Parameter | Default | Meaning |
+|---|---|---|
+| `anomaly_mode` | `true` | Include recurring correlated episodes |
+| `anomaly_interval_hours` | `24` | Hours between episode starts, from 6 to 8760 |
 
-| Parameter | Default | Description |
-| --- | --- | --- |
-| `anomaly_mode` | `true` | Include periodic anomaly episodes; `false` gives background only |
-| `anomaly_interval_hours` | `24` | Hours between episode starts; 6 to 8760, other values fail validation |
-
-Inventories come from `samples/`: `hosts.json` (name, IP, role, optional Group Policy task), `tasks.json` (recurring tasks with action, principal, interval, duration, failure rate and host role), `admins.json`, `adhoc_names.json` and `adhoc_actions.json` (ad-hoc task names and executables). Each host gets a random stable Schedule service process ID, thread pool and starting record number. Episode rotation needs at least two admins and two hosts.
-
-### Output Parameters
-
-The shipped output writes `output/events.json` and needs no credentials. To send events elsewhere, replace the output and pass values through placeholders, for example:
-
-```yaml
-output:
-  - opensearch:
-      hosts:
-        - ${params.opensearch_host}
-      username: ${params.opensearch_user}
-      password: ${secrets.opensearch_password}
-      index: windows-task-scheduler
-```
-
-A collector that expects the raw Windows event should read `event.original`.
+The inventories in `samples/` define hosts, recurring tasks, administrators and assigned host indexes, temporary-task name stems, and executables. At least two administrators assigned to different servers are needed for rotation. Output defaults to `output/events.json`; no secrets or substitution parameters are required. Consumers of native Windows records should read `event.original`.
 
 ## Usage
 
-Live mode:
+From the content-packs root:
 
 ```bash
-eventum generate --path generators/windows-task-scheduler-operational/generator.yml --id task-scheduler --live-mode true
+eventum generate --path generators/windows-task-scheduler-operational/generator.yml --id tasks --live-mode true --keep-order true
 ```
 
-Batch mode, as fast as possible (the cron input runs until stopped unless `start` and `end` are set on it):
+For a finite batch, copy the generator directory and set `start` and `end` in every `patterns/*.yml` oscillator to midnight UTC dates:
 
 ```bash
-eventum generate --path generators/windows-task-scheduler-operational/generator.yml --id task-scheduler --live-mode false
+eventum generate --path /tmp/tasks-batch/generator.yml --id tasks-batch --live-mode false --keep-order true
 ```
+
+Change the output path in the copied configuration as needed. Pattern ratios control daily volume and the office-hours increment.
+
+## Source Fidelity and Limitations
+
+- Eight event IDs are included. Trigger records 107/110/118/119, startup failures 101/103/202/203, queueing records 322/325 and service records are omitted. Unsuccessful task-deletion attempts have no corresponding success record in this profile.
+- EventData layouts follow published Event Viewer XML and provider manifests. The selected run order is 129, 100, 200, 201, 102; Windows does not promise this order for every build and workload. Related records can be tens of seconds apart rather than milliseconds.
+- The Operational channel does not contain task definitions, command-line arguments or a remote registration's source address. Those require Security 4698/4699 events or task XML.
+- ECS categories, actions, user and process projections are normalization. They are not native EventData fields. Timing, action frequencies, task limits and cleanup policy are synthetic; the data was not calibrated against a live fleet.
+- Instance GUIDs use uppercase braces in XML and lowercase in rendered messages. Native TimeCreated has seven fractional digits; the final digit is synthetic.
 
 ## Sample Output
 
-The deletion that completes the first episode, copied from the default capture:
+One complete synthetic event:
 
 ```json
-{"@timestamp": "2026-09-20T15:07:23.251Z", "ecs": {"version": "8.17.0"}, "event": {"action": "task-deleted", "category": ["configuration"], "code": "141", "kind": "event", "original": "\u003cEvent xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"\u003e\u003cSystem\u003e\u003cProvider Name=\"Microsoft-Windows-TaskScheduler\" Guid=\"{DE7B24EA-73C8-4A09-985D-5BDADCFA9017}\"/\u003e\u003cEventID\u003e141\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e141\u003c/Task\u003e\u003cOpcode\u003e0\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\"2026-09-20T15:07:23.2519006Z\"/\u003e\u003cEventRecordID\u003e624577\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\"3016\" ThreadID=\"10460\"/\u003e\u003cChannel\u003eMicrosoft-Windows-TaskScheduler/Operational\u003c/Channel\u003e\u003cComputer\u003eWEB02.corp.contoso.test\u003c/Computer\u003e\u003cSecurity UserID=\"S-1-5-18\"/\u003e\u003c/System\u003e\u003cEventData Name=\"TaskDeleted\"\u003e\u003cData Name=\"TaskName\"\u003e\\Collect-Logs-2a11\u003c/Data\u003e\u003cData Name=\"UserName\"\u003eCORP\\adm_jsmith\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e", "provider": "Microsoft-Windows-TaskScheduler", "type": ["deletion"]}, "host": {"ip": ["10.20.4.52"], "name": "WEB02.corp.contoso.test"}, "log": {"level": "information"}, "message": "User \"CORP\\adm_jsmith\"  deleted Task Scheduler task \"\\Collect-Logs-2a11\"", "related": {"user": ["adm_jsmith"]}, "user": {"domain": "CORP", "name": "adm_jsmith"}, "winlog": {"channel": "Microsoft-Windows-TaskScheduler/Operational", "computer_name": "WEB02.corp.contoso.test", "event_data": {"TaskName": "\\Collect-Logs-2a11", "UserName": "CORP\\adm_jsmith"}, "event_id": "141", "process": {"pid": 3016, "thread": {"id": 10460}}, "provider_guid": "{DE7B24EA-73C8-4A09-985D-5BDADCFA9017}", "provider_name": "Microsoft-Windows-TaskScheduler", "record_id": 624577, "user": {"identifier": "S-1-5-18"}, "version": 0}}
+{"@timestamp": "2026-09-01T00:54:26.472Z", "ecs": {"version": "8.17.0"}, "event": {"action": "task-deleted", "category": ["configuration"], "code": "141", "kind": "event", "original": "\u003cEvent xmlns=\"http://schemas.microsoft.com/win/2004/08/events/event\"\u003e\u003cSystem\u003e\u003cProvider Name=\"Microsoft-Windows-TaskScheduler\" Guid=\"{DE7B24EA-73C8-4A09-985D-5BDADCFA9017}\"/\u003e\u003cEventID\u003e141\u003c/EventID\u003e\u003cVersion\u003e0\u003c/Version\u003e\u003cLevel\u003e4\u003c/Level\u003e\u003cTask\u003e141\u003c/Task\u003e\u003cOpcode\u003e0\u003c/Opcode\u003e\u003cKeywords\u003e0x8000000000000000\u003c/Keywords\u003e\u003cTimeCreated SystemTime=\"2026-09-01T00:54:26.4724655Z\"/\u003e\u003cEventRecordID\u003e785173\u003c/EventRecordID\u003e\u003cCorrelation/\u003e\u003cExecution ProcessID=\"1472\" ThreadID=\"400\"/\u003e\u003cChannel\u003eMicrosoft-Windows-TaskScheduler/Operational\u003c/Channel\u003e\u003cComputer\u003eAPP02.corp.contoso.test\u003c/Computer\u003e\u003cSecurity UserID=\"S-1-5-18\"/\u003e\u003c/System\u003e\u003cEventData Name=\"TaskDeleted\"\u003e\u003cData Name=\"TaskName\"\u003e\\Collect-Logs-56bfd7c2-f27c-4394-9252-c845e446b1d5\u003c/Data\u003e\u003cData Name=\"UserName\"\u003eCORP\\adm_rpatel\u003c/Data\u003e\u003c/EventData\u003e\u003c/Event\u003e", "provider": "Microsoft-Windows-TaskScheduler", "type": ["deletion"]}, "host": {"ip": ["10.20.2.32"], "name": "APP02.corp.contoso.test"}, "log": {"level": "information"}, "message": "User \"CORP\\adm_rpatel\"  deleted Task Scheduler task \"\\Collect-Logs-56bfd7c2-f27c-4394-9252-c845e446b1d5\"", "related": {"user": ["adm_rpatel"]}, "user": {"domain": "CORP", "name": "adm_rpatel"}, "winlog": {"channel": "Microsoft-Windows-TaskScheduler/Operational", "computer_name": "APP02.corp.contoso.test", "event_data": {"TaskName": "\\Collect-Logs-56bfd7c2-f27c-4394-9252-c845e446b1d5", "UserName": "CORP\\adm_rpatel"}, "event_id": "141", "process": {"pid": 1472, "thread": {"id": 400}}, "provider_guid": "{DE7B24EA-73C8-4A09-985D-5BDADCFA9017}", "provider_name": "Microsoft-Windows-TaskScheduler", "record_id": 785173, "user": {"identifier": "S-1-5-18"}, "version": 0}}
 ```
-
-## Limitations
-
-- Only eight event IDs are modeled. Trigger records (`107`, `110`, `118`, `119`), failures (`101`, `103`, `202`, `203`), `322`/`325` queueing and service records are not emitted; record numbers skip for the trigger records only.
-- EventData layouts come from published examples: `100`, `102` and `201` (Microsoft Q&A and TechNet XML), `200` v1 (Splunk example), `106`, `129`, `140` and `141` (EvtxECmd map examples from real logs). Microsoft does not document these layouts. The order `129`, `100`, `200` inside a run follows the usual Task Scheduler history view and is not documented either.
-- Instance GUIDs are uppercase with braces in XML and lowercase in `message`, as in the Microsoft Q&A example for `102`. `message` renders the manifest templates with double quotes; spacing follows the manifest dump.
-- The Operational log does not show the task definition, command-line arguments or the source of a remote registration; those need Security events 4698/4699 or the task XML.
-- The ECS projection follows Winlogbeat field names; `event.category`/`event.type`/`event.action`, `user.*`, `related.user` and `process.*` are normalization, not source fields. `winlog.task`, `winlog.opcode` and `winlog.keywords` are omitted.
-- Task intervals, durations, failure rates, admin behavior, the admin hour-of-day curve (fixed, in UTC, not tied to a host time zone) and process and thread IDs are synthetic, not measured. Scheduled runs and Group Policy refreshes have no daily cycle. The seventh fractional digit of `TimeCreated` is random.
-- Ad-hoc tasks whose completing deletion is dropped stay registered. Registered ad-hoc tasks are capped at 30, so live runs longer than about two months register fewer new ad-hoc tasks, in both modes.
 
 ## References
 
