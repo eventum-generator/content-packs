@@ -12,7 +12,7 @@ Record volume follows a UTC hour-of-day curve, about 16,700 records per day with
 | 07-08, 19-21 | 0.18 |
 | 21-07 | 0.10 |
 
-The application account writes about 96% of the records. DBAs and delegates work mostly in business hours: at 08-18 UTC the four accounts together open about 4.7 sessions an hour, at 07-08 and 18-19 about 1.2, and at night about 0.1. Grant maintenance follows the same working day: about 0.75 an hour at 08-18 UTC, 0.2 an hour at 07-08 and 18-19, and 0.06 an hour at night, about 11 a day.
+The application account writes about 96% of the records. DBAs and delegates work mostly in business hours: at 08-18 UTC the four accounts together open about 4.7 sessions an hour, at 07-08 and 18-19 about 1.2, and at night about 0.1. Grant maintenance follows the same working day: about 1.0 an hour at 08-18 UTC, 0.3 an hour at 07-08 and 18-19, and 0.06 an hour at night, about 11 a day.
 
 The records of one statement (its table records and its `QUERY`) and a failed login with its `DISCONNECT` share one second in `@timestamp`, as the server writes them. `event.created` is the collection time: the same second in half of the records, within 8 s for 90%, and up to about two minutes at night.
 
