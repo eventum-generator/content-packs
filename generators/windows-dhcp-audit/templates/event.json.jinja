@@ -1,12 +1,22 @@
 {#- Microsoft DHCP Server IPv4 audit CSV rows (IDs 10, 11, 12, 30, 31,
-    32) as ECS JSON with the native row in event.original. One input
-    tick per second; each tick emits the earliest due row or drops.
-    Every client runs its own processes: sessions (Assign, T1 Renew,
-    Release at session end, reconnect after an offline gap), link flap
-    bursts (Release, Assign again shortly after, sometimes repeated) and
-    DNS updates after Assign/Renew. Times are epoch seconds (UTC). -#}
+    32) as ECS JSON with the native row in event.original. Every input
+    timestamp yields exactly one row at that time. Every client runs its
+    own processes: sessions (Assign, Renew 0-30 min after T1, Release at
+    session end, reconnect after an offline gap), link flap bursts
+    (Release, Assign again shortly after, sometimes repeated) and DNS
+    updates after Assign/Renew. A DNS update takes the two timestamps
+    right after the Assign or Renew that triggers it (request, then
+    result). The other steps wait in three queues: `tight` holds the
+    reassignments and continuations inside a flap, `renew` the renewals,
+    `flex` the spontaneous starts (connects, session ends, first
+    Releases of flaps). A timestamp takes the earliest due tight step,
+    then a due renewal, otherwise the earliest flex start, even when
+    that start is not due yet (the earliest of the clients' independent
+    clocks); the client then schedules its next step from that time.
+    Starts rejected by the activity curve move later, so the curve
+    shapes what the timestamps of each hour carry. Times are epoch
+    seconds (UTC). -#}
 {%- set now = module.builtins.int(timestamp.timestamp()) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set hq = module.heapq -%}
 {%- set hour = 3600 -%}
 {#- Chain window: a background DNS failure is turned into a success when
@@ -17,31 +27,50 @@
   {#- Lognormal seconds with median med. -#}
   {{- module.rand.number.lognormal(module.math.log(med), sig) -}}
 {%- endmacro -%}
+{%- macro offline(mobile) -%}
+  {#- Offline gap before the next connect: lognormal (median 2 h for
+      laptops, 50 min for desktops), 60 s to 12 h / 8 h. -#}
+  {{- [[ln(2 * hour if mobile else 50 * 60, 1.0) | float, (12 if mobile else 8) * hour] | min, 60] | max | int -}}
+{%- endmacro -%}
 {%- macro push(due, item) -%}
   {%- set s = shared.get('seq') + 1 -%}
   {%- do shared.set('seq', s) -%}
-  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+  {%- if item.k == 'dns' -%}
+    {%- do shared.get('urgent').append([due, s, item]) -%}
+  {%- else -%}
+    {%- set tight = item.k == 'reasg' or (item.k == 'flap' and item.cont) -%}
+    {%- do module.heapq.heappush(shared.get('renew' if item.k == 'renew' else 'tight' if tight else 'flex'), [due, s, item]) -%}
+  {%- endif -%}
 {%- endmacro -%}
 {%- macro pick_start(lo, span) -%}
-  {#- Time in [lo, lo + span) with its UTC hour weighted by the client
+  {#- Time in [lo, lo + span) with its hour weighted by the client
       activity curve squared plus a small floor. -#}
   {%- set curve = shared.get('curve') -%}
   {%- set top = (curve | max) ** 2 + 0.02 -%}
   {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
   {%- for _ in range(500) if not r.ok -%}
     {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
-    {%- if module.rand.number.floating(0, top) < curve[(c // 3600) % 24] ** 2 + 0.02 -%}
+    {%- if module.rand.number.floating(0, top) < curve[((c + shared.get('tzoff')) // 3600) % 24] ** 2 + 0.02 -%}
       {%- set r.v = c -%}
       {%- set r.ok = true -%}
     {%- endif -%}
   {%- endfor -%}
   {{- r.v -}}
 {%- endmacro -%}
-{%- macro next_addr(c) -%}
+{%- macro next_addr(c, t) -%}
   {#- Address for a new assignment: usually the previous one, otherwise
-      another address of the client's own set (dock, VLAN or port move). -#}
-  {%- if module.rand.chance(0.5 if c.mobile else 0.2) -%}
-    {{- module.rand.choice(c.addrs | reject('equalto', c.ip) | list) -}}
+      another address of the client's own set (dock, Wi-Fi, VLAN or port
+      move), weighted towards addresses the client has not held for a
+      while (weight 1 + hours since its last Assign / 2, at most 49;
+      an address the client has not held yet weighs 200, so a client
+      that changes address at all soon covers its whole set). -#}
+  {%- if module.rand.chance(0.7 if c.mobile else 0.2) -%}
+    {%- set other = c.addrs | reject('equalto', c.ip) | list -%}
+    {%- set w = [] -%}
+    {%- for a in other -%}
+      {%- do w.append(200 if a not in c.used else 1 + [(t - c.used[a]) / 7200, 48] | min) -%}
+    {%- endfor -%}
+    {{- module.rand.weighted_choice(other, w) -}}
   {%- else -%}
     {{- c.ip -}}
   {%- endif -%}
@@ -55,22 +84,24 @@
   {%- for row in c.recent -%}
     {%- set nxt = [] -%}
     {%- for s in st.v -%}
-      {%- do nxt.append(s) -%}
+      {%- if s not in nxt -%}{%- do nxt.append(s) -%}{%- endif -%}
       {%- set k = s[0] -%}
-      {%- if k == 1 and row[1] == 10 and row[2] != s[1] -%}{%- do nxt.append([2, s[1], row[2], none, none]) -%}
-      {%- elif k == 2 and row[1] == 12 and row[2] == s[2] -%}{%- do nxt.append([3, s[1], s[2], none, none]) -%}
-      {%- elif k == 3 and row[1] == 10 and row[2] not in [s[1], s[2]] -%}{%- do nxt.append([4, s[1], s[2], row[2], none]) -%}
-      {%- elif k == 4 and row[1] == 12 and row[2] == s[3] -%}{%- do nxt.append([5, s[1], s[2], s[3], none]) -%}
-      {%- elif k == 5 and row[1] == 10 and row[2] not in [s[1], s[2], s[3]] -%}{%- do nxt.append([6, s[1], s[2], s[3], row[2]]) -%}
-      {%- elif k == 6 and row[1] == 30 and row[2] == s[4] -%}{%- do nxt.append([7, s[1], s[2], s[3], s[4]]) -%}
+      {%- set n = none -%}
+      {%- if k == 1 and row[1] == 10 and row[2] != s[1] -%}{%- set n = [2, s[1], row[2], none, none] -%}
+      {%- elif k == 2 and row[1] == 12 and row[2] == s[2] -%}{%- set n = [3, s[1], s[2], none, none] -%}
+      {%- elif k == 3 and row[1] == 10 and row[2] not in [s[1], s[2]] -%}{%- set n = [4, s[1], s[2], row[2], none] -%}
+      {%- elif k == 4 and row[1] == 12 and row[2] == s[3] -%}{%- set n = [5, s[1], s[2], s[3], none] -%}
+      {%- elif k == 5 and row[1] == 10 and row[2] not in [s[1], s[2], s[3]] -%}{%- set n = [6, s[1], s[2], s[3], row[2]] -%}
+      {%- elif k == 6 and row[1] == 30 and row[2] == s[4] -%}{%- set n = [7, s[1], s[2], s[3], s[4]] -%}
       {%- endif -%}
+      {%- if n is not none and n not in nxt -%}{%- do nxt.append(n) -%}{%- endif -%}
     {%- endfor -%}
-    {%- if row[1] == 12 and t - row[0] <= window -%}{%- do nxt.append([1, row[2], none, none, none]) -%}{%- endif -%}
-    {%- set st.v = nxt[-256:] -%}
+    {%- if row[1] == 12 and t - row[0] <= window and [1, row[2], none, none, none] not in nxt -%}{%- do nxt.append([1, row[2], none, none, none]) -%}{%- endif -%}
+    {%- set st.v = nxt -%}
   {%- endfor -%}
   {{- 'hit' if st.v | selectattr(0, 'equalto', 7) | selectattr(4, 'equalto', ip) | list else 'ok' -}}
 {%- endmacro -%}
-{%- if shared.get('queue') is none -%}
+{%- if shared.get('tight') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'server_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
     'server_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 7}},
@@ -79,20 +110,22 @@
     'lease_renew_minutes': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 60, 'le': 5760}}
   }} -%}
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
-  {#- Client activity by UTC hour (relative rate, peak 1): connects and
-      flaps are thinned by it, episode starts weighted by its square. -#}
-  {%- do shared.update({'queue': [], 'seq': 0, 'last': now - 1, 'ep_last': none, 'armed': false, 'curve': [0.15, 0.12, 0.12, 0.12, 0.15, 0.25, 0.45, 0.75, 0.95, 1.0, 1.0, 0.95, 0.85, 0.95, 1.0, 1.0, 0.9, 0.75, 0.55, 0.4, 0.3, 0.25, 0.2, 0.17]}) -%}
+  {#- Client activity by hour of the generator timezone (relative rate,
+      peak 1): connects and flaps are thinned by it, episode starts
+      weighted by its square. -#}
+  {%- do shared.update({'tight': [], 'renew': [], 'flex': [], 'urgent': [], 'seq': 0, 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()), 'ep_last': none, 'armed': false, 'curve': [0.15, 0.12, 0.12, 0.12, 0.15, 0.25, 0.45, 0.75, 0.95, 1.0, 1.0, 0.95, 0.85, 0.95, 1.0, 1.0, 0.9, 0.75, 0.55, 0.4, 0.3, 0.25, 0.2, 0.17]}) -%}
   {%- set t1 = params.lease_renew_minutes * 60 -%}
   {%- set clients = [] -%}
   {%- for row in samples.clients -%}
     {%- set ci = loop.index0 -%}
-    {%- set c = {'name': row.hostname, 'mac': row.client_id, 'mobile': row.mobile, 'addrs': row.addresses | list, 'ip': row.addresses[0] if module.rand.chance(0.7) else module.rand.choice(row.addresses | list), 'active': false, 'burst': false, 'ending': false, 'ep': false, 'ep_step': 0, 'ep_ips': [], 'renew_due': none, 'end_due': none, 'conn_due': none, 'flap_due': none, 'flap_mean': module.rand.number.lognormal(module.math.log(3 * hour if row.mobile else 30 * hour), 0.5), 'last_fail': none, 'recent': []} -%}
+    {%- set c = {'name': row.hostname, 'idx': ci, 'mac': row.client_id, 'mobile': row.mobile, 'addrs': row.addresses | list, 'ip': row.addresses[0] if module.rand.chance(0.7) else module.rand.choice(row.addresses | list), 'active': false, 'burst': false, 'ending': false, 'ep': false, 'ep_step': 0, 'ep_ips': [], 'renew_due': none, 'end_due': none, 'conn_due': none, 'flap_due': none, 'flap_mean': [[module.rand.number.lognormal(module.math.log(3 * hour if row.mobile else 30 * hour), 0.5), (1.5 if row.mobile else 15) * hour] | max, (4 if row.mobile else 60) * hour] | min, 'last_fail': none, 'recent': [], 'used': {}} -%}
+    {%- do c.used.update({c.ip: now}) -%}
     {%- if module.rand.chance(0.45 if row.mobile else 0.9) -%}
-      {%- do c.update({'active': true, 'renew_due': now + module.rand.number.integer(1, t1), 'end_due': now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(4 * hour if row.mobile else 30 * hour, 0.8) | float)) + 1}) -%}
+      {%- do c.update({'active': true, 'renew_due': now + module.rand.number.integer(1, t1 + 1800), 'end_due': now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(4 * hour if row.mobile else 30 * hour, 0.8) | float)) + 1}) -%}
       {{- push(c.renew_due, {'k': 'renew', 'c': ci}) -}}
       {{- push(c.end_due, {'k': 'end', 'c': ci}) -}}
     {%- else -%}
-      {%- do c.update({'conn_due': now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(2 * hour if row.mobile else 50 * 60, 1.0) | float)) + 1}) -%}
+      {%- do c.update({'conn_due': now + module.builtins.int(module.rand.number.floating(0, 1) * (offline(row.mobile) | float)) + 1}) -%}
       {{- push(c.conn_due, {'k': 'conn', 'c': ci}) -}}
     {%- endif -%}
     {%- do c.update({'flap_due': now + module.builtins.int(module.rand.number.exponential(1 / c.flap_mean)) + 1}) -%}
@@ -100,141 +133,195 @@
     {%- do clients.append(c) -%}
   {%- endfor -%}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-  {%- do shared.update({'clients': clients, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
+  {%- do shared.update({'clients': clients, 'laptops': clients | selectattr('mobile') | map(attribute='idx') | list, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
 {%- endif -%}
-{%- set queue = shared.get('queue') -%}
+{%- set tight = shared.get('tight') -%}
+{%- set flex = shared.get('flex') -%}
+{%- set urgent = shared.get('urgent') -%}
+{%- set renew = shared.get('renew') -%}
 {%- set clients = shared.get('clients') -%}
-{%- set curve = shared.get('curve') -%}
+{%- set act = shared.get('curve')[((now + shared.get('tzoff')) // hour) % 24] -%}
 {%- set t1 = params.lease_renew_minutes * 60 -%}
 {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{#- Episode: once due, the next accepted background flap of a laptop
-    other than the previous episode's client becomes the episode. Its
-    Release time, the client's session end, renewals and every other
-    timer stay the client's own. The episode only forces the first two
-    continuations of that flap burst (continuation gaps drawn from the
-    background distribution), gives the three reassignments the client's
-    three other addresses in random order, and follows the last one with
-    a DNS update that fails. After the third reassignment the burst
-    continues or ends by the background rule. A session end inside the
-    burst ends it as in background, and the episode is then incomplete.
-    Due times: the first falls within the first min(interval, 24 h);
-    each later one within a window of min(interval / 4, 6 h) centred one
-    interval after the actual start, both weighted by the curve squared.
-    Missed episodes are not replayed. -#}
+{#- Episode: at its due time an extra link flap starts on an active
+    laptop, other than the previous episode's client, picked with the
+    weights of background flaps (the laptop's flap rate). The flap
+    replaces the laptop's pending flap timer; like after every burst,
+    the next one is drawn afresh after it (exponential, so the laptop's
+    flap timing is unchanged). Session end, renewals and every other
+    timer stay the laptop's own. The episode forces the first two
+    continuations of the burst (continuation gaps drawn from the
+    background distribution), gives the three reassignments the
+    laptop's three other addresses in random order, and follows the last
+    one with a DNS update that fails. Its steps are ordinary tight steps
+    of that laptop, so they take timestamps like any other flap. After
+    the third reassignment the burst continues or ends by the background
+    rule. A session end inside the burst ends it as in background, and
+    the episode is then incomplete. Due times: the first falls within
+    the first min(interval, 24 h); each later one within a window of
+    min(interval / 4, 6 h) centred one interval after the actual start,
+    both weighted by the curve squared. With no eligible laptop active
+    the episode waits for one. Missed episodes are not replayed. -#}
 {%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
   {%- do shared.update({'armed': true, 'ep_due': now + 876000 * hour}) -%}
 {%- endif -%}
-{%- if now < queue[0][0] -%}
-  {%- do shared.set('next_due', queue[0][0]) -%}
-  {{- dispatch.drop() -}}
+{%- if shared.get('armed') -%}
+  {%- set cand = [] -%}
+  {%- set cw = [] -%}
+  {%- for ci in shared.get('laptops') -%}
+    {%- set c = clients[ci] -%}
+    {%- if c.active and not c.burst and not c.ep and ci != shared.get('ep_last') -%}
+      {%- do cand.append(ci) -%}
+      {%- do cw.append(1 / c.flap_mean) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if cand -%}
+    {%- set ci = module.rand.weighted_choice(cand, cw) -%}
+    {%- do clients[ci].update({'flap_due': now}) -%}
+    {{- push(now, {'k': 'flap', 'c': ci, 'cont': true, 'ep': true}) -}}
+    {%- do shared.update({'armed': false}) -%}
+  {%- endif -%}
 {%- endif -%}
+{#- Dispatcher: a pending DNS request or result first (it follows the
+    row of the previous timestamp), then the earliest due tight step,
+    then the earliest due renewal, otherwise the earliest flex start.
+    While the oldest due renewal is less than 10 min late, a timestamp
+    leaves it to a flex start with probability 0.5, so renewals mix with
+    other rows instead of running in long blocks. Stale queue entries
+    (superseded timers) and starts rejected by the activity curve
+    produce no row and reschedule; the next entry is tried. After 150
+    entries without a row the curve is ignored, so every timestamp
+    yields a row. -#}
 {%- set out = namespace(row=none) -%}
-{%- for _ in range(64) if out.row is none and queue and queue[0][0] <= now -%}
-  {%- set top = hq.heappop(queue) -%}
+{%- set dns_asg = 0.55 -%}
+{%- set yield_renew = module.rand.chance(0.5) -%}
+{%- for i in range(200) if out.row is none -%}
+  {%- if urgent -%}
+    {%- set top = urgent.pop(0) -%}
+  {%- elif tight and tight[0][0] <= now -%}
+    {%- set top = hq.heappop(tight) -%}
+  {%- elif renew and renew[0][0] <= now and (now - renew[0][0] >= 600 or not yield_renew) -%}
+    {%- set top = hq.heappop(renew) -%}
+  {%- else -%}
+    {%- set top = hq.heappop(flex) -%}
+  {%- endif -%}
   {%- set due = top[0] -%}
   {%- set item = top[2] -%}
   {%- set ci = item.c -%}
   {%- set c = clients[ci] -%}
-  {%- set dns_asg = 0.55 -%}
-  {%- if item.k == 'renew' and c.active and c.renew_due == due -%}
-    {%- set out.row = {'code': 11, 'c': ci, 'ip': c.ip, 't': due} -%}
-    {%- do c.update({'renew_due': due + t1 + (ln(90, 1.2) | float) | int}) -%}
-    {{- push(c.renew_due, item) -}}
-    {%- if module.rand.chance(0.12) -%}
-      {{- push(due + [1, (ln(5, 0.9) | float) | round | int] | max, {'k': 'dns', 'c': ci, 'ip': c.ip, 'phase': 'req', 'force': false}) -}}
-    {%- endif -%}
-  {%- elif item.k == 'end' and c.end_due == due -%}
-    {%- do c.update({'end_due': none}) -%}
-    {%- if c.active -%}
-      {%- set out.row = {'code': 12, 'c': ci, 'ip': c.ip, 't': due} -%}
-      {%- do c.update({'active': false, 'ep': false, 'renew_due': none, 'conn_due': due + [60, (ln(2 * hour if c.mobile else 50 * 60, 1.0) | float) | int] | max}) -%}
-      {{- push(c.conn_due, {'k': 'conn', 'c': ci}) -}}
-    {%- elif c.burst -%}
-      {#- The session ends inside a flap: the pending reassignment becomes
-          an ordinary reconnect. -#}
-      {%- do c.update({'ending': true}) -%}
-    {%- endif -%}
-  {%- elif item.k == 'conn' and c.conn_due == due and not c.active -%}
-    {%- if module.rand.chance(curve[(due // hour) % 24]) -%}
-      {%- set ip = next_addr(c) -%}
-      {%- set out.row = {'code': 10, 'c': ci, 'ip': ip, 't': due} -%}
-      {%- do c.update({'active': true, 'ip': ip, 'conn_due': none, 'renew_due': due + t1 + (ln(90, 1.2) | float) | int, 'end_due': due + [600, (ln(4 * hour if c.mobile else 30 * hour, 0.8) | float) | int] | max}) -%}
-      {{- push(c.renew_due, {'k': 'renew', 'c': ci}) -}}
-      {{- push(c.end_due, {'k': 'end', 'c': ci}) -}}
-      {%- if module.rand.chance(dns_asg) -%}
-        {{- push(due + [1, (ln(5, 0.9) | float) | round | int] | max, {'k': 'dns', 'c': ci, 'ip': ip, 'phase': 'req', 'force': false}) -}}
+  {%- set pass = i >= 150 or module.rand.chance(act) -%}
+  {%- if item.k == 'renew' -%}
+    {%- if c.active and c.renew_due == due -%}
+      {%- set out.row = {'code': 11, 'c': ci, 'ip': c.ip} -%}
+      {%- do c.update({'renew_due': now + t1 + module.rand.number.integer(0, 1800)}) -%}
+      {{- push(c.renew_due, item) -}}
+      {%- if module.rand.chance(0.4) -%}
+        {{- push(now + 1, {'k': 'dns', 'c': ci, 'ip': c.ip, 'phase': 'req', 'force': false}) -}}
       {%- endif -%}
-    {%- else -%}
-      {%- do c.update({'conn_due': due + [60, (ln(40 * 60, 1.0) | float) | int] | max}) -%}
-      {{- push(c.conn_due, item) -}}
     {%- endif -%}
-  {%- elif item.k == 'flap' and c.flap_due == due -%}
-    {%- if c.active and not c.burst and (item.cont or module.rand.chance(curve[(due // hour) % 24])) -%}
-      {%- set out.row = {'code': 12, 'c': ci, 'ip': c.ip, 't': due} -%}
-      {%- do c.update({'active': false, 'burst': true, 'renew_due': none, 'flap_due': none}) -%}
-      {%- if shared.get('armed') and c.mobile and not item.cont and not c.ep and ci != shared.get('ep_last') -%}
-        {%- do c.update({'ep': true, 'ep_step': 0, 'ep_ips': module.rand.shuffle(c.addrs | reject('equalto', c.ip) | list)}) -%}
-        {%- set w = [interval // 4, 6 * hour] | min -%}
-        {%- do shared.update({'armed': false, 'ep_last': ci, 'ep_due': pick_start(due + interval - w // 2, w) | int}) -%}
+  {%- elif item.k == 'end' -%}
+    {%- if c.end_due == due -%}
+      {%- do c.update({'end_due': none}) -%}
+      {%- if c.active -%}
+        {%- set out.row = {'code': 12, 'c': ci, 'ip': c.ip} -%}
+        {%- do c.update({'active': false, 'ep': false, 'renew_due': none, 'conn_due': now + offline(c.mobile) | int}) -%}
+        {{- push(c.conn_due, {'k': 'conn', 'c': ci}) -}}
+      {%- elif c.burst -%}
+        {#- The session ends inside a flap: the pending reassignment
+            becomes an ordinary reconnect. -#}
+        {%- do c.update({'ending': true}) -%}
       {%- endif -%}
-      {{- push(due + [1, (ln(45, 1.0) | float) | int] | max, {'k': 'reasg', 'c': ci}) -}}
-    {%- else -%}
-      {%- do c.update({'flap_due': due + module.builtins.int(module.rand.number.exponential(1 / c.flap_mean)) + 1}) -%}
-      {{- push(c.flap_due, {'k': 'flap', 'c': ci, 'cont': false}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'conn' -%}
+    {%- if c.conn_due == due and not c.active -%}
+      {%- if pass -%}
+        {%- set ip = next_addr(c, now) -%}
+        {%- set out.row = {'code': 10, 'c': ci, 'ip': ip} -%}
+        {%- do c.update({'active': true, 'ip': ip, 'conn_due': none, 'renew_due': now + t1 + module.rand.number.integer(0, 1800), 'end_due': now + [600, (ln(4 * hour if c.mobile else 30 * hour, 0.8) | float) | int] | max}) -%}
+        {{- push(c.renew_due, {'k': 'renew', 'c': ci}) -}}
+        {{- push(c.end_due, {'k': 'end', 'c': ci}) -}}
+        {%- if module.rand.chance(dns_asg) -%}
+          {{- push(now + 1, {'k': 'dns', 'c': ci, 'ip': ip, 'phase': 'req', 'force': false}) -}}
+        {%- endif -%}
+      {%- else -%}
+        {#- Rejected by the activity curve: retry after a lognormal
+            delay (median 40 min, 1 min to 2 h), counted from the start
+            itself so that a rejection never brings it back earlier. -#}
+        {%- do c.update({'conn_due': [due, now] | max + [[ln(40 * 60, 1.0) | float, 2 * hour] | min, 60] | max | int}) -%}
+        {{- push(c.conn_due, item) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'flap' -%}
+    {%- if c.flap_due == due -%}
+      {%- if c.active and not c.burst and (item.cont or pass) -%}
+        {%- set out.row = {'code': 12, 'c': ci, 'ip': c.ip} -%}
+        {%- do c.update({'active': false, 'burst': true, 'renew_due': none, 'flap_due': none}) -%}
+        {%- if item.get('ep') -%}
+          {%- do c.update({'ep': true, 'ep_step': 0, 'ep_ips': module.rand.shuffle(c.addrs | reject('equalto', c.ip) | list)}) -%}
+          {%- set w = [interval // 4, 6 * hour] | min -%}
+          {%- do shared.update({'ep_last': ci, 'ep_due': pick_start(now + interval - w // 2, w) | int}) -%}
+        {%- endif -%}
+        {{- push(now + [1, (ln(45, 1.0) | float) | int] | max, {'k': 'reasg', 'c': ci}) -}}
+      {%- else -%}
+        {%- if item.get('ep') -%}{%- do shared.update({'armed': true}) -%}{%- endif -%}
+        {%- do c.update({'flap_due': [due, now] | max + module.builtins.int(module.rand.number.exponential(1 / c.flap_mean)) + 1}) -%}
+        {{- push(c.flap_due, {'k': 'flap', 'c': ci, 'cont': false}) -}}
+      {%- endif -%}
+    {%- elif item.get('ep') -%}
+      {%- do shared.update({'armed': true}) -%}
     {%- endif -%}
   {%- elif item.k == 'reasg' -%}
     {%- do c.update({'burst': false}) -%}
     {%- if c.ending -%}
-      {%- do c.update({'ending': false, 'ep': false, 'conn_due': due + [60, (ln(2 * hour if c.mobile else 50 * 60, 1.0) | float) | int] | max}) -%}
+      {%- do c.update({'ending': false, 'ep': false, 'conn_due': now + offline(c.mobile) | int}) -%}
       {{- push(c.conn_due, {'k': 'conn', 'c': ci}) -}}
-      {%- do c.update({'flap_due': due + module.builtins.int(module.rand.number.exponential(1 / c.flap_mean)) + 1}) -%}
+      {%- do c.update({'flap_due': now + module.builtins.int(module.rand.number.exponential(1 / c.flap_mean)) + 1}) -%}
       {{- push(c.flap_due, {'k': 'flap', 'c': ci, 'cont': false}) -}}
     {%- else -%}
       {%- set epi = c.ep and c.ep_step < 3 -%}
-      {%- set ip = c.ep_ips[c.ep_step] if epi else next_addr(c) -%}
-      {%- set out.row = {'code': 10, 'c': ci, 'ip': ip, 't': due} -%}
-      {%- do c.update({'active': true, 'ip': ip, 'renew_due': due + t1 + (ln(90, 1.2) | float) | int}) -%}
+      {%- set ip = c.ep_ips[c.ep_step] if epi else next_addr(c, now) -%}
+      {%- set out.row = {'code': 10, 'c': ci, 'ip': ip} -%}
+      {%- do c.update({'active': true, 'ip': ip, 'renew_due': now + t1 + module.rand.number.integer(0, 1800)}) -%}
       {{- push(c.renew_due, {'k': 'renew', 'c': ci}) -}}
       {%- if epi and c.ep_step == 2 -%}
-        {{- push(due + [1, (ln(5, 0.9) | float) | round | int] | max, {'k': 'dns', 'c': ci, 'ip': ip, 'phase': 'req', 'force': true, 'gap': [1, (ln(5, 0.9) | float) | round | int] | max}) -}}
+        {{- push(now + 1, {'k': 'dns', 'c': ci, 'ip': ip, 'phase': 'req', 'force': true}) -}}
       {%- elif module.rand.chance(dns_asg) -%}
-        {{- push(due + [1, (ln(5, 0.9) | float) | round | int] | max, {'k': 'dns', 'c': ci, 'ip': ip, 'phase': 'req', 'force': false}) -}}
+        {{- push(now + 1, {'k': 'dns', 'c': ci, 'ip': ip, 'phase': 'req', 'force': false}) -}}
       {%- endif -%}
       {%- set cont = (epi and c.ep_step < 2) or module.rand.chance(0.4) -%}
       {%- if epi -%}{%- do c.update({'ep_step': c.ep_step + 1}) -%}{%- endif -%}
-      {%- do c.update({'flap_due': due + ([1, (ln(150, 0.9) | float) | int] | max if cont else module.builtins.int(module.rand.number.exponential(1 / c.flap_mean)) + 1)}) -%}
+      {%- do c.update({'flap_due': now + ([1, (ln(150, 0.9) | float) | int] | max if cont else module.builtins.int(module.rand.number.exponential(1 / c.flap_mean)) + 1)}) -%}
       {{- push(c.flap_due, {'k': 'flap', 'c': ci, 'cont': cont}) -}}
     {%- endif -%}
   {%- elif item.k == 'dns' -%}
     {%- if item.phase == 'req' -%}
-      {%- set out.row = {'code': 30, 'c': ci, 'ip': item.ip, 't': due} -%}
-      {{- push(due + (item.gap if item.force else [1, (ln(5, 0.9) | float) | round | int] | max), {'k': 'dns', 'c': ci, 'ip': item.ip, 'phase': 'res', 'force': item.force}) -}}
+      {%- set out.row = {'code': 30, 'c': ci, 'ip': item.ip} -%}
+      {{- push(now + 1, {'k': 'dns', 'c': ci, 'ip': item.ip, 'phase': 'res', 'force': item.force}) -}}
     {%- else -%}
-      {%- set out.row = {'code': 31, 'c': ci, 'ip': item.ip, 't': due, 'force': item.force} -%}
+      {%- set out.row = {'code': 31, 'c': ci, 'ip': item.ip, 'force': item.force} -%}
       {%- if item.force -%}
         {%- do c.update({'ep': false}) -%}
-      {%- elif not module.rand.chance(0.5 if c.last_fail is not none and due - c.last_fail < 3 * hour else 0.06) -%}
-        {%- set out.row = {'code': 32, 'c': ci, 'ip': item.ip, 't': due} -%}
+      {%- elif not module.rand.chance(0.5 if c.last_fail is not none and now - c.last_fail < 3 * hour else 0.06) -%}
+        {%- set out.row = {'code': 32, 'c': ci, 'ip': item.ip} -%}
       {%- endif -%}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if out.row is none -%}
-  {%- do shared.set('next_due', queue[0][0] if queue else now + 1) -%}
-  {{- dispatch.drop() -}}
-{%- endif -%}
 {%- set row = out.row -%}
 {%- set c = clients[row.c] -%}
-{%- set stamp = [row.t, shared.get('last')] | max -%}
-{%- do shared.set('last', stamp) -%}
+{%- set stamp = now -%}
 {%- if row.code == 31 and not row.get('force') and chain_guard(c, row.ip, stamp) == 'hit' -%}
   {%- do row.update({'code': 32}) -%}
 {%- endif -%}
 {%- if row.code == 31 -%}{%- do c.update({'last_fail': stamp}) -%}{%- endif -%}
-{%- do c.recent.append([stamp, row.code, row.ip]) -%}
-{%- set keep = c.recent | selectattr(0, 'ge', stamp - window) | list -%}
-{%- do c.update({'recent': keep[-40:]}) -%}
-{%- do shared.set('next_due', queue[0][0] if queue else now + 1) -%}
+{%- if row.code == 10 -%}{%- do c.used.update({row.ip: stamp}) -%}{%- endif -%}
+{%- if row.code in [10, 12, 30] -%}
+  {#- Guard history: every Release, Assign and DNS request of the
+      client within the chain window, episodes included. -#}
+  {%- do c.recent.append([stamp, row.code, row.ip]) -%}
+  {%- set keep = c.recent | selectattr(0, 'ge', stamp - window) | list -%}
+  {%- do c.update({'recent': keep[-200:]}) -%}
+{%- endif -%}
 {%- set timestamp = module.datetime.datetime.fromtimestamp(stamp, module.datetime.timezone.utc) -%}
 {%- set hostname = c.name -%}
 {%- set client_id = c.mac -%}
