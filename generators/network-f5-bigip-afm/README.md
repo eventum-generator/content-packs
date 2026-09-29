@@ -20,7 +20,7 @@ Network Event records (signature `23003137`) carry `act=Accept` with the matched
 
 ## Traffic Model
 
-The device logs about 28,400 records a day. Volume follows the day: about 360 records an hour at 03:00-04:00 UTC, rising to about 1,900 an hour at 13:00-14:00 UTC. Service use carries the daily curve; closed-port hits from scanners stay flat at about 180 records an hour. Day totals vary by about 3%.
+The device logs about 28,400 records a day. Volume follows the day: about 360 records an hour at 03:00-04:00 UTC, rising to about 1,900 an hour at 13:00-14:00 UTC. Service use carries the daily curve; scanners stay flat over the day at about 180 records an hour, about 150 of them closed-port hits. Day totals vary by about 3%.
 
 Clients are 400 documentation-range addresses (`198.51.100.0/24`, `192.0.2.0/24`) listed in `samples/clients.csv`, each with a role and a fixed activity weight:
 
