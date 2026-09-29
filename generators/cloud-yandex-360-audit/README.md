@@ -58,7 +58,7 @@ Edit `event.template.params` in `generator.yml`:
 | `sensitive_path` | `disk:/finance/payroll-2026.xlsx` | File held by the extra account and by sampled owners that list it |
 | `sensitive_media_type` | `spreadsheet` | Native media category of that file (`document` or `spreadsheet`) |
 
-The five employees are inline `users` samples: login prefix, display name (surname first), UID, usual address and the list of their file paths. The `files` sample lists the other file paths with their categories. The extra account holds `sensitive_path` and the first three sampled files.
+The five employees are the `users` sample in `samples/users.json`: login prefix, display name (surname first), UID, usual address and the list of their file paths. The `files` sample in `samples/files.csv` lists the other file paths with their categories. The extra account holds `sensitive_path` and the first three sampled files.
 
 The template requires six distinct UIDs and logins, distinct `disk:/` paths with DOCX `document` or XLSX `spreadsheet` categories, and two to four known files per owner. Addresses must be `2001:db8::/32` documentation addresses with a `/128` prefix; each owner's usual and alternate addresses differ. Logins cannot contain commas, since the sign-in request ID is comma-delimited. Keep the shipped cadence of exactly one timestamp per minute. These are model bounds, not restrictions of Yandex's API.
 
