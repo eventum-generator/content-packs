@@ -1,108 +1,71 @@
-# VMware ESXi hostd logs
+# VMware ESXi hostd
 
-Synthetic ESXi `hostd.log` lines following Broadcom examples of host maintenance tasks, maintenance mode events and API logins.
+VMware ESXi 8 hostd authentication and VM task messages, preserved in `event.original` with a synthetic ECS JSON wrapper. The profile represents one host, four administrators and two API automation clients.
 
-## Event Types
+## Event types
 
-| Action | Baseline frequency | Category |
-| --- | ---: | --- |
-| `login` - Host API login | 55% baseline | authentication |
-| `logout` - Host API logout | 45% baseline | authentication |
-| `task-created` - Enter-maintenance task created | Chain only | configuration |
-| `maintenance-begin` - Host begins entering maintenance | Chain only | configuration |
-| `maintenance-started` - User-attributed maintenance starts | Chain only | configuration |
-| `maintenance-entered` - Host enters maintenance | Chain only | configuration |
-| `task-completed` - Enter-maintenance task succeeds | Chain only | configuration |
+| Action | Approximate share | Category |
+|---|---:|---|
+| `login` | 48.44% | Authentication |
+| `logout` | 48.44% | Authentication |
+| `auth-failed` | 1.18% | Authentication |
+| `vm-snapshot-request` | 0.71% | Configuration |
+| `task-completed` | 0.97% | Configuration |
+| `vm-poweroff-request` | 0.13% | Configuration |
+| `vm-poweron-request` | 0.13% | Configuration |
 
-Baseline percentages are synthetic weights, not measured vendor frequencies.
+## Activity
+
+About 3,300 records per day. Automated API clients operate throughout the day. Administrator activity is concentrated at 08:00-18:00 UTC with a small overnight share. Most records describe successful logins and logouts. Password mistakes are uncommon, with single mistakes more frequent than two or three retries. Accounts make at most four consecutive failed attempts before success, so account lockouts are outside this profile. Occasional VM snapshots and planned power cycles use the same client population.
 
 ## Anomaly Chain
 
-A `HostSystem.enterMaintenanceMode` task is created by `vpxuser:CORP\svc-backup`, followed by host begin, user-attributed start, entered mode, and task completion with `Status success`. Correlate task creation and completion by task ID, operation ID and actor; correlate the two unattributed host-mode records by host and a short time window. Sort by `@timestamp` before applying the sequence; file line order is not guaranteed. Maintenance by a backup service account is a synthetic suspicious condition that still needs an approved change-window check.
+For one user and source address: three rejected passwords, a successful login, then a VM power-off request within 30 minutes. Each action and user/address pair also appears in ordinary activity. With `anomaly_mode: false`, this complete ordered sequence is absent. With `true`, each episode adds one complete sequence. Subsequent episodes use a different administrator and VM. Ordinary sessions continue independently. Powered-off VMs are restored after approximately 5-15 minutes in either mode.
 
-`anomaly_mode` defaults to `true`. Set `event.template.params.anomaly_mode: false` for background activity only.
+The first episode starts within the smaller of the configured interval and 24 hours, favouring working hours. Later starts are drawn around the previous actual start plus the interval, within half a window of `min(interval / 4, 6 hours)` on either side. Working hours are favoured within that window. The next available record time can add a short delay. Missed episodes do not accumulate.
 
 ## Parameters
 
-### Event Parameters
-
-| Name | Default | Purpose |
-| --- | --- | --- |
-| `anomaly_mode` | `true` | Include the maintenance-task sequence |
-| `host_name` | `esx-04.example.test` | ESXi host |
-| `datacenter_name` | `dc-east` | Datacenter in maintenance event |
-| `maintenance_actor` | `vpxuser:CORP\svc-backup` | Actor in the maintenance task |
-
-### Output Parameters
-
-The shipped config writes `output/events.json` and needs no connection parameters or secrets. To send to a SIEM, replace the file output in a local copy and add `${params.siem_host}` and `${secrets.siem_token}` for the selected output plugin where applicable.
+| Parameter | Default | Description |
+|---|---|---|
+| `anomaly_mode` | `true` | Include recurring complete chains. |
+| `anomaly_interval_hours` | `24` | Recurrence interval, 2-8760 hours. |
+| `host_name` | `esx-04.example.test` | ESXi host name. |
 
 ## Usage
 
 ```bash
-eventum generate --path generators/virtualization-vmware-esxi-hostd/generator.yml --id esxi --live-mode false
-eventum generate --path generators/virtualization-vmware-esxi-hostd/generator.yml --id esxi --live-mode true
+eventum generate --path generators/virtualization-vmware-esxi-hostd/generator.yml --id esxi-hostd --live-mode true
 ```
 
-## Sample Output
+For a finite batch, set `oscillator.start` and `oscillator.end` in each `patterns/*.yml` file to the same UTC date range, starting at midnight, then run:
 
-This event was copied from an `anomaly_mode: true` generator run.
+```bash
+eventum generate --path generators/virtualization-vmware-esxi-hostd/generator.yml --id esxi-hostd --live-mode false --keep-order true
+```
+
+Results are written to `output/events.json`. Set the template parameters in `generator.yml` before starting. Performance: approximately 1,400 events/second in a four-day batch on the development machine.
+
+## Sample output
 
 ```json
-{
-  "@timestamp": "2026-09-25T12:58:44+00:00",
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "task-created",
-    "category": [
-      "configuration"
-    ],
-    "kind": "event",
-    "original": "2026-09-25T12:58:44.000Z In(166) Hostd[2101270]: [Originator@6876 sub=Vimsvc.TaskManager opID=a51bb486-3b41-42eb-a394-22ac9e452c6f-6a-a-615a sid=8c327895 user=vpxuser:CORP\\svc-backup] Task Created : haTask-ha-host-vim.HostSystem.enterMaintenanceMode-17044002",
-    "type": [
-      "change"
-    ]
-  },
-  "host": {
-    "name": "esx-04.example.test"
-  },
-  "log": {
-    "file": {
-      "path": "/var/run/log/hostd.log"
-    },
-    "level": "info"
-  },
-  "process": {
-    "name": "Hostd",
-    "pid": 2101270
-  },
-  "related": {
-    "user": [
-      "vpxuser:CORP\\svc-backup"
-    ]
-  },
-  "vmware": {
-    "esxi": {
-      "actor": "vpxuser:CORP\\svc-backup",
-      "message": "Task Created : haTask-ha-host-vim.HostSystem.enterMaintenanceMode-17044002",
-      "operation_id": "a51bb486-3b41-42eb-a394-22ac9e452c6f-6a-a-615a",
-      "session_id": "8c327895",
-      "subsystem": "Vimsvc.TaskManager",
-      "task_id": "haTask-ha-host-vim.HostSystem.enterMaintenanceMode-17044002"
-    }
-  }
-}
+{"@timestamp": "2026-09-21T00:02:39.760Z", "ecs": {"version": "8.17.0"}, "event": {"action": "login", "category": ["authentication"], "kind": "event", "original": "2026-09-21T00:02:39.760Z In(166) Hostd[2103838]: [Originator@6876 sub=Vimsvc.ha-eventmgr opID=esxui-e3e6-d1bf sid=7926f1f1] Event 6549 : User svc-backup@10.20.2.32 logged in as pyvmomi Python/3.8.18 (VMkernel; 8.0.2; x86_64)", "outcome": "success", "type": ["start"]}, "host": {"name": "esx-04.example.test"}, "log": {"file": {"path": "/var/run/log/hostd.log"}, "level": "info"}, "process": {"name": "Hostd", "pid": 2103838}, "related": {"ip": ["10.20.2.32"], "user": ["svc-backup"]}, "source": {"ip": "10.20.2.32"}, "user": {"name": "svc-backup"}, "vmware": {"esxi": {"client_agent": "pyvmomi Python/3.8.18 (VMkernel; 8.0.2; x86_64)", "message": "Event 6549 : User svc-backup@10.20.2.32 logged in as pyvmomi Python/3.8.18 (VMkernel; 8.0.2; x86_64)", "subsystem": "Vimsvc.ha-eventmgr"}}}
 ```
 
-## Coverage and Limits
+## Limitations
 
-Broadcom examples establish 11 selected raw fields, all preserved in `event.original`: timestamp, level, process/PID, Originator, subsystem, operation ID, session ID, user where present, event key or task ID, message, and completion status. Numeric `Event N` values are event keys, not stable semantic event IDs, so detection uses message/action. The chosen login example is from ESXi 8.0.2, while KUMA 4.2 lists ESXi syslog normalizers through 7.0; direct compatibility with those normalizers is unverified. `event.original` is a local hostd line, so a remote syslog collector may add an outer header.
+- The ECS wrapper and `vmware.esxi` fields are this pack's mapping, not the output of a vendor collector or Elastic integration. Client addresses on task records are inferred from the associated synthetic session.
+- The selected hostd lines omit PAM diagnostics, companion authentication messages, snapshot cleanup, VM state transitions and most hostd subsystems. Full native-file and live parser compatibility have not been established.
+- Related records are seconds apart, sometimes longer, rather than the millisecond spacing common in native logs. Session counts, message shares and VM activity are synthetic.
+- Episodes add their own authentication and VM task records, increasing those counts. Each complete chain describes only the selected user/address sequence, not all possible suspicious activity.
 
 ## References
 
-- [Broadcom maintenance event samples](https://knowledge.broadcom.com/external/article/428259/how-to-confirm-when-esx-host-was-placed.html)
-- [Broadcom hostd task samples](https://knowledge.broadcom.com/external/article/424736/vsan-cluster-shutdown-wizard-fails-at-st.html)
-- [Broadcom hostd login samples](https://knowledge.broadcom.com/external/article/393891/esxi-host-events-log-flooded-with-user.html)
-- [KUMA 4.2 source catalog](https://support.kaspersky.ru/kuma/4.2/255782)
+- [Broadcom: ESXi API login and logout messages](https://knowledge.broadcom.com/external/article/393891/esxi-host-events-log-flooded-with-user.html)
+- [Broadcom: rejected password message and session identifier](https://knowledge.broadcom.com/external/article/323622)
+- [Broadcom: VM power-off task](https://knowledge.broadcom.com/external/article/397721)
+- [Broadcom: VM power-on task](https://knowledge.broadcom.com/external/article/416006/a-general-system-error-occurred-while-tr.html)
+- [Broadcom: snapshot task](https://knowledge.broadcom.com/external/article/318905)
+- [Broadcom: Task Completed message](https://knowledge.broadcom.com/external/article/424736/vsan-cluster-shutdown-wizard-fails-at-st.html)
+
+No matching Elastic ESXi integration is asserted for this custom wrapper.
