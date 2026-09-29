@@ -1,81 +1,72 @@
 # Proxmox VE access and pveam logs
 
-Synthetic Proxmox VE 7.x lines from the API proxy log `/var/log/pveproxy/access.log` and the appliance index update log `/var/log/pveam.log`, wrapped in ECS JSON, for testing detections of API login abuse and VM power changes on a Proxmox node.
+Synthetic Proxmox VE 7.x API proxy and appliance index update records, preserved in `event.original` with an ECS JSON wrapper. The profile represents one node, twelve VMs, six administrators, two automation accounts and an API-token monitor.
 
-Nine API clients run independent random sessions: ticket logins with occasional mistyped passwords and give-ups, ticket renewals, GUI/API reads, and VM start, stop, shutdown and reboot requests against twelve VMs whose power state is tracked. A monitoring API token polls without tickets. The daily `pveam` index update runs between 01:00 and 06:00 host time.
+## Event types
 
-## Event Types
+About 12,240 records per day. Administrator requests concentrate at 08:00-18:00 UTC with a low overnight share. Automation and monitoring continue throughout the day. Normal sessions include ticket authentication and renewal, cluster/node/VM reads, occasional planned power changes and later restoration. The daily appliance index update starts between 01:00 and 06:00 UTC.
 
-Shares are measured on a 120-hour `anomaly_mode: true` capture (27,231 events, four episodes).
-
-| Action | Share | Category |
+| Action | Approximate share | Category |
 | --- | ---: | --- |
-| `api-read` - authenticated `GET` of cluster, node or VM data | 94.59% | web |
-| `ticket-issued` - `POST /api2/json/access/ticket`, HTTP 200 (login or renewal) | 3.19% | authentication |
-| `ticket-denied` - `POST /api2/json/access/ticket`, HTTP 401 | 0.75% | authentication |
-| `vm-start-request` - `POST .../qemu/<vmid>/status/start` | 0.52% | host |
-| `vm-shutdown-request` - `POST .../qemu/<vmid>/status/shutdown` | 0.29% | host |
-| `vm-stop-request` - `POST .../qemu/<vmid>/status/stop` | 0.24% | host |
-| `vm-reboot-request` - `POST .../qemu/<vmid>/status/reboot` | 0.11% | host |
-| `pveam-signature-verification` - gpgv output lines | 0.11% | package |
-| `pveam-download-start` - `start download <url>` | 0.07% | package |
-| `pveam-download-finished` - `download finished: 200 OK` | 0.07% | package |
-| `pveam-update-successful` - `update successful` (per index source) | 0.04% | package |
-| `pveam-update-start` - `starting update` | 0.02% | package |
+| `api-read` | 94.83% | API request |
+| `ticket-issued` | 4.64% | Authentication |
+| `ticket-denied` | 0.14% | Authentication |
+| `vm-start-request` | 0.11% | VM operation |
+| `vm-stop-request` | 0.06% | VM operation |
+| `pveam-signature-verification` | 0.05% | Appliance index update |
+| `vm-shutdown-request` | 0.05% | VM operation |
+| `pveam-download-start` | 0.03% | Appliance index update |
+| `pveam-download-finished` | 0.03% | Appliance index update |
+| `vm-reboot-request` | 0.03% | VM operation |
+| `pveam-update-successful` | 0.02% | Appliance index update |
+| `pveam-update-start` | 0.01% | Appliance index update |
 
-Rates, session lengths and response sizes are synthetic; Proxmox publishes no frequency data.
+Password mistakes are uncommon and single mistakes are more frequent than repeated mistakes. Response sizes, session lengths and request rates are synthetic.
 
 ## Anomaly Chain
 
-One client address sends three `POST /api2/json/access/ticket` requests answered with HTTP 401, then one answered with HTTP 200, and then, as that client's user, zero to four reads followed by `POST /api2/json/nodes/<node>/qemu/<vmid>/status/stop` on a running VM. The session then continues like any other: reads and ticket renewals until it ends or a renewal fails. The stopped VM is started again later by any power-capable user who is logged in, which appears as `vm-start-request`.
+One automation-client address receives three HTTP 401 responses from `POST /api2/json/access/ticket`, then a 200 response from that endpoint and a successful `POST /api2/json/nodes/<node>/qemu/<vmid>/status/stop` within 30 minutes. Zero to four reads can occur before the stop. Correlate by `source.ip`; ticket requests have no authenticated username in the native log. `user.name` identifies the account on subsequent requests.
 
-- **Linking fields:** `source.ip` across all steps; `user.name` on the stop request (ticket requests log `-` as the user, because pveproxy fills the user field only after authentication); the VM id in `url.path`.
-- **Timing:** gaps between attempts, requests and renewals and the session length come from the same model as ordinary sessions; measured spans from the first denial to the stop were 37-279 seconds.
-- **Recurrence:** `anomaly_interval_hours` (default 24, minimum 6, maximum 8760). The first episode is due one interval after the generator starts. At each due time the episode starts after a random delay of up to `min(30 min, interval / 8)`, and waits for an idle power-capable client whose own next login is more than an hour away. The next due time is one interval after the actual start; missed episodes are not replayed.
-- **Variation:** each episode uses a client and a running VM different from the previous episode's. All six power-capable clients and all twelve VMs also appear in ordinary traffic.
-- **Background overlap:** ordinary traffic in both modes contains one to five denied logins by the same address seconds to minutes apart (about seven runs of three or more per day), logins that give up, renewal failures, successful logins followed by power requests, and stop requests by every chain user. Only the full ordered sequence is kept out of the background: an ordinary stop that would complete it within 30 minutes is replaced by a read.
-- **Detection idea:** per `source.ip`, three or more HTTP 401 ticket responses followed by an HTTP 200 ticket response and a VM stop within 30 minutes. Sort by `@timestamp` first. A 401 on the ticket endpoint can also be an expired-ticket renewal, and HTTP 200 on the stop endpoint means that the task was queued, not that the VM halted.
+The first sequence starts within the smaller of 24 hours and the configured interval. Subsequent starts are centered on the previous actual start plus the interval, with a window width of `min(interval / 4, 6 hours)`. The two automation clients run around the clock, so episode hours are uniformly weighted. Consecutive episodes use different clients and VMs. Existing ordinary sessions continue independently. The stopped VM is restored using the same schedule as ordinary power changes, usually within minutes to an hour and occasionally longer.
 
-`anomaly_mode` defaults to `true`. With `anomaly_mode: false` the generator produces only the background described above, with no complete chain.
+`anomaly_mode: false` retains the individual request types and clients without the complete sequence. Enabling it adds one correlated sequence per episode. HTTP 200 on a power endpoint means the task was queued, not that the VM completed the operation. The synthetic scenario assumes the queued power requests succeed; task-status responses are outside this profile.
 
 ## Parameters
 
-### Event Parameters
-
-| Name | Default | Description |
+| Parameter | Default | Meaning |
 | --- | --- | --- |
-| `node_name` | `pve-01` | Node name in API paths, task UPIDs and `host.name` |
-| `anomaly_mode` | `true` | Add recurring anomaly chain episodes to the background |
-| `anomaly_interval_hours` | `24` | Hours between episode due times (6-8760) |
+| `node_name` | `pve-01` | Node name in native API paths and ECS host fields |
+| `anomaly_mode` | `true` | Include correlated authentication and stop requests |
+| `anomaly_interval_hours` | `24` | Recurrence interval, from 6 to 8760 hours |
 
-### Output Parameters
-
-The shipped config writes `output/events.json` and needs no connection parameters or secrets. To send events to a SIEM, replace the file output in a local copy and reference placeholders such as `${params.opensearch_host}` and `${secrets.opensearch_password}` in the chosen output plugin.
+Edit these under `event.template.params` in `generator.yml`. The file output needs no credentials.
 
 ## Usage
 
 ```bash
-eventum generate --path generators/virtualization-proxmox-ve/generator.yml --id proxmox --live-mode false
 eventum generate --path generators/virtualization-proxmox-ve/generator.yml --id proxmox --live-mode true
 ```
 
-Live mode emits one event at most per second. For a finite batch, add `start` and `end` to the `cron` input.
+For a finite batch, set the same explicit UTC start/end dates in every `patterns/*.yml` oscillator, starting at midnight, then run:
 
-## Sample Output
-
-The stop request of an episode, copied from the final `anomaly_mode: true` capture:
-
-```json
-{"@timestamp": "2026-09-21T00:06:36+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "vm-stop-request", "category": ["host"], "kind": "event", "original": "::ffff:10.20.1.22 - backup-ops@pve [21/09/2026:00:06:36 +0000] \"POST /api2/json/nodes/pve-01/qemu/110/status/stop HTTP/1.1\" 200 76", "outcome": "success", "type": ["change"]}, "host": {"name": "pve-01"}, "http": {"request": {"method": "POST"}, "response": {"body": {"bytes": 76}, "status_code": 200}, "version": "1.1"}, "log": {"file": {"path": "/var/log/pveproxy/access.log"}}, "proxmox": {"access": {"username": "backup-ops@pve"}}, "related": {"ip": ["10.20.1.22"], "user": ["backup-ops@pve"]}, "source": {"ip": "10.20.1.22"}, "url": {"path": "/api2/json/nodes/pve-01/qemu/110/status/stop"}, "user": {"name": "backup-ops@pve"}}
+```bash
+eventum generate --path generators/virtualization-proxmox-ve/generator.yml --id proxmox-batch --live-mode false --keep-order true
 ```
 
-## Coverage and Limits
+Output is `output/events.json` relative to the generator directory. Replace the output block to send to a SIEM. Performance: about 2,290 events/second for a four-day batch on the development machine.
 
-- **Access log.** Lines follow `log_request` in pve-http-server: `<client> - <user> [%d/%m/%Y:%H:%M:%S %z] "<request line>" <status> <bytes>`, with IPv4 clients shown as `::ffff:a.b.c.d`. The 401 body size of 13 bytes (`{"data":null}`) matches a 2023 forum capture; pve-http-server added an error message to JSON error bodies in January 2025, so newer releases log a larger size. Stop, start, shutdown and reboot sizes are the exact length of the returned task UPID. Ticket and read sizes are synthetic.
-- **Not modeled.** Web GUI password logins through `/api2/extjs/access/ticket` (logged as HTTP 200 even when they fail), API token creation, console and websocket traffic, the pvedaemon syslog lines that name the user of a failed login, and task-status polling after power requests. One node, twelve VMs, no cluster.
-- **pveam.** The 17-line update sequence follows `APLInfo.pm` and a 2022 Proxmox 7.x user log: both index sources (`aplinfo-pve-7.dat`, then TurnKey), gpgv output, one `update successful` per source. Failures are not modeled. Current releases use `sqv` and newer index files, so this part is pinned to 7.x. pveam timestamps have no zone; the generator assumes the host clock is UTC.
-- **Timing.** Timestamps have one-second resolution like the native lines. The generator emits at most one event per one-second input tick; events due close together, such as the 17 lines of one pveam update, are written on consecutive ticks but keep their own timestamps, so output order and timestamps stay consistent.
-- **Mapping.** ECS fields repeat values from the native line only; `event.action` names are this pack's labels.
+## Sample output
+
+```json
+{"@timestamp": "2026-09-01T03:13:28+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "vm-stop-request", "category": ["host"], "kind": "event", "original": "::ffff:10.20.1.22 - backup-ops@pve [01/09/2026:03:13:28 +0000] \"POST /api2/json/nodes/pve-01/qemu/101/status/stop HTTP/1.1\" 200 76", "outcome": "success", "type": ["change"]}, "host": {"name": "pve-01"}, "http": {"request": {"method": "POST"}, "response": {"body": {"bytes": 76}, "status_code": 200}, "version": "1.1"}, "log": {"file": {"path": "/var/log/pveproxy/access.log"}}, "proxmox": {"access": {"username": "backup-ops@pve"}}, "related": {"ip": ["10.20.1.22"], "user": ["backup-ops@pve"]}, "source": {"ip": "10.20.1.22"}, "url": {"path": "/api2/json/nodes/pve-01/qemu/101/status/stop"}, "user": {"name": "backup-ops@pve"}}
+```
+
+## Coverage and limits
+
+- Native access records follow `<client> - <user> [%d/%m/%Y:%H:%M:%S %z] "<request line>" <status> <bytes>`. IPv4 clients appear as IPv4-mapped IPv6 addresses. The 13-byte HTTP 401 body corresponds to the older JSON error response. Releases from 2025 can include a larger error body. Read and ticket response sizes are illustrative; power-task response sizes include the corresponding UPID length.
+- The selected source profile is Proxmox VE 7.x. Its appliance update uses `aplinfo-pve-7.dat`, the TurnKey index and `gpgv`; newer releases use different files and verification tools. Update failures are omitted. The host clock is UTC.
+- Web console and websocket traffic, API-token creation, failed-login user names from pvedaemon, task-status polling, and cluster operations are omitted. Related appliance update messages are seconds apart rather than milliseconds. Native timestamps have one-second precision.
+- ECS fields and action names are enrichment. They do not appear in the native lines. A failed new ticket request does not invalidate another existing ticket from the same client.
 
 ## References
 
