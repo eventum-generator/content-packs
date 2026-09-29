@@ -2,43 +2,59 @@
 
 Generates audit records of one MariaDB Community Server 11.4.4 instance written by the bundled `server_audit` plugin 1.4.14 to its FILE output. Each output line is ECS JSON; `event.original` holds the native 10-field CSV record and `mariadb.audit.*` holds its parsed fields.
 
+## Volume and Timing
+
+Record volume follows a UTC hour-of-day curve, about 16,700 records per day with ±3% day-to-day variation; records fall at random times inside each band.
+
+| UTC hours | Records/s |
+|---|---:|
+| 08-19 | 0.28 |
+| 07-08, 19-21 | 0.18 |
+| 21-07 | 0.10 |
+
+The application account writes about 96% of the records. DBAs and delegates work mostly in business hours: at 08-18 UTC the four accounts together open about 4.7 sessions an hour, at 07-08 and 18-19 about 1.2, and at night about 0.1. Grant maintenance follows the same working day: about 0.75 an hour at 08-18 UTC, 0.2 an hour at 07-08 and 18-19, and 0.06 an hour at night, about 11 a day.
+
+The records of one statement (its table records and its `QUERY`) and a failed login with its `DISCONNECT` share one second in `@timestamp`, as the server writes them. `event.created` is the collection time: the same second in half of the records, within 8 s for 90%, and up to about two minutes at night.
+
 ## Event Types Covered
 
-Rates are measured from the final 14-day default capture with `anomaly_mode: false` (19,617 records per day).
+Shares over 40 days with `anomaly_mode: false` (667,823 records).
 
-| Native operation | Meaning | Records/day | ECS category / type |
-|---|---|---:|---|
-| `QUERY` | Completed `COM_QUERY` statement with its result code | 9,493 | `database` (plus `iam` for GRANT/REVOKE) |
-| `READ` | Successful read table lock taken by the statement | 6,166 | `database` / `access`, outcome `unknown` |
-| `WRITE` | Successful write table lock taken by the statement | 3,335 | `database` / `access`, outcome `unknown` |
-| `CONNECT` | Successful login, current database set | 274 | `authentication` / `start` |
-| `DISCONNECT` | End of a successful or failed connection | 311 | `authentication` / `end` |
-| `FAILED_CONNECT` | Wrong password, retcode `1045`, empty database | 37 | `authentication` / `start`, outcome `failure` |
+| Native operation | Meaning | Share | Records/day | ECS category / type |
+|---|---|---:|---:|---|
+| `QUERY` | Completed `COM_QUERY` statement with its result code | 48.6% | 8,118 | `database` (plus `iam` for GRANT/REVOKE) |
+| `READ` | Successful read table lock taken by the statement | 31.5% | 5,265 | `database` / `access`, outcome `unknown` |
+| `WRITE` | Successful write table lock taken by the statement | 17.2% | 2,865 | `database` / `access`, outcome `unknown` |
+| `DISCONNECT` | End of a successful or failed connection | 1.34% | 224 | `authentication` / `end` |
+| `CONNECT` | Successful login, current database set | 1.29% | 215 | `authentication` / `start` |
+| `FAILED_CONNECT` | Wrong password, retcode `1045`, empty database | 0.05% | 9 | `authentication` / `start`, outcome `failure` |
+
+With the default `anomaly_mode: true`, episodes add about three failed logins a day, so `FAILED_CONNECT` is about 0.07% of records, about 12 a day; the other shares stay the same.
 
 Statements behind the `QUERY` records:
 
 | Statement | Actors | Table records before QUERY | Retcode | Per day |
 |---|---|---|---:|---:|
-| `SELECT ... FROM orders_NN WHERE order_id = N`, `SELECT status, COUNT(*) FROM orders_NN GROUP BY status` | every account | `READ <app db>.orders_NN` | 0 | 6,081 |
-| `UPDATE orders_NN SET status = '<paid, shipped or cancelled>' WHERE order_id = N` | application account, DBAs | `WRITE <app db>.orders_NN` | 0 | 2,307 |
-| `INSERT INTO orders_NN (customer_id, status, total) VALUES (...)` | application account | `WRITE <app db>.orders_NN` | 0 | 915 |
-| `SELECT * FROM <sensitive db>.<table> ...` by a DBA, or by a delegate holding a grant | DBAs, grantee | `READ <sensitive db>.<table>` | 0 | 86 |
-| `UPDATE <sensitive db>.<table> SET last_reviewed = CURRENT_DATE WHERE employee_id = N` | DBAs | `WRITE <sensitive db>.<table>` | 0 | 37 |
-| Sensitive `SELECT` without a grant | delegates | none | 1142 | 22 |
-| Mistyped statements (`SELEC`, `FORM`, `UPDTE`) | DBAs, delegates | none | 1064 | 14 |
-| `GRANT SELECT ON <sensitive db>.<table> TO '<delegate>'@'<ip>'` | DBAs | `WRITE mysql.tables_priv`, `WRITE mysql.global_priv` | 0 | 15 |
-| `REVOKE SELECT ON <sensitive db>.<table> FROM '<delegate>'@'<ip>'` | DBAs | `WRITE mysql.tables_priv`, `WRITE mysql.columns_priv`, `WRITE mysql.global_priv` | 0 | 15 |
+| `SELECT ... FROM orders_NN WHERE order_id = N`, `SELECT status, COUNT(*) FROM orders_NN GROUP BY status` | every account | `READ <app db>.orders_NN` | 0 | 5,215 |
+| `UPDATE orders_NN SET status = '<paid, shipped or cancelled>' WHERE order_id = N` | application account, DBAs | `WRITE <app db>.orders_NN` | 0 | 1,992 |
+| `INSERT INTO orders_NN (customer_id, status, total) VALUES (...)` | application account | `WRITE <app db>.orders_NN` | 0 | 794 |
+| `SELECT * FROM <sensitive db>.<table> ...` by a DBA, or by a delegate holding a grant | DBAs, grantee | `READ <sensitive db>.<table>` | 0 | 50 |
+| `UPDATE <sensitive db>.<table> SET last_reviewed = CURRENT_DATE WHERE employee_id = N` | DBAs | `WRITE <sensitive db>.<table>` | 0 | 22 |
+| Sensitive `SELECT` without a grant | delegates | none | 1142 | 15 |
+| `GRANT SELECT ON <sensitive db>.<table> TO '<delegate>'@'<ip>'` | DBAs | `WRITE mysql.tables_priv`, `WRITE mysql.global_priv` | 0 | 11.5 |
+| `REVOKE SELECT ON <sensitive db>.<table> FROM '<delegate>'@'<ip>'` | DBAs | `WRITE mysql.tables_priv`, `WRITE mysql.columns_priv`, `WRITE mysql.global_priv` | 0 | 11.5 |
+| Mistyped statements (`SELEC`, `FORM`, `UPDTE`) | DBAs, delegates | none | 1064 | 7 |
 
 ## Workload Model
 
-The generator runs a bounded event simulation of the server's clients. Every choice below is random and is taken the same way in both modes. No choice is paused or re-phased by an episode, and none uses a fixed rotation or a hard minimum gap: delays are exponential or lognormal, and accounts and tables are drawn at random. Rates and proportions are chosen assumptions, not vendor-measured frequencies.
+Rates are chosen assumptions, not vendor-measured frequencies. Both modes run the same activity. An episode adds one grant cycle that takes its DBA and delegate exactly as an ordinary maintenance does, including the 30 minutes after its GRANT in which that DBA takes no other maintenance; it does not pause or cancel any session or maintenance, and afterwards both accounts continue as after any maintenance. Accounts, tables, rows and delays are drawn at random; no choice follows a fixed rotation.
 
-- **Application pool:** three long-lived connections of the application account. Each issues a statement after an exponential think time (mean 28 s), chosen 65% point `SELECT`, 25% `UPDATE`, 10% `INSERT` against a random table from `samples/tables.json` and a random row. Each connection is retired after a lognormal lifetime (median 30 minutes) and replaced about a second later. In the default capture the application account produces 95% of records, with a median of 65 statements and 31 minutes per connection.
-- **People:** every DBA and delegate opens a session after a lognormal idle time (median 30 and 40 minutes), runs a random number of statements (median 2) with lognormal think times (median 25 s), and disconnects. DBAs connect to the application database (60%) or the sensitive database (40%). They mix application reads and updates, sensitive-table reads and updates, reports, and occasional typos. Delegates run reports and point reads, sometimes try a sensitive table and are denied with 1142, and occasionally mistype.
-- **Failed logins:** a DBA login starts with a wrong password 10% of the time, a delegate login 8%, a pooled reconnect 0.4%. After a failure a person retries after a lognormal delay (median 8 s), and each retry fails again with probability 0.4, up to five attempts; after any failure there is a 12% chance the person gives up and comes back later (lognormal, median 25 minutes). In addition, 8% of a DBA's own logins come from a client with a stale saved password that retries it 3 to 6 times within seconds (lognormal spacing, median 4 s); the DBA then types the right password and logs in (60%) or leaves it for later. Runs of two to six failures of one account within minutes, failures without a following success, and failures followed by a successful login are therefore ordinary in both modes (about 37 failed logins per day across all accounts in the default `false` capture, 28 of them by DBAs; 61 to 87 DBA runs of three or more failures per 14 days in the eight `false` captures). The maintenance DBA's login follows the ordinary retry law (up to five failures) but does not give up.
-- **Grant maintenance:** a DBA temporarily grants a delegate `SELECT` on one sensitive table. The DBA, delegate, and table are drawn at random from the idle accounts and all tables. The delegate connects after a lognormal delay (median 2 minutes), reads the table one to five times, and disconnects. The DBA revokes the grant and disconnects, and after a further delay (median 200 s) the delegate's next attempt is denied with 1142. Occurrences start as a Poisson process: the time between starts is exponential with a mean of 90 minutes, whatever the previous occurrence is doing. Each occurrence takes a DBA and a delegate who are idle at that moment (and waits a minute at a time if none is), so two occurrences can overlap on different accounts. In the default `false` capture this gives about 15 occurrences per day and up to two temporary grants at once; consecutive GRANTs are seconds to 9.8 hours apart.
-- **Chain guard (both modes):** an ordinary GRANT is not issued when it would complete the episode's chain: three `FAILED_CONNECT`, a `CONNECT` and a GRANT of the same DBA account, the first failure at most 30 minutes earlier. Nothing is granted, read, or revoked; the DBA disconnects after the usual think time and the delegate stays idle. Only that GRANT is affected, the account and all times stay as drawn, and a GRANT more than 30 minutes after the first failure is issued as usual. In the 14-day `false` captures this happens 11 to 20 times per capture (12 to 30 in the `true` captures, where an episode's failures also count for 30 minutes); each leaves a DBA session to the sensitive database that holds no statement (`CONNECT` followed by `DISCONNECT`). Partial matches are not reset when an episode completes its chain, so an ordinary GRANT cannot complete a chain together with episode records either.
-- Up to seven sessions are open at once (mean 3.3) in the default capture.
+- **Application pool:** three long-lived connections of the application account. Statements arrive at the rate of the hour curve on a random connection: 65% point `SELECT`, 25% `UPDATE`, 10% `INSERT` against a random table from `samples/tables.json` and a random row. A connection is retired after a lognormal lifetime (median 30 minutes) and replaced about 1.5 s later; 0.4% of the replacements fail once with a wrong password. A connection runs a median of 51 statements.
+- **People:** a session belongs to an idle DBA (1.6 times as likely) or delegate. DBAs connect to the application database (60%) or the sensitive database (40%) and mix application reads and updates, sensitive-table reads and updates, reports, and occasional typos. Delegates run reports and point reads, sometimes try a sensitive table and are denied with 1142, and occasionally mistype. A session runs a random number of statements (median 2) with lognormal think times (median 25 s).
+- **Failed logins:** a DBA login starts with a wrong password 6% of the time, a delegate login 5%. A retry follows after a lognormal delay (median 8 s) and fails again with probability 0.3, up to five failures; after any failure there is a 12% chance the person gives up. In addition, 2% of a DBA's sessions start from a client with a stale saved password that retries it 2 to 5 times within seconds (fewer retries more likely); the DBA then logs in by hand (60%) or leaves it. One failure before a login is the most common case, and runs of three or more failures followed by a login happen about two to three times a week for the two DBAs together. About 0.05% of records, about 4% of all login attempts, are failed logins, about 9 a day; the two DBAs together have about 5 a day.
+- **Grant maintenance:** a DBA temporarily grants a delegate `SELECT` on one sensitive table. The DBA, delegate, and table are drawn at random from the idle accounts and all tables. A DBA takes no maintenance within 30 minutes of its previous GRANT; while no DBA and delegate are available the maintenance waits about a minute at a time, for up to half an hour. The DBA's login follows the ordinary failed-login law without giving up. The delegate connects after a lognormal delay (median 2 minutes), reads the table one to five times, and disconnects. The DBA revokes the grant and disconnects, and a few minutes later (median 200 s) the delegate's next attempt is denied with 1142. Two maintenances can overlap on different accounts, so up to two temporary grants exist at once.
+- **Grants after failed logins:** a DBA never issues an ordinary GRANT within 30 minutes of the first of three failed logins that were followed by a login of that DBA. If maintenance reaches that point, the DBA works on the sensitive tables as in an ordinary session instead, and the delegate is not involved. This happens about twice a week, at the same rate in both modes.
+- Up to seven sessions are open at once (mean 3.2).
 
 ## Selected Source Profile
 
@@ -66,27 +82,23 @@ timestamp,serverhost,username,host,connectionid,queryid,operation,database,objec
 - `GRANT` locks `tables_priv` and `global_priv`; `REVOKE SELECT` also locks `columns_priv` because `SELECT` is a column-level privilege. This order is derived from the grant-table constructor, not from a captured GRANT/REVOKE trace.
 - A denied `SELECT` (1142) and a syntax error (1064) take no table lock and write no table record.
 
-A statement's table records and its `QUERY` share one source second. The input ticks once per second and the collector writes at most one record per tick; ticks with nothing due are dropped, so `event.created` trails `@timestamp` by 0 to a few seconds (12 s at most in the final captures).
-
 ## Anomaly Chain
 
 `event.template.params.anomaly_mode` defaults to `true`. With `false`, only background is produced.
 
-An episode is an additional grant cycle, run like ordinary maintenance but on its own schedule, whose DBA login is preceded by three wrong passwords:
+An episode is an additional grant cycle, run like ordinary maintenance but at its own time, whose DBA login is preceded by wrong passwords:
 
 1. Three (70%) or four `FAILED_CONNECT` of the DBA from its address, spaced like ordinary password retries (median 8 s), each closed by its `DISCONNECT` in the same second.
-2. The DBA's `CONNECT` to the sensitive database and `GRANT SELECT` on the table to the delegate.
+2. The DBA's `CONNECT` to the sensitive database and `GRANT SELECT` on the table to the delegate, a median 25 s later.
 3. The delegate's `CONNECT` to the sensitive database, `READ` and successful `QUERY` of that table, `DISCONNECT`.
 4. The DBA's `REVOKE SELECT` of the same grant and `DISCONNECT`.
 5. The delegate's next connection to the application database, denied with 1142 on the same table.
 
-The episode's records interleave with the application pool and other people's sessions. Linking fields: `username` and `host` of the DBA and delegate, `connectionid` of each session, `queryid` between table records and their `QUERY`, and the grantee, address, and table in the GRANT/REVOKE text and in the delegate's read and denial.
+The episode's records interleave with the application pool and other people's sessions, and take the place of an equal number of application records around them, so the daily volume and the hour curve are the same as in background. Linking fields: `username` and `host` of the DBA and delegate, `connectionid` of each session, `queryid` between table records and their `QUERY`, and the grantee, address, and table in the GRANT/REVOKE text and in the delegate's read and denial.
 
-Recurrence: the first episode starts at a uniform random time within the first interval or the first 24 hours, whichever is shorter. Each next episode starts at a uniform random time in a window centred one interval after the actual start of the previous episode; the window is a quarter of the interval wide, at most six hours (24 h default: 21 to 27 hours). The workload has no daily cycle, so no hour of day is preferred. The episode is its own session and grant cycle: it takes a DBA and a delegate who are idle at that moment, like ordinary maintenance, and it never moves ordinary maintenance, which runs on its own schedule in both modes. If no such pair is idle, the start waits a minute and tries again. Like ordinary occurrences, an episode can overlap another grant cycle. Missed intervals are not replayed.
+Recurrence: the first episode starts within the first min(interval, 24 hours) of the log, at a time drawn from the grant-maintenance hour curve. Each next episode is due one interval after the actual start of the previous one; its start is drawn in a window of width w = min(interval / 4, 6 hours) centred on the due time, weighted by the squared hour curve plus a small floor (24 h default: 21 to 27 hours after the previous start, mostly in business hours). The episode takes a DBA and a delegate who are available at that moment, like ordinary maintenance, and waits about a minute at a time while none is. Missed intervals are not replayed. The interval is `anomaly_interval_hours` (default 24, minimum 6). At intervals shorter than a day some episodes necessarily fall outside business hours.
 
-Variation: the DBA, delegate, and table come from the same random draw as ordinary maintenance. An episode additionally avoids the previous episode's DBA and table pair, so consecutive episodes differ in the DBA or the table.
-
-The episode repeats the steps of ordinary maintenance, so its account and table choice, delays and the post-revoke denial come from the same random draws as background, within background ranges. Because ordinary occurrences start as a Poisson process, the gap from the previous GRANT to an episode's GRANT has the same distribution as the gaps between ordinary GRANTs. Failure runs of three or more followed by a successful login are ordinary too; what only episodes contain is such a run and login followed by that DBA's GRANT within 30 minutes of the first failure. Each episode adds one failure run of the DBA. Counted per capture (runs of three or more failures by one DBA account, reset by its login), the eight 14-day `false` captures have 61 to 87 runs (mean 76); the default 24-hour `true` captures have 87 and 88, within or one above that spread; the 12-hour `true` captures have 94 and 102, above it. At intervals shorter than a day the additional runs remain visible in this count.
+Variation: the DBA, delegate, and table come from the same random draw as ordinary maintenance; an episode additionally avoids the previous episode's DBA and table pair, so consecutive episodes differ in the DBA or the table. Every account, account pair, and table an episode uses also appears in ordinary maintenance, and failure runs followed by a login occur in background too. What only episodes contain is such a run of at least three failures and a login followed by that DBA's GRANT within 30 minutes of the first failure.
 
 Possible detection: at least three `FAILED_CONNECT` for one account and address within 5 minutes, followed within 5 minutes by a successful `CONNECT` and within 30 minutes by a `GRANT` from that same connection; join the grantee and table to the later read, the REVOKE, and the grantee's 1142. These records do not show why the logins failed, which rows were returned, or data exfiltration.
 
@@ -110,7 +122,9 @@ Edit `event.template.params` in `generator.yml`. Invalid values stop rendering w
 | `anomaly_interval_hours` | `24` | Episode interval in hours of source time, number from 6 to 8,760 |
 | `anomaly_mode` | `true` | `true` adds episodes to background, `false` produces background only |
 
-Account, database, and table names are lowercase identifiers matching `[a-z][a-z0-9_]{0,31}`. All accounts must have distinct names and distinct IPv4 addresses, sensitive tables must be distinct, the two databases must differ and must not be `mysql`, and the DBA or table pool needs two or more entries so that consecutive episodes can differ. `samples/tables.json` must hold 1 to 100 unique `orders_NN` names. With about 15 grant maintenances per day, the 6-hour minimum keeps episodes to at most a quarter of them, so ordinary grants remain the majority in both modes.
+Account, database, and table names are lowercase identifiers matching `[a-z][a-z0-9_]{0,31}`. All accounts must have distinct names and distinct IPv4 addresses, sensitive tables must be distinct, the two databases must differ and must not be `mysql`, and the DBA or table pool needs two or more entries so that consecutive episodes can differ. `samples/tables.json` must hold 1 to 100 unique `orders_NN` names. With about 11 grant maintenances per day, the 6-hour minimum keeps episodes to at most about a quarter of all grants, so ordinary grants remain the majority in both modes.
+
+The volume and the hour curves live in the `time_patterns` files under `patterns/`: `app-floor` (00-24 UTC), `app-day` (07-21) and `app-core` (08-19) for application statements, `people-floor`, `people-day` (07-19) and `people-core` (08-18) for DBA and delegate sessions, and `maint-floor`, `maint-day` and `maint-core` for grant maintenance. To change the volume, scale the `ratio` of the three `app-*` files by the same factor. To move the working day to another time zone, shift the `low` / `high` bounds of the `-day` and `-core` files; episode start hours follow the shipped maintenance curve. To use other application table names, edit `samples/tables.json`.
 
 ### Output Parameters
 
@@ -118,52 +132,40 @@ The shipped file output needs no substitutions. To deliver elsewhere, replace th
 
 ## Usage
 
-From the content-packs repository root:
+Live generation at the configured rate, from the content-packs repository root:
 
 ```bash
-# Bounded batch sample; timeout exit code 124 is expected.
-timeout 3 eventum generate --path generators/database-mariadb-audit/generator.yml --id database-mariadb-audit --live-mode false --keep-order true
-
-# Live generation, about 19,400 records per day.
 eventum generate --path generators/database-mariadb-audit/generator.yml --id database-mariadb-audit --live-mode true --keep-order true
 ```
 
-Output goes to `generators/database-mariadb-audit/output/events.json`. Keep `--keep-order true`: session and table-to-query ordering depends on the physical record order. To check recurrence, copy `generator.yml`, set finite `input[0].cron.start` and `end` covering at least two intervals plus six hours, and run it with `--live-mode false`; a 3-second sample covers no episode.
+Batch generation: set `start` and `end` of the `oscillator` in all nine `patterns/*.yml` files to the same range, with `start` at 00:00 UTC so the hour bands stay in place (for example `start: "2026-09-21T00:00:00Z"` and `end: "2026-09-25T00:00:00Z"`), then run:
 
-## Validation
+```bash
+eventum generate --path generators/database-mariadb-audit/generator.yml --id database-mariadb-audit --live-mode false --keep-order true
+```
 
-Final 14-day finite captures (2026-09-01 to 2026-09-15, default accounts), each checked row by row against the native grammar, session and query-id lifecycles, statement and lock semantics, the privilege model, recurrence, and variation:
+Output goes to `generators/database-mariadb-audit/output/events.json`. Keep `--keep-order true`: session and table-to-query ordering depends on the physical record order. A window of two intervals plus six hours holds at least two episodes.
 
-| Capture | Records | Complete episodes | First episode after start | Episode gaps |
-|---|---:|---:|---|---|
-| Default 24 h, `true` | 273,718 | 14 | 5.5 h | 21.3 to 26.9 h |
-| Default 24 h, `false` | 274,629 | 0 | - | - |
-| 12 h, `true` | 273,650 | 28 | 6.0 h | 10.6 to 13.3 h |
-| 12 h, `false` | 273,156 | 0 | - | - |
-| 12 h, second pair, `true` | 273,594 | 28 | 4.3 h | 10.6 to 13.4 h |
-| 12 h, second pair, `false` | 273,107 | 0 | - | - |
+Performance: about 3,600 records per second in batch mode on one core.
 
-- Each `true` capture was compared with its `false` pair using the shared calibrated on/off comparison (per-account gaps, low quantiles and minima, same-account bursts and failure runs, daily counts, successor determinism, session holds, periodicity, constants and mix, calibrated on five independent 14-day `false` captures with family-wise error control). All three pairs are OK in every class.
-- Every episode starts inside its window: first starts 4.3 to 6.0 hours after the capture start; later starts deviate from the window centre by -9,704 to 10,585 s at 24 hours (window +/- 10,800 s) and -5,047 to 5,032 s at 12 hours (window +/- 5,400 s).
-- The gap from the previous GRANT to an episode's GRANT matches the other GRANT-to-GRANT gaps of the same captures (70 episode GRANTs: mean 6,164 s, 21% under 30 minutes; 579 other gaps: mean 5,485 s, 25% under 30 minutes; two-sample KS p = 0.50).
-- Every user, address, operation, database, statement shape (numbers abstracted), and retcode used in an episode also appears outside episodes in the same capture and in the paired `false` capture. The eight `false` captures contain no complete chain, counted without a cap on partial matches, with every candidate run, and without resetting after a completion; in the `true` captures the same count equals the number of episodes.
-- After three failures and a login of a DBA in the `false` captures, a GRANT by that DBA follows at 0 per hour up to 30 minutes after the first failure (the guard) and at 0.25 to 0.39 per hour in each 10-minute bin of the following half hour; GRANTs by the other DBA follow at 0.30 to 0.38 per hour inside the window and 0.33 to 0.43 per hour after it.
-
-## Limitations and Assumptions
+## Limitations
 
 - No unmodified production audit file was available. The vendor regression result replaces times, host names, and IDs with placeholders, so the field grammar comes from the tagged source code, and ID values, timing, and workload are synthetic.
 - The profile covers FILE output only. SYSLOG output of this version omits the timestamp slot and adds a syslog header; MariaDB 12.x adds client ports and TLS details. Neither is modelled.
 - The GRANT/REVOKE system-table records are derived from source, not from a captured trace. Other hook-producing activity (statistics tables, DDL, stored programs, `CHANGE USER`, proxies, password statements, prepared statements) is excluded by the selected settings and workload.
-- All connections come from the configured accounts, so connection ids increase by one per connection. Clients send no connect-time statements (for example the `mysql` client's `select @@version_comment limit 1`); the modelled clients are an application pool and scripted sessions. The workload has no daily cycle, one application server, at most as many temporary grants at a time as there are DBA and delegate pairs (two in the default captures), and one record per second at most from the collector.
+- All connections come from the configured accounts, so connection ids increase by one per connection. Clients send no connect-time statements (for example the `mysql` client's `select @@version_comment limit 1`); the modelled clients are an application pool and scripted sessions. There is one application server, and a DBA or delegate takes part in at most one temporary grant at a time.
+- `event.created` trails `@timestamp` by up to about two minutes at night (median 0 s, 90% within 8 s), more than a file collector usually shows. At night a person's consecutive actions, such as password retries, are at least several seconds apart.
+- The hour curves are in UTC and repeat every day: there is no weekly cycle, so weekends look like weekdays.
+- With `anomaly_mode: true` each episode adds its own records: three or four failed logins of one DBA, and one GRANT, REVOKE and 1142 denial more than in background. At the default interval the DBAs' failed logins are therefore about 1.7 times the background level (about 8.5 instead of 5 a day), and runs of three or more failures followed by a login occur about 9-10 times a week instead of two or three.
 - ECS fields other than the parsed native slots (`event.*`, `host.*`, `observer.*`, `service.*`, `source.ip`, `related.*`, `log.file.path`) are collector-side enrichment. No maintained Elastic integration for MariaDB `server_audit` was found to compare against, and no SIEM parser was run.
 
 ## Sample Output
 
-The GRANT of the first episode, row 4,592 of the final default `true` capture (the same statement shape by the same DBA also appears in ordinary grant maintenance):
+The GRANT of an episode (the same statement shape by the same DBA also appears in ordinary grant maintenance):
 
 ```json
 {
-  "@timestamp": "2026-09-01T05:28:51+00:00",
+  "@timestamp": "2026-10-12T10:26:30+00:00",
   "ecs": {
     "version": "8.17.0"
   },
@@ -173,11 +175,11 @@ The GRANT of the first episode, row 4,592 of the final default `true` capture (t
       "database",
       "iam"
     ],
-    "created": "2026-09-01T05:28:53+00:00",
+    "created": "2026-10-12T10:26:35.421863+00:00",
     "dataset": "mariadb.audit",
-    "ingested": "2026-09-01T05:28:53+00:00",
+    "ingested": "2026-10-12T10:26:35.421863+00:00",
     "kind": "event",
-    "original": "20260901 05:28:51,db-01.corp.example,dba_ops,10.99.4.52,1081,4282,QUERY,payroll,'GRANT SELECT ON payroll.salaries TO \\'report_user\\'@\\'10.99.5.22\\'',0",
+    "original": "20261012 10:26:30,db-01.corp.example,dba_ops,10.99.4.52,1081,4771,QUERY,payroll,'GRANT SELECT ON payroll.bonuses TO \\'report_user\\'@\\'10.99.5.22\\'',0",
     "outcome": "success",
     "type": [
       "change"
@@ -199,16 +201,16 @@ The GRANT of the first episode, row 4,592 of the final default `true` capture (t
       "connectionid": 1081,
       "database": "payroll",
       "host": "10.99.4.52",
-      "object": "GRANT SELECT ON payroll.salaries TO 'report_user'@'10.99.5.22'",
+      "object": "GRANT SELECT ON payroll.bonuses TO 'report_user'@'10.99.5.22'",
       "operation": "QUERY",
-      "queryid": 4282,
+      "queryid": 4771,
       "retcode": 0,
       "serverhost": "db-01.corp.example",
-      "timestamp": "20260901 05:28:51",
+      "timestamp": "20261012 10:26:30",
       "username": "dba_ops"
     }
   },
-  "message": "20260901 05:28:51,db-01.corp.example,dba_ops,10.99.4.52,1081,4282,QUERY,payroll,'GRANT SELECT ON payroll.salaries TO \\'report_user\\'@\\'10.99.5.22\\'',0",
+  "message": "20261012 10:26:30,db-01.corp.example,dba_ops,10.99.4.52,1081,4771,QUERY,payroll,'GRANT SELECT ON payroll.bonuses TO \\'report_user\\'@\\'10.99.5.22\\'',0",
   "observer": {
     "hostname": "db-01.corp.example",
     "ip": [

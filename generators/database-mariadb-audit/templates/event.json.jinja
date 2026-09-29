@@ -1,4 +1,14 @@
-{# One MariaDB 11.4.4 instance, server_audit FILE records. Discrete-event model: one input tick per second, idle ticks are dropped. #}
+{#- One MariaDB 11.4.4 instance, server_audit FILE records.
+    The input sets the rate and the hour curves; every timestamp becomes exactly one audit record.
+    - Records that the server writes in one second (the table records of a statement and its QUERY, a failed login
+      and its DISCONNECT) are created together with that second and written on consecutive timestamps first.
+    - `people` timestamps open a session of an idle DBA or delegate; `maint` timestamps start a grant cycle.
+    - `app` timestamps take the earliest due step of an open session or grant cycle, and otherwise run the next
+      statement of the application pool (or retire / reopen a pooled connection).
+    An episode is one more grant cycle at its own scheduled time, whose steps queue like any cycle's. -#}
+{%- set N = module.rand.number -%}
+{%- set R = module.rand -%}
+{%- set HQ = module.heapq -%}
 {%- set poll = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set now = poll.timestamp() | int -%}
 {%- set dbas = params.dba_accounts -%}
@@ -6,6 +16,26 @@
 {%- set stables = params.sensitive_tables -%}
 {%- set ndb = params.normal_database -%}
 {%- set sdb = params.sensitive_database -%}
+{#- Grant cycles by UTC hour relative to the peak. It repeats patterns/maint-*.yml and only places episode starts;
+    the input alone sets the rate. -#}
+{%- set PH = [0.06] * 7 + [0.27] + [1.0] * 10 + [0.27] + [0.06] * 5 -%}
+
+{%- macro pick_start(lo, hi, sq) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = PH[(a // 3600) % 24] -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.05) if sq else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = R.weighted_choice(s.slots, s.w) -%}
+  {{- N.integer(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+
 {%- if not shared.get('initialized', false) -%}
   {%- if params.anomaly_mode is not boolean or params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean -%}
     {{- module.builtins.int('MariaDB requires boolean anomaly_mode and numeric interval hours') -}}
@@ -53,29 +83,39 @@
     {%- endif -%}
     {%- do names.append(row.table) -%}
   {%- endfor -%}
-  {%- set actors = [] -%}
+  {#- The application pool: three connections of the application account, opened within the first half minute. -#}
+  {%- set pool = [] -%}
   {%- for i in range(3) -%}
-    {%- do actors.append({'kind':'pool', 'user':params.normal_user, 'ip':params.normal_ip, 'cid':none, 'db':'', 'mode':'idle', 'next':now + module.rand.number.integer(0, 30), 'expire':0, 'left':0}) -%}
+    {%- do pool.append({'kind':'pool', 'user':params.normal_user, 'ip':params.normal_ip, 'cid':none, 'db':'', 'up':false, 'expire':0, 'reup':now + N.integer(0, 30)}) -%}
   {%- endfor -%}
+  {%- set people = [] -%}
   {%- for account in dbas -%}
-    {%- do actors.append({'kind':'dba', 'user':account.user, 'ip':account.ip, 'cid':none, 'db':'', 'mode':'idle', 'next':now + (module.rand.number.exponential(1 / 1800) | int), 'expire':0, 'left':0}) -%}
+    {%- do people.append({'kind':'dba', 'user':account.user, 'ip':account.ip, 'cid':none, 'db':'', 'busy':false, 'free':0}) -%}
   {%- endfor -%}
   {%- for account in dels -%}
-    {%- do actors.append({'kind':'dlg', 'user':account.user, 'ip':account.ip, 'cid':none, 'db':'', 'mode':'idle', 'next':now + (module.rand.number.exponential(1 / 2400) | int), 'expire':0, 'left':0}) -%}
+    {%- do people.append({'kind':'dlg', 'user':account.user, 'ip':account.ip, 'cid':none, 'db':'', 'busy':false}) -%}
   {%- endfor -%}
-  {#- The first episode starts at a uniform time within the first min(interval, 24 h); the workload has no daily cycle. -#}
-  {%- set first = module.rand.number.floating(0, [params.anomaly_interval_hours, 24] | min * 3600) | int -%}
-  {%- do shared.update({'initialized':true, 'q':[], 'actors':actors, 'ctr':{'cid':1000, 'qid':2000}, 'seqm':{}, 'grants':[], 'machines':[], 'mid':0, 'arr':now + (module.rand.number.exponential(1 / 5400) | int), 'ep':{'next':(now + first) if params.anomaly_mode else none, 'prev':none}}) -%}
+  {%- set S = {'cid':1000, 'qid':2000, 'seq':0, 'nm':0, 'guard':0, 'start_at':none, 'prev':none} -%}
+  {%- if params.anomaly_mode -%}
+    {#- First episode: within the first min(interval, 24 h), hour drawn from the grant-cycle hour curve. -#}
+    {%- do S.update({'start_at':pick_start(now, now + ([params.anomaly_interval_hours, 24] | min * 3600) | int, false) | int}) -%}
+  {%- endif -%}
+  {%- do shared.update({'initialized':true, 'G':[], 'H':[], 'pool':pool, 'people':people, 'seqm':{}, 'grants':[], 'S':S}) -%}
 {%- endif -%}
-{%- set q = shared.get('q') -%}
-{%- set ctr = shared.get('ctr') -%}
+{%- set G = shared.get('G') -%}
+{%- set H = shared.get('H') -%}
+{%- set pool = shared.get('pool') -%}
+{%- set people = shared.get('people') -%}
 {%- set seqm = shared.get('seqm') -%}
+{%- set grants = shared.get('grants') -%}
+{%- set S = shared.get('S') -%}
 {%- set dba_users = dbas | map(attribute='user') | list -%}
-{%- set actors = shared.get('actors') -%}
-{%- set machines = shared.get('machines') -%}
-{%- set ep = shared.get('ep') -%}
 
-{#- Mirror of the chain matcher per DBA account: three FAILED_CONNECT, a CONNECT and a GRANT of one username, the first failure at most 1800 s before the GRANT. Every failure starts a partial match; partial matches advance on every matching record, and are all kept (no cap, no reset when a chain completes) until they expire, so no later GRANT completes a chain with records of a completed one. The chain binds no values, so the most advanced partial per first failure covers every candidate run. -#}
+{#- Mirror of the chain matcher per DBA account: three FAILED_CONNECT, a CONNECT and a GRANT of one username, the
+    first failure at most 1800 s before the GRANT. Every failure starts a partial match; partial matches advance on
+    every matching record and are all kept (no cap, no reset when a chain completes) until they expire, so no later
+    GRANT completes a chain with records of a completed one. The chain binds no values, so the most advanced
+    partial per first failure covers every candidate run. -#}
 {%- macro seqfeed(t, user, op, obj) -%}
   {%- set is_f = op == 'FAILED_CONNECT' -%}
   {%- set is_c = op == 'CONNECT' -%}
@@ -101,57 +141,70 @@
   {%- endif -%}
 {%- endmacro -%}
 
+{%- macro completes(t, user) -%}
+  {%- set gd = namespace(hit='') -%}
+  {%- for p in seqm.get(user, []) if p[0] == 4 and t - p[1] <= 1800 -%}
+    {%- set gd.hit = 'y' -%}
+  {%- endfor -%}
+  {{- gd.hit -}}
+{%- endmacro -%}
+
 {%- macro push(t, user, ip, cid, qid, op, db, obj, rc) -%}
-  {%- do q.append({'t':t, 'username':user, 'ip':ip, 'connectionid':cid, 'queryid':qid, 'operation':op, 'database':db, 'object':obj, 'retcode':rc}) -%}
+  {%- do G.append({'t':t, 'username':user, 'ip':ip, 'connectionid':cid, 'queryid':qid, 'operation':op, 'database':db, 'object':obj, 'retcode':rc}) -%}
   {%- do seqfeed(t, user, op, obj) -%}
 {%- endmacro -%}
 
+{%- macro due(t, p) -%}
+  {%- do S.update({'seq':S.seq + 1}) -%}
+  {%- do HQ.heappush(H, [t, S.seq, p]) -%}
+{%- endmacro -%}
+
+{#- A wrong password: the thread closes without entering the command loop, in the same second. -#}
 {%- macro fail(t, a) -%}
-  {%- do ctr.update({'cid':ctr.cid + 1}) -%}
-  {%- do push(t, a.user, a.ip, ctr.cid, 0, 'FAILED_CONNECT', '', '', 1045) -%}
-  {%- do push(t, a.user, a.ip, ctr.cid, 0, 'DISCONNECT', '', '', 0) -%}
+  {%- do S.update({'cid':S.cid + 1}) -%}
+  {%- do push(t, a.user, a.ip, S.cid, 0, 'FAILED_CONNECT', '', '', 1045) -%}
+  {%- do push(t, a.user, a.ip, S.cid, 0, 'DISCONNECT', '', '', 0) -%}
 {%- endmacro -%}
 
 {%- macro connect(t, a, db) -%}
-  {%- do ctr.update({'cid':ctr.cid + 1}) -%}
-  {%- do a.update({'cid':ctr.cid, 'db':db}) -%}
+  {%- do S.update({'cid':S.cid + 1}) -%}
+  {%- do a.update({'cid':S.cid, 'db':db}) -%}
   {%- do push(t, a.user, a.ip, a.cid, 0, 'CONNECT', db, '', 0) -%}
 {%- endmacro -%}
 
 {%- macro quit(t, a) -%}
   {#- COM_QUIT consumes a query id before the connection closes. -#}
-  {%- do ctr.update({'qid':ctr.qid + 1}) -%}
+  {%- do S.update({'qid':S.qid + 1}) -%}
   {%- do push(t, a.user, a.ip, a.cid, 0, 'DISCONNECT', a.db, '', 0) -%}
   {%- do a.update({'cid':none, 'db':''}) -%}
 {%- endmacro -%}
 
-{%- macro stmt(t, a, kind, table, yi=none) -%}
-  {%- do ctr.update({'qid':ctr.qid + 1}) -%}
+{%- macro stmt(t, a, kind, table, y=none) -%}
+  {%- do S.update({'qid':S.qid + 1}) -%}
   {%- set s = namespace(sql='', code=0, tables=[], tdb=ndb, op='READ') -%}
-  {%- set app = samples.tables[module.rand.number.integer(0, (samples.tables | length) - 1)].table -%}
+  {%- set app = samples.tables[N.integer(0, (samples.tables | length) - 1)].table -%}
   {%- set app = app if a.db == ndb else ndb ~ '.' ~ app -%}
   {%- set target = sdb ~ '.' ~ table -%}
-  {%- set grants = shared.get('grants') -%}
   {%- set granted = [a.user, table] in grants -%}
   {%- if kind == 'app_select' -%}
-    {%- set s.sql = 'SELECT order_id, status, total FROM ' ~ app ~ ' WHERE order_id = ' ~ module.rand.number.integer(1, 20000) -%}
+    {%- set s.sql = 'SELECT order_id, status, total FROM ' ~ app ~ ' WHERE order_id = ' ~ N.integer(1, 20000) -%}
     {%- set s.tables = [app.split('.')[-1]] -%}
   {%- elif kind == 'report' -%}
     {%- set s.sql = 'SELECT status, COUNT(*) FROM ' ~ app ~ ' GROUP BY status' -%}
     {%- set s.tables = [app.split('.')[-1]] -%}
   {%- elif kind == 'app_update' -%}
-    {%- set s.sql = 'UPDATE ' ~ app ~ " SET status = '" ~ module.rand.choice(['paid', 'shipped', 'cancelled']) ~ "' WHERE order_id = " ~ module.rand.number.integer(1, 20000) -%}
+    {%- set s.sql = 'UPDATE ' ~ app ~ " SET status = '" ~ R.choice(['paid', 'shipped', 'cancelled']) ~ "' WHERE order_id = " ~ N.integer(1, 20000) -%}
     {%- set s.tables = [app.split('.')[-1]] -%}
     {%- set s.op = 'WRITE' -%}
   {%- elif kind == 'app_insert' -%}
-    {%- set s.sql = 'INSERT INTO ' ~ app ~ " (customer_id, status, total) VALUES (" ~ module.rand.number.integer(1, 9000) ~ ", 'open', " ~ ('%.2f' | format(module.rand.number.floating(5, 900))) ~ ')' -%}
+    {%- set s.sql = 'INSERT INTO ' ~ app ~ " (customer_id, status, total) VALUES (" ~ N.integer(1, 9000) ~ ", 'open', " ~ ('%.2f' | format(N.floating(5, 900))) ~ ')' -%}
     {%- set s.tables = [app.split('.')[-1]] -%}
     {%- set s.op = 'WRITE' -%}
   {%- elif kind == 'typo' -%}
-    {%- set s.sql = module.rand.choice(['SELEC order_id FROM ' ~ app ~ ' WHERE order_id = ' ~ module.rand.number.integer(1, 20000), 'SELECT order_id, status FORM ' ~ app, 'UPDTE ' ~ app ~ " SET status = 'paid' WHERE order_id = " ~ module.rand.number.integer(1, 20000)]) -%}
+    {%- set s.sql = R.choice(['SELEC order_id FROM ' ~ app ~ ' WHERE order_id = ' ~ N.integer(1, 20000), 'SELECT order_id, status FORM ' ~ app, 'UPDTE ' ~ app ~ " SET status = 'paid' WHERE order_id = " ~ N.integer(1, 20000)]) -%}
     {%- set s.code = 1064 -%}
   {%- elif kind == 'sens_select' -%}
-    {%- set s.sql = module.rand.choice(['SELECT * FROM ' ~ target ~ ' LIMIT 100', 'SELECT * FROM ' ~ target ~ ' WHERE employee_id = ' ~ module.rand.number.integer(1, 800)]) if a.kind == 'dba' else 'SELECT * FROM ' ~ target ~ ' LIMIT 100' -%}
+    {%- set s.sql = R.choice(['SELECT * FROM ' ~ target ~ ' LIMIT 100', 'SELECT * FROM ' ~ target ~ ' WHERE employee_id = ' ~ N.integer(1, 800)]) if a.kind == 'dba' else 'SELECT * FROM ' ~ target ~ ' LIMIT 100' -%}
     {%- if a.kind == 'dba' or granted -%}
       {%- set s.tables = [table] -%}
       {%- set s.tdb = sdb -%}
@@ -160,12 +213,11 @@
     {%- endif -%}
   {%- elif kind == 'sens_update' -%}
     {%- if a.kind != 'dba' -%}{{- module.builtins.int('MariaDB sensitive update requires a DBA') -}}{%- endif -%}
-    {%- set s.sql = 'UPDATE ' ~ target ~ ' SET last_reviewed = CURRENT_DATE WHERE employee_id = ' ~ module.rand.number.integer(1, 800) -%}
+    {%- set s.sql = 'UPDATE ' ~ target ~ ' SET last_reviewed = CURRENT_DATE WHERE employee_id = ' ~ N.integer(1, 800) -%}
     {%- set s.tables = [table] -%}
     {%- set s.tdb = sdb -%}
     {%- set s.op = 'WRITE' -%}
   {%- elif kind in ['grant', 'revoke'] -%}
-    {%- set y = actors[yi] -%}
     {%- if (kind == 'grant' and grants | selectattr(0, 'equalto', y.user) | list) or (kind == 'revoke' and ([y.user, table] not in grants or y.cid is not none)) -%}
       {{- module.builtins.int('MariaDB grant/revoke lifecycle precondition failed') -}}
     {%- endif -%}
@@ -181,204 +233,290 @@
   {%- endif -%}
   {%- if s.sql.encode('utf-8') | length > 512 -%}{{- module.builtins.int('MariaDB selected SQL exceeds nontruncating byte ceiling') -}}{%- endif -%}
   {%- for tb in s.tables -%}
-    {%- do push(t, a.user, a.ip, a.cid, ctr.qid, s.op, s.tdb, tb, none) -%}
+    {%- do push(t, a.user, a.ip, a.cid, S.qid, s.op, s.tdb, tb, none) -%}
   {%- endfor -%}
-  {%- do push(t, a.user, a.ip, a.cid, ctr.qid, 'QUERY', a.db, s.sql, s.code) -%}
+  {%- do push(t, a.user, a.ip, a.cid, S.qid, 'QUERY', a.db, s.sql, s.code) -%}
 {%- endmacro -%}
 
-{%- macro ln(median, sigma) -%}{{- [1, module.rand.number.lognormal(module.math.log(median), sigma) | round | int] | max -}}{%- endmacro -%}
+{%- macro ln(median, sigma) -%}{{- [1, N.lognormal(module.math.log(median), sigma) | round | int] | max -}}{%- endmacro -%}
 
-{%- macro think(mean) -%}{{- [1, module.rand.number.exponential(1 / mean) | round | int] | max -}}{%- endmacro -%}
+{%- macro think(mean) -%}{{- [1, N.exponential(1 / mean) | round | int] | max -}}{%- endmacro -%}
 
-{#- Credential failures: a first attempt fails with probability p0, each retry fails again with probability 0.4, up to five failures. Human logins sometimes give up; the maintenance DBA keeps retrying. -#}
-{%- macro miss(p) -%}{{- 'y' if module.rand.number.floating(0, 1) < p else '' -}}{%- endmacro -%}
+{%- macro miss(p) -%}{{- 'y' if N.floating(0, 1) < p else '' -}}{%- endmacro -%}
 
-{%- if not q -%}
-  {%- set pick = namespace(i=-1, t=0) -%}
-  {%- for a in actors -%}
-    {%- if a.mode != 'maint' and (pick.i < 0 or a.next < pick.t) -%}
-      {%- set pick.i = loop.index0 -%}
-      {%- set pick.t = a.next -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {#- Grant maintenance: occurrences arrive as a Poisson process (exponential spacing between starts, mean 90 min) and each runs as its own grant cycle, so two can overlap on different DBAs and delegates. An episode is one more cycle started at its own scheduled time; it never moves a maintenance. -#}
-  {%- set ev = namespace(kind='actor', t=pick.t, m=none) -%}
-  {%- for mc in machines if mc.next < ev.t -%}
-    {%- set ev.kind = 'mach' -%}
-    {%- set ev.t = mc.next -%}
-    {%- set ev.m = mc -%}
-  {%- endfor -%}
-  {%- if shared.get('arr') < ev.t -%}
-    {%- set ev.kind = 'arr' -%}
-    {%- set ev.t = shared.get('arr') -%}
-  {%- endif -%}
-  {%- if ep.next is not none and ep.next < ev.t -%}
-    {%- set ev.kind = 'ep' -%}
-    {%- set ev.t = ep.next -%}
-  {%- endif -%}
-  {%- set t = ev.t -%}
-  {%- set ma = ev.kind == 'mach' -%}
-  {%- if t <= now and ev.kind in ['arr', 'ep'] -%}
-    {%- do shared.set('mid', shared.get('mid') + 1) -%}
-    {%- do machines.append({'id':shared.get('mid'), 'phase':'idle', 'next':t, 'x':none, 'y':none, 'table':none, 'episode':ev.kind == 'ep', 'fails':0, 'reads':0, 'aborted':false}) -%}
-    {%- if ev.kind == 'arr' -%}
-      {%- do shared.set('arr', t + (module.rand.number.exponential(1 / 5400) | int)) -%}
+{#- A person's session. Credential failures: a first attempt fails with probability 0.06 (DBA) or 0.05 (delegate),
+    each retry with 0.3, up to five failures, and after each failure the person gives up with probability 0.12.
+    2% of a DBA's sessions start from a client with a stale saved password that retries it 2 to 5 times within
+    seconds; the DBA then logs in by hand (60%) or leaves it. -#}
+{%- macro session(t, p) -%}
+  {%- set a = p.a -%}
+  {%- if p.st == 'burst' -%}
+    {%- do fail(t, a) -%}
+    {%- do p.update({'burst':p.burst - 1}) -%}
+    {%- if p.burst > 0 -%}
+      {%- do due(t + ln(4, 0.5) | int, p) -%}
+    {%- elif miss(0.6) -%}
+      {%- do p.update({'st':'connect'}) -%}
+      {%- do due(t + ln(20, 0.6) | int, p) -%}
     {%- else -%}
-      {%- do ep.update({'next':none}) -%}
+      {%- do a.update({'busy':false}) -%}
     {%- endif -%}
-  {%- elif t <= now and ma -%}
-    {%- set m = ev.m -%}
-    {%- set ph = m.phase -%}
-    {%- set x = actors[m.x] if m.x is not none else none -%}
-    {%- set y = actors[m.y] if m.y is not none else none -%}
-    {%- if ph == 'idle' -%}
-      {%- set episode = m.episode -%}
-      {%- set cand = [] -%}
-      {%- for xi in range(actors | length) if actors[xi].kind == 'dba' and actors[xi].mode == 'idle' -%}
-        {%- for yi in range(actors | length) if actors[yi].kind == 'dlg' and actors[yi].mode == 'idle' -%}
-          {%- for tb in stables if not episode or [actors[xi].user, tb] != ep.prev -%}
-            {%- do cand.append([xi, yi, tb]) -%}
-          {%- endfor -%}
-        {%- endfor -%}
-      {%- endfor -%}
-      {%- if not cand -%}
-        {%- do m.update({'next':t + think(60) | int}) -%}
-      {%- else -%}
-        {%- set c = module.rand.choice(cand) -%}
-        {%- do actors[c[0]].update({'mode':'maint'}) -%}
-        {%- do actors[c[1]].update({'mode':'maint'}) -%}
-        {%- do m.update({'phase':'dba_login', 'next':t, 'x':c[0], 'y':c[1], 'table':c[2], 'fails':(3 if module.rand.number.floating(0, 1) < 0.7 else 4) if episode else 0, 'mfails':0}) -%}
-        {%- if episode -%}
-          {#- Next start: uniform in a window of width w = min(interval / 4, 6 h) centred one interval after this actual start. -#}
-          {%- set w = [params.anomaly_interval_hours / 4, 6] | min * 3600 -%}
-          {%- do ep.update({'prev':[actors[c[0]].user, c[2]], 'next':t + (params.anomaly_interval_hours * 3600 + module.rand.number.floating(-w / 2, w / 2)) | int}) -%}
-        {%- endif -%}
-      {%- endif -%}
-    {%- elif ph == 'dba_login' -%}
-      {%- if m.fails > 0 -%}
-        {%- do fail(t, x) -%}
-        {%- do m.update({'fails':m.fails - 1, 'next':t + ln(8, 0.5) | int}) -%}
-      {%- elif not m.episode and m.get('mfails', 0) < 5 and miss(0.10 if m.get('mfails', 0) == 0 else 0.4) -%}
-        {%- do fail(t, x) -%}
-        {%- do m.update({'mfails':m.get('mfails', 0) + 1, 'next':t + ln(8, 0.5) | int}) -%}
-      {%- else -%}
-        {%- do connect(t, x, sdb) -%}
-        {%- do m.update({'phase':'grant', 'mfails':0, 'next':t + ln(25, 0.9) | int}) -%}
-      {%- endif -%}
-    {%- elif ph == 'grant' -%}
-      {%- set gd = namespace(hit=false) -%}
-      {%- for p in seqm.get(x.user, []) if p[0] == 4 and t - p[1] <= 1800 -%}
-        {%- set gd.hit = true -%}
-      {%- endfor -%}
-      {%- if not m.episode and gd.hit -%}
-        {#- Guard (both modes): an ordinary GRANT that would complete the chain (three failures, login, GRANT of this DBA within 1800 s of the first failure) is not issued. Nothing is granted, read or revoked; the DBA disconnects and the delegate stays idle. -#}
-        {%- do m.update({'phase':'dba_quit', 'aborted':true, 'next':t + ln(25, 0.9) | int}) -%}
-      {%- else -%}
-        {%- do stmt(t, x, 'grant', m.table, m.y) -%}
-        {%- do m.update({'phase':'dlg_login', 'next':t + ln(120, 0.6) | int}) -%}
-      {%- endif -%}
-    {%- elif ph in ['dlg_login', 'deny_login'] -%}
-      {%- if m.get('mfails', 0) < 2 and miss(0.08 if m.get('mfails', 0) == 0 else 0.4) -%}
-        {%- do fail(t, y) -%}
-        {%- do m.update({'mfails':m.get('mfails', 0) + 1, 'next':t + ln(8, 0.5) | int}) -%}
-      {%- else -%}
-        {%- do connect(t, y, sdb if ph == 'dlg_login' else ndb) -%}
-        {%- do m.update({'phase':'dlg_read' if ph == 'dlg_login' else 'deny_query', 'mfails':0, 'reads':1 + ([module.rand.number.exponential(1) | int, 4] | min), 'next':t + ln(25, 0.9) | int}) -%}
-      {%- endif -%}
-    {%- elif ph in ['dlg_read', 'deny_query'] -%}
-      {%- do stmt(t, y, 'sens_select', m.table) -%}
-      {%- do m.update({'reads':m.reads - 1, 'next':t + ln(25, 0.9) | int}) -%}
-      {%- if ph == 'deny_query' or m.reads <= 0 -%}
-        {%- do m.update({'phase':'dlg_quit' if ph == 'dlg_read' else 'deny_quit'}) -%}
-      {%- endif -%}
-    {%- elif ph == 'dlg_quit' -%}
-      {%- do quit(t, y) -%}
-      {%- do m.update({'phase':'revoke', 'next':t + ln(45, 0.6) | int}) -%}
-    {%- elif ph == 'revoke' -%}
-      {%- do stmt(t, x, 'revoke', m.table, m.y) -%}
-      {%- do m.update({'phase':'dba_quit', 'next':t + ln(25, 0.9) | int}) -%}
-    {%- elif ph == 'dba_quit' -%}
-      {%- do quit(t, x) -%}
-      {%- do x.update({'mode':'idle', 'next':[x.next, t + ln(300, 0.6) | int] | max}) -%}
-      {%- if m.get('aborted') -%}
-        {%- do y.update({'mode':'idle', 'next':[y.next, t + ln(300, 0.6) | int] | max}) -%}
-        {%- do machines.pop((machines | map(attribute='id') | list).index(m.id)) -%}
-      {%- else -%}
-        {%- do m.update({'phase':'deny_login', 'next':t + ln(200, 0.7) | int}) -%}
-      {%- endif -%}
-    {%- elif ph == 'deny_quit' -%}
-      {%- do quit(t, y) -%}
-      {%- do y.update({'mode':'idle', 'next':[y.next, t + ln(300, 0.6) | int] | max}) -%}
-      {%- do machines.pop((machines | map(attribute='id') | list).index(m.id)) -%}
-    {%- endif -%}
-  {%- elif t <= now -%}
-    {%- set a = actors[pick.i] -%}
-    {%- if a.kind == 'pool' -%}
-      {%- if a.cid is none -%}
-        {%- if miss(0.004) -%}
-          {%- do fail(t, a) -%}
-          {%- do a.update({'next':t + ln(3, 0.5) | int}) -%}
-        {%- else -%}
-          {%- do connect(t, a, ndb) -%}
-          {%- do a.update({'expire':t + ln(1800, 0.4) | int, 'next':t + think(28) | int}) -%}
-        {%- endif -%}
-      {%- elif t >= a.expire -%}
-        {%- do quit(t, a) -%}
-        {%- do a.update({'next':t + (module.rand.number.exponential(1 / 1.5) | round | int)}) -%}
-      {%- else -%}
-        {%- do stmt(t, a, module.rand.weighted_choice({'app_select':65, 'app_update':25, 'app_insert':10}), none) -%}
-        {%- do a.update({'next':t + think(28) | int}) -%}
-      {%- endif -%}
-    {%- elif a.mode == 'burst' -%}
+  {%- elif p.st in ['login', 'connect'] -%}
+    {%- if p.st == 'login' and p.tries < 5 and miss((0.06 if a.kind == 'dba' else 0.05) if p.tries == 0 else 0.3) -%}
       {%- do fail(t, a) -%}
-      {%- if a.burst > 1 -%}
-        {%- do a.update({'burst':a.burst - 1, 'next':t + ln(4, 0.5) | int}) -%}
-      {%- elif miss(0.6) -%}
-        {#- The person notices, types the right password and logs in. -#}
-        {%- do a.update({'mode':'retry', 'tries':5, 'burst':0, 'next':t + ln(20, 0.6) | int}) -%}
+      {%- do p.update({'tries':p.tries + 1}) -%}
+      {%- if miss(0.12) -%}
+        {%- do a.update({'busy':false}) -%}
       {%- else -%}
-        {%- do a.update({'mode':'idle', 'tries':0, 'burst':0, 'next':t + ln(1500, 0.8) | int}) -%}
+        {%- do due(t + ln(8, 0.5) | int, p) -%}
       {%- endif -%}
-    {%- elif a.mode in ['idle', 'retry'] -%}
-      {%- set db = a.get('retry_db', ndb) if a.mode == 'retry' else (sdb if a.kind == 'dba' and module.rand.number.floating(0, 1) < 0.4 else ndb) -%}
-      {#- Stale saved credentials: 8% of a DBA's own logins come from a client that retries a stale saved password 3 to 6 times within seconds; the DBA then logs in by hand (60%) or leaves it for later. -#}
-      {%- if a.mode == 'idle' and a.kind == 'dba' and miss(0.08) -%}
-        {%- do fail(t, a) -%}
-        {%- do a.update({'mode':'burst', 'burst':module.rand.weighted_choice({2:50, 3:30, 4:15, 5:5}), 'retry_db':db, 'tries':0, 'next':t + ln(4, 0.5) | int}) -%}
-      {%- elif a.get('tries', 0) < 5 and miss((0.10 if a.kind == 'dba' else 0.08) if a.mode == 'idle' else 0.4) -%}
-        {%- do fail(t, a) -%}
-        {%- if miss(0.12) -%}
-          {%- do a.update({'mode':'idle', 'tries':0, 'next':t + ln(1500, 0.8) | int}) -%}
-        {%- else -%}
-          {%- do a.update({'mode':'retry', 'retry_db':db, 'tries':a.get('tries', 0) + 1, 'next':t + ln(8, 0.5) | int}) -%}
-        {%- endif -%}
-      {%- else -%}
-        {%- do connect(t, a, db) -%}
-        {%- do a.update({'mode':'session', 'tries':0, 'left':1 + ([module.rand.number.exponential(1 / 2.5) | int, 19] | min), 'next':t + ln(25, 0.9) | int}) -%}
-      {%- endif -%}
-    {%- elif a.left > 0 -%}
-      {%- if a.kind == 'dba' and a.db == sdb -%}
-        {%- set kind = module.rand.weighted_choice({'sens_select':60, 'sens_update':35, 'typo':5}) -%}
-      {%- elif a.kind == 'dba' -%}
-        {%- set kind = module.rand.weighted_choice({'app_select':35, 'app_update':15, 'sens_select':20, 'sens_update':15, 'report':10, 'typo':5}) -%}
-      {%- else -%}
-        {%- set kind = module.rand.weighted_choice({'report':55, 'app_select':35, 'sens_select':6, 'typo':4}) -%}
-      {%- endif -%}
-      {%- do stmt(t, a, kind, module.rand.choice(stables)) -%}
-      {%- do a.update({'left':a.left - 1, 'next':t + ln(25, 0.9) | int}) -%}
     {%- else -%}
-      {%- do quit(t, a) -%}
-      {%- do a.update({'mode':'idle', 'next':t + ln(1800 if a.kind == 'dba' else 2400, 1.0) | int}) -%}
+      {%- do connect(t, a, p.db) -%}
+      {%- do p.update({'st':'stmt', 'left':1 + ([N.exponential(1 / 2.5) | int, 19] | min)}) -%}
+      {%- do due(t + ln(25, 0.9) | int, p) -%}
+    {%- endif -%}
+  {%- elif p.left > 0 -%}
+    {%- if a.kind == 'dba' and a.db == sdb -%}
+      {%- set kind = R.weighted_choice({'sens_select':60, 'sens_update':35, 'typo':5}) -%}
+    {%- elif a.kind == 'dba' -%}
+      {%- set kind = R.weighted_choice({'app_select':35, 'app_update':15, 'sens_select':20, 'sens_update':15, 'report':10, 'typo':5}) -%}
+    {%- else -%}
+      {%- set kind = R.weighted_choice({'report':55, 'app_select':35, 'sens_select':6, 'typo':4}) -%}
+    {%- endif -%}
+    {%- do stmt(t, a, kind, R.choice(stables)) -%}
+    {%- do p.update({'left':p.left - 1}) -%}
+    {%- do due(t + ln(25, 0.9) | int, p) -%}
+  {%- else -%}
+    {%- do quit(t, a) -%}
+    {%- do a.update({'busy':false}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro open_session(t, a) -%}
+  {%- do a.update({'busy':true}) -%}
+  {%- set p = {'k':'sess', 'a':a, 'st':'login', 'tries':0, 'burst':0, 'left':0, 'db':sdb if a.kind == 'dba' and miss(0.4) else ndb} -%}
+  {%- if a.kind == 'dba' and miss(0.02) -%}
+    {%- do p.update({'st':'burst', 'burst':R.weighted_choice({2:50, 3:30, 4:15, 5:5})}) -%}
+  {%- endif -%}
+  {%- do session(t, p) -%}
+{%- endmacro -%}
+
+{#- A people timestamp: an idle DBA (weight 1.6) or delegate (weight 1) opens a session. -#}
+{%- macro people_start(t) -%}
+  {%- set idle = [] -%}
+  {%- set w = [] -%}
+  {%- for a in people if not a.busy -%}
+    {%- do idle.append(a) -%}
+    {%- do w.append(1.6 if a.kind == 'dba' else 1.0) -%}
+  {%- endfor -%}
+  {%- if idle -%}
+    {%- do open_session(t, R.weighted_choice(idle, w)) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Grant cycle: a DBA temporarily grants a delegate SELECT on one sensitive table; the delegate connects, reads
+    and disconnects; the DBA revokes and disconnects; the delegate's next attempt is denied with 1142. It takes a
+    DBA and a delegate who are idle, drawn at random with the table, and waits about a minute at a time while no
+    pair is idle (an ordinary cycle gives up after 30 tries). A DBA takes no cycle within 1800 s of its previous
+    GRANT. An episode is the same cycle whose DBA login is preceded by three or four wrong passwords; it avoids the
+    previous episode's DBA and table. Its first failure precedes its GRANT, so the chain window has closed before
+    its DBA can take the next cycle, and the DBA leaves the episode as it leaves any cycle. -#}
+{%- macro cycle_idle(t, m) -%}
+  {%- set cand = [] -%}
+  {%- for xa in people if xa.kind == 'dba' and not xa.busy and xa.free <= t -%}
+    {%- for ya in people if ya.kind == 'dlg' and not ya.busy -%}
+      {%- for tb in stables if not m.ep or [xa.user, tb] != S.prev -%}
+        {%- do cand.append([xa, ya, tb]) -%}
+      {%- endfor -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- if not cand -%}
+    {%- do m.update({'tries':m.tries + 1}) -%}
+    {%- if not m.ep and m.tries > 30 -%}
+      {%- do S.update({'nm':S.nm - 1}) -%}
+    {%- else -%}
+      {%- do due(t + think(60) | int, m) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set c = R.choice(cand) -%}
+    {%- do c[0].update({'busy':true}) -%}
+    {%- do c[1].update({'busy':true}) -%}
+    {%- do m.update({'st':'dba_login', 'x':c[0], 'y':c[1], 'table':c[2], 'fails':(3 if miss(0.7) else 4) if m.ep else 0}) -%}
+    {%- if m.ep -%}
+      {#- Next start: due one interval after this actual start, in a window of width w = min(interval / 4, 6 h)
+          centred on the due time, weighted by the squared hour curve plus a floor. -#}
+      {%- set iv = (params.anomaly_interval_hours * 3600) | int -%}
+      {%- set half = (([params.anomaly_interval_hours / 4, 6] | min) * 1800) | int -%}
+      {%- do S.update({'prev':[c[0].user, c[2]], 'start_at':pick_start(t + iv - half, t + iv + half, true) | int}) -%}
     {%- endif -%}
   {%- endif -%}
+{%- endmacro -%}
+
+{%- macro cycle(t, m) -%}
+  {%- if m.st == 'idle' -%}
+    {%- do cycle_idle(t, m) -%}
+  {%- endif -%}
+  {%- set ph = m.st -%}
+  {%- set x = m.x -%}
+  {%- set y = m.y -%}
+  {%- if ph == 'dba_login' -%}
+    {%- if m.fails > 0 -%}
+      {%- do fail(t, x) -%}
+      {%- do m.update({'fails':m.fails - 1}) -%}
+      {%- do due(t + ln(8, 0.5) | int, m) -%}
+    {%- elif not m.ep and m.mf < 5 and miss(0.06 if m.mf == 0 else 0.3) -%}
+      {%- do fail(t, x) -%}
+      {%- do m.update({'mf':m.mf + 1}) -%}
+      {%- do due(t + ln(8, 0.5) | int, m) -%}
+    {%- else -%}
+      {%- do connect(t, x, sdb) -%}
+      {%- do m.update({'st':'grant', 'mf':0}) -%}
+      {%- do due(t + ln(25, 0.9) | int, m) -%}
+    {%- endif -%}
+  {%- elif ph == 'grant' -%}
+    {%- if not m.ep and completes(t, x.user) -%}
+      {#- Guard (both modes): an ordinary GRANT that would complete the chain (three failures, login, GRANT of this
+          DBA within 1800 s of the first failure) is not issued. The DBA works on the sensitive tables as in an
+          ordinary session instead, from this statement on, and the delegate stays idle. -#}
+      {%- do S.update({'guard':S.guard + 1, 'nm':S.nm - 1}) -%}
+      {%- do y.update({'busy':false}) -%}
+      {%- do session(t, {'k':'sess', 'a':x, 'st':'stmt', 'tries':0, 'burst':0, 'left':1 + ([N.exponential(1 / 2.5) | int, 19] | min), 'db':sdb}) -%}
+    {%- else -%}
+      {%- do stmt(t, x, 'grant', m.table, y) -%}
+      {%- do x.update({'free':t + 1800}) -%}
+      {%- do m.update({'st':'dlg_login'}) -%}
+      {%- do due(t + ln(120, 0.6) | int, m) -%}
+    {%- endif -%}
+  {%- elif ph in ['dlg_login', 'deny_login'] -%}
+    {%- if m.mf < 2 and miss(0.05 if m.mf == 0 else 0.3) -%}
+      {%- do fail(t, y) -%}
+      {%- do m.update({'mf':m.mf + 1}) -%}
+      {%- do due(t + ln(8, 0.5) | int, m) -%}
+    {%- else -%}
+      {%- do connect(t, y, sdb if ph == 'dlg_login' else ndb) -%}
+      {%- do m.update({'st':'dlg_read' if ph == 'dlg_login' else 'deny_query', 'mf':0, 'reads':1 + ([N.exponential(1) | int, 4] | min)}) -%}
+      {%- do due(t + ln(25, 0.9) | int, m) -%}
+    {%- endif -%}
+  {%- elif ph in ['dlg_read', 'deny_query'] -%}
+    {%- do stmt(t, y, 'sens_select', m.table) -%}
+    {%- do m.update({'reads':m.reads - 1}) -%}
+    {%- if ph == 'deny_query' or m.reads <= 0 -%}
+      {%- do m.update({'st':'dlg_quit' if ph == 'dlg_read' else 'deny_quit'}) -%}
+    {%- endif -%}
+    {%- do due(t + ln(25, 0.9) | int, m) -%}
+  {%- elif ph == 'dlg_quit' -%}
+    {%- do quit(t, y) -%}
+    {%- do m.update({'st':'revoke'}) -%}
+    {%- do due(t + ln(45, 0.6) | int, m) -%}
+  {%- elif ph == 'revoke' -%}
+    {%- do stmt(t, x, 'revoke', m.table, y) -%}
+    {%- do m.update({'st':'dba_quit'}) -%}
+    {%- do due(t + ln(25, 0.9) | int, m) -%}
+  {%- elif ph == 'dba_quit' -%}
+    {%- do quit(t, x) -%}
+    {%- do x.update({'busy':false}) -%}
+    {%- do m.update({'st':'deny_login'}) -%}
+    {%- do due(t + ln(200, 0.7) | int, m) -%}
+  {%- elif ph == 'deny_quit' -%}
+    {%- do quit(t, y) -%}
+    {%- do y.update({'busy':false}) -%}
+    {%- if not m.ep -%}
+      {%- do S.update({'nm':S.nm - 1}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro cycle_start(t, ep) -%}
+  {%- if ep or S.nm < 6 -%}
+    {%- if not ep -%}
+      {%- do S.update({'nm':S.nm + 1}) -%}
+    {%- endif -%}
+    {%- do cycle(t, {'k':'cycle', 'ep':ep, 'st':'idle', 'x':none, 'y':none, 'table':none, 'fails':0, 'mf':0, 'reads':0, 'tries':0}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Application pool: a statement on a random open pooled connection (65% point SELECT, 25% UPDATE, 10% INSERT on
+    a random table and row). A connection is retired after a lognormal lifetime (median 30 minutes) and reopened
+    about 1.5 s later; 0.4% of reopens fail once with a wrong password. -#}
+{%- macro reopen(t, c) -%}
+  {%- if miss(0.004) -%}
+    {%- do fail(t, c) -%}
+    {%- do c.update({'reup':t + ln(3, 0.5) | int}) -%}
+  {%- else -%}
+    {%- do connect(t, c, ndb) -%}
+    {%- do c.update({'up':true, 'expire':t + ln(1800, 0.4) | int}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro app(t) -%}
+  {%- set r = namespace(down=none, ups=[]) -%}
+  {%- for c in pool -%}
+    {%- if c.up -%}
+      {%- do r.ups.append(c) -%}
+    {%- elif r.down is none or c.reup < r.down.reup -%}
+      {%- set r.down = c -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if r.down is not none and (r.down.reup <= t or not r.ups) -%}
+    {%- do reopen(t, r.down) -%}
+  {%- else -%}
+    {%- set c = R.choice(r.ups) -%}
+    {%- if t >= c.expire -%}
+      {%- do quit(t, c) -%}
+      {%- do c.update({'up':false, 'reup':t + think(1.5) | int}) -%}
+    {%- else -%}
+      {%- do stmt(t, c, R.weighted_choice({'app_select':65, 'app_update':25, 'app_insert':10}), none) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro run(t, p) -%}
+  {%- if p.k == 'sess' -%}
+    {%- do session(t, p) -%}
+  {%- elif p.k == 'cycle' -%}
+    {%- do cycle(t, p) -%}
+  {%- elif p.k == 'people' -%}
+    {%- do people_start(t) -%}
+  {%- elif p.k == 'maint' -%}
+    {%- do cycle_start(t, false) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Episode start, by source time: one more grant cycle queued at this timestamp. Missed intervals are not
+    replayed. -#}
+{%- if params.anomaly_mode and S.start_at is not none and now >= S.start_at -%}
+  {%- do S.update({'start_at':none}) -%}
+  {%- do due(now, {'k':'cycle', 'ep':true, 'st':'idle', 'x':none, 'y':none, 'table':none, 'fails':0, 'mf':0, 'reads':0, 'tries':0}) -%}
 {%- endif -%}
-{%- if not q or q[0].t > now -%}
-  {%- do dispatch.drop() -%}
+
+{#- 2. One record for this timestamp: records of an earlier second first; a people or maint timestamp that meets
+    such records queues its start instead. -#}
+{%- set kind = 'people' if 'people' in tags else 'maint' if 'maint' in tags else 'app' -%}
+{%- if kind != 'app' -%}
+  {%- if G -%}
+    {%- do due(now, {'k':kind}) -%}
+  {%- elif kind == 'people' -%}
+    {%- do people_start(now) -%}
+  {%- else -%}
+    {%- do cycle_start(now, false) -%}
+  {%- endif -%}
 {%- endif -%}
-{%- set head = q.pop(0) -%}
-{%- if q | length > 4 or seqm | length > 4 or actors | length > 11 or machines | length > 12 -%}
-  {{- module.builtins.int('MariaDB bounded state exceeded selected profile') -}}
+{%- for _ in range(64) -%}
+  {%- if G -%}
+    {%- break -%}
+  {%- elif H and H[0][0] <= now -%}
+    {%- do run(now, HQ.heappop(H)[2]) -%}
+  {%- else -%}
+    {%- do app(now) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if not G or G | length > 8 or H | length > 64 or grants | length > 16 -%}
+  {{- module.builtins.int('MariaDB record missing or bounded state exceeded') -}}
 {%- endif -%}
+{%- for u in seqm if seqm[u] | length > 64 -%}
+  {{- module.builtins.int('MariaDB chain mirror state exceeded') -}}
+{%- endfor -%}
+{%- set head = G.pop(0) -%}
 {%- set record = {'time':module.datetime.datetime.fromtimestamp(head.t, module.datetime.timezone.utc), 'username':head.username, 'ip':head.ip, 'connectionid':head.connectionid, 'queryid':head.queryid, 'operation':head.operation, 'database':head.database, 'object':head.object, 'retcode':head.retcode} -%}
 {%- set native_time = record.time.strftime('%Y%m%d %H:%M:%S') -%}
 {%- set object_wire = record.object -%}
