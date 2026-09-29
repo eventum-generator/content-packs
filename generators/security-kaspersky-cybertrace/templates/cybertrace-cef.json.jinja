@@ -1,13 +1,14 @@
 {#- Kaspersky CyberTrace 4.0 detection events in the ArcSight CEF pattern,
-    wrapped in ECS JSON. One input tick per second; each tick emits the
-    earliest due detection, stamped with its own microsecond time, or
-    drops. Every endpoint runs its own incident process: lognormal gaps
-    between incidents, and inside an incident URL matches with retries,
-    downloads (URL, file hash, further contacts), hash-first detections,
-    phishing redirects and beacon-like repeats. Times are microseconds. -#}
+    wrapped in ECS JSON. Every input timestamp yields one detection: the
+    earliest queued detection that is due, stamped with its own time,
+    or else the first detection of a new incident of the timestamp's
+    population (tag `svc`: service-account endpoints, otherwise user
+    endpoints), stamped with the input time. An incident is URL matches
+    with retries, a download (URL, file hash, further contacts), a
+    hash-first detection, a phishing redirect or beacon-like repeats;
+    its later detections are queued. Times are microseconds. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
-{%- if shared.get('queue') is not none and (not shared.get('queue') or shared.get('queue')[0][0] > now) -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set hq = module.heapq -%}
 {%- set sec = 1000000 -%}
 {%- set hour = 3600 * sec -%}
@@ -16,11 +17,13 @@
 {%- set within = hour -%}
 {#- Recent URLs of an endpoint that a new episode avoids. -#}
 {%- set recent_window = 2 * hour -%}
-{#- Incident opportunities per day over all endpoints; user endpoints
-    take up an opportunity with an hour-of-day probability (UTC business
-    hours), service accounts always. -#}
-{%- set incidents_per_day = 260 -%}
+{#- Relative detection rate of user endpoints per UTC hour, as set by
+    the user input patterns; service accounts are flat. -#}
 {%- set diurnal = [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.6, 0.6, 0.6, 0.3, 0.3, 0.3, 0.3] -%}
+{#- An episode uses an endpoint and user with at least this effective
+    weight (per-user weight, user endpoints scaled by the mean diurnal
+    factor 0.66), about 1.4 incidents a day. -#}
+{%- set min_pair_w = 0.65 -%}
 {%- macro ln(med, sig) -%}
   {#- Lognormal seconds with median med; returns microseconds. -#}
   {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
@@ -121,7 +124,6 @@
   {%- for r in samples.endpoints -%}
     {%- do eps.append({'ip': r.ip, 'users': r.users.split(' '), 'w': r.weight | float, 'eid': module.rand.number.integer(100000, 9000000), 'hist': [], 'remap': {}, 'seqm': {}}) -%}
   {%- endfor -%}
-  {%- set lists = {} -%}
   {%- set fields = {
     'mal': ['url', 'mask', 'domain', 'dst', 'category', 'threat', 'first_seen', 'last_seen', 'popularity', 'weight'],
     'phi': ['url', 'mask', 'domain', 'dst', 'industry', 'first_seen', 'last_seen', 'popularity', 'weight'],
@@ -137,16 +139,25 @@
   {%- endfor -%}
   {%- do shared.update({'eps': eps, 'ep_last_a': none, 'ep_last_x': none, 'ep_last_h': none}) -%}
   {%- set total_w = eps | sum(attribute='w') -%}
+  {%- set pairs = [] -%}
   {%- for a in range(eps | length) -%}
-    {#- Mean gap from the endpoint's share; lognormal sigma 1.1. The
-        first opportunity is a uniform point of a length-biased gap
-        (median scaled by exp(sigma^2)), so the run starts stationary. -#}
-    {%- set mean_s = 86400 * total_w / (incidents_per_day * eps[a].w) -%}
-    {%- do eps[a].update({'med': mean_s * module.math.exp(-0.605), 'svc': eps[a].users[0].startswith('svc-')}) -%}
-    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(eps[a].med * module.math.exp(1.21), 1.1) | int)), {'k': 'inc', 'a': a}) -}}
+    {%- do eps[a].update({'svc': eps[a].users[0].startswith('svc-')}) -%}
+    {%- set pw = eps[a].w / (eps[a].users | length) -%}
+    {%- if pw * (1 if eps[a].svc else 0.66) >= min_pair_w -%}
+      {%- for u in eps[a].users -%}{%- do pairs.append({'a': a, 'u': u, 'w': pw, 'svc': eps[a].svc}) -%}{%- endfor -%}
+    {%- endif -%}
   {%- endfor -%}
-  {#- Relative incident rate per UTC hour: service accounts flat, user
-      endpoints thinned by the diurnal factor. -#}
+  {#- Incident starts pick an endpoint of the timestamp's population in
+      proportion to its weight. -#}
+  {%- for key, sel in [('svc', true), ('usr', false)] -%}
+    {%- set idx = [] -%}
+    {%- set w = [] -%}
+    {%- for a in range(eps | length) if eps[a].svc == sel -%}{%- do idx.append(a) -%}{%- do w.append(eps[a].w) -%}{%- endfor -%}
+    {%- do shared.update({key ~ '_idx': idx, key ~ '_w': w}) -%}
+  {%- endfor -%}
+  {%- do shared.set('pairs', pairs) -%}
+  {#- Relative detection rate per UTC hour: service accounts flat, user
+      endpoints scaled by the diurnal factor (the input curve). -#}
   {%- set svc_w = eps | selectattr('svc') | sum(attribute='w') -%}
   {%- set curve = [] -%}
   {%- for h in range(24) -%}{%- do curve.append(svc_w + (total_w - svc_w) * diurnal[h]) -%}{%- endfor -%}
@@ -165,26 +176,26 @@
 {%- for _ in range(500) if out.item is none and q and q[0][0] <= now -%}
   {%- set top = hq.heappop(q) -%}
   {%- set it = top[2] -%}
-  {%- if it.k == 'inc' -%}
-    {%- set hr = module.datetime.datetime.fromtimestamp(top[0] / 1000000, module.datetime.timezone.utc).hour -%}
-    {%- if eps[it.a].svc or module.rand.chance(diurnal[hr]) -%}{{- incident(it.a, top[0]) -}}{%- endif -%}
-    {{- push(top[0] + (ln(eps[it.a].med, 1.1) | int), it) -}}
-  {%- elif it.k == 'ep' -%}
+  {%- if it.k == 'ep' -%}
     {#- Episode: URL match, a file hash from the same endpoint and user,
         then the same URL again. Actor and objects rotate. The next
         start is drawn in a window of width w = min(interval / 4, 6 h)
         centred one interval after this start, weighted by the squared
         incident rate of the hour plus a floor. -#}
     {%- set start = top[0] -%}
-    {%- set a = namespace(v=shared.get('ep_last_a')) -%}
-    {%- for _ in range(50) if a.v == shared.get('ep_last_a') -%}{%- set a.v = module.rand.number.integer(0, eps | length - 1) -%}{%- endfor -%}
+    {%- set hr = module.datetime.datetime.fromtimestamp(start / 1000000, module.datetime.timezone.utc).hour -%}
+    {%- set pairs = shared.get('pairs') -%}
+    {%- set pw = [] -%}
+    {%- for p in pairs -%}{%- do pw.append(0 if p.a == shared.get('ep_last_a') else p.w * (1 if p.svc else diurnal[hr])) -%}{%- endfor -%}
+    {%- set pr = pairs[module.rand.weighted_choice(range(pairs | length) | list, pw)] -%}
+    {%- set a = namespace(v=pr.a) -%}
     {%- set ep = eps[a.v] -%}
     {%- set recent = ep.hist | map(attribute=2) | list -%}
     {%- set x = namespace(v=shared.get('ep_last_x')) -%}
     {%- for _ in range(50) if x.v == shared.get('ep_last_x') or shared.get('mal')[x.v].url in recent -%}{%- set x.v = pick('mal') | int -%}{%- endfor -%}
     {%- set h = namespace(v=shared.get('ep_last_h')) -%}
     {%- for _ in range(50) if h.v == shared.get('ep_last_h') -%}{%- set h.v = pick('hash') | int -%}{%- endfor -%}
-    {%- set u = module.rand.choice(ep.users) -%}
+    {%- set u = pr.u -%}
     {%- set t = hits(a.v, u, 'M', x.v, start, true) | int -%}
     {#- Gaps from the ordinary distributions, redrawn in the rare case
         that the repeated URL would fall outside the chain window. -#}
@@ -207,7 +218,14 @@
     {%- set out.item = it -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if out.item is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- if out.item is none -%}
+  {#- Nothing due: a new incident of the timestamp's population; its
+      first detection is due now and takes this timestamp. -#}
+  {{- incident(pick('svc' if 'svc' in tags else 'usr') | int, now) -}}
+  {%- set top = hq.heappop(q) -%}
+  {%- set out.due = top[0] -%}
+  {%- set out.item = top[2] -%}
+{%- endif -%}
 {%- set it = out.item -%}
 {%- set ep = eps[it.a] -%}
 {%- set keep = ep.hist | selectattr(0, 'ge', out.due - recent_window) | list -%}
