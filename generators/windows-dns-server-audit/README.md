@@ -16,7 +16,7 @@ A 257 or 259 follows its 256 after a median of 1.1 s (99th percentile 17 s, at m
 
 ## Event Types
 
-Shares over 15 days with `anomaly_mode: true` and the default interval, and the range over two 15-day spans without episodes. The category is `event.category`; the parsed Audit records carry none.
+Shares over 15 days with `anomaly_mode: true` and the default interval, and the range over 7- to 15-day spans without episodes. The category is `event.category`; the parsed Audit records carry none.
 
 | Native ID | Channel | Category | Share | Range without episodes | Meaning |
 | --- | --- | --- | ---: | ---: | --- |
