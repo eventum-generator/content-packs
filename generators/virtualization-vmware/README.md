@@ -14,7 +14,7 @@ About 8,100 records per day, ±3% from day to day. Service accounts produce abou
 | 06-07, 17-19 | 6% |
 | 19-06 (on-call work, even rate) | 4% |
 
-Service accounts log in and out every few seconds to minutes: the monitoring poller about 2,300 times a day, the metrics collector about 970, the orchestration account about 390 and the backup account about 200. Staff members log in about 3-14 times a day each (administrators most). A staff session lasts a median 10-12 minutes (90th percentile about 30 minutes); a monitoring poller session a median 14 s, a metrics collector session about 2 minutes, a backup session about 10 minutes.
+Service accounts log in and out every few seconds to minutes: the monitoring poller about 2,300 times a day, the metrics collector about 970, the orchestration account about 390 and the backup account about 200. Staff members log in about 3-17 times a day each (administrators most). A staff session lasts a median 10-12 minutes (90th percentile about 30 minutes); a monitoring poller session a median 14 s, a metrics collector session about 2 minutes, a backup session about 10 minutes.
 
 Records of one session follow each other seconds to minutes apart: wrong passwords a median 12 s apart, the first operation a median 1 minute after login, maintenance steps 30-45 s apart. The syslog header trails the event's `createdTime` by a median 0.5 ms (rarely up to 2.5 s); `event.ingested` is 0.2-30 s later and in whole seconds.
 
@@ -24,14 +24,14 @@ Shares over four days of a default run (`anomaly_mode: true`); the last column s
 
 | Native class | Share | Background | ECS fields from the pipeline | Meaning |
 |---|---:|---:|---|---|
-| `vim.event.UserLoginSessionEvent` | 49.26% | 49.20-49.25% | `event.action: login`, `event.outcome: success`, `user.*`, `source.ip`, `user_agent.*` | API session opened |
-| `vim.event.UserLogoutSessionEvent` | 49.24% | 49.18-49.23% | as login, plus `event.start`/`end`/`duration`, `vsphere.log.api.invocations` | Session closed: login time and number of API calls |
-| `vim.event.VmPoweredOffEvent` | 0.55% | 0.58-0.62% | — | VM powered off |
-| `vim.event.VmPoweredOnEvent` | 0.55% | 0.58-0.62% | — | The same VM powered on again |
-| `vim.event.VmReconfiguredEvent` | 0.17% | 0.17-0.21% | — | `numCPU` or `memoryMB` changed while the VM is off |
-| `vim.event.EventEx` (failed SSO login) | 0.11% | 0.06-0.08% | `event.outcome: failure`, `user.name`, `source.ip` (no `event.action`) | Wrong password for a staff account |
-| `vim.event.PermissionAddedEvent` | 0.08% | 0.07-0.09% | — | Temporary permission created |
-| `vim.event.PermissionRemovedEvent` | 0.04% | 0.03-0.04% | — | Expired permission removed |
+| `vim.event.UserLoginSessionEvent` | 49.26% | 49.15-49.35% | `event.action: login`, `event.outcome: success`, `user.*`, `source.ip`, `user_agent.*` | API session opened |
+| `vim.event.UserLogoutSessionEvent` | 49.24% | 49.15-49.35% | as login, plus `event.start`/`end`/`duration`, `vsphere.log.api.invocations` | Session closed: login time and number of API calls |
+| `vim.event.VmPoweredOffEvent` | 0.55% | 0.50-0.65% | — | VM powered off |
+| `vim.event.VmPoweredOnEvent` | 0.55% | 0.50-0.65% | — | The same VM powered on again |
+| `vim.event.VmReconfiguredEvent` | 0.17% | 0.15-0.21% | — | `numCPU` or `memoryMB` changed while the VM is off |
+| `vim.event.EventEx` (failed SSO login) | 0.11% | 0.05-0.09% | `event.outcome: failure`, `user.name`, `source.ip` (no `event.action`) | Wrong password for a staff account |
+| `vim.event.PermissionAddedEvent` | 0.08% | 0.07-0.11% | — | Temporary permission created |
+| `vim.event.PermissionRemovedEvent` | 0.04% | 0.03-0.05% | — | Expired permission removed |
 
 For VM and permission events the vSphere pipeline only splits the syslog envelope, so the acting account, VM and principal are in `message` and `event.original`, not in `user.*` or `event.action`.
 
