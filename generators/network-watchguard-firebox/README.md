@@ -29,7 +29,7 @@ With `anomaly_mode: true` the hourly volume of each population is the same as wi
 
 ## Background Model
 
-A LAN record is HTTPS to one of 40 internet servers (skewed popularity) allowed by `Outgoing-00` with source NAT to the Firebox address (82.5%), HTTP through `HTTP-proxy-00` logged when the connection ends (log-normal duration, median 4 s; 14.6%), or 1, 2 or 4 echo requests to the Firebox denied by `Ping-00` (2.9%). Clients differ in activity by a fixed log-normal weight, so a few clients carry most of the traffic.
+A LAN record is HTTPS to one of up to 40 internet servers (skewed popularity) allowed by `Outgoing-00` with source NAT to the Firebox address (82.5%), HTTP through `HTTP-proxy-00` logged when the connection ends (log-normal duration, median 4 s; 14.6%), or 1, 2 or 4 echo requests to the Firebox denied by `Ping-00` (2.9%). Clients differ in activity by a fixed log-normal weight, so a few clients carry most of the traffic.
 
 External addresses come from `samples/remote_addresses.csv`, one row per address with its role, operating system, hop count and two activity weights (probes and portal connections):
 
