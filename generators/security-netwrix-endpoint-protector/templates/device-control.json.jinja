@@ -1,316 +1,432 @@
 {#- Netwrix Endpoint Protector Device Control SIEM export (Standard
     format, Exclude Headers on), wrapped in ECS JSON with the native
-    message body in event.original. One input tick per second; each tick
-    emits the earliest due record or drops. Staff work in randomly
-    phased shifts; while at work each user now and then plugs an
-    approved company device (files read, written, deleted) or an
-    unapproved personal device (blocked, sometimes re-plugged, sometimes
-    followed by an approved device). Times are in microseconds. -#}
+    message body in event.original. The input sets the rate and the
+    hour-of-day curve; every timestamp becomes exactly one record. Each
+    timestamp takes the earliest due record of an open device activity;
+    when none is due, it starts a new activity of an idle user who is
+    at work at that hour, picked by activity weight, or brings the next
+    planned record forward while enough activities are open. An
+    episode is one more activity of such a user. An activity is an
+    approved-device session (Connected, file operations, Disconnected)
+    or a personal device plugged in (Blocked, sometimes re-plugged,
+    sometimes followed by an approved-device session). -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set nows = module.builtins.int(ts.timestamp()) -%}
 {%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set hq = module.heapq -%}
-{%- set sec = 1000000 -%}
-{%- set minute = 60 * sec -%}
-{%- set hour = 3600 * sec -%}
-{#- Guard: within this window after a Blocked record, the same user
-    writes at most 4 files in total (the chain needs 5). -#}
-{%- set guard = 2 * hour -%}
+{%- set hour_us = 3600000000 -%}
+{%- set lsec = nows + module.builtins.int(params.utc_offset_hours * 3600) -%}
+{%- set day = lsec // 86400 -%}
+{%- set hour = (lsec % 86400) // 3600 -%}
+{#- Chain window: a Blocked record and five File Write records to one
+    approved device within one hour. -#}
+{%- set window = 3601 -%}
 {%- macro ln(med, sig) -%}
   {#- Lognormal seconds with median med; returns microseconds. -#}
   {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
 {%- endmacro -%}
-{%- macro push(due, item) -%}
-  {%- set s = shared.get('seq') + 1 -%}
-  {%- do shared.set('seq', s) -%}
-  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- macro clip(x, lo, hi) -%}{{- [[x, lo] | max, hi] | min -}}{%- endmacro -%}
+{%- macro push(due, it) -%}
+  {%- set S = shared.get('s') -%}
+  {%- do S.update({'seq': S.seq + 1}) -%}
+  {%- do module.heapq.heappush(S.queue, [due, S.seq, it]) -%}
+  {%- set u = S.users[it.u] -%}
+  {%- if u.pend == 0 -%}{%- do S.update({'open': S.open + 1}) -%}{%- endif -%}
+  {%- do u.update({'pend': u.pend + 1}) -%}
 {%- endmacro -%}
-{%- macro row(due, ev, u, dev, drive, f) -%}
-  {{- push(due, {'k': 'row', 'ev': ev, 'u': u, 'dev': dev, 'drive': drive, 'f': f}) -}}
+{%- macro pick_file(d) -%}
+  {{- d.pool[[module.bisect.bisect_right(d.cum, module.rand.number.floating(0, d.cum[-1])), d.pool | length - 1] | min] -}}
 {%- endmacro -%}
-{%- if shared.get('queue') is none -%}
+{%- macro session(t0, ui, dev, ep) -%}
+  {#- One approved device plugged in: Connected, file operations in
+      quick succession with occasional pauses (a bulk copy writes its
+      files seconds apart), Disconnected. Phone-charging users read
+      from their sticks more and bulk-copy less than others. An
+      episode session writes exactly five files, like a short bulk
+      copy. -#}
+  {%- set S = shared.get('s') -%}
+  {%- set u = S.users[ui] -%}
+  {%- set d = S.depts[u.dept] -%}
+  {%- set has = S.devices[dev].files | length > 0 -%}
+  {%- set drive = module.rand.weighted_choice(['E:', 'F:', 'D:', 'G:'], [70, 18, 8, 4]) -%}
+  {%- set base = {'u': ui, 'dev': dev, 'drive': drive, 'f': none, 're': false, 'ep': ep} -%}
+  {%- do push(t0, dict(base, ev='Connected')) -%}
+  {%- if ep -%}
+    {%- set mode = 'bulk' -%}
+    {%- set ops = ['File Write'] * 5 -%}
+  {%- else -%}
+    {%- set mode = module.rand.weighted_choice(['browse', 'drop', 'mixed', 'bulk', 'idle'], [40, 30, 20, 4, 6] if u.heavy else [34, 30, 20, 10, 6]) -%}
+    {%- if mode == 'browse' and not has -%}{%- set mode = 'drop' -%}{%- endif -%}
+    {%- if mode == 'browse' -%}
+      {%- set ops = ['File Read'] * module.rand.weighted_choice([1, 2, 3, 4, 6, 9], [30, 22, 16, 12, 12, 8]) -%}
+    {%- elif mode == 'drop' -%}
+      {%- set ops = ['File Write'] * module.rand.weighted_choice([1, 2, 3, 4], [45, 28, 17, 10]) -%}
+      {%- if has and module.rand.chance(0.3) -%}{%- set ops = ['File Read'] + ops -%}{%- endif -%}
+    {%- elif mode == 'mixed' -%}
+      {%- set ops = [] -%}
+      {%- for _ in range(module.rand.number.integer(3, 14)) -%}
+        {%- do ops.append(module.rand.weighted_choice(['File Read', 'File Write', 'File Delete'], [50, 35, 15])) -%}
+      {%- endfor -%}
+    {%- elif mode == 'bulk' -%}
+      {%- set nb = [[module.builtins.int(module.rand.number.lognormal(module.math.log(11), 0.65)), 1] | max, 60] | min -%}
+      {%- set ops = ['File Write'] * nb -%}
+      {%- if has and module.rand.chance(0.25) -%}{%- set ops = ['File Delete'] * module.rand.number.integer(1, 4) + ops -%}{%- endif -%}
+    {%- else -%}
+      {%- set ops = [] -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set t = namespace(v=t0 + (ln(15, 0.9) | int)) -%}
+  {%- for op in ops -%}
+    {%- if op == 'File Write' -%}
+      {%- do push(t.v, dict(base, ev=op, f=pick_file(d), re=module.rand.chance(0.1))) -%}
+    {%- else -%}
+      {%- do push(t.v, dict(base, ev=op)) -%}
+    {%- endif -%}
+    {%- if op == 'File Write' and mode == 'bulk' -%}
+      {%- set t.v = t.v + (ln(2, 0.8) | int) -%}
+    {%- else -%}
+      {%- set t.v = t.v + (ln(25, 1.2) | int) -%}
+      {%- if module.rand.chance(0.08) -%}{%- set t.v = t.v + (ln(240, 0.9) | int) -%}{%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do push(t.v + (ln(150, 1.1) | int), dict(base, ev='Disconnected')) -%}
+{%- endmacro -%}
+{%- macro attempt(t0, ui, ep) -%}
+  {#- Personal device plugged in: Blocked, re-plugged and blocked again
+      within a minute or two in 40% of cases per attempt, and in half
+      of the attempts (always in an episode) followed a few minutes
+      later by an approved device. -#}
+  {%- set S = shared.get('s') -%}
+  {%- set u = S.users[ui] -%}
+  {%- set pd = module.rand.choice(u.personal) -%}
+  {%- set t = namespace(v=t0, go=true) -%}
+  {%- for _ in range(5) if t.go -%}
+    {%- do push(t.v, {'ev': 'Blocked', 'u': ui, 'dev': pd, 'drive': '', 'f': none, 're': false, 'ep': ep}) -%}
+    {%- set t.go = module.rand.chance(0.4) -%}
+    {%- if t.go -%}{%- set t.v = t.v + (ln(35, 0.8) | int) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if ep or module.rand.chance(0.5) -%}
+    {%- set dev = u.own if u.own and (ep or module.rand.chance(u.own_p)) else module.rand.choice(S.depts[u.dept].shared) -%}
+    {%- do session(t.v + ([ln(150, 0.9) | int, 900000000] | min), ui, dev, ep) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro pick_time(a, b, pw) -%}
+  {#- A moment in [a, b) weighted by the hour-of-day load to the power
+      pw (plus a small floor for pw 2). -#}
+  {%- set S = shared.get('s') -%}
+  {%- set off = module.builtins.int(params.utc_offset_hours * 3600) * 1000000 -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- set t = namespace(v=a) -%}
+  {%- for _ in range(400) if t.v < b -%}
+    {%- set l = t.v + off -%}
+    {%- set hend = [b, t.v + 3600000000 - (l % 3600000000)] | min -%}
+    {%- set c = S.curve[(l // 3600000000) % 24] / (S.curve | max) -%}
+    {%- do slots.append([t.v, hend]) -%}
+    {%- do ws.append(((c ** pw) + (0.01 if pw == 2 else 0)) * (hend - t.v)) -%}
+    {%- set t.v = hend -%}
+  {%- endfor -%}
+  {%- set s = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.integer(s[0], [s[0], s[1] - 1] | max) -}}
+{%- endmacro -%}
+{%- if shared.get('s') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
     'epp_server': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
-    'staff_count': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 20, 'le': 1000}},
+    'staff_count': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 100, 'le': 5000}},
     'utc_offset_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': -12, 'le': 14}}
   }} -%}
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
-  {%- set surnames = ['ivanov', 'petrova', 'smirnov', 'kuznetsova', 'popov', 'volkova', 'sokolov', 'lebedeva', 'kozlov', 'novikova', 'morozov', 'pavlova', 'orlov', 'semenova', 'egorov', 'vinogradova', 'belov', 'kovaleva', 'tarasov', 'zaitseva', 'frolov', 'medvedeva', 'zhukov', 'nikitina', 'sorokin', 'makarova', 'antonov', 'baranova', 'kiselev', 'andreeva', 'mironov', 'gusev', 'titova', 'komarov', 'filippova', 'davydov', 'belyaeva', 'bogdanov', 'grigoreva', 'romanov', 'vasileva', 'fedorov', 'yakovleva', 'stepanov', 'polyakova', 'nikolaev', 'krylova', 'maksimov', 'osipova', 'sidorov', 'chernova', 'shcherbakov', 'danilova', 'kalinin', 'efimova', 'gerasimov', 'zueva', 'rybakov', 'suvorova', 'karpov'] -%}
-  {%- set depts = [
-    {'code': 'FIN', 'folder': 'Finance', 'words': ['budget', 'forecast', 'invoice register', 'payroll', 'vendor list', 'audit notes', 'cash flow', 'expense report', 'ledger export', 'tax return'], 'exts': ['xlsx', 'pdf', 'csv', 'docx'], 'w': 12},
-    {'code': 'SAL', 'folder': 'Sales', 'words': ['customer list', 'price list', 'proposal', 'pipeline', 'contract draft', 'quote', 'deal review', 'territory plan'], 'exts': ['pptx', 'xlsx', 'pdf', 'docx'], 'w': 18},
-    {'code': 'HR', 'folder': 'HR', 'words': ['staff list', 'offer letter', 'vacation plan', 'training plan', 'org chart', 'appraisal', 'job description'], 'exts': ['docx', 'xlsx', 'pdf'], 'w': 6},
-    {'code': 'ENG', 'folder': 'Engineering', 'words': ['firmware', 'drawings', 'test report', 'design spec', 'build logs', 'schematics', 'release notes', 'bom'], 'exts': ['zip', 'pdf', 'dwg', 'txt', 'bin'], 'w': 22},
-    {'code': 'MKT', 'folder': 'Marketing', 'words': ['brochure', 'banner', 'campaign plan', 'press kit', 'event photos', 'logo pack', 'video teaser'], 'exts': ['pdf', 'png', 'jpg', 'mp4', 'pptx', 'zip'], 'w': 10},
-    {'code': 'OPS', 'folder': 'Operations', 'words': ['shift schedule', 'inventory', 'delivery plan', 'incident log', 'supplier list', 'checklist'], 'exts': ['xlsx', 'pdf', 'docx', 'csv'], 'w': 16},
-    {'code': 'LGL', 'folder': 'Legal', 'words': ['contract', 'nda', 'claim', 'power of attorney', 'court filing', 'policy draft'], 'exts': ['docx', 'pdf'], 'w': 5},
-    {'code': 'IT', 'folder': 'IT', 'words': ['installer', 'driver pack', 'config backup', 'iso image', 'scripts', 'network diagram', 'license keys'], 'exts': ['zip', 'exe', 'msi', 'iso', 'txt', 'vsdx'], 'w': 11}
-  ] -%}
-  {%- set ext_med = {'xlsx': 400000, 'pdf': 900000, 'csv': 250000, 'docx': 180000, 'pptx': 4000000, 'zip': 25000000, 'dwg': 3000000, 'txt': 40000, 'bin': 8000000, 'png': 1200000, 'jpg': 2500000, 'mp4': 90000000, 'exe': 30000000, 'msi': 45000000, 'iso': 900000000, 'vsdx': 600000} -%}
+  {#- The estate (staff, workstations, devices, files) comes from a
+      fixed seed, so every run models the same office; only behaviour
+      is random. -#}
+  {%- set rnd = module.random.Random(9604) -%}
+  {%- set ext_med = {} -%}
+  {%- for r in samples.file_types -%}{%- do ext_med.update({r.extension: r.median_bytes | int}) -%}{%- endfor -%}
+  {%- set approved = [] -%}
+  {%- set approved_w = [] -%}
+  {%- set personal = [] -%}
+  {%- set personal_w = [] -%}
+  {%- set phones = [] -%}
+  {%- set phones_w = [] -%}
+  {%- for r in samples.device_models -%}
+    {%- set m = [r.vid, r.pid, r.type, r.name] -%}
+    {%- if r.policy == 'approved' -%}
+      {%- do approved.append(m) -%}{%- do approved_w.append(r.weight | int) -%}
+    {%- else -%}
+      {%- do personal.append(m) -%}{%- do personal_w.append(r.weight | int) -%}
+      {%- if r.type in ['iPods / iPhones / iPads', 'Smartphones / Handhelds / PDAs'] -%}
+        {%- do phones.append(m) -%}{%- do phones_w.append(r.weight | int) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
   {%- set periods = ['Q1', 'Q2', 'Q3', 'Q4', '2025', '2026', 'Jan', 'Mar', 'Jun', 'Sep', 'Oct', 'Nov', 'v2', 'final', 'draft'] -%}
-  {#- Company-approved storage models and personal devices that the
-      Device Control policy blocks (VID, PID, type, device name). -#}
-  {%- set approved_models = [
-    ['0951', '1666', 'Removable Storage Devices', 'Kingston DataTraveler 3.0', 30],
-    ['0781', '5581', 'Removable Storage Devices', 'SanDisk Ultra', 25],
-    ['8564', '1000', 'Removable Storage Devices', 'JetFlash Mass Storage Device', 12],
-    ['18A5', '0302', 'Removable Storage Devices', 'Verbatim STORE N GO', 8],
-    ['04E8', '4001', 'External HDDs / portable hard disks', 'Samsung PSSD T7', 15],
-    ['1058', '25E2', 'External HDDs / portable hard disks', 'WD My Passport 25E2', 10]
-  ] -%}
-  {%- set personal_models = [
-    ['05AC', '12A8', 'iPods / iPhones / iPads', 'Apple iPhone', 35],
-    ['04E8', '6860', 'Smartphones / Handhelds / PDAs', 'SAMSUNG Mobile USB Modem', 25],
-    ['058F', '6387', 'Removable Storage Devices', 'Generic Flash Disk', 25],
-    ['090C', '1000', 'Removable Storage Devices', 'Silicon Motion Flash Drive', 15]
-  ] -%}
   {%- set hexd = '0123456789ABCDEF' -%}
   {%- set alnum = '0123456789ABCDEFGHJKLMNPRSTUVWXYZ' -%}
-  {%- macro serial(n, alphabet) -%}{%- for _ in range(n) -%}{{- module.rand.choice(alphabet) -}}{%- endfor -%}{%- endmacro -%}
-  {%- do shared.update({'devices': {}, 'files': {}}) -%}
-  {%- set devices = shared.get('devices') -%}
-  {%- macro new_device(model, owner) -%}
+  {%- macro serial(n, alphabet) -%}{%- for _ in range(n) -%}{{- rnd.choice(alphabet) -}}{%- endfor -%}{%- endmacro -%}
+  {%- set devices = {} -%}
+  {%- macro new_device(model) -%}
     {%- set s = serial(16 if model[2] != 'iPods / iPhones / iPads' else 24, hexd if model[0] != '04E8' or model[1] != '6860' else alnum) -%}
-    {%- do shared.get('devices').update({s: {'serial': s, 'vid': model[0], 'pid': model[1], 'type': model[2], 'name': model[3], 'files': {}, 'owner': owner}}) -%}
+    {%- do devices.update({s: {'vid': model[0], 'pid': model[1], 'type': model[2], 'name': model[3], 'files': {}}}) -%}
     {{- s -}}
   {%- endmacro -%}
-  {%- set files = shared.get('files') -%}
-  {%- for d in depts -%}
-    {%- set pool = [] -%}
+  {%- set files = {} -%}
+  {%- set depts = [] -%}
+  {%- for r in samples.departments -%}
+    {%- set d = {'code': r.code, 'folder': r.folder, 'w': r.weight, 'pool': [], 'cum': [], 'shared': []} -%}
+    {%- set acc = namespace(v=0.0) -%}
     {%- for _ in range(40) -%}
-      {%- set ext = module.rand.choice(d.exts) -%}
-      {%- set nm = (module.rand.choice(d.words) ~ ' ' ~ module.rand.choice(periods)) | capitalize ~ '.' ~ ext -%}
-      {%- set sub = module.rand.weighted_choice(['', 'Export\\', 'Work\\', 'Archive\\'], [50, 20, 20, 10]) -%}
-      {%- set path = d.folder ~ '\\' ~ sub ~ nm -%}
+      {%- set ext = rnd.choice(r.extensions) -%}
+      {%- set nm = (rnd.choice(r.words) ~ ' ' ~ rnd.choice(periods)) | capitalize ~ '.' ~ ext -%}
+      {%- set sub = rnd.choices(['', 'Export\\', 'Work\\', 'Archive\\'], [50, 20, 20, 10])[0] -%}
+      {%- set path = r.folder ~ '\\' ~ sub ~ nm -%}
       {%- if path not in files -%}
-        {%- do files.update({path: {'path': path, 'ext': ext, 'size': [module.builtins.int(module.rand.number.lognormal(module.math.log(ext_med[ext]), 0.9)), 120] | max, 'hash': module.hashlib.md5((path ~ module.rand.string.hex(8)).encode()).hexdigest(), 'w': module.rand.number.lognormal(0, 1.0)}}) -%}
-        {%- do pool.append(path) -%}
+        {%- do files.update({path: {'path': path, 'ext': ext, 'size': [module.builtins.int(rnd.lognormvariate(module.math.log(ext_med[ext]), 0.9)), 120] | max, 'hash': module.hashlib.md5((path ~ '%08x' | format(rnd.getrandbits(32))).encode()).hexdigest()}}) -%}
+        {%- set acc.v = acc.v + rnd.lognormvariate(0, 1.0) -%}
+        {%- do d.pool.append(path) -%}
+        {%- do d.cum.append(acc.v) -%}
       {%- endif -%}
     {%- endfor -%}
-    {%- do d.update({'pool': pool, 'shared_devs': []}) -%}
     {%- for _ in range(2) -%}
-      {%- do d.shared_devs.append(new_device(module.rand.weighted_choice(approved_models, [30, 25, 12, 8, 15, 10]), none) | trim) -%}
+      {%- do d.shared.append(new_device(rnd.choices(approved, approved_w)[0]) | trim) -%}
     {%- endfor -%}
+    {%- do depts.append(d) -%}
   {%- endfor -%}
   {#- Manuals and installers found on most company sticks. -#}
-  {%- for p in ['Manuals\\Quick start.pdf', 'Setup\\VPN client.msi', 'Setup\\Printer driver.zip', 'Readme.txt'] -%}
+  {%- set common = ['Manuals\\Quick start.pdf', 'Setup\\VPN client.msi', 'Setup\\Printer driver.zip', 'Readme.txt'] -%}
+  {%- for p in common -%}
     {%- set ext = p.split('.')[-1] -%}
-    {%- do files.update({p: {'path': p, 'ext': ext, 'size': [module.builtins.int(module.rand.number.lognormal(module.math.log(ext_med[ext]), 0.6)), 120] | max, 'hash': module.hashlib.md5((p ~ module.rand.string.hex(8)).encode()).hexdigest(), 'w': 1.0}}) -%}
+    {%- do files.update({p: {'path': p, 'ext': ext, 'size': [module.builtins.int(rnd.lognormvariate(module.math.log(ext_med[ext]), 0.6)), 120] | max, 'hash': module.hashlib.md5((p ~ '%08x' | format(rnd.getrandbits(32))).encode()).hexdigest()}}) -%}
   {%- endfor -%}
+  {%- set surnames = [] -%}
+  {%- for r in samples.surnames -%}{%- do surnames.append(r.surname) -%}{%- endfor -%}
+  {%- set dept_ix = range(depts | length) | list -%}
+  {%- set dept_w = depts | map(attribute='w') | list -%}
+  {%- set ops_ix = [] -%}
+  {%- for d in depts -%}{%- if d.code in ['OPS', 'IT'] -%}{%- do ops_ix.append(loop.index0) -%}{%- endif -%}{%- endfor -%}
   {%- set ouis = ['D4-81-D7', '3C-52-82', '00-1B-21', 'F8-B4-6A', '54-BF-64', '8C-EC-4B', 'B0-7B-25'] -%}
-  {%- set users = {} -%}
-  {%- set taken = [] -%}
-  {%- set counters = {} -%}
+  {#- Staff: about a tenth are duty staff (Operations and IT) on
+      alternating 12-hour day or night shifts at head office; the rest
+      work a single office day in their own office's zone (head office,
+      or a branch 2 h or 4 h east or 1 h west). A small tier of users
+      (five duty staff per shift and about 2% of office staff) plug
+      their own phone into the workstation several times a day (to
+      charge it) and use their own company stick often. -#}
+  {%- set nd = [20, (params.staff_count * 0.1) | round | int] | max -%}
+  {%- set users = [] -%}
+  {%- set taken = {} -%}
   {%- for i in range(params.staff_count) -%}
-    {%- set di = module.rand.weighted_choice(range(depts | length) | list, depts | map(attribute='w') | list) -%}
+    {%- set duty = ('day' if i % 2 == 0 else 'night') if i < nd else none -%}
+    {%- set heavy = i < 20 or (i >= nd and rnd.random() < 0.02) -%}
+    {%- set di = rnd.choice(ops_ix) if duty else rnd.choices(dept_ix, dept_w)[0] -%}
     {%- set d = depts[di] -%}
-    {%- set base = module.rand.choice('adeiklmnoprstvy') ~ module.rand.choice(surnames) -%}
+    {%- set base = rnd.choice('adeiklmnoprstvy') ~ rnd.choice(surnames) -%}
     {%- set nm = namespace(v=base) -%}
-    {%- for k in range(2, 9) if nm.v in taken -%}{%- set nm.v = base ~ k -%}{%- endfor -%}
-    {%- do taken.append(nm.v) -%}
-    {%- set n = counters.get(d.code, 0) + 1 -%}
-    {%- do counters.update({d.code: n}) -%}
-    {%- set own = [] -%}
-    {%- if module.rand.chance(0.7) -%}{%- do own.append(new_device(module.rand.weighted_choice(approved_models, [30, 25, 12, 8, 15, 10]), nm.v) | trim) -%}{%- endif -%}
-    {%- set personal = [] -%}
-    {%- for _ in range(module.rand.weighted_choice([0, 1, 2], [35, 45, 20])) -%}
-      {%- do personal.append(new_device(module.rand.weighted_choice(personal_models, [35, 25, 25, 15]), nm.v) | trim) -%}
-    {%- endfor -%}
-    {%- do users.update({nm.v: {
-      'name': nm.v, 'dept': di,
-      'host': d.code ~ '-WS-' ~ '%03d' | format(module.rand.number.integer(1, 399)),
-      'ip': '10.20.' ~ (di * 8 + module.rand.number.integer(0, 3)) ~ '.' ~ module.rand.number.integer(10, 250),
-      'mac': module.rand.choice(ouis) ~ '-' ~ serial(2, hexd) ~ '-' ~ serial(2, hexd) ~ '-' ~ serial(2, hexd),
-      'hw': module.rand.choice(['5CG', 'CZC', 'MXL', 'PF']) ~ serial(7, alnum),
-      'os': module.rand.weighted_choice(['Windows 11 Enterprise', 'Windows 10 Enterprise', 'Windows 11 Pro'], [55, 35, 10]),
-      'ver': module.rand.weighted_choice(['5.9.4', '5.9.3'], [80, 20]),
-      'tz': module.rand.weighted_choice([0, 2, 4, -1], [75, 12, 8, 5]),
-      'own': own, 'personal': personal,
-      'pace': module.rand.number.lognormal(0, 0.7),
-      'p_block': [module.rand.number.lognormal(module.math.log(0.07), 0.7) if personal else 0, 0.5] | min,
-      'we': 0, 'sid': 0, 'blocks': []
-    }}) -%}
-  {%- endfor -%}
-  {%- for d in depts -%}
-    {%- for s in d.shared_devs -%}
-      {%- for _ in range(module.rand.number.integer(2, 6)) -%}
-        {%- set p = module.rand.choice(d.pool) -%}
-        {%- do devices[s].files.update({p: true}) -%}
+    {%- for k in range(2, 30) if nm.v in taken -%}{%- set nm.v = base ~ k -%}{%- endfor -%}
+    {%- do taken.update({nm.v: true}) -%}
+    {%- set host = namespace(v=d.code ~ '-WS-' ~ '%03d' | format(rnd.randint(1, 399))) -%}
+    {%- for _ in range(50) if host.v in taken -%}{%- set host.v = d.code ~ '-WS-' ~ '%03d' | format(rnd.randint(1, 399)) -%}{%- endfor -%}
+    {%- do taken.update({host.v: true}) -%}
+    {%- set tz = 0 if duty else rnd.choices([0, 2, 4, -1], [75, 12, 8, 5])[0] -%}
+    {%- if duty -%}
+      {%- set st = 8.0 if duty == 'day' else 20.0 -%}
+      {%- set len = 12.0 -%}
+    {%- else -%}
+      {%- set st = (clip(rnd.gauss(8.8, 0.6), 7.0, 11.0) | float) - tz -%}
+      {%- set len = clip(rnd.gauss(9.0, 0.6), 7.5, 10.5) | float -%}
+    {%- endif -%}
+    {%- if heavy -%}
+      {%- set own = new_device(rnd.choices(approved, approved_w)[0]) | trim -%}
+      {%- set pers = [new_device(rnd.choices(phones, phones_w)[0]) | trim] -%}
+      {%- set p_block = 0.5 -%}
+    {%- else -%}
+      {%- set own = new_device(rnd.choices(approved, approved_w)[0]) | trim if rnd.random() < 0.7 else none -%}
+      {%- set pers = [] -%}
+      {%- for _ in range(rnd.choices([0, 1, 2], [35, 45, 20])[0]) -%}
+        {%- do pers.append(new_device(rnd.choices(personal, personal_w)[0]) | trim) -%}
       {%- endfor -%}
+      {%- set p_block = clip(rnd.lognormvariate(module.math.log(0.07), 0.7), 0.01, 0.3) | float if pers else 0 -%}
+    {%- endif -%}
+    {%- do users.append({
+      'i': i, 'name': nm.v, 'dept': di,
+      'host': host.v,
+      'ip': '10.20.' ~ (di * 8 + rnd.randint(0, 3)) ~ '.' ~ rnd.randint(10, 250),
+      'mac': rnd.choice(ouis) ~ '-' ~ serial(2, hexd) ~ '-' ~ serial(2, hexd) ~ '-' ~ serial(2, hexd),
+      'hw': rnd.choice(['5CG', 'CZC', 'MXL', 'PF']) ~ serial(7, alnum),
+      'os': rnd.choices(['Windows 11 Enterprise', 'Windows 10 Enterprise', 'Windows 11 Pro'], [55, 35, 10])[0],
+      'ver': rnd.choices(['5.9.4', '5.9.3'], [80, 20])[0],
+      'tz': tz, 'duty': duty, 'phase': (i // 2) % 2, 'st': st, 'len': len,
+      'own': own, 'own_p': 0.9 if heavy else 0.75, 'personal': pers, 'heavy': heavy, 'p_block': p_block,
+      'w': (clip(rnd.lognormvariate(0, 0.5), 1.6 if heavy else 0.4, 2.5) | float) * (3.0 if heavy else 1.0),
+      'pend': 0, 'blk': []
+    }) -%}
+  {%- endfor -%}
+  {#- Devices start with some files: department files on shared and
+      own sticks, manuals and installers on about a third. -#}
+  {%- for d in depts -%}
+    {%- for s in d.shared -%}
+      {%- for _ in range(rnd.randint(2, 6)) -%}{%- do devices[s].files.update({rnd.choice(d.pool): true}) -%}{%- endfor -%}
     {%- endfor -%}
+  {%- endfor -%}
+  {%- for u in users if u.own -%}
+    {%- for _ in range(rnd.randint(1, 8)) -%}{%- do devices[u.own].files.update({rnd.choice(depts[u.dept].pool): true}) -%}{%- endfor -%}
   {%- endfor -%}
   {%- for s, dv in devices.items() if dv.type in ['Removable Storage Devices', 'External HDDs / portable hard disks'] -%}
-    {%- for p in ['Manuals\\Quick start.pdf', 'Setup\\VPN client.msi', 'Setup\\Printer driver.zip', 'Readme.txt'] if module.rand.chance(0.35) -%}
-      {%- do dv.files.update({p: true}) -%}
-    {%- endfor -%}
-    {%- if dv.owner -%}
-      {%- for _ in range(module.rand.number.integer(1, 8)) -%}
-        {%- do dv.files.update({module.rand.choice(depts[users[dv.owner].dept].pool): true}) -%}
-      {%- endfor -%}
-    {%- endif -%}
+    {%- for p in common if rnd.random() < 0.35 -%}{%- do dv.files.update({p: true}) -%}{%- endfor -%}
   {%- endfor -%}
-  {%- do shared.update({'queue': [], 'seq': 0, 'users': users, 'devices': devices, 'files': files, 'depts': depts, 'last_us': now - 1, 'ep_last': none}) -%}
-  {%- for name in users -%}
-    {#- First shift starts somewhere inside one typical off-duty gap. -#}
-    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(15 * 3600, 0.4) | int)), {'k': 'shift', 'u': name}) -}}
-  {%- endfor -%}
-  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-  {%- do shared.set('ep_due', now + hour + module.rand.number.integer(0, [hour, interval // 8] | min)) -%}
+  {#- Records per hour of the head-office day; the same rates as the
+      patterns/*.yml input files, used only to place episode starts. -#}
+  {%- set curve = [43, 43, 43, 43, 43, 188, 188, 360, 929, 1470, 1470, 1470, 1470, 1470, 1470, 1470, 1470, 929, 216, 43, 43, 43, 43, 43] -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600) * 1000000 -%}
+  {%- do shared.set('s', {'queue': [], 'seq': 0, 'users': users, 'devices': devices, 'files': files, 'depts': depts, 'curve': curve, 'day': none, 'tabs': none,
+    'interval': interval, 'ep_at': 0, 'ep_last': none, 'ep_open': 0, 'ep_n': 0, 'open': 0, 'gap': 30.0, 'prev': ts.timestamp()}) -%}
+  {%- set S = shared.get('s') -%}
+  {#- First episode: within min(interval, 24 h) of the start, at an hour
+      drawn from the hour-of-day load. -#}
+  {%- do S.update({'ep_at': pick_time(now, now + ([interval, 24 * hour_us] | min), 1) | int}) -%}
 {%- endif -%}
-{%- set queue = shared.get('queue') -%}
-{%- set users = shared.get('users') -%}
-{%- set devices = shared.get('devices') -%}
-{%- set files = shared.get('files') -%}
-{%- set depts = shared.get('depts') -%}
-{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{#- Episode: once due (plus a random delay), the episode is armed. The
-    next background blocked attempt that is naturally followed by an
-    approved device, by a user other than the previous episode's, becomes
-    the episode: that approved-device session is a bulk copy of at least
-    5 files and is exempt from the guard. Users therefore take episodes in
-    proportion to their own rate of such attempts. The next due time is
-    one interval after the episode's first Blocked record; missed
-    episodes are not replayed. -#}
-{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
-  {%- do shared.update({'ep_armed': true, 'ep_due': now + 1000 * hour}) -%}
-{%- endif -%}
-{%- if now < queue[0][0] -%}
-  {%- do shared.set('next_due', queue[0][0]) -%}
-  {{- dispatch.drop() -}}
-{%- endif -%}
-{%- macro pick_file(pool) -%}
-  {%- set ws = [] -%}
-  {%- for p in pool -%}{%- do ws.append(shared.get('files')[p].w) -%}{%- endfor -%}
-  {{- module.rand.weighted_choice(pool, ws) -}}
-{%- endmacro -%}
-{%- macro session(t0, u, dev, ep) -%}
-  {#- One approved device plugged in: Connected, file operations in
-      quick succession with occasional pauses, Disconnected. Returns the
-      time of the Disconnected record. -#}
-  {%- set dv = shared.get('devices')[dev] -%}
-  {%- set drive = module.rand.weighted_choice(['E:', 'F:', 'D:', 'G:'], [70, 18, 8, 4]) -%}
-  {{- row(t0, 'Connected', u.name, dev, drive, none) -}}
-  {#- Guard, part 1: a session that follows a Blocked record of the same
-      user within the guard window is never a bulk copy (episodes
-      excepted); part 2 below caps its writes. -#}
-  {%- set guarded = namespace(v=false) -%}
-  {%- for b in u.blocks if b.t < t0 and t0 <= b.t + 7200000000 -%}{%- set guarded.v = true -%}{%- endfor -%}
-  {%- set modes = ['browse', 'drop', 'mixed', 'bulk', 'idle'] -%}
-  {%- set mode = 'bulk' if ep else module.rand.weighted_choice(modes, [34, 30, 20, 0, 6] if guarded.v else [34, 30, 20, 10, 6]) -%}
-  {%- if mode == 'browse' -%}
-    {%- set ops = ['File Read'] * module.rand.weighted_choice([1, 2, 3, 4, 6, 9], [30, 22, 16, 12, 12, 8]) -%}
-  {%- elif mode == 'drop' -%}
-    {%- set ops = ['File Write'] * module.rand.weighted_choice([1, 2, 3, 4], [45, 28, 17, 10]) -%}
-    {%- if module.rand.chance(0.3) -%}{%- set ops = ['File Read'] + ops -%}{%- endif -%}
-  {%- elif mode == 'mixed' -%}
-    {%- set ops = [] -%}
-    {%- for _ in range(module.rand.number.integer(3, 14)) -%}
-      {%- do ops.append(module.rand.weighted_choice(['File Read', 'File Write', 'File Delete'], [50, 35, 15])) -%}
-    {%- endfor -%}
-  {%- elif mode == 'bulk' -%}
-    {%- set nb = namespace(v=0) -%}
-    {%- for _ in range(40) if nb.v < (5 if ep else 1) -%}
-      {%- set nb.v = [module.builtins.int(module.rand.number.lognormal(module.math.log(11), 0.65)), 60] | min -%}
-    {%- endfor -%}
-    {%- set ops = ['File Write'] * nb.v -%}
-    {%- if module.rand.chance(0.25) -%}{%- set ops = ['File Delete'] * module.rand.number.integer(1, 4) + ops -%}{%- endif -%}
-  {%- else -%}
-    {%- set ops = [] -%}
-  {%- endif -%}
-  {%- set t = namespace(v=t0 + (ln(15, 0.9) | int), nw=0) -%}
-  {%- set pool = shared.get('depts')[u.dept].pool -%}
-  {%- for op in ops -%}
-    {%- set on_dev = dv.files.keys() | list -%}
-    {%- if op == 'File Write' -%}
-      {#- Guard, part 2: every Blocked record of this user in the window
-          allows at most 4 writes after it (episodes excepted). -#}
-      {%- set ok = namespace(v=true) -%}
-      {%- if not ep -%}
-        {%- for b in u.blocks if b.t < t0 and t.v <= b.t + 7200000000 and b.n >= 4 -%}{%- set ok.v = false -%}{%- endfor -%}
-      {%- endif -%}
-      {%- if ok.v -%}
-        {%- for b in u.blocks if b.t < t0 and t.v <= b.t + 7200000000 -%}{%- do b.update({'n': b.n + 1}) -%}{%- endfor -%}
-        {%- set p = pick_file(pool) if module.rand.chance(0.9) or not on_dev else module.rand.choice(on_dev) -%}
-        {{- row(t.v, 'File Write', u.name, dev, drive, p) -}}
-        {%- do dv.files.update({p: true}) -%}
-      {%- endif -%}
-    {%- elif op == 'File Read' and on_dev -%}
-      {{- row(t.v, 'File Read', u.name, dev, drive, module.rand.choice(on_dev)) -}}
-    {%- elif op == 'File Delete' and on_dev -%}
-      {%- set p = module.rand.choice(on_dev) -%}
-      {{- row(t.v, 'File Delete', u.name, dev, drive, p) -}}
-      {%- do dv.files.pop(p) -%}
-    {%- endif -%}
-    {%- set t.v = t.v + (ln(9, 1.1) | int if op == 'File Write' and mode == 'bulk' else ln(25, 1.2) | int) -%}
-    {%- if module.rand.chance(0.08) -%}{%- set t.v = t.v + (ln(240, 0.9) | int) -%}{%- endif -%}
-  {%- endfor -%}
-  {%- for p in dv.files.keys() | list -%}
-    {%- if dv.files | length > 80 -%}{%- do dv.files.pop(p) -%}{%- endif -%}
-  {%- endfor -%}
-  {%- set t.v = t.v + (ln(150, 1.1) | int) -%}
-  {{- row(t.v, 'Disconnected', u.name, dev, drive, none) -}}
-  {{- t.v -}}
-{%- endmacro -%}
-{%- set out = namespace(row=none, rec=0) -%}
-{%- for _ in range(32) if out.row is none and queue and queue[0][0] <= now -%}
-  {%- set top = hq.heappop(queue) -%}
-  {%- set due = top[0] -%}
-  {%- set item = top[2] -%}
-  {%- set u = users.get(item.get('u')) -%}
-  {%- if item.k == 'row' -%}
-    {%- set out.row = item -%}
-    {%- set out.rec = [due, shared.get('last_us') + 1] | max -%}
-    {%- do shared.set('last_us', out.rec) -%}
-  {%- elif item.k == 'shift' -%}
-    {#- A shift begins; the first device activity follows after a gap
-        scaled by the user's pace. -#}
-    {%- do u.update({'we': due + (ln(9 * 3600, 0.25) | int), 'sid': u.sid + 1}) -%}
-    {{- push(due + module.builtins.int((ln(2.5 * 3600, 1.0) | int) / u.pace), {'k': 'act', 'u': u.name, 'sid': u.sid}) -}}
-    {%- set off = ln(14.5 * 3600, 0.4) | int -%}
-    {%- if module.rand.chance(0.12) -%}{%- set off = off + (ln(40 * 3600, 0.5) | int) -%}{%- endif -%}
-    {{- push(u.we + off, {'k': 'shift', 'u': u.name}) -}}
-  {%- elif item.k == 'act' and due < u.we and item.sid == u.sid -%}
-    {#- One device activity, then the next after a gap scaled by pace.
-        The Blocked list keeps only records inside the guard window. -#}
-    {%- set keep = [] -%}
-    {%- for b in u.blocks if b.t + guard > due -%}{%- do keep.append(b) -%}{%- endfor -%}
-    {%- do u.update({'blocks': keep}) -%}
-    {%- set t = namespace(v=due) -%}
-    {%- if module.rand.chance(u.p_block) -%}
-      {#- Personal device: blocked, sometimes re-plugged within a minute
-          or two, sometimes followed by an approved device. -#}
-      {%- set pd = module.rand.choice(u.personal) -%}
-      {%- set go = namespace(v=true) -%}
-      {%- for _ in range(5) if go.v -%}
-        {{- row(t.v, 'Blocked', u.name, pd, '', none) -}}
-        {%- do u.blocks.append({'t': t.v, 'n': 0}) -%}
-        {%- set go.v = module.rand.chance(0.4) -%}
-        {%- if go.v -%}{%- set t.v = t.v + (ln(35, 0.8) | int) -%}{%- endif -%}
-      {%- endfor -%}
-      {%- if module.rand.chance(0.5) -%}
-        {%- set is_ep = params.anomaly_mode and shared.get('ep_armed') and u.name != shared.get('ep_last') -%}
-        {%- if is_ep -%}
-          {%- do shared.update({'ep_armed': false, 'ep_last': u.name, 'ep_due': due + interval + module.rand.number.integer(0, [hour, interval // 8] | min)}) -%}
+{%- set S = shared.get('s') -%}
+{%- set U = S.users -%}
+{%- set queue = S.queue -%}
+{#- Once per head-office day: who is at work in each hour. Office
+    staff start within about 20 minutes of their usual time and are
+    away on about 4% of days; duty staff work every other day. -#}
+{%- if S.day != day -%}
+  {%- set tabs = [] -%}
+  {%- for _ in range(24) -%}{%- do tabs.append({'u': [], 'c': [], 't': 0.0}) -%}{%- endfor -%}
+  {%- for u in U -%}
+    {%- if u.duty -%}
+      {%- for h in range(24) -%}
+        {%- set on = (8 <= h < 20) if u.duty == 'day' else (h >= 20 or h < 8) -%}
+        {%- set wd = day - 1 if u.duty == 'night' and h < 8 else day -%}
+        {%- if on and (wd + u.phase) % 2 == 0 -%}
+          {%- set tb = tabs[h] -%}
+          {%- do tb.update({'t': tb.t + u.w}) -%}
+          {%- do tb.u.append(u.i) -%}
+          {%- do tb.c.append(tb.t) -%}
         {%- endif -%}
-        {%- set dev = module.rand.choice(u.own) if u.own and module.rand.chance(0.75) else module.rand.choice(depts[u.dept].shared_devs) -%}
-        {%- set t.v = session(t.v + (ln(150, 0.9) | int), u, dev, is_ep) | int -%}
-      {%- endif -%}
-    {%- else -%}
-      {%- set dev = module.rand.choice(u.own) if u.own and module.rand.chance(0.75) else module.rand.choice(depts[u.dept].shared_devs) -%}
-      {%- set t.v = session(t.v, u, dev, false) | int -%}
+      {%- endfor -%}
+    {%- elif not module.rand.chance(0.04) -%}
+      {%- set st = u.st + module.rand.number.gauss(0, 0.3) -%}
+      {%- set en = st + u.len -%}
+      {%- for h in range(module.math.floor(st), module.math.ceil(en)) -%}
+        {%- set ov = ([h + 1, en] | min) - ([h, st] | max) -%}
+        {%- if ov > 0 -%}
+          {%- set tb = tabs[h % 24] -%}
+          {%- do tb.update({'t': tb.t + u.w * ov}) -%}
+          {%- do tb.u.append(u.i) -%}
+          {%- do tb.c.append(tb.t) -%}
+        {%- endif -%}
+      {%- endfor -%}
     {%- endif -%}
-    {{- push(t.v + module.builtins.int((ln(2.5 * 3600, 1.0) | int) / u.pace), item) -}}
+  {%- endfor -%}
+  {%- do S.update({'day': day, 'tabs': tabs}) -%}
+{%- endif -%}
+{#- Open activities are kept near a target that follows the current
+    record rate (a smoothed gap between records), so that records come
+    out close to their planned times: a due record goes first; with no
+    record due, a new activity starts while fewer than the target are
+    open, otherwise the next planned record comes out now. -#}
+{%- do S.update({'gap': 0.95 * S.gap + 0.05 * ([[ts.timestamp() - S.prev, 0] | max, 3600] | min), 'prev': ts.timestamp()}) -%}
+{%- set target = [1, 73.0 / [S.gap, 0.001] | max] | max -%}
+{%- set out = namespace(row=none, started=false) -%}
+{%- for _ in range(40) if out.row is none -%}
+  {%- if queue and (queue[0][0] <= now or S.open >= target or out.started) -%}
+    {%- set it = hq.heappop(queue)[2] -%}
+    {%- set u = U[it.u] -%}
+    {%- do u.update({'pend': u.pend - 1}) -%}
+    {%- if u.pend == 0 -%}{%- do S.update({'open': S.open - 1}) -%}{%- endif -%}
+    {%- set dv = S.devices[it.dev] -%}
+    {%- if it.ev == 'Blocked' -%}
+      {%- set keep = [] -%}
+      {%- for b in u.blk if nows - b.t <= window -%}{%- do keep.append(b) -%}{%- endfor -%}
+      {%- do keep.append({'t': nows, 'd': it.dev, 'c': {}}) -%}
+      {%- do u.update({'blk': keep[-10:]}) -%}
+      {%- set out.row = it -%}
+    {%- elif it.ev == 'Connected' -%}
+      {%- for b in u.blk if nows - b.t <= window and b.d != it.dev and it.dev not in b.c -%}{%- do b.c.update({it.dev: 0}) -%}{%- endfor -%}
+      {%- set out.row = it -%}
+    {%- elif it.ev == 'File Write' -%}
+      {#- Guard on the exact final step: a write that would be the fifth
+          to this device within an hour of a Blocked record (after the
+          device was connected) is not made, unless it is the episode's
+          own fifth write. -#}
+      {%- set g = namespace(full=false) -%}
+      {%- for b in u.blk if nows - b.t <= window and it.dev in b.c and b.c[it.dev] >= 4 -%}{%- set g.full = true -%}{%- endfor -%}
+      {%- if g.full and not (it.ep and it.ep == S.ep_open) -%}
+        {%- do S.update({'guard': S.get('guard', 0) + 1}) -%}
+      {%- else -%}
+        {%- if g.full -%}{%- do S.update({'ep_open': 0}) -%}{%- endif -%}
+        {%- for b in u.blk if nows - b.t <= window and it.dev in b.c -%}{%- do b.c.update({it.dev: b.c[it.dev] + 1}) -%}{%- endfor -%}
+        {%- set p = module.rand.choice(dv.files.keys() | list) if it.re and dv.files else it.f -%}
+        {%- do dv.files.update({p: true}) -%}
+        {%- do it.update({'f': p}) -%}
+        {%- set out.row = it -%}
+      {%- endif -%}
+    {%- elif it.ev == 'Disconnected' -%}
+      {%- for p in dv.files.keys() | list -%}
+        {%- if dv.files | length > 80 -%}{%- do dv.files.pop(p) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set out.row = it -%}
+    {%- elif dv.files -%}
+      {#- File Read or File Delete of a file that is on the device now. -#}
+      {%- set p = module.rand.choice(dv.files.keys() | list) -%}
+      {%- if it.ev == 'File Delete' -%}{%- do dv.files.pop(p) -%}{%- endif -%}
+      {%- do it.update({'f': p}) -%}
+      {%- set out.row = it -%}
+    {%- endif -%}
+  {%- elif not out.started -%}
+    {%- set out.started = true -%}
+    {%- set tb = S.tabs[hour] -%}
+    {%- set ep = namespace(ui=none) -%}
+    {#- Episode: at its planned moment, an idle phone-charging user who
+        is at work, had no Blocked record in the last hour and did not
+        take the previous episode plugs the phone in, is blocked and
+        copies five files to the own company stick. -#}
+    {%- if params.anomaly_mode and now >= S.ep_at -%}
+      {%- set cand = [] -%}
+      {%- set cw = [] -%}
+      {%- for i in tb.u -%}
+        {%- set c = U[i] -%}
+        {%- if c.heavy and c.pend == 0 and c.name != S.ep_last -%}
+          {%- set fresh = namespace(v=true) -%}
+          {%- for b in c.blk if nows - b.t <= window -%}{%- set fresh.v = false -%}{%- endfor -%}
+          {%- if fresh.v -%}{%- do cand.append(i) -%}{%- do cw.append(c.w) -%}{%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if cand -%}
+        {%- set ep.ui = module.rand.weighted_choice(cand, cw) -%}
+        {%- set due = now + S.interval -%}
+        {%- set w = [S.interval // 4, 6 * hour_us] | min -%}
+        {%- do S.update({'ep_n': S.ep_n + 1, 'ep_last': U[ep.ui].name, 'ep_at': pick_time(due - w // 2, due + w // 2, 2) | int}) -%}
+        {%- do S.update({'ep_open': S.ep_n}) -%}
+        {%- do attempt(now, ep.ui, S.ep_n) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if ep.ui is none -%}
+      {%- set pick = namespace(ui=none) -%}
+      {%- for _ in range(8) if pick.ui is none -%}
+        {%- set i = tb.u[[module.bisect.bisect_right(tb.c, module.rand.number.floating(0, tb.t)), tb.u | length - 1] | min] if tb.u else module.rand.number.integer(0, U | length - 1) -%}
+        {%- if U[i].pend == 0 -%}{%- set pick.ui = i -%}{%- endif -%}
+      {%- endfor -%}
+      {%- for i in tb.u if pick.ui is none and U[i].pend == 0 -%}{%- set pick.ui = i -%}{%- endfor -%}
+      {%- if pick.ui is none -%}{%- set pick.ui = tb.u[0] if tb.u else 0 -%}{%- endif -%}
+      {%- set u = U[pick.ui] -%}
+      {%- if u.personal and module.rand.chance(u.p_block) -%}
+        {%- do attempt(now, pick.ui, 0) -%}
+      {%- else -%}
+        {%- do session(now, pick.ui, u.own if u.own and module.rand.chance(u.own_p) else module.rand.choice(S.depts[u.dept].shared), 0) -%}
+      {%- endif -%}
+    {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', queue[0][0] if queue else now + sec) -%}
 {%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set r = out.row -%}
-{%- set u = users[r.u] -%}
-{%- set dv = devices[r.dev] -%}
-{%- set f = files[r.f] if r.f else none -%}
-{%- set client = (ts + module.datetime.timedelta(microseconds=out.rec - now)).replace(microsecond=0) -%}
+{%- set u = U[r.u] -%}
+{%- set dv = S.devices[r.dev] -%}
+{%- set f = S.files[r.f] if r.f else none -%}
+{%- set client = ts.replace(microsecond=0) -%}
 {%- set server = client + module.datetime.timedelta(seconds=module.builtins.int(module.rand.number.lognormal(module.math.log(2), 0.9))) -%}
 {#- Server columns use the server's zone; client columns the
     workstation's (head office, or a branch office some hours away). -#}
@@ -330,7 +446,7 @@
   'Device': dv.name,
   'Device VID': dv.vid,
   'Device PID': dv.pid,
-  'Device Serial': dv.serial,
+  'Device Serial': r.dev,
   'EPP Client Version': u.ver,
   'File Name': r.drive ~ '\\' ~ f.path if f else '',
   'File Hash': f.hash if f else '',
