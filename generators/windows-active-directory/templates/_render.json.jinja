@@ -1,0 +1,209 @@
+{%- set user_sid = params.domain_sid ~ '-' ~ user_row.rid -%}
+{# One current TGT per modeled account/client. Missing entries predate the window. #}
+{%- if code in ['4768', '4769'] -%}
+  {%- set tgt_cache = shared.get('tgt_cache', {}) -%}
+  {%- set tgt_key = user_sid ~ '|' ~ source_ip -%}
+  {%- set tgt = tgt_cache.get(tgt_key) -%}
+  {%- if code == '4768' or tgt is none -%}
+    {%- set tgt = {
+      'hash': module.base64.b64encode(module.os.urandom(32)).decode('ascii'),
+      'logon_guid': '{' ~ module.rand.crypto.uuid4() ~ '}'} -%}
+    {%- do tgt_cache.update({tgt_key: tgt}) -%}
+    {%- do shared.set('tgt_cache', tgt_cache) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if item.get('episode', false) and code == '4768' -%}
+  {%- do item.job.update({'tgt': tgt}) -%}
+{%- elif item.get('episode', false) and code == '4769' -%}
+  {%- set tgt = item.job.tgt -%}
+{%- endif -%}
+{%- set seq = shared.get('record_id', 900000) + 1 -%}
+{%- do shared.set('record_id', seq) -%}
+{%- set event_data = {} -%}
+{%- set related_users = [user_row.name] -%}
+{%- set category = ['authentication'] -%}
+{%- set event_types = ['start'] -%}
+{%- set outcome = 'success' -%}
+{%- set service_name = none -%}
+{%- set action = '' -%}
+{%- set task = '' -%}
+{%- set extra = {} -%}
+{%- if code == '4768' -%}
+  {%- set action = 'kerberos-authentication-ticket-requested' -%}
+  {%- set task = 'Kerberos Authentication Service' -%}
+  {%- set service_name = 'krbtgt' -%}
+  {%- do event_data.update({
+    'PreAuthType': '2', 'ServiceName': service_name,
+    'ServiceSid': params.domain_sid ~ '-502', 'Status': '0x0',
+    'StatusDescription': 'KDC_ERR_NONE',
+    'TargetDomainName': params.dns_domain,
+    'TargetSid': user_sid, 'TargetUserName': user_row.name,
+    'TicketEncryptionType': '0x12',
+    'TicketEncryptionTypeDescription': 'AES256-CTS-HMAC-SHA1-96',
+    'TicketOptions': '0x40810010',
+    'TicketOptionsDescription': ['Forwardable', 'Renewable-ok',
+      'Name-canonicalize', 'Renewable']}) -%}
+  {%- do event_data.update({
+    'ResponseTicket': tgt.hash,
+    'AccountSupportedEncryptionTypes': '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)',
+    'AccountAvailableKeys': 'AES-SHA1, RC4',
+    'ServiceSupportedEncryptionTypes': '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)',
+    'ServiceAvailableKeys': 'AES-SHA1, RC4',
+    'DCSupportedEncryptionTypes': '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)',
+    'DCAvailableKeys': 'AES-SHA1, RC4',
+    'ClientAdvertizedEncryptionTypes': 'AES256-CTS-HMAC-SHA1-96 AES128-CTS-HMAC-SHA1-96 RC4-HMAC-NT',
+    'SessionKeyEncryptionType': '0x12',
+    'PreAuthEncryptionType': '0x12'}) -%}
+{%- elif code == '4769' -%}
+  {%- set action = 'kerberos-service-ticket-requested' -%}
+  {%- set task = 'Kerberos Service Ticket Operations' -%}
+  {%- set service_name = service_row.account -%}
+  {%- set enc_name = {'0x12': 'AES256-CTS-HMAC-SHA1-96',
+    '0x17': 'RC4-HMAC'}[enc] -%}
+  {%- do event_data.update({
+    'LogonGuid': tgt.logon_guid,
+    'ServiceName': service_name,
+    'ServiceSid': params.domain_sid ~ '-' ~ service_row.rid,
+    'Status': '0x0', 'StatusDescription': 'KDC_ERR_NONE',
+    'TargetDomainName': params.dns_domain,
+    'TargetUserName': user_row.name ~ '@' ~ params.dns_domain,
+    'TicketEncryptionType': enc,
+    'TicketEncryptionTypeDescription': enc_name,
+    'TicketOptions': '0x40810000',
+    'TicketOptionsDescription': ['Forwardable', 'Name-canonicalize',
+      'Renewable']}) -%}
+  {%- do event_data.update({
+    'TransmittedServices': '-',
+    'RequestTicketHash': tgt.hash,
+    'ResponseTicketHash': module.base64.b64encode(module.os.urandom(32)).decode('ascii'),
+    'AccountSupportedEncryptionTypes': 'N/A',
+    'AccountAvailableKeys': 'N/A',
+    'ServiceSupportedEncryptionTypes': '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)',
+    'ServiceAvailableKeys': 'AES-SHA1, RC4',
+    'DCSupportedEncryptionTypes': '0x1F (DES, RC4, AES128-SHA96, AES256-SHA96)',
+    'DCAvailableKeys': 'AES-SHA1, RC4',
+    'ClientAdvertizedEncryptionTypes': 'RC4-HMAC-NT' if enc == '0x17'
+      else 'AES256-CTS-HMAC-SHA1-96 AES128-CTS-HMAC-SHA1-96 RC4-HMAC-NT',
+    'SessionKeyEncryptionType': '0x17' if enc == '0x17' else '0x12'}) -%}
+{%- elif code == '4771' -%}
+  {%- set action = 'kerberos-preauth-failed' -%}
+  {%- set task = 'Kerberos Authentication Service' -%}
+  {%- set service_name = 'krbtgt/' ~ params.dns_domain -%}
+  {%- set outcome = 'failure' -%}
+  {%- do event_data.update({
+    'PreAuthType': '2', 'ServiceName': service_name,
+    'Status': '0x18', 'StatusDescription': 'KDC_ERR_PREAUTH_FAILED',
+    'TargetSid': user_sid, 'TargetUserName': user_row.name,
+    'TicketOptions': '0x40810010',
+    'TicketOptionsDescription': ['Forwardable', 'Renewable-ok',
+      'Name-canonicalize', 'Renewable']}) -%}
+{%- elif code == '4776' -%}
+  {%- set action = 'credential-validated' -%}
+  {%- set task = 'Credential Validation' -%}
+  {%- do event_data.update({
+    'PackageName': 'MICROSOFT_AUTHENTICATION_PACKAGE_V1_0',
+    'Status': '0x0', 'TargetUserName': user_row.name,
+    'Workstation': user_row.workstation}) -%}
+  {%- do extra.update({'winlog_logon': {
+    'failure': {'status': 'Status OK.'}}}) -%}
+{%- elif code in ['4728', '4729'] -%}
+  {%- set action = 'added-member-to-group' if code == '4728' else 'removed-member-from-group' -%}
+  {%- set task = 'Security Group Management' -%}
+  {%- set category = ['iam'] -%}
+  {%- set event_types = ['group', 'change'] -%}
+  {%- set member_name = user_row.member -%}
+  {%- set member_sid = params.domain_sid ~ '-' ~ user_row.member_rid -%}
+  {%- set group_name = 'Domain Admins' if item.group == 512 else 'Maintenance Operators' -%}
+  {%- set group_sid = params.domain_sid ~ '-' ~ item.group -%}
+  {%- set logon_id = item.logon -%}
+  {%- set related_users = [user_row.name, member_name] -%}
+  {%- do event_data.update({
+    'MemberName': 'CN=' ~ member_name ~ ',CN=Users,' ~ params.domain_dn,
+    'MemberSid': member_sid,
+    'SubjectDomainName': params.domain, 'SubjectLogonId': logon_id,
+    'SubjectUserName': user_row.name, 'SubjectUserSid': user_sid,
+    'TargetDomainName': params.domain, 'TargetSid': group_sid,
+    'TargetUserName': group_name}) -%}
+  {%- do extra.update({
+    'group': {'domain': params.domain, 'id': group_sid, 'name': group_name},
+    'user_target': {'domain': params.domain, 'name': member_name,
+      'id': member_sid, 'group': {'domain': params.domain,
+        'id': group_sid, 'name': group_name}},
+    'winlog_logon': {'id': logon_id}}) -%}
+{%- elif code == '5136' -%}
+  {%- set action = 'directory-service-object-modified' -%}
+  {%- set task = 'Directory Service Changes' -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_types = ['admin', 'change'] -%}
+  {%- set operation = item.operation -%}
+  {%- set attribute_value = item.value -%}
+  {%- set object_name = user_row.member -%}
+  {%- set object_guid = user_row.object_guid -%}
+  {%- set correlation_id = item.correlation -%}
+  {%- set logon_id = item.logon -%}
+  {%- do event_data.update({
+    'AppCorrelationID': '-',
+    'AttributeLDAPDisplayName': 'msDS-AllowedToDelegateTo',
+    'AttributeSyntaxOID': '2.5.5.12',
+    'AttributeValue': attribute_value,
+    'DSName': params.dns_domain,
+    'DSType': 'Active Directory Domain Services',
+    'ObjectClass': 'user',
+    'ObjectDN': 'CN=' ~ object_name ~ ',CN=Users,' ~ params.domain_dn,
+    'ObjectGUID': object_guid,
+    'OpCorrelationID': correlation_id,
+    'OperationType': operation,
+    'SubjectDomainName': params.domain,
+    'SubjectLogonId': logon_id,
+    'SubjectUserName': user_row.name,
+    'SubjectUserSid': user_sid}) -%}
+  {%- do extra.update({'winlog_logon': {'id': logon_id}}) -%}
+{%- endif -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'agent': {
+    'ephemeral_id': params.dc_ephemeral_id,
+    'id': params.dc_agent_id,
+    'name': params.dc_host,
+    'type': 'filebeat',
+    'version': params.agent_version},
+  'ecs': {'version': '8.11.0'},
+  'event': {
+    'action': action, 'category': category, 'code': code,
+    'kind': 'event', 'outcome': outcome,
+    'provider': 'Microsoft-Windows-Security-Auditing',
+    'sequence': seq, 'type': event_types},
+  'host': {'name': params.dc_host,
+    'os': {'family': 'windows', 'type': 'windows'}},
+  'log': {'level': 'information'},
+  'related': {'user': related_users},
+  'user': {'domain': params.dns_domain if code in ['4768', '4769', '4771'] else params.domain, 'id': user_sid,
+    'name': user_row.name},
+  'winlog': {
+    'channel': 'Security', 'computer_name': params.dc_host,
+    'event_data': event_data, 'event_id': code,
+    'keywords': ['Audit Failure' if outcome == 'failure'
+      else 'Audit Success'],
+    'level': 'information', 'opcode': 'Info', 'outcome': outcome,
+    'process': {'pid': 516, 'thread': {
+      'id': module.rand.number.integer(1000, 8191)}},
+    'provider_guid': '{54849625-5478-4994-a5ba-3e3b0328c30d}',
+    'provider_name': 'Microsoft-Windows-Security-Auditing',
+    'record_id': seq | string, 'task': task,
+    'version': 2 if code in ['4768', '4769'] else 0,
+    'time_created': timestamp.isoformat()}}
+-%}
+{%- if code in ['4768', '4769', '4771'] -%}
+  {%- do event.update({
+    'source': {'ip': source_ip, 'port': source_port},
+    'service': {'name': service_name}}) -%}
+  {%- do event.related.update({'ip': [source_ip]}) -%}
+{%- endif -%}
+{%- if code in ['4728', '4729'] -%}
+  {%- do event.update({'group': extra.group}) -%}
+  {%- do event.user.update({'target': extra.user_target}) -%}
+{%- endif -%}
+{%- if code in ['4728', '4729', '4776', '5136'] -%}
+  {%- do event.winlog.update({'logon': extra.winlog_logon}) -%}
+{%- endif -%}
+{{- event | tojson -}}
