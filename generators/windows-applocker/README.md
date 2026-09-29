@@ -47,7 +47,7 @@ About 9,250 records a day from 18 workstations and two administrators:
 | `8005` | MSI and Script | Script/MSI allowed to run | 20.9% | ~108 | `process` |
 | `8004` | EXE and DLL | Executable/DLL prevented from running | 2.0% | ~10 | `process` |
 | `8007` | MSI and Script | Script/MSI prevented from running | 1.0% | ~6 (on the 15 enforced hosts) | `process` |
-| `8006` | MSI and Script | Script/MSI would have been blocked (Audit only) | ~0.2% | ~6.5 (on the 3 audit hosts) | `process` |
+| `8006` | MSI and Script | Script/MSI would have been blocked (Audit only) | 0.15-0.3% | 4.5-8 (on the 3 audit hosts) | `process` |
 
 `event.code` is a string; `event.action` is `None` and `event.type` is
 `["start"]`, matching the Elastic Windows integration output for these
