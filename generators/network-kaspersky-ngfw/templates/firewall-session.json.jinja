@@ -1,9 +1,10 @@
 {#- One Kaspersky NGFW 1.0 device logging the Firewall session stream.
-    Each one-second tick emits at most one record: the earliest due
-    session start or session end. Client activity is a superposition
-    of independent per-client random processes; the anomaly episode
-    only adds three sessions for one client and never touches the
-    background queue. -#}
+    The input sets the record rate and its hour-of-day curve. Every
+    timestamp emits exactly one record: the earliest due session start
+    or session end, otherwise the start of a new background activity
+    of a client drawn by its weight. The anomaly episode only queues
+    three sessions for one client and never touches the background
+    queue. -#}
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
@@ -11,7 +12,8 @@
 {#- Chain window of the detector (first read to upload), shared by
     the background guard. -#}
 {%- set guard_s = 3600 -%}
-{#- Background load factor by UTC hour, mean 1 over the day. -#}
+{#- Load factor by UTC hour, mean 1 over the day; the step curve the
+    time patterns draw (1.45 06-16, 0.8 16-20, 0.35 otherwise). -#}
 {%- macro load_at(h) -%}
 {{- (1.45 if 6 <= h < 16 else (0.8 if 16 <= h < 20 else 0.35)) / 0.883 -}}
 {%- endmacro -%}
@@ -68,8 +70,6 @@
 {%- set clients = shared.get('clients') -%}
 {%- set q = shared.get('q') -%}
 {%- set hist = shared.get('hist') -%}
-{%- set hour = timestamp.astimezone(utc).hour -%}
-{%- set load = load_at(hour) | float -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
@@ -117,43 +117,20 @@
 {{- (scale * module.rand.number.lognormal(0, 0.7)) | int + 2000 -}}
 {%- endmacro -%}
 
-{#- 1. Background arrivals: one merged Poisson stream of independent
-    clients, weighted per client, modulated by office hours. -#}
-{%- if module.rand.chance(0.05 * load) -%}
-  {%- set c = module.rand.weighted_choice(clients, shared.get('weights')) -%}
-  {%- set kind = module.rand.weighted_choice(['web', 'cloud', 'smb', 'http', 'dns'],
-      [62, 8, 18, 6, 6]) -%}
-  {%- if kind in ['web', 'cloud', 'http'] and module.rand.chance(0.6) -%}
-    {{- open_session(c, 'dns', params.dns_server, now) -}}
-  {%- endif -%}
-  {%- set lag = now + module.rand.weighted_choice([0, 1, 2], [40, 45, 15]) -%}
-  {%- if kind == 'web' or kind == 'http' -%}
-    {{- open_session(c, 'https' if kind == 'web' else 'http',
-        module.rand.choice(shared.get('web')[:[(module.rand.number.exponential(0.12)) | int + 1, 40] | min]),
-        lag, down=web_down() | int, up=web_up() | int) -}}
-  {%- elif kind == 'cloud' -%}
-    {%- set upl = module.rand.chance(0.18) -%}
-    {{- open_session(c, 'https', module.rand.choice(params.cloud_destinations), lag,
-        down=web_down() | int,
-        up=(upload_size() | int) if upl else (web_up() | int)) -}}
-  {%- elif kind == 'smb' -%}
-    {%- set scale = module.rand.number.lognormal(module.math.log(300000), 2.2) -%}
-    {%- set burst = module.rand.weighted_choice([0, 1, 2, 3, 4, 5, 6],
-        [55, 22, 11, 6, 3, 2, 1]) -%}
-    {{- open_session(c, 'smb', module.rand.choice(params.file_servers), now,
-        down=smb_size(scale) | int, burst=burst, scale=scale) -}}
-  {%- else -%}
-    {{- open_session(c, 'dns', params.dns_server, now) -}}
-  {%- endif -%}
-{%- endif -%}
-
-{#- 2. Episode: the first starts within min(interval, 24 h), its time
+{#- 1. Episode: the first starts within min(interval, 24 h), its time
     drawn from the load curve; each later one in a window of
     min(interval / 4, 6 h) centred on its due time (previous start
     plus the interval), weighted by the squared load curve. -#}
 {%- if params.anomaly_mode -%}
   {%- if now >= shared.get('start_at') -%}
-    {%- set c = module.rand.choice(clients | reject('equalto', shared.get('last_client')) | list) -%}
+    {%- set cw = namespace(c=[], w=[]) -%}
+    {%- for n in range(clients | length) -%}
+      {%- if clients[n] != shared.get('last_client') -%}
+        {%- do cw.c.append(clients[n]) -%}
+        {%- do cw.w.append(shared.get('weights')[n]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set c = module.rand.weighted_choice(cw.c, cw.w) -%}
     {%- set dest = module.rand.choice(params.cloud_destinations
         | reject('equalto', shared.get('last_dest')) | list) -%}
     {%- set srv = module.rand.choice(params.file_servers) -%}
@@ -179,14 +156,48 @@
   {%- endif -%}
 {%- endif -%}
 
-{#- 3. Emit the earliest due record, otherwise nothing. -#}
+{#- 2. Background: when no queued record is due, a new activity of a
+    client drawn by its weight starts now. -#}
+{%- set due_now = namespace(v=false) -%}
+{%- for e in q -%}
+  {%- if e.due <= now -%}{%- set due_now.v = true -%}{%- endif -%}
+{%- endfor -%}
+{%- if not due_now.v -%}
+  {%- set c = module.rand.weighted_choice(clients, shared.get('weights')) -%}
+  {%- set kind = module.rand.weighted_choice(['web', 'cloud', 'smb', 'http', 'dns'],
+      [62, 8, 18, 6, 6]) -%}
+  {%- set lag = now -%}
+  {%- if kind in ['web', 'cloud', 'http'] and module.rand.chance(0.6) -%}
+    {{- open_session(c, 'dns', params.dns_server, now) -}}
+    {%- set lag = now + module.rand.weighted_choice([0, 1, 2], [40, 45, 15]) -%}
+  {%- endif -%}
+  {%- if kind == 'web' or kind == 'http' -%}
+    {{- open_session(c, 'https' if kind == 'web' else 'http',
+        module.rand.choice(shared.get('web')[:[(module.rand.number.exponential(0.12)) | int + 1, 40] | min]),
+        lag, down=web_down() | int, up=web_up() | int) -}}
+  {%- elif kind == 'cloud' -%}
+    {%- set upl = module.rand.chance(0.18) -%}
+    {{- open_session(c, 'https', module.rand.choice(params.cloud_destinations), lag,
+        down=web_down() | int,
+        up=(upload_size() | int) if upl else (web_up() | int)) -}}
+  {%- elif kind == 'smb' -%}
+    {%- set scale = module.rand.number.lognormal(module.math.log(300000), 2.2) -%}
+    {%- set burst = module.rand.weighted_choice([0, 1, 2, 3, 4, 5, 6],
+        [55, 22, 11, 6, 3, 2, 1]) -%}
+    {{- open_session(c, 'smb', module.rand.choice(params.file_servers), now,
+        down=smb_size(scale) | int, burst=burst, scale=scale) -}}
+  {%- else -%}
+    {{- open_session(c, 'dns', params.dns_server, now) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due record; one is always due here. -#}
 {%- set pick = namespace(i=-1, due=now + 1) -%}
 {%- for e in q -%}
   {%- if e.due <= now and e.due < pick.due -%}
     {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
   {%- endif -%}
 {%- endfor -%}
-{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
 {%- set e = q.pop(pick.i) -%}
 {%- set s = e.s -%}
 {%- set started = e.kind == 'start' -%}
@@ -217,10 +228,6 @@
     {%- if blocked.v -%}
       {%- set up_b = module.rand.number.integer(5000000, 45000000) -%}
     {%- endif -%}
-  {%- endif -%}
-  {#- An episode upload completes the chain; the detector starts over. -#}
-  {%- if s.profile == 'https' and s.episode -%}
-    {%- do hist.pop(s.client, none) -%}
   {%- endif -%}
   {%- if s.proto == 'UDP' -%}
     {%- set cpk = module.rand.weighted_choice([1, 2], [90, 10]) -%}
