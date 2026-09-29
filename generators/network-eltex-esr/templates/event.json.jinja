@@ -1,9 +1,12 @@
-{#- One ESR router. Every one-second tick emits at most one record:
-    the earliest due SSH/maintenance step, otherwise random traffic.
-    Administrators, temporary accounts and traffic are independent
-    random processes; the anomaly episode is one extra session. -#}
+{#- One ESR router. The input timestamps set the rate; every
+    timestamp yields exactly one record at that time: the earliest due
+    SSH/maintenance step, otherwise a traffic record. Administrators and
+    temporary accounts start sessions as independent random processes
+    whose steps take over the next timestamps; the anomaly episode is
+    one extra session. -#}
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
+{%- set tzoff = timestamp.utcoffset().total_seconds() | int -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set aliases_all = [] -%}
 {%- for n in range(1, 6) -%}
@@ -11,12 +14,11 @@
 {%- endfor -%}
 {%- set admins = [{'user': params.normal_user, 'ip': params.normal_source_ip},
     {'user': params.unusual_user, 'ip': params.unusual_source_ip}] -%}
-{#- Office-hours intensity by UTC hour; the mean over a day is 1. -#}
-{%- set curve = [] -%}
-{%- for h in range(24) -%}
-  {%- do curve.append((1.45 if 6 <= h < 16 else (0.8 if 16 <= h < 20
-      else 0.35)) / 0.883) -%}
-{%- endfor -%}
+{#- Office-hours intensity by hour of the generator timezone: the
+    hourly input rate of patterns/*.yml (147, 336, 609 an hour) over its
+    daily mean of 371; the mean over a day is 1. -#}
+{%- set curve = [0.39623] * 6 + [1.64151] * 10 + [0.90566] * 4
+    + [0.39623] * 4 -%}
 {#- A start time in [lo, hi), density curve (first episode) or
     curve^2 plus a small floor (later episodes). -#}
 {%- macro pick_time(lo, hi, squared) -%}
@@ -25,7 +27,7 @@
   {%- for attempt in range(500) -%}
     {%- if not r.ok -%}
       {%- set t = module.rand.number.integer(lo | int, (hi | int) - 1) -%}
-      {%- set c = curve[(t // 3600) % 24] -%}
+      {%- set c = curve[((t + tzoff) // 3600) % 24] -%}
       {%- if module.rand.number.floating(0, top) < (c * c + 0.05 if squared else c) -%}
         {%- set r.t = t -%}{%- set r.ok = true -%}
       {%- endif -%}
@@ -35,19 +37,24 @@
 {%- endmacro -%}
 {%- if not shared.get('initialized', false) -%}
   {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- for name in [params.normal_user, params.unusual_user] + aliases_all -%}
+  {%- for name in [params.normal_user, params.unusual_user,
+      params.automation_user] + aliases_all -%}
     {%- if not module.re.fullmatch('[A-Za-z][A-Za-z0-9_-]{0,30}', name) -%}
       {{ module.math.sqrt(-1) }}
     {%- endif -%}
   {%- endfor -%}
   {%- if params.normal_user == params.unusual_user
+      or params.automation_user in [params.normal_user, params.unusual_user]
       or params.normal_user in aliases_all
       or params.unusual_user in aliases_all
-      or params.normal_source_ip == params.unusual_source_ip -%}
+      or params.automation_user in aliases_all
+      or params.normal_source_ip == params.unusual_source_ip
+      or params.automation_source_ip in [params.normal_source_ip,
+          params.unusual_source_ip] -%}
     {{ module.math.sqrt(-1) }}
   {%- endif -%}
   {%- for ip in [params.router_ip, params.normal_source_ip,
-      params.unusual_source_ip] -%}
+      params.unusual_source_ip, params.automation_source_ip] -%}
     {%- set checked_ip = module.ipaddress.IPv4Address(ip) -%}
   {%- endfor -%}
   {%- if not module.re.fullmatch('[A-Za-z0-9][A-Za-z0-9.-]{0,63}',
@@ -57,14 +64,14 @@
   {%- set pool = {} -%}
   {%- for name in aliases_all -%}
     {%- do pool.update({name: {'present': false, 'applied': false,
-        'priv': 1, 'removing': false, 'reserved': false}}) -%}
+        'priv': 1, 'removing': false, 'reserved': false, 'expires': 0}}) -%}
   {%- endfor -%}
   {#- First episode inside the first min(interval, 24 h), its hour
       drawn from the background hour curve. -#}
   {%- do shared.update({'initialized': true, 'aliases': pool, 'procs': [],
       'parts': [], 'consec': {}, 'sequence': module.rand.number.integer(1, 5000),
       'start_at': pick_time(now, now + ([interval, 24] | min) * 3600, false) | trim | int,
-      'last_actor': none, 'last_alias': none}) -%}
+      'last_actor': none, 'last_alias': none, 'last_t': now}) -%}
 {%- endif -%}
 {%- set pool = shared.get('aliases') -%}
 {%- set procs = shared.get('procs') -%}
@@ -76,7 +83,31 @@
 {%- for u in consec_t -%}
   {%- if now - consec_t[u] > 300 -%}{%- do consec.update({u: 0}) -%}{%- endif -%}
 {%- endfor -%}
-{%- set load = curve[timestamp.astimezone(utc).hour] -%}
+{%- set load = curve[((now + tzoff) // 3600) % 24] -%}
+{#- Background rates: administrator sessions a day per administrator,
+    the share of sessions that run the onboarding routine, and the
+    failed-password counts (0-3) of connections that succeed. -#}
+{%- set ADMIN_RATE = 16 -%}
+{%- set ROUTINE_SHARE = 0.5 -%}
+{%- set ADMIN_FAILS = [920, 55, 15, 10] -%}
+
+{#- Arrivals are Poisson processes: the chance of an arrival since the
+    previous timestamp follows the elapsed time, so their rate does not
+    depend on the input rate. -#}
+{%- set dt = [now - shared.get('last_t'), 0] | max -%}
+{%- do shared.set('last_t', now) -%}
+{#- Administrator workload varies from day to day (mean 1). -#}
+{%- set day = (now + tzoff) // 86400 -%}
+{%- if shared.get('day') != day -%}
+  {%- do shared.update({'day': day,
+      'workload': module.rand.number.lognormal(-0.03125, 0.25)}) -%}
+{%- endif -%}
+{%- set p_admin = 1 - module.math.exp(-ADMIN_RATE * shared.get('workload')
+    / 86400 * load * dt) -%}
+{%- set p_account = 1 - module.math.exp(-8 / 86400 * load * dt) -%}
+{#- Configuration backup and monitoring log in around the clock, about
+    twice an hour, with a stored password. -#}
+{%- set p_auto = 1 - module.math.exp(-48 / 86400 * dt) -%}
 
 {%- macro spawn(kind, user, ip, delay, fails=none, ops=none, episode=false,
     target=none, guard=true) -%}
@@ -90,13 +121,15 @@
   {%- endfor -%}
   {%- set ok = true -%}
   {%- if fails is none -%}
-    {%- if kind == 'admin' and module.rand.chance(0.12) -%}
+    {%- if kind == 'auto' -%}
+      {%- set k = 0 -%}
+    {%- elif kind == 'admin' and module.rand.chance(0.015) -%}
       {%- set ok = false -%}
       {%- set k = module.rand.weighted_choice([1, 2, 3], [5, 3, 2]) -%}
     {%- elif kind == 'admin' -%}
-      {%- set k = module.rand.weighted_choice([0, 1, 2, 3], [76, 10, 6, 8]) -%}
+      {%- set k = module.rand.weighted_choice([0, 1, 2, 3], ADMIN_FAILS) -%}
     {%- else -%}
-      {%- set k = module.rand.weighted_choice([0, 1, 2, 3], [85, 9, 4, 2]) -%}
+      {%- set k = module.rand.weighted_choice([0, 1, 2, 3], [965, 25, 7, 3]) -%}
     {%- endif -%}
   {%- else -%}
     {%- set k = fails -%}
@@ -107,18 +140,43 @@
     {%- if p.user == user -%}{%- set queued.n = queued.n + p.fails -%}{%- endif -%}
   {%- endfor -%}
   {%- set k = [k, [4 - queued.n, 0] | max] | min -%}
-  {%- if ok or k > 0 -%}
-    {%- if ops is none and kind == 'admin' and ok -%}
-      {%- set plan = ['any'] * module.rand.weighted_choice(
-          [0, 1, 2, 3, 4, 5, 6], [26, 26, 18, 12, 8, 6, 4]) -%}
-    {%- else -%}
-      {%- set plan = ops or [] -%}
+  {%- set s = namespace(plan=ops or [], target=target) -%}
+  {%- if ops is none and kind == 'admin' and ok -%}
+    {%- set s.plan = ['any'] * module.rand.weighted_choice(
+        [0, 1, 2, 3, 4, 5, 6], [26, 26, 18, 12, 8, 6, 4]) -%}
+    {#- Onboarding routine: rotate the enable password, create an absent
+        account, raise it to 14, apply, set the clock, then test the
+        account's login. An episode is this routine after three failed
+        passwords, added on top of the background. -#}
+    {%- if module.rand.chance(ROUTINE_SHARE) -%}
+      {%- set free = [] -%}
+      {%- for name in aliases_all -%}
+        {%- if not pool[name].present and not pool[name].reserved -%}
+          {%- do free.append(name) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if free -%}
+        {%- set s.target = module.rand.choice(free) -%}
+        {%- do pool[s.target].update({'reserved': true}) -%}
+        {%- set s.plan = ['enable', 'create', 'privilege', 'apply', 'time'] -%}
+      {%- endif -%}
     {%- endif -%}
+    {#- An ordinary session first cleans up expired accounts. -#}
+    {%- if not s.target -%}
+      {%- for name in aliases_all -%}
+        {%- if pool[name].present and pool[name].applied
+            and not pool[name].removing and pool[name].expires <= now -%}
+          {%- do s.plan.insert(0, 'any') -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if ok or k > 0 -%}
     {%- do procs.append({'due': now + ([delay, 0] | max) | int, 'kind': kind,
         'user': user, 'ip': ip, 'port': port.v, 'fails': k, 'ok': ok,
-        'stage': 'fail' if k else 'accept', 'ops': plan, 'pending': false,
+        'stage': 'fail' if k else 'accept', 'ops': s.plan, 'pending': false,
         'apply_next': false, 'changes': [], 'episode': episode,
-        'target': target, 'guard': guard}) -%}
+        'target': s.target, 'guard': guard}) -%}
   {%- endif -%}
 {%- endmacro -%}
 
@@ -128,18 +186,21 @@
 
 {#- 1. Independent arrivals: administrator sessions, account logins. -#}
 {%- for a in admins -%}
-  {%- if module.rand.chance(16 / 86400 * load) -%}
+  {%- if module.rand.chance(p_admin) -%}
     {{- spawn('admin', a.user, a.ip, 0) -}}
   {%- endif -%}
 {%- endfor -%}
 {%- for name in aliases_all -%}
   {%- set acc = pool[name] -%}
   {%- if acc.present and acc.applied and not acc.removing
-      and module.rand.chance(5 / 86400 * load) -%}
+      and module.rand.chance(p_account) -%}
     {%- set via = module.rand.choice(admins) -%}
     {{- spawn('svc', name, via.ip, 0) -}}
   {%- endif -%}
 {%- endfor -%}
+{%- if module.rand.chance(p_auto) -%}
+  {{- spawn('auto', params.automation_user, params.automation_source_ip, 0) -}}
+{%- endif -%}
 
 {#- 2. Episode: starts at a drawn time once an administrator and an
     account are free; the next one is due one interval after the actual
@@ -176,7 +237,7 @@
   {%- endif -%}
 {%- endif -%}
 
-{#- 3. Earliest due step, otherwise traffic, otherwise nothing. -#}
+{#- 3. Earliest due step, otherwise traffic. -#}
 {%- set pick = namespace(i=-1, due=now + 1) -%}
 {%- for p in procs -%}
   {%- if p.due <= now and p.due < pick.due -%}
@@ -217,7 +278,8 @@
     {%- set step = 'accepted' -%}
     {#- Guard on the final chain step only: an ordinary account login
         that would complete a partial chain (first failure at most
-        1800 s earlier, as in the detector) does not happen. -#}
+        1800 s earlier, as in the detector) does not happen; this
+        timestamp carries a traffic record instead. -#}
     {%- if p.kind == 'svc' and p.guard -%}
       {%- set g = namespace(block=false) -%}
       {%- for q in parts -%}
@@ -240,6 +302,8 @@
     {%- set step = 'opened' -%}
     {%- if p.kind == 'admin' -%}
       {%- do p.update({'stage': 'ops', 'due': now + gap(25, 0.8) | int}) -%}
+    {%- elif p.kind == 'auto' -%}
+      {%- do p.update({'stage': 'close', 'due': now + gap(15, 0.5) | int}) -%}
     {%- else -%}
       {%- do p.update({'stage': 'close', 'due': now + gap(100, 1.0) | int}) -%}
     {%- endif -%}
@@ -266,11 +330,16 @@
           {%- do absent.v.append(name) -%}
         {%- elif acc.present and not acc.removing -%}
           {%- do absent.present.append(name) -%}
+          {#- Not while the account logs in or another session is still
+              onboarding it. -#}
           {%- set active = namespace(n=0) -%}
           {%- for q in procs -%}
-            {%- if q.user == name -%}{%- set active.n = active.n + 1 -%}{%- endif -%}
+            {%- if q.user == name or q.target == name -%}
+              {%- set active.n = active.n + 1 -%}
+            {%- endif -%}
           {%- endfor -%}
-          {%- if acc.applied and active.n == 0 and name not in p.changes -%}
+          {%- if acc.applied and active.n == 0 and name not in p.changes
+              and acc.expires <= now -%}
             {%- do absent.removable.append(name) -%}
           {%- endif -%}
         {%- endif -%}
@@ -286,16 +355,17 @@
       {%- if op == 'any' -%}
         {%- set op = module.rand.weighted_choice(
             ['create', 'privilege', 'remove', 'password', 'enable', 'time'],
-            [20 if absent.v else 0,
+            [10 if absent.v else 0,
              (18 if visible.v else 0) + (30 if mine else 0),
-             12 * (absent.removable | length), 14, 24, 22]) -%}
+             400 * (absent.removable | length), 14, 24, 22]) -%}
       {%- endif -%}
       {%- set step = op -%}
       {%- set tgt = none -%}
       {%- if op == 'create' -%}
         {%- set tgt = p.target if p.target else module.rand.choice(absent.v) -%}
         {%- do pool[tgt].update({'present': true, 'applied': false, 'priv': 1,
-            'reserved': false, 'removing': false}) -%}
+            'reserved': false, 'removing': false,
+            'expires': now + gap(2400, 0.7) | int}) -%}
       {%- elif op == 'privilege' -%}
         {%- if p.target -%}
           {%- set tgt = p.target -%}
@@ -305,10 +375,10 @@
           {%- set tgt = module.rand.choice(visible.v) -%}
         {%- endif -%}
         {%- set old = pool[tgt].priv -%}
-        {%- if p.episode -%}
+        {%- if p.target -%}
           {%- set new = 14 -%}
         {%- elif old == 1 -%}
-          {%- set new = module.rand.weighted_choice([14, 5, 15], [60, 25, 15]) -%}
+          {%- set new = module.rand.weighted_choice([14, 5, 15], [75, 15, 10]) -%}
         {%- else -%}
           {%- set new = module.rand.choice([1, 5, 14, 15] | reject('equalto', old) | list) -%}
         {%- endif -%}
@@ -321,13 +391,13 @@
       {%- endif -%}
       {%- if op in ['create', 'privilege', 'remove', 'password', 'enable'] -%}
         {%- if tgt and tgt not in p.changes -%}{%- do p.changes.append(tgt) -%}{%- endif -%}
-        {%- if op == 'create' and not p.episode and module.rand.chance(0.5) -%}
+        {%- if op == 'create' and not p.target and module.rand.chance(0.5) -%}
           {#- Account and its privilege configured in one go. -#}
           {%- do p.ops.insert(0, 'privilege') -%}
           {%- do p.update({'pending': true, 'apply_next': false}) -%}
         {%- else -%}
           {%- do p.update({'pending': true,
-              'apply_next': (not p.episode) and module.rand.chance(0.5)}) -%}
+              'apply_next': (not p.target) and module.rand.chance(0.5)}) -%}
         {%- endif -%}
       {%- elif op == 'apply' -%}
         {%- set tested = namespace(v=none) -%}
@@ -342,12 +412,15 @@
             {%- endif -%}
           {%- endif -%}
         {%- endfor -%}
-        {%- if tested.v and not p.episode and module.rand.chance(0.45) -%}
+        {%- if tested.v and not p.target and module.rand.chance(0.45) -%}
           {{- spawn('svc', tested.v, p.ip, gap(40, 0.8) | int) -}}
         {%- endif -%}
         {%- do p.update({'pending': false, 'apply_next': false, 'changes': []}) -%}
-      {%- elif op == 'time' and p.episode -%}
-        {{- spawn('svc', p.target, p.ip, gap(40, 0.8) | int, guard=false) -}}
+      {%- elif op == 'time' and p.target and pool[p.target].present
+          and pool[p.target].applied and not pool[p.target].removing -%}
+        {#- The test login needs the account to still exist. -#}
+        {{- spawn('svc', p.target, p.ip, gap(40, 0.8) | int,
+            guard=not p.episode) -}}
       {%- endif -%}
       {%- if not p.ops and not p.pending -%}
         {%- do p.update({'due': now + gap(45, 0.8) | int}) -%}
@@ -481,7 +554,8 @@
     {%- do parts.clear() -%}
     {%- do parts.extend(out) -%}
   {%- endif -%}
-{%- elif module.rand.chance(0.1 * load) -%}
+{%- endif -%}
+{%- if action is none -%}
   {%- set kind = module.rand.weighted_choice(['permit', 'deny', 'nat', 'ips'], [620, 200, 150, 15]) -%}
   {%- set flow = samples.flows.where(decision='denied' if kind == 'deny' else 'permitted').pick() -%}
   {%- set sport = module.rand.number.integer(32768, 60999) -%}
@@ -543,7 +617,6 @@
             'native_destination_suffix': 0}}}}) -%}
   {%- endif -%}
 {%- endif -%}
-{%- if action is none -%}{{ dispatch.drop() }}{%- endif -%}
 {%- set raw = '%' ~ group ~ '-' ~ severity_code
     ~ '-' ~ mnemonic ~ ': ' ~ body -%}
 {#- The device also numbers messages outside this subset. -#}
