@@ -2,39 +2,55 @@
 
 Generates Nextcloud 35.0.0 `admin_audit` HTTP records from the dedicated file backend (`data/audit.log`) and wraps each native JSON line in ECS, for testing detections on logins, file access and public links. The native record is retained in `event.original` and parsed under `nextcloud.audit`. The ECS `agent.type: filebeat` and `log.file.path` fields model a file collector; they are not native Nextcloud fields. This pack does not mix ordinary `nextcloud.log` diagnostics or syslog framing into the audit stream.
 
-The modeled instance has 12 users and 60 files. Existing sessions account for file activity without a login event immediately before every request. A login attempt and its result share one request ID and native timestamp; separate requests never use that ID as a session key. The native `version` value `35.0.0.10` is the four-part internal number in the [35.0.0 release tag](https://github.com/nextcloud/server/blob/v35.0.0/version.php), rather than the public release string.
+The modeled instance has 180 users and 1,154 files. Existing sessions account for file activity without a login event immediately before every request. A login attempt and its result share one request ID and native timestamp; separate requests never use that ID as a session key. The native `version` value `35.0.0.10` is the four-part internal number in the [35.0.0 release tag](https://github.com/nextcloud/server/blob/v35.0.0/version.php), rather than the public release string.
+
+## Volume and Timing
+
+About 10,800 records per day, following a UTC working-day curve; the daily total varies by about ±10% from day to day.
+
+| UTC hours | Records/s |
+| --- | ---: |
+| 10-15 | 0.27 |
+| 08-10, 15-17 | 0.20 |
+| 07-08, 17-19 | 0.12 |
+| 19-07 | 0.04 |
+
+User activity follows this curve: each user works in sessions, and busier users have more of them. Password guesses from outside arrive at about five a day around the clock. Operations within a session are minutes apart; records that belong to one moment (a login and its immediate retry, consecutive requests) are a few seconds apart in office hours and 15-25 seconds apart at night.
 
 ## Event Types
 
-| Native message | Action | Share |
-| --- | --- | ---: |
-| `Login attempt: "..."` | Password login request | 10.3% |
-| `Login successful: "..."` | Login result | 5.0% |
-| `Login failed: "..."` | Login result | 5.4% |
-| `File with id "..." accessed: "..."` | DAV file read | 46.1% |
-| `File with id "..." written to: "..."` | DAV file update | 18.6% |
-| `The file ... has been shared via link ...` | Public link creation | 6.8% |
-| `The expiration date ... has been removed` | Public link expiration removal | 4.8% |
-| `The permissions ... have been changed to "3"` | Public link changed from read-only (1) to read and update (3) | 3.1% |
+| Native message | Action | Category | Share | Weekly range |
+| --- | --- | --- | ---: | ---: |
+| `File with id "..." accessed: "..."` | DAV file read | file | 57.5% | 57.5-57.9% |
+| `File with id "..." written to: "..."` | DAV file update | file | 24.0% | 23.7-24.0% |
+| `Login attempt: "..."` | Password login request | authentication | 8.4% | 8.4-8.5% |
+| `Login successful: "..."` | Login result | authentication | 7.7% | 7.7-7.8% |
+| `The file ... has been shared via link ...` | Public link creation | file | 0.9% | 0.7-1.1% |
+| `Login failed: "..."` | Login result | authentication | 0.7% | 0.7-0.7% |
+| `The expiration date ... has been removed` | Public link expiration removal | file | 0.5% | 0.4-0.6% |
+| `The permissions ... have been changed to "3"` | Public link changed from read-only (1) to read and update (3) | file | 0.2% | 0.2-0.3% |
 
-Shares are measured on a 7-day `anomaly_mode: false` run with the default settings (4,127 records, about 25 per hour). They are synthetic workload settings, not measured Nextcloud rates.
+Shares are over a typical week of about 75,000 records; the last column shows how they vary from week to week. They are synthetic workload settings, not measured Nextcloud rates. About 8% of login attempts fail. Users create about 75-120 public links a day; about half of the links later lose their expiration date and about a quarter are opened for updates.
+
+The permission-change message gives the file path relative to the owner's files folder (`/Sales/Forecast-01.pdf`), while reads, writes and link creation give the full path (`/maria.p/files/Sales/Forecast-01.pdf`). `file.path` holds the full path in every file and link record.
 
 Background activity comes from independent random processes; none of them runs on a fixed period, rotation or script:
 
-- **User sessions.** Each user works in sessions at an own random rate, mostly during UTC working hours, from the office address or one of two home addresses. About a third of sessions start with a password login; about 15% of those logins follow one to five mistyped passwords a few seconds apart, and a few are given up. A session then reads and writes the user's files minutes apart, often the file it just used, creates public links (read-only, with a default expiration date) and removes a link's expiration or allows updates through it, often minutes after creating the link. Each property of a link changes at most once.
-- **Stale passwords.** A sync client with an outdated password retries three to eight times about a minute apart; half of them end with a successful login.
-- **Outside guesses.** A few times a day, an address from the documentation ranges tries one or more passwords for a user, without success.
+- **User sessions.** Each user works from the office address or a home address, mostly during UTC working hours. Half of the sessions start with a password login in the web interface; 3% of those logins follow one to five mistyped passwords seconds apart, and a tenth of those are given up. Other sessions read and write the user's files minutes apart, often the file just used, and now and then create a public link (read-only, with a default expiration date) or remove a link's expiration or allow updates through it. Each property of a link changes at most once.
+- **Sharing sessions.** A few web sessions are opened to share a file with someone outside: the user reads the file, creates a public link to it, in half of the cases removes the link's expiration date minutes later and sometimes then allows updates, and may go on with a few ordinary operations. The share of web sessions opened to share drifts from day to day between 4% and 12%, so sharing activity differs from week to week.
+- **Stale passwords.** About once a day a sync client with an outdated password retries three to eight times about a minute apart; half of them end with a successful login.
+- **Outside guesses.** About five times a day an address from the documentation ranges tries one or more passwords for a user, without success.
 
-Users, their files, office and home addresses and activity rates are fixed per `server_name`; all activity on top of that differs in every run. Public link IDs grow by one to four per link, as other share types consume IDs; the model retains at most 64 links.
+Users, their files, office and home addresses and activity weights are fixed per `server_name`; all activity on top of that differs in every run. Public link IDs grow by one to four per link, as other share types consume IDs.
 
 ## Anomaly Chain
 
-One user fails password login three times from one home address, a few seconds to about a minute apart, then logs in successfully from that address. Minutes later, from the same address and with the same delays between operations as ordinary sessions, the user reads a file, creates a public link to it, removes the link's expiration date and changes it from read-only to read and update. The pattern fits a guessed password followed by publishing a file for outside access. Each attempt/result pair shares `reqId`; other requests have distinct IDs. The link creation and changes share a link ID, recorded in the creation message and the update request URLs; the expiry message contains the file ID but not the link ID. Episodes in the measured runs lasted 3-20 minutes; the length is not capped below the one-hour chain window.
+One user fails password login three times from their home address, seconds to about a minute apart, then logs in successfully from that address. Minutes later, from the same address and with the same delays between operations as ordinary sessions, the user reads a file, creates a public link to it, removes the link's expiration date and changes it from read-only to read and update. The pattern fits a guessed password followed by publishing a file for outside access. Each attempt/result pair shares `reqId`; other requests have distinct IDs. The link creation and changes share a link ID, recorded in the creation message and the update request URLs; the expiry message contains the file ID but not the link ID. Episodes last about 3-25 minutes and always finish within an hour of the first failure.
 
-- **Recurrence.** With `anomaly_mode: true` (the default), the first episode starts within the first `anomaly_interval_hours` (at most 24 hours) of the run, at a time of day drawn from the user activity curve. Each next episode is due one interval after the previous actual start; its start is drawn in a window of a quarter interval (at most 6 hours) centred on that due time, weighted towards busy hours. Missed episodes are never caught up. At intervals of 8 hours or less the window covers most of the clock, so episodes also fall into quiet hours.
-- **Variation.** Each episode uses a different user (chosen in proportion to activity), a different home address and a different file from the previous one. The address and file belong to that user and also appear in the user's ordinary sessions.
-- **Background overlap.** Every part of the chain also occurs in ordinary traffic of both modes: repeated failed logins of one user and address within minutes, failures followed by a success, reads followed by a link to the same file, and expiration removals and permission changes of fresh links. Per 7 days of background, five default runs showed 87-119 cases of three failed logins of one user and address within 10 minutes, 7-17 cases of three failures followed by a success from that address within an hour, 128-156 reads followed by a link to the same file within an hour, and 37-78 links whose expiration was removed and whose permissions were then changed within an hour of creation.
-- **Detection.** Only the full order separates the modes. Ordinary traffic never completes three failed logins and a successful login from one address, then a read, link creation, expiration removal and permission change for one file from that user and address, within 60 minutes of the first failure, in any combination of its records: an ordinary permission change that would complete it is left out, and the session goes on unchanged. In the measured runs, a rule that correlates these records for one user and address within 60 minutes, over every combination of records, matched each episode once and never matched `anomaly_mode: false` traffic. `reqId` joins only records of the same HTTP request; it does not prove a persistent session.
+- **Recurrence.** With `anomaly_mode: true` (the default), the first episode starts within the first `anomaly_interval_hours` (at most 24 hours) of the run, at a time of day drawn from the activity curve. Each next episode is due one interval after the previous actual start; its start is drawn in a window of a quarter interval (at most 6 hours) centred on that due time, weighted towards busy hours, so each start lies within three hours of its due time. Episodes that start in office hours stay there, moving through the day by a few hours at a time; an episode that starts late at night can recur at night for many days, since the night hours are equally quiet. Missed episodes are never caught up. At intervals of 8 hours or less the window covers most of the clock, so episodes also fall into quiet hours.
+- **Variation.** Each episode uses a different user (chosen in proportion to activity) and a different file from the previous one. The home address and file belong to that user and also appear in the user's ordinary sessions. The episode adds its own records; the user's ordinary sessions go on as usual.
+- **Background overlap.** Every step of the chain, and the user, home address and file of every episode, also occur in ordinary traffic of both modes. In a typical week of background there are about 75-90 cases of three failed logins of one user and address within 10 minutes, 55-65 cases of three failures followed by a success from that address within an hour, and 80-120 reads followed within an hour by a link to the same file, removal of its expiration date and a permission change. Failed logins followed within the hour by publishing a file are rare: about one to five a week reach the expiration removal after three failures, and at most two a week also reach the permission change after two failures.
+- **Detection.** Only the full order separates single occurrences; the longest parts are rare in background, so episodes stand out in their weekly counts (see the limits below). Ordinary traffic never completes three failed logins and a successful login from one address, then a read, link creation, expiration removal and permission change for one file from that user and address, within 60 minutes of the first failure, in any combination of its records: an ordinary permission change that would complete it applies to another of the user's read-only links instead, and when the user has no other read-only link that change is absent. `reqId` joins only records of the same HTTP request; it does not prove a persistent session.
 
 The modeled sharing policy sets a default public-link expiration but does not enforce it, so a user can remove the date. It also permits editing a public file link. These settings are necessary for the later two audit messages to represent valid operations.
 
@@ -61,103 +77,28 @@ The shipped config writes to `output/events.json` and has no `${params.*}` or `$
 
 ## Usage
 
-Enable `admin_audit` with file logging and allow its INFO messages through the log-level configuration. From the `content-packs` repository root:
+Enable `admin_audit` with file logging and allow its INFO messages through the log-level configuration. From the `content-packs` repository root, live generation at the configured rate:
 
 ```bash
 eventum generate --path generators/application-nextcloud-audit/generator.yml --id nextcloud-audit --live-mode true
 ```
 
-For a finite batch, add `start` and `end` to the `cron` input in a local copy and run it with `--live-mode false --keep-order true`. The input ticks every second, and a tick without a due record is dropped, so each second holds at most one record.
+Batch generation: set `start` and `end` of the `oscillator` in all four `patterns/*.yml` files to the same range, with `start` at 00:00 UTC so the hour bands stay in place (for example `start: "2026-09-21T00:00:00Z"` and `end: "2026-09-28T00:00:00Z"`), then run:
+
+```bash
+eventum generate --path generators/application-nextcloud-audit/generator.yml --id nextcloud-audit --live-mode false --keep-order true
+```
+
+To change the volume, scale the `ratio` of every pattern file by the same factor.
+
+Performance: about 2,900 records per second in batch mode on one core (14 days, 149,972 records, in 52 s).
 
 ## Sample Output
 
-This complete link-creation event came from the first episode of a finite run with the default settings:
+The link creation of the first episode of a week of default output:
 
 ```json
-{
-  "@timestamp": "2026-09-25T12:21:18+00:00",
-  "agent": {
-    "name": "cloud-01.corp.example",
-    "type": "filebeat"
-  },
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "share-create",
-    "category": [
-      "file"
-    ],
-    "dataset": "nextcloud.audit",
-    "kind": "event",
-    "original": "{\"reqId\":\"te22OTIhWKqMTpIpkzI5\",\"level\":1,\"time\":\"2026-09-25T12:21:18+00:00\",\"remoteAddr\":\"198.51.100.30\",\"user\":\"konstantin\",\"app\":\"admin_audit\",\"method\":\"POST\",\"url\":\"/ocs/v2.php/apps/files_sharing/api/v1/shares\",\"scriptName\":\"/ocs/v2.php\",\"message\":\"The file \\\"/konstantin/files/IT/Inventory-01.pdf\\\" with ID \\\"14090\\\" has been shared via link with permissions \\\"1\\\" (Share ID: 32049)\",\"userAgent\":\"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36\",\"version\":\"35.0.0.10\",\"data\":{\"app\":\"admin_audit\"}}",
-    "outcome": "success",
-    "type": [
-      "creation"
-    ]
-  },
-  "file": {
-    "path": "/konstantin/files/IT/Inventory-01.pdf"
-  },
-  "host": {
-    "name": "cloud-01.corp.example"
-  },
-  "http": {
-    "request": {
-      "method": "POST"
-    }
-  },
-  "log": {
-    "file": {
-      "path": "/var/www/html/data/audit.log"
-    },
-    "level": "info"
-  },
-  "message": "The file \"/konstantin/files/IT/Inventory-01.pdf\" with ID \"14090\" has been shared via link with permissions \"1\" (Share ID: 32049)",
-  "nextcloud": {
-    "audit": {
-      "app": "admin_audit",
-      "data": {
-        "app": "admin_audit"
-      },
-      "level": 1,
-      "message": "The file \"/konstantin/files/IT/Inventory-01.pdf\" with ID \"14090\" has been shared via link with permissions \"1\" (Share ID: 32049)",
-      "method": "POST",
-      "remoteAddr": "198.51.100.30",
-      "reqId": "te22OTIhWKqMTpIpkzI5",
-      "scriptName": "/ocs/v2.php",
-      "time": "2026-09-25T12:21:18+00:00",
-      "url": "/ocs/v2.php/apps/files_sharing/api/v1/shares",
-      "user": "konstantin",
-      "userAgent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36",
-      "version": "35.0.0.10"
-    }
-  },
-  "related": {
-    "ip": [
-      "198.51.100.30"
-    ],
-    "user": [
-      "konstantin"
-    ]
-  },
-  "source": {
-    "ip": "198.51.100.30"
-  },
-  "tags": [
-    "nextcloud",
-    "admin_audit"
-  ],
-  "url": {
-    "path": "/ocs/v2.php/apps/files_sharing/api/v1/shares"
-  },
-  "user": {
-    "name": "konstantin"
-  },
-  "user_agent": {
-    "original": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"
-  }
-}
+{"@timestamp": "2026-09-21T11:08:04+00:00", "agent": {"name": "cloud-01.corp.example", "type": "filebeat"}, "ecs": {"version": "8.17.0"}, "event": {"action": "share-create", "category": ["file"], "dataset": "nextcloud.audit", "kind": "event", "original": "{\"reqId\":\"wQvQ0YOnvKhJDWzisYVe\",\"level\":1,\"time\":\"2026-09-21T11:08:04+00:00\",\"remoteAddr\":\"203.0.113.29\",\"user\":\"ulyana\",\"app\":\"admin_audit\",\"method\":\"POST\",\"url\":\"/ocs/v2.php/apps/files_sharing/api/v1/shares\",\"scriptName\":\"/ocs/v2.php\",\"message\":\"The file \\\"/ulyana/files/HR/Onboarding-02.xlsx\\\" with ID \\\"14432\\\" has been shared via link with permissions \\\"1\\\" (Share ID: 32120)\",\"userAgent\":\"Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36\",\"version\":\"35.0.0.10\",\"data\":{\"app\":\"admin_audit\"}}", "outcome": "success", "type": ["creation"]}, "file": {"path": "/ulyana/files/HR/Onboarding-02.xlsx"}, "host": {"name": "cloud-01.corp.example"}, "http": {"request": {"method": "POST"}}, "log": {"file": {"path": "/var/www/html/data/audit.log"}, "level": "info"}, "message": "The file \"/ulyana/files/HR/Onboarding-02.xlsx\" with ID \"14432\" has been shared via link with permissions \"1\" (Share ID: 32120)", "nextcloud": {"audit": {"app": "admin_audit", "data": {"app": "admin_audit"}, "level": 1, "message": "The file \"/ulyana/files/HR/Onboarding-02.xlsx\" with ID \"14432\" has been shared via link with permissions \"1\" (Share ID: 32120)", "method": "POST", "remoteAddr": "203.0.113.29", "reqId": "wQvQ0YOnvKhJDWzisYVe", "scriptName": "/ocs/v2.php", "time": "2026-09-21T11:08:04+00:00", "url": "/ocs/v2.php/apps/files_sharing/api/v1/shares", "user": "ulyana", "userAgent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36", "version": "35.0.0.10"}}, "related": {"ip": ["203.0.113.29"], "user": ["ulyana"]}, "source": {"ip": "203.0.113.29"}, "tags": ["nextcloud", "admin_audit"], "url": {"path": "/ocs/v2.php/apps/files_sharing/api/v1/shares"}, "user": {"name": "ulyana"}, "user_agent": {"original": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36"}}
 ```
 
 ## References and Limits
@@ -171,4 +112,7 @@ This complete link-creation event came from the first episode of a finite run wi
 
 Field coverage is **13/13** for the non-optional native fields emitted by the tagged serializer for these HTTP audit records, including `data.app`. CLI-only, exception, backtrace and optional client request ID fields are outside scope. The `event.original` JSON uses the tagged PHP serializer's field order and compact separators for the modeled values. A captured production `audit.log` line from a running 35.0.0 server was not available, so request routes and end-to-end native bytes remain unconfirmed against a live instance. The guide's illustrative JSON example is from Nextcloud 21 and is not a 35.0.0 raw fixture.
 
-Rates, session shapes and addresses are synthetic workload settings; working hours follow UTC. Timestamps have one-second resolution, as in the native log, and each second holds at most one record apart from a login attempt and its result, which share their time.
+- Rates, session shapes, the sharing share and addresses are synthetic workload settings; working hours follow UTC.
+- Timestamps have one-second resolution, as in the native log. A login attempt and its result share their time. Records of one moment, such as a mistyped password and its retry or consecutive requests of one session, are a few seconds apart in office hours and 15-25 seconds apart at night, rather than milliseconds.
+- With `anomaly_mode: true` each episode adds its own records, so counts of the chain parts (repeated failures followed by a success, then a read, link, expiration removal and permission change of one file from one address) are about one per episode higher than in background alone: about seven more a week at the default interval, about 21 more at 8 hours. For the longest parts, which background produces only a few times a week, this is several times the background count.
+- An ordinary permission change that would complete the full chain within the hour goes to another read-only link of the same user, or is absent when there is none; the full order over a span longer than an hour is rare as well.
