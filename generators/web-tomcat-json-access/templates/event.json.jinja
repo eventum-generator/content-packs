@@ -1,43 +1,296 @@
-{%- set step = vars.step -%}
-{%- set kind = step -%}
-{%- if step == 'routine' -%}
-  {%- do shared.pop('to_attack', none) -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_attack', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
+{#- Apache Tomcat 10.1 JsonAccessLogValve - one JSON access-log record per tick.
+    Valve pattern: %a %l %u %t "%r" %s %b %D %S %v %{Referer}i %{User-Agent}i
+    Native key order: remoteAddr, logicalUserName, user, time, request,
+    statusCode, size, elapsedTime, sessionId, localServerName,
+    requestHeaders{Referer, User-Agent}. Simple keys are compact; the
+    requestHeaders sub-object is rendered with a space after the colon and
+    the record is closed with "}}", matching the valve. Every value is a
+    quoted string; missing values and zero-byte size render as "-". -#}
+{%- macro esc(v) -%}{{ (v | string | tojson)[1:-1] }}{%- endmacro -%}
+
+{#- ------------------------------------------------------------------ -#}
+{#- Clamp the recurrence to its documented lower bound. -#}
+{%- set interval_h = params.anomaly_interval_hours | float -%}
+{%- set min_h = params.anomaly_min_interval_hours | float -%}
+{%- set interval_h = [interval_h, min_h] | max -%}
+
+{#- ------------------------------------------------------------------ -#}
+{#- Clock: native CLF time carries the configured JVM offset; @timestamp -#}
+{#- stays UTC. Access timestamps have second precision.                -#}
+{%- set epoch = timestamp.timestamp() -%}
+{%- set offmin = params.jvm_offset_minutes | int -%}
+{%- set localdt = timestamp + module.datetime.timedelta(minutes=offmin) -%}
+{%- set ao = offmin if offmin >= 0 else -offmin -%}
+{%- set offlabel = ('+' if offmin >= 0 else '-') ~ '%02d%02d'|format(ao // 60, ao % 60) -%}
+{%- set clf = '[' ~ localdt.strftime('%d/%b/%Y:%H:%M:%S') ~ ' ' ~ offlabel ~ ']' -%}
+{%- set iso = timestamp.strftime('%Y-%m-%dT%H:%M:%S.000Z') -%}
+
+{#- ------------------------------------------------------------------ -#}
+{#- Fixed automation accounts share the same ordinary and episode traffic. -#}
+{%- set actors = samples.managers -%}
+{%- if shared.get('sched_next') is none -%}
+  {%- do shared.set('sched_next', epoch + module.rand.number.floating(0, [interval_h * 3600, 86400]|min)) -%}
 {%- endif -%}
-{%- set req = samples.requests.pick() -%}
-{%- set method = req.method -%}{%- set path = req.path -%}
-{%- set status = req.status -%}{%- set size = req.size -%}
-{%- set src = '10.120.2.' ~ module.rand.number.integer(20,180) -%}
-{%- set user = '-' -%}{%- set session = '-' -%}{%- set query = '' -%}
-{%- set elapsed = 10 if status != 503 else 35 -%}
-{%- if kind.startswith('fail_') -%}
-  {%- set src = params.anomaly_ip -%}{%- set method = 'GET' -%}
-  {%- set path = '/manager/html' -%}{%- set status = 401 -%}{%- set size = 190 -%}
-  {%- set elapsed = 14 -%}
-{%- elif kind == 'manager_ok' -%}
-  {%- set src = params.anomaly_ip -%}{%- set method = 'GET' -%}
-  {%- set path = '/manager/html' -%}{%- set status = 200 -%}{%- set size = 4891 -%}
-  {%- set user = params.anomaly_user -%}
-  {%- set session = 'B4MANAGER' ~ (shared.get('session_counter', 0) + 1) -%}
-  {%- do shared.set('session_counter', (shared.get('session_counter', 0) % 2147483647) + 1) -%}
-  {%- do shared.set('attack_session', session) -%}
-{%- elif kind == 'deploy' -%}
-  {%- set src = params.anomaly_ip -%}{%- set method = 'POST' -%}
-  {%- set path = '/manager/text/deploy' -%}{%- set query = '?war=file:/tmp/support.war&path=/support' -%}
-  {%- set status = 200 -%}{%- set size = 142 -%}{%- set elapsed = 429 -%}
-  {%- set user = params.anomaly_user -%}{%- set session = shared.get('attack_session') -%}
-{%- elif kind == 'deployed_get' -%}
-  {%- set src = params.anomaly_ip -%}{%- set method = 'GET' -%}
-  {%- set path = '/support/' -%}{%- set status = 200 -%}
-  {%- set size = 2048 -%}{%- set elapsed = 45 -%}
+
+{#- Start an episode when due (anomaly mode only) and none is running. -#}
+{%- set q = shared.get('ep_queue', []) -%}
+{%- if params.anomaly_mode and (q | length) == 0 and epoch >= shared.get('sched_next', epoch + 1.0e12) -%}
+  {%- set cnt = shared.get('ep_counter', 0) + 1 -%}
+  {%- do shared.set('ep_counter', cnt) -%}
+  {%- set actor = actors.pick() -%}
+  {%- set previous = shared.get('last_actor', -1) -%}
+  {%- set idx = module.rand.number.integer(0, actors|length - 2) -%}
+  {%- if idx >= previous and previous >= 0 -%}{%- set idx = idx + 1 -%}{%- endif -%}
+  {%- set actor = actors[idx] -%}
+  {%- do shared.set('last_actor', idx) -%}
+  {%- set ctx = actor.context -%}
+  {%- set sid = module.rand.string.hex(32) | upper -%}
+  {%- set steps = [] -%}
+  {%- for i in range(3) -%}
+    {%- do steps.append({'k': 'm401', 'ip': actor.ip, 'ua': actor.ua}) -%}
+  {%- endfor -%}
+  {%- do steps.append({'k': 'mok', 'ip': actor.ip, 'ua': actor.ua, 'user': actor.user, 'sid': '-'}) -%}
+  {%- do steps.append({'k': 'deploy', 'ip': actor.ip, 'ua': actor.ua, 'user': actor.user, 'sid': '-', 'ctx': ctx}) -%}
+
+  {%- do shared.set('ep_queue', steps) -%}
+  {%- set width = [interval_h * 900, 21600] | min -%}
+  {%- do shared.set('sched_next', epoch + interval_h * 3600 + module.rand.number.floating(-width/2, width/2)) -%}
 {%- endif -%}
+
+{#- ------------------------------------------------------------------ -#}
+{#- Defaults for one record.                                            -#}
+{%- set method = 'GET' -%}{%- set path = '/' -%}{%- set query = '' -%}
+{%- set status = 200 -%}{%- set user = '-' -%}{%- set session = '-' -%}
+{%- set referer = '-' -%}{%- set ua = '-' -%}{%- set cls = 'page' -%}
+{%- set size_override = none -%}{%- set is_chain = false -%}
+
+{%- set q = shared.get('ep_queue', []) -%}
+{%- if (q | length) > 0 -%}
+  {#- ---- Anomaly step: unusual manager activity worth reviewing ---- -#}
+  {%- set is_chain = true -%}
+  {%- set step = q[0] -%}{%- do shared.set('ep_queue', q[1:]) -%}
+  {%- set src = step.ip -%}{%- set ua = step.ua -%}
+  {%- if step.k == 'm401' -%}
+    {%- set method = 'GET' -%}{%- set path = '/manager/text/list' -%}
+    {%- set status = 401 -%}{%- set cls = 'm401' -%}
+  {%- elif step.k == 'mok' -%}
+    {%- set method = 'GET' -%}{%- set path = '/manager/text/list' -%}
+    {%- set status = 200 -%}{%- set cls = 'mlist' -%}
+    {%- set user = step.user -%}{%- set session = '-' -%}
+  {%- elif step.k == 'deploy' -%}
+    {%- set method = 'PUT' -%}{%- set path = '/manager/text/deploy' -%}
+    {%- set query = '?path=' ~ step.ctx -%}{%- set status = 200 -%}{%- set cls = 'mdeploy' -%}
+    {%- set user = step.user -%}{%- set session = '-' -%}
+  {%- elif step.k == 'ctxget' -%}
+    {%- set method = 'GET' -%}{%- set path = step.ctx ~ '/' -%}
+    {%- set status = 200 -%}{%- set cls = 'page' -%}
+  {%- elif step.k == 'undeploy' -%}
+    {%- set method = 'GET' -%}{%- set path = '/manager/text/undeploy' -%}
+    {%- set query = '?path=' ~ step.ctx -%}{%- set status = 200 -%}{%- set cls = 'mdeploy' -%}
+    {%- set user = step.user -%}{%- set session = '-' -%}
+  {%- endif -%}
+{%- else -%}
+  {#- ---- Background traffic (present in both modes) ---- -#}
+  {%- if 'human' in tags -%}
+    {%- set ct = module.rand.weighted_choice(['bauth','banon','mgui'],[49,49,2]) -%}
+  {%- else -%}
+    {%- set ct = module.rand.weighted_choice(['api','health','mscript'],[78,20,2]) -%}
+  {%- endif -%}
+
+
+  {%- if ct == 'bauth' -%}
+    {%- set sess = shared.get('sess', {}) -%}
+    {%- set keys = sess.keys() | list -%}
+    {%- if (keys | length) > 0 and module.rand.chance(0.7) -%}
+      {%- set src = module.rand.choice(keys) -%}
+      {%- set session = sess[src].sid -%}{%- set uname = sess[src].user -%}
+      {%- set ua = sess[src].ua -%}
+    {%- else -%}
+      {%- set src = '203.0.113.' ~ module.rand.number.integer(1, 254) -%}
+      {%- set session = '-' -%}
+      {%- set uname = samples.app_users.pick().name -%}
+      {%- set ua = samples.browser_agents.pick().value -%}
+      {%- do sess.update({src: {'sid': session, 'user': uname, 'ua': ua}}) -%}
+      {%- if (sess | length) > (params.session_pool_cap | int) -%}
+        {%- do sess.pop((sess.keys() | list)[0]) -%}
+      {%- endif -%}
+      {%- do shared.set('sess', sess) -%}
+    {%- endif -%}
+    {%- set r = samples.app_requests.weighted_pick('w') -%}
+    {%- set method = r.m -%}{%- set path = r.p -%}{%- set cls = r.c -%}
+    {%- if path.startswith('/shop/account') or path.startswith('/shop/cart') or path.startswith('/shop/checkout') -%}
+      {%- set user = uname -%}
+    {%- endif -%}
+    {%- if module.rand.chance(0.6) -%}{%- set referer = 'https://' ~ params.server_name ~ '/shop/' -%}{%- endif -%}
+
+  {%- elif ct == 'banon' -%}
+    {%- set src = '198.51.100.' ~ module.rand.number.integer(1, 254) -%}
+    {%- set r = samples.app_requests.weighted_pick('w') -%}
+    {%- set method = r.m -%}{%- set path = r.p -%}{%- set cls = r.c -%}
+    {%- set ua = samples.browser_agents.pick().value -%}
+    {%- if module.rand.chance(0.35) -%}{%- set referer = 'https://www.example-search.test/' -%}{%- endif -%}
+
+  {%- elif ct == 'api' -%}
+    {%- set src = '10.10.0.' ~ module.rand.number.integer(20, 60) -%}
+
+    {%- set r = samples.api_requests.pick() -%}
+    {%- set method = r.m -%}{%- set path = r.p -%}{%- set cls = r.c -%}
+    {%- set ua = samples.api_agents.pick().value -%}
+
+  {%- elif ct == 'health' -%}
+    {%- set src = '10.120.0.' ~ module.rand.number.integer(10, 12) -%}
+    {%- set method = 'GET' -%}{%- set path = module.rand.choice(['/health', '/']) -%}
+    {%- set cls = 'health' -%}
+    {%- set ua = samples.health_agents.pick().value -%}
+
+  {%- elif ct == 'mscript' -%}
+    {%- set actor = actors.pick() -%}
+    {%- set src = actor.ip -%}{%- set ua = actor.ua -%}
+    {%- set act = module.rand.weighted_choice(['list', 'deploy_known', 'undeploy_known', 'fail'], [94, 2, 2, 2]) -%}
+    {%- set known = [actor.context] -%}
+    {%- if act == 'fail' -%}
+      {%- set method = 'GET' -%}{%- set path = '/manager/text/list' -%}
+      {%- set status = 401 -%}{%- set cls = 'm401' -%}
+    {%- elif act == 'list' -%}
+      {%- set method = 'GET' -%}{%- set path = '/manager/text/list' -%}
+      {%- set status = 200 -%}{%- set cls = 'mlist' -%}
+      {%- set user = actor.user -%}{%- set session = '-' -%}
+    {%- elif act == 'deploy_known' -%}
+      {%- set method = 'PUT' -%}{%- set path = '/manager/text/deploy' -%}
+      {%- set query = '?path=' ~ module.rand.choice(known) -%}
+      {%- set status = 200 -%}{%- set cls = 'mdeploy' -%}
+      {%- set user = actor.user -%}{%- set session = '-' -%}
+    {%- else -%}
+      {%- set method = 'GET' -%}{%- set path = '/manager/text/undeploy' -%}
+      {%- set query = '?path=' ~ module.rand.choice(known) -%}
+      {%- set status = 200 -%}{%- set cls = 'mdeploy' -%}
+      {%- set user = actor.user -%}{%- set session = '-' -%}
+    {%- endif -%}
+
+  {%- else -%}{#- mgui -#}
+    {%- set gui = samples.gui_users.pick() -%}
+    {%- set src = gui.ip -%}{%- set ua = samples.browser_agents.pick().value -%}
+    {%- set act = module.rand.weighted_choice(['html', 'status', 'html401', 'html403'], [55, 25, 14, 6]) -%}
+    {%- if act == 'html' -%}
+      {%- set method = 'GET' -%}{%- set path = '/manager/html' -%}
+      {%- set status = 200 -%}{%- set cls = 'mlist' -%}
+      {%- set user = gui.user -%}{%- set session = '-' -%}
+    {%- elif act == 'status' -%}
+      {%- set method = 'GET' -%}{%- set path = '/manager/status' -%}
+      {%- set status = 200 -%}{%- set cls = 'mlist' -%}
+      {%- set user = gui.user -%}{%- set session = '-' -%}
+    {%- elif act == 'html401' -%}
+      {%- set method = 'GET' -%}{%- set path = '/manager/html' -%}
+      {%- set status = 401 -%}{%- set cls = 'm401' -%}
+    {%- else -%}
+      {%- set method = 'GET' -%}{%- set path = '/manager/html' -%}
+      {%- set status = 403 -%}{%- set cls = 'm401' -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------------ -#}
+{#- Only the exact final successful deploy request is guarded. Retain
+    prefix evidence through completions, so later requests cannot reuse it. -#}
+{%- if path.startswith('/manager/text/') -%}
+  {%- set hist = shared.get('manager_history', {}) -%}
+  {%- set h = hist.get(src, {'fail': [], 'prefix': -1.0e12}) -%}
+  {%- set fresh = [] -%}
+  {%- for t0 in h.fail -%}{%- if epoch-t0 <= 900 -%}{%- do fresh.append(t0) -%}{%- endif -%}{%- endfor -%}
+  {%- if status == 401 -%}{%- do fresh.append(epoch) -%}{%- endif -%}
+  {%- set fresh = fresh[-3:] -%}
+  {%- if path == '/manager/text/list' and status == 200 and fresh|length == 3 -%}
+    {%- do h.update({'prefix': fresh[0]}) -%}
+  {%- endif -%}
+  {%- if path == '/manager/text/deploy' and status == 200 and not is_chain and epoch-h.prefix <= 900 -%}
+    {%- set status = 403 -%}
+  {%- endif -%}
+  {%- do h.update({'fail': fresh}) -%}{%- do hist.update({src:h}) -%}
+  {%- do shared.set('manager_history', hist) -%}
+{%- endif -%}
+
+{#- Resolve dynamic path parts and query for background app requests.  -#}
+{%- if '#' in path -%}{%- set path = path.replace('#', module.rand.number.integer(1, 9999) | string) -%}{%- endif -%}
+{%- if cls == 'search' and query == '' -%}
+  {%- set query = '?q=' ~ samples.search_terms.pick().value -%}
+{%- endif -%}
+
+{#- Status for background records not fixed above (app classes). -#}
+{%- if not is_chain and cls not in ['m401', 'mlist', 'mdeploy'] -%}
+  {%- set dist = {
+        'root':     {200: 86, 304: 6, 302: 3, 404: 3, 500: 2},
+        'page':     {200: 90, 304: 6, 302: 3, 404: 1},
+        'account': {200: 88, 302: 5, 403: 2, 404: 1, 500: 4},
+        'asset':    {200: 80, 304: 17, 404: 3},
+        'search':   {200: 99, 500: 1},
+        'api':      {200: 88, 404: 5, 401: 3, 500: 4},
+        'post':     {200: 96, 400: 3, 500: 1},
+        'apipost':  {201: 70, 200: 12, 400: 9, 401: 4, 422: 3, 500: 2},
+        'apitok':   {200: 82, 401: 14, 400: 4},
+        'health':   {200: 100}
+  } -%}
+  {%- set status = module.rand.weighted_choice(dist[cls]) -%}
+{%- endif -%}
+
+{#- ------------------------------------------------------------------ -#}
+{#- Size (bytes) and elapsed (microseconds). 304/204 carry no body.    -#}
+{%- set tier = {
+      'page':    [9.4, 0.6, 400, 120000,   9.5, 0.7, 1500, 400000],
+      'root':    [9.0, 0.6, 400, 90000,    9.3, 0.7, 1500, 300000],
+      'account':[9.2, 0.6, 400, 90000,    9.6, 0.7, 2000, 400000],
+      'asset':   [10.2, 0.8, 300, 600000,  8.0, 0.6, 400, 80000],
+      'search':  [9.3, 0.6, 400, 90000,    9.8, 0.7, 2000, 500000],
+      'api':     [7.2, 0.7, 120, 40000,    9.0, 0.7, 1000, 300000],
+      'post':    [7.2, 0.6, 120, 40000, 9.4, 0.7, 1500, 400000],
+      'apipost': [6.9, 0.7, 90, 30000,     9.4, 0.7, 1500, 400000],
+      'apitok':  [6.6, 0.5, 90, 8000,      9.6, 0.6, 2000, 300000],
+      'health':  [2.3, 0.4, 0, 60,         6.6, 0.6, 200, 20000],
+      'm401':    [7.0, 0.15, 950, 1200,    8.6, 0.6, 800, 120000],
+      'mlist':   [6.4, 0.6, 140, 9000,     9.6, 0.6, 2000, 500000],
+      'mdeploy': [4.1, 0.15, 48, 82,       12.6, 0.6, 90000, 8000000]
+} -%}
+{%- set err_tier = [7.0, 0.5, 400, 4000] -%}
+{%- set t = tier[cls] -%}
+{%- if status in [304, 204] -%}
+  {%- set size = 0 -%}
+{%- elif (not is_chain) and status >= 400 and cls not in ['m401', 'mlist', 'mdeploy'] -%}
+  {%- set size = module.rand.number.clamp(module.rand.number.lognormal(err_tier[0], err_tier[1]), err_tier[2], err_tier[3]) | int -%}
+{%- else -%}
+  {%- set size = module.rand.number.clamp(module.rand.number.lognormal(t[0], t[1]), t[2], t[3]) | int -%}
+{%- endif -%}
+{%- set elapsed = module.rand.number.clamp(module.rand.number.lognormal(t[4], t[5]), t[6], t[7]) | int -%}
+
+{#- ------------------------------------------------------------------ -#}
+{#- Assemble the request line and native record. -#}
 {%- set request = method ~ ' ' ~ path ~ query ~ ' HTTP/1.1' -%}
-{%- set native = {'time':'[' ~ timestamp.strftime('%d/%b/%Y:%H:%M:%S %z') ~ ']','remoteAddr':src,'user':user,'method':method,'path':path,'query':query,'statusCode':status|string,'size':'-' if size == 0 else size|string,'elapsedTime':elapsed|string,'sessionId':session,'request':request,'protocol':'HTTP/1.1','localServerName':params.server_name} -%}
-{%- set category = ['web'] -%}{%- set event_type = ['access'] -%}{%- set outcome = 'failure' if status >= 400 else 'success' -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':'http-access','category':category,'dataset':'tomcat.access','kind':'event','original':native|tojson,'outcome':outcome,'type':event_type},'host':{'name':params.server_name,'ip':[params.server_ip]},'http':{'request':{'method':method},'response':{'status_code':status,'bytes':size},'version':'1.1'},'message':request,'observer':{'hostname':params.server_name,'ip':params.server_ip,'product':'Tomcat','type':'web','vendor':'Apache'},'related':{'ip':[src]},'source':{'ip':src},'tags':['tomcat-json-access','preserve_original_event'],'tomcat':{'access':native},'url':{'path':path,'query':query}} -%}
-{%- if user != '-' -%}{%- do out.update({'user':{'name':user}}) -%}{%- do out.related.update({'user':[user]}) -%}{%- endif -%}
-{{- out | tojson -}}
+{%- set size_field = '-' if size == 0 else size | string -%}
+{%- set native -%}
+{"remoteAddr":"{{ esc(src) }}","logicalUserName":"-","user":"{{ esc(user) }}","time":"{{ clf }}","request":"{{ esc(request) }}","statusCode":"{{ status }}","size":"{{ size_field }}","elapsedTime":"{{ elapsed }}","sessionId":"{{ esc(session) }}","localServerName":"{{ esc(params.server_name) }}","requestHeaders": {"Referer":"{{ esc(referer) }}","User-Agent":"{{ esc(ua) }}"}}
+{%- endset -%}
+
+{#- ECS envelope (enrichment; keys follow the Elastic apache_tomcat.access stream). -#}
+{%- set url_query = query[1:] if query.startswith('?') else '' -%}
+{%- set outcome = 'failure' if status >= 400 else 'success' -%}
+{%- set acc = {'logicalUserName': '-', 'user': user, 'elapsedTime': elapsed | string, 'sessionId': session, 'localServerName': params.server_name, 'http': {'ident': '-', 'useragent': ua}} -%}
+{%- set out = {
+  '@timestamp': iso,
+  'ecs': {'version': '8.11.0'},
+  'event': {'category': ['web'], 'type': ['access'], 'kind': 'event', 'module': 'apache_tomcat', 'dataset': 'apache_tomcat.access', 'outcome': outcome, 'original': native, 'duration': elapsed * 1000},
+  'apache_tomcat': {'access': acc},
+  'host': {'name': params.server_name, 'hostname': params.server_name, 'ip': [params.server_ip]},
+  'observer': {'vendor': 'Apache', 'product': 'Tomcat', 'type': 'web'},
+  'http': {'request': {'method': method}, 'response': {'status_code': status}, 'version': '1.1'},
+  'url': {'original': path ~ query, 'path': path},
+  'source': {'ip': src, 'address': src},
+  'related': {'ip': [src]},
+  'user_agent': {'original': ua},
+  'tags': ['apache_tomcat-access', 'preserve_original_event']
+} -%}
+{%- if size > 0 -%}
+  {%- do out.http.response.update({'body': {'bytes': size}}) -%}
+  {%- do out.update({'destination': {'bytes': size}}) -%}
+{%- endif -%}
+{%- if url_query -%}{%- do out.url.update({'query': url_query}) -%}{%- endif -%}
+{%- if user != '-' -%}{%- do out.update({'user': {'name': user}}) -%}{%- do out.related.update({'user': [user]}) -%}{%- endif -%}
+{%- if referer != '-' -%}{%- do out.http.request.update({'referrer': referer}) -%}{%- endif -%}
+{{ out | tojson }}
