@@ -113,7 +113,7 @@ The completing `1200` of an episode, with default settings:
 - Office hours are UTC with no weekday or weekend cycle; one server node, no farm load balancing.
 - Records that AD FS writes within the same second (a `1202` and its first `1200`) are a few seconds apart here (median 4 s, up to about 3 minutes at night), and failures of one burst are at least a few seconds apart.
 - Each user has one home address and at most one sign-in session at a time.
-- The data starts with no open single sign-on sessions, so in about the first hour new password sign-ins (`1202`) make up a larger share of records (about 39% against about 27% later).
+- The data starts with no open single sign-on sessions, so in about the first hour new password sign-ins (`1202`) make up a larger share of records (about 39% in the first hour against about 27-33% in the same hour on later days).
 - The denial of tokens within 15 minutes of five or more failures (see Anomaly Chain) is a modelled policy, not documented AD FS behaviour.
 - With `anomaly_mode: true` each episode adds its own records, so bursts of five or more failures followed by a sign-in within 15 minutes are about one per episode more frequent.
 
