@@ -1,78 +1,72 @@
 # Atlassian Jira security log
 
-Synthetic `atlassian-jira-security.log` records for Jira Data Center 9.5 and later, where Jira uses the Log4j2 layout. Each event wraps one raw log line in ECS JSON: the line sits in `event.original`, and the eight documented columns (timestamp, thread, Jira username, request ID, session ID, source IP, request URL, message) are also parsed into structured fields under `jira.security`.
+Synthetic Jira Data Center 9.5+ `atlassian-jira-security.log` messages preserved in `event.original`, with an ECS JSON wrapper. The profile represents one Jira node and 512 accounts, including sixteen frequently active users.
 
-The log records user login and session activity. Ten accounts sign in mostly from their own workstation, sometimes from a neighbouring desk or through a shared VPN pool, so every address carries several accounts. They mistype passwords, trip the CAPTCHA check after three failures - then give up, answer the CAPTCHA at once, or come back to the open login page later - and log out. Against that background the generator can weave a credential-guessing episode.
+## Event types
 
-## Event Types
+About 6,600 records per day. Activity rises from roughly 100 records per hour overnight to 520 per hour at 08:00-18:00 UTC. Most records describe ordinary login, logout and session replacement. Password mistakes account for a few percent of authentication attempts; one mistake is more frequent than two or three.
 
-Measured shares from a default 6-day `anomaly_mode: true` capture (2032 rows):
-
-| Action | Share | ECS category |
+| Action | Approximate share | Category |
 | --- | ---: | --- |
-| `session-created` | 38.5% | session |
-| `session-destroyed` | 25.3% | session |
-| `authentication-passed` | 12.6% | authentication |
-| `logout` | 12.5% | authentication |
-| `authentication-failed` | 10.2% | authentication |
-| `captcha-required` | 0.8% | authentication |
+| `session-created` | 42.55% | Session lifecycle |
+| `session-destroyed` | 28.35% | Session lifecycle |
+| `authentication-passed` | 14.19% | Authentication |
+| `logout` | 14.15% | Authentication |
+| `authentication-failed` | 0.64% | Authentication |
+| `captcha-required` | 0.11% | Authentication |
 
-Shares describe synthetic traffic, not measured Jira frequencies. Every action appears in both modes; `captcha-required` occurs in ordinary traffic when a user fails three times and is refused by the CAPTCHA check on the fourth attempt (failure count 4).
+Accounts normally use their own workstation, with occasional access from an alternate address. Jira requests a CAPTCHA after three failed passwords. Ordinary users can answer one or two CAPTCHA challenges and then sign in successfully. Failure counts belong to the account and reset after successful authentication. Existing authenticated sessions can overlap a new login.
 
 ## Anomaly Chain
 
-An episode is a credential-guessing run against one account from one address: three `authentication-failed` records (failure counts 1-3), a fourth attempt refused by `captcha-required` (failure count 4), then an `authentication-passed` for that account - the compromise - followed later by a logout.
+For one account, source address and anonymous session: three failed password attempts, three successive CAPTCHA refusals, then a successful login within one hour. This is a persistent retry sequence for detection testing, not proof of compromise. A single CAPTCHA followed by successful login remains ordinary activity.
 
-- **Linking fields.** Every step of the run shares one anonymous pre-login `jira.security.session_id`; Jira keeps the anonymous session across attempts and reports it on the successful login too. The failed and CAPTCHA records carry `user.name: anonymous`; the guessed account is in the message and in `jira.security.target_user`. The source IP is constant across the run.
-- **Recurrence.** Episodes recur by source time on a configurable interval (`anomaly_interval_hours`, default 24, 1-8760). The first episode is scheduled at a uniformly random time within the first `min(interval, 24 h)` of the run; each next one is due one interval after the previous episode's actual start and is scheduled uniformly within a window of `w = min(interval / 4, 6 h)` centred on the due time (the background has no hour-of-day profile). No catch-up. At the scheduled time the episode starts as soon as such an account is available (see Variation). Measured: two default 6-day captures 6 episodes each, 21.4-26.9 h apart; 6-hour interval 11 episodes in three days, 5.4-6.8 h apart.
-- **Variation.** The target is an account idle for at least 30 minutes, never the previous episode's target, and one whose own next sign-in is due more than 10 minutes after the episode's logout, so the episode never overlaps the account's own sessions; ordinary activity of the account is not moved to make room. The address is one the target already uses in ordinary traffic - a neighbouring desk or a VPN address - never the previous episode's address. Gaps between attempts and the session length after the compromise are drawn from skewed random distributions.
-- **Detection idea.** Group by `jira.security.session_id`; flag a session with three failed logins and a CAPTCHA refusal followed by a successful login within an hour of the first failure. Ordinary users reach the CAPTCHA refusal too, and some of them sign in later in the same anonymous session after leaving the login page open; the full ordered run is kept out of the background only inside that hour: an ordinary successful login that would complete it within 3600 s of the session's first failed login is not logged and no other record takes its place: that anonymous session ends there without a logged teardown, and the account stays quiet until the time its logout would have come, then keeps its usual schedule. Sort by `@timestamp` before applying sequence logic; output line order is not guaranteed.
+The first sequence begins within the smaller of 24 hours and the configured interval, with hours weighted by the daily activity curve. Later starts fall around the previous actual start plus the interval, in a window of width `min(interval / 4, 6 hours)`, with stronger preference for active hours. Consecutive episodes use different accounts. Episodes use frequent workstation/account pairs and retain independent sessions. Successful sessions end on the same schedule as ordinary sessions, typically tens of minutes later.
 
-`event.template.params.anomaly_mode` defaults to `true`. Set it to `false` for realistic background records only, with no complete chain.
+With `anomaly_mode: false`, all message types and the episode accounts remain present without this complete sequence. Enabling it adds one correlated sequence per episode. Correlate `jira.security.target_user` and `source.ip`, and require the same `jira.security.session_id` through the failed attempts and successful authentication. The session column retains the old anonymous session ID on the successful login request even though that request creates a new authenticated session.
 
 ## Parameters
 
-### Event Parameters
-
-| Name | Default | Purpose |
+| Parameter | Default | Meaning |
 | --- | --- | --- |
-| `anomaly_mode` | `true` | Weave the credential-guessing episodes into the stream |
-| `anomaly_interval_hours` | `24` | Source-time interval between episodes (1-8760) |
-| `host_name` | `jira-dc-01.example.test` | Jira node emitting the log (`host.name`) |
-| `context_path` | `/jira` | Servlet context path prefixing each request URL |
+| `host_name` | `jira-dc-01.example.test` | Jira node name in the ECS wrapper |
+| `context_path` | `/jira` | Application context in the thread's request URL |
+| `anomaly_mode` | `true` | Include the recurring retry sequence |
+| `anomaly_interval_hours` | `24` | Recurrence interval, from 1 to 8760 hours |
 
-The episode's target account and address are chosen at runtime from the built-in workstation pool; they are not parameters.
-
-### Output Parameters
-
-The shipped configuration writes `output/events.json` with no connection parameters or secrets. To deliver events to a SIEM, replace the file output in a local copy with the required output plugin, using `${params.*}` and `${secrets.*}` placeholders for hosts and credentials as that plugin needs.
+Edit values under `event.template.params` in `generator.yml`.
 
 ## Usage
 
 ```bash
-eventum generate --path generators/web-atlassian-jira-security/generator.yml --id jira --live-mode false
-eventum generate --path generators/web-atlassian-jira-security/generator.yml --id jira --live-mode true
+eventum generate --path generators/web-atlassian-jira-security/generator.yml --id jira-security --live-mode true
 ```
 
-## Sample Output
+For a finite batch, set the same explicit UTC start/end dates in every `patterns/*.yml` oscillator. Start at midnight to retain the working-day hours. Then run:
 
-One record, copied byte-for-byte from the default `anomaly_mode: true` capture - the successful login that completes an episode:
+```bash
+eventum generate --path generators/web-atlassian-jira-security/generator.yml --id jira-security-batch --live-mode false --keep-order true
+```
+
+Output is `output/events.json` relative to the generator directory. Replace the output block to deliver records to a SIEM. Performance: about 5,500 events/second for a four-day batch on the development machine.
+
+## Sample output
 
 ```json
-{"@timestamp": "2026-09-01T10:59:24.403000+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "authentication-passed", "category": ["authentication"], "kind": "event", "original": "2026-09-01 10:59:24,403+0000 http-nio-8080-exec-8 url: /jira/login.jsp pnovak 659x463x3 saw5wm7 10.20.9.52 /login.jsp The user \u0027pnovak\u0027 has PASSED authentication.", "outcome": "success", "type": ["start"]}, "host": {"name": "jira-dc-01.example.test"}, "jira": {"security": {"context_url": "/jira/login.jsp", "message": "The user \u0027pnovak\u0027 has PASSED authentication.", "request_id": "659x463x3", "request_url": "/login.jsp", "session_id": "saw5wm7", "target_user": "pnovak"}}, "log": {"file": {"path": "atlassian-jira-security.log"}}, "process": {"thread": {"name": "http-nio-8080-exec-8"}}, "related": {"ip": ["10.20.9.52"], "user": ["pnovak"]}, "source": {"ip": "10.20.9.52"}, "user": {"name": "pnovak"}}
+{"@timestamp": "2026-09-01T00:01:23.300000+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "authentication-passed", "category": ["authentication"], "kind": "event", "original": "2026-09-01 00:01:23,300+0000 http-nio-8080-exec-8 url: /jira/login.jsp user0029 0x103x1 4mk6er2 10.20.10.29 /login.jsp The user \u0027user0029\u0027 has PASSED authentication.", "outcome": "success", "type": ["start"]}, "host": {"name": "jira-dc-01.example.test"}, "jira": {"security": {"context_url": "/jira/login.jsp", "message": "The user \u0027user0029\u0027 has PASSED authentication.", "request_id": "0x103x1", "request_url": "/login.jsp", "session_id": "4mk6er2", "target_user": "user0029"}}, "log": {"file": {"path": "atlassian-jira-security.log"}}, "process": {"thread": {"name": "http-nio-8080-exec-8"}}, "related": {"ip": ["10.20.10.29"], "user": ["user0029"]}, "source": {"ip": "10.20.10.29"}, "user": {"name": "user0029"}}
 ```
 
-## Coverage and Limits
+## Limitations
 
-- The eight columns Atlassian documents are represented in `event.original` and in `jira.security` fields. In Atlassian's examples the first request ID segment equals the minutes since midnight (the article text says seconds); the pack follows the examples. The second segment is a per-restart request counter, the third the concurrent-request count. Session IDs are 6-7 lowercase base-36 characters, as in the examples.
-- The CAPTCHA refusal after three failures matches Atlassian's example (`Failure count equals 4` on the CAPTCHA line) and assumes the default of three allowed attempts; a changed limit shifts where the refusal appears.
-- An episode targets only an account that has been signed out for at least 30 minutes, while about 7% of ordinary sign-ins follow a logout more quickly. Over roughly 65 episodes (about 65 days at the default interval, about 3 days at the 1 h minimum) this gap becomes statistically visible.
-- As a result, episode targets have been idle longer before the episode than accounts usually are before a session (median about 223 vs 139 minutes in the review captures). Idle time alone flags about one episode per ten ordinary sessions at a 600-minute cutoff.
-- Failure counts restart at 1 on every new sign-in. Jira keeps the count per user until a successful login, so a real user returning after a lockout would meet the CAPTCHA check at once.
-- The pack models the login, failed-login, CAPTCHA, session lifecycle and logout messages. It does not emit the secondary `login : '<user>' tried to login ...` diagnostic line, the "NOT AUTHORIZED" no-application-access variant, session expiry, or REST API 403 records. As Atlassian notes, the security log is not comprehensive and excludes exceptions such as LDAP connection errors.
-- The raw line's timestamp offset is fixed to `+0000`, and the IP column carries a single origin address; proxy deployments may log an `origin,proxy` pair.
-- Compatibility with a specific SIEM normalizer (for example KUMA) is unverified.
+- This selected security-message profile omits remember-me-cookie diagnostics, application-permission failures, REST authentication, SSO, directory errors and anonymous-session timeout messages. It does not reproduce a complete Jira log file.
+- Related messages from one request are emitted on consecutive timestamps, typically seconds apart and occasionally minutes apart at low volume. They retain the same request ID and thread, including across a minute boundary. Session durations, account activity and message frequencies are synthetic.
+- The CAPTCHA threshold is three failed passwords. External-directory lockouts and password policy are outside this profile. Successful CAPTCHA authentication clears the local failure count; abandoned anonymous sessions expire outside the selected message set.
+- ECS fields and `jira.security` are this pack's enrichment. The target account on session-only messages is inferred from the associated synthetic activity. Native authentication messages name the account explicitly.
 
 ## References
 
-- [How to analyze the atlassian-jira-security.log file](https://support.atlassian.com/jira/kb/how-to-analyze-the-atlassian-jira-securitylog-file/) - column definitions and raw examples (Jira Data Center 9.5+, Log4j2 layout).
+- [Atlassian: analyzing the Jira security log](https://support.atlassian.com/jira/kb/how-to-analyze-the-atlassian-jira-securitylog-file/)
+- [Atlassian: repeated CAPTCHA failures and login outcomes](https://support.atlassian.com/jira/kb/user-unable-to-login-with-you-do-not-have-permission-error/)
+- [Atlassian LoginStore API: account failure counters and reset](https://docs.atlassian.com/software/jira/docs/api/10.5.0/com/atlassian/jira/security/login/LoginStore.html)
+
+No matching Elastic integration is asserted for this custom wrapper.
