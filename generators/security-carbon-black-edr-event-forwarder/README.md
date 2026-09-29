@@ -1,135 +1,69 @@
-# Carbon Black EDR Event Forwarder JSON
+# Carbon Black EDR Event Forwarder
 
-Synthetic Carbon Black EDR (formerly CB Response) endpoint events for SIEM process and network correlation.
+Legacy Event Forwarder ingress events, preserved as JSON in `event.original` and normalized following the Elastic `carbonblack_edr.log` pipeline. The selected stream describes application processes on ten workstations and two automation servers.
 
 ## Event types
 
-| Native type | Behavior | Approximate frequency with anomaly mode | ECS category/type |
-| --- | --- | --- | --- |
-| `ingress.event.procstart` (`event_type: proc`) | Process creation | about 40% | `process` / `start` |
-| `ingress.event.netconn` | Outbound TCP connection | about 40% | `network` / `connection` |
-| `ingress.event.childproc` | Child process creation | about 4% | `process` / `start` |
-| `ingress.event.regmod` | Registry value written | about 6% | `registry` / `change` |
-| `ingress.event.filemod` | File last-write change | about 11% | `file` / `change` |
+About 9,840 records/day combine continuous server activity with human activity concentrated between 08:00 and 18:00 UTC. The fleet, accounts and application paths are synthetic. Rates and shares are workload assumptions.
 
-The generator models one EDR server and five routine endpoint sensors. The same fifth sensor and user also participate in the anomaly; background PowerShell starts have a distinct parent and command line. Each source event is JSON under `carbon_black.edr`; its raw JSON record is retained in `event.original`. The outer document adds ECS fields for SIEM use.
+| Native type | Activity | Approximate background share |
+| --- | --- | ---: |
+| ingress.event.procstart | Process starts | 6.1% |
+| ingress.event.procend | Process exits | 6.1% |
+| ingress.event.regmod | Temporary registry value written or deleted | 3.0% |
+| ingress.event.filemod | Temporary file written or deleted | 10.2% |
+| ingress.event.netconn | Outbound application connection | 74.6% |
+
+Each host runs short application sessions. Process identifiers, hashes, paths and parent references remain stable throughout a session. The process GUID encodes the sensor, process ID and Windows FILETIME creation time. A process may write a temporary registry value, write a temporary file and make outbound HTTPS connections. Sessions end after about 10–20 minutes, removing their temporary objects before the process exit. One ordinary process per host is represented at a time; parent processes predate the capture.
 
 ## Anomaly Chain
 
-With `anomaly_mode: true` (the default), a Word process on `WS-FIN-01` creates PowerShell. That process starts with a hidden script, writes a `Run` registry value, modifies an AppData file and opens an outbound TCP connection. These are five distinct vendor-documented endpoint event types. The `childproc.child_process_guid` equals the later events' `process_guid`; the `childproc.process_guid` equals `procstart.parent_process_guid`. All five retain the same `sensor_id`, host and process MD5. A rule can correlate those keys within 10 seconds and distinguish the sequence from ordinary endpoint activity. In the validated one-second cadence, the five steps span exactly 4 seconds. Sort by `@timestamp` when inspecting a batch, since output line order can differ from event time.
+With `anomaly_mode: true`, one workstation process starts, writes a registry value, writes a file and connects to an external application address within ten minutes. Host and process GUID join the four records. Each action, workstation, account and application also appears in ordinary activity. The same temporary-object cleanup applies to ordinary and episode processes.
 
-With `anomaly_mode: false`, only the linked five-step series disappears. All five event types remain in the background, including child creation followed by its own process-start record and PowerShell activity on the same sensor and user. Routine children do not continue through the full `procstart` → `regmod` → `filemod` → `netconn` sequence on one child `process_guid`; the shared identifiers and order are the detection signal.
+The first episode starts within `min(interval, 24 hours)`, weighted toward office hours. Later starts lie within half of `min(interval/4, 6 hours)` around the preceding actual start plus the interval, with stronger daytime weighting. Workstations rotate between episodes. The default interval is 24 hours. Ordinary sessions continue during episodes; missed historical episodes are not replayed.
+
+With `anomaly_mode: false`, the complete four-step sequence is absent. Registry and file changes, external connections and process starts remain ordinary activities. The correlated sequence describes observable application behavior; it does not establish malicious code execution or persistence.
 
 ## Parameters
 
-### Event Parameters
+Edit `event.template.params` in `generator.yml`.
 
-Edit `event.template.params` in `generator.yml`:
-
-| Parameter | Default | Purpose |
+| Parameter | Default | Meaning |
 | --- | --- | --- |
-| `cb_server` | `cb-01.example.test` | EDR server name in the native record |
-| `link_base` | `https://cb-01.example.test` | Base URL for native sensor and process links |
-| `anomaly_mode` | `true` | Include the correlated five-event chain |
-| `anomaly_interval_events` | `60` | Routine process starts between chains |
-| `chain_host` | `WS-FIN-01` | Hostname for the correlated series |
-| `chain_sensor_id` | `7` | Sensor ID for the correlated series |
-| `chain_user` | `alice@example.test` | User context of the process |
-| `chain_local_ip` | `10.20.30.77` | Source address of the final connection |
+| `cb_server` | `cb-01.example.test` | EDR server name |
+| `link_base` | `https://cb-01.example.test/` | Console base URL for process and sensor links |
+| `anomaly_mode` | `true` | Include recurring correlated process activity |
+| `anomaly_interval_hours` | `24` | Episode interval in hours, from 2 to 8760 |
 
-### Output Parameters
-
-The supplied config writes ECS JSON Lines to `output/events.json`; it defines no top-level `params` or `secrets`. To send it elsewhere, replace `output.file` with the desired output plugin and define that plugin's `${params.*}` and `${secrets.*}` values. Forward `event.original` if the receiver expects the unwrapped Event Forwarder JSON record.
+Host identities and application paths are in `samples/`. All shipped values are synthetic; no secrets are needed.
 
 ## Usage
 
-Run from the content-packs repository root:
+From the content-packs root:
 
 ```bash
-eventum generate --path generators/security-carbon-black-edr-event-forwarder/generator.yml --id cb-edr --live-mode false
-eventum generate --path generators/security-carbon-black-edr-event-forwarder/generator.yml --id cb-edr-live --live-mode true
+eventum generate --path generators/security-carbon-black-edr-event-forwarder/generator.yml --id carbonblack --live-mode true --keep-order true
 ```
 
-Set `anomaly_mode: false` in `generator.yml` for background-only output.
+For a finite batch, copy the directory and set every `patterns/*.yml` oscillator start/end to UTC midnight boundaries. Run that copy with `--live-mode false --keep-order true`. Output defaults to `output/events.json`. Pattern ratios control volume and office-hour ranges control the human schedule.
 
-## Sample output event
+## Source fidelity and limitations
 
-This registry event was copied from an anomaly-mode run:
+The profile follows the open-source legacy protobuf message processor. It covers procstart/procend, regmod, filemod and netconn ingress events; childproc, watchlist hits, threat intelligence and binary metadata are omitted. Executable hashes are stable synthetic values, not hashes of actual binaries. Parent processes are references rather than a complete process tree.
+
+The ECS projection follows selected Elastic pipeline mappings. Native fields remain under `carbonblack.edr`; ingress events do not automatically gain ECS host, process, user or source/destination objects. Process start/end retain their native action without invented ECS categories. Registry and network fields follow the selected pipeline transformations. Compatibility with a live forwarder and downstream parser has not been exercised.
+
+## Sample output
+
+One complete synthetic normalized event:
 
 ```json
-{
-  "@timestamp": "2026-09-25T14:53:12+00:00",
-  "carbon_black": {
-    "edr": {
-      "action": "writeval",
-      "actiontype": 2,
-      "cb_server": "cb-01.example.test",
-      "computer_name": "WS-FIN-01",
-      "event_type": "regmod",
-      "link_process": "https://cb-01.example.test/#analyze/00000007-0000-7470-7708-38e8b8dc068b/1",
-      "link_sensor": "https://cb-01.example.test/#/host/7",
-      "md5": "E3F7D643F0133A6BCB598EAD3B4F1C76",
-      "path": "\\registry\\user\\s-1-5-21-1000-1000-1000-1001\\software\\microsoft\\windows\\currentversion\\run\\updater",
-      "pid": 2003,
-      "process_guid": "00000007-0000-7470-7708-38e8b8dc068b",
-      "sensor_id": 7,
-      "timestamp": 1790347992,
-      "type": "ingress.event.regmod"
-    }
-  },
-  "ecs": {
-    "version": "8.17.0"
-  },
-  "event": {
-    "action": "ingress.event.regmod",
-    "category": [
-      "registry"
-    ],
-    "dataset": "carbon_black_edr.event_forwarder",
-    "kind": "event",
-    "original": "{\"action\": \"writeval\", \"actiontype\": 2, \"cb_server\": \"cb-01.example.test\", \"computer_name\": \"WS-FIN-01\", \"event_type\": \"regmod\", \"link_process\": \"https://cb-01.example.test/#analyze/00000007-0000-7470-7708-38e8b8dc068b/1\", \"link_sensor\": \"https://cb-01.example.test/#/host/7\", \"md5\": \"E3F7D643F0133A6BCB598EAD3B4F1C76\", \"path\": \"\\\\registry\\\\user\\\\s-1-5-21-1000-1000-1000-1001\\\\software\\\\microsoft\\\\windows\\\\currentversion\\\\run\\\\updater\", \"pid\": 2003, \"process_guid\": \"00000007-0000-7470-7708-38e8b8dc068b\", \"sensor_id\": 7, \"timestamp\": 1790347992, \"type\": \"ingress.event.regmod\"}",
-    "type": [
-      "change"
-    ]
-  },
-  "host": {
-    "name": "WS-FIN-01"
-  },
-  "observer": {
-    "name": "cb-01.example.test",
-    "product": "EDR",
-    "vendor": "Carbon Black"
-  },
-  "process": {
-    "entity_id": "00000007-0000-7470-7708-38e8b8dc068b",
-    "executable": "c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe",
-    "pid": 2003
-  },
-  "registry": {
-    "path": "\\registry\\user\\s-1-5-21-1000-1000-1000-1001\\software\\microsoft\\windows\\currentversion\\run\\updater"
-  },
-  "related": {
-    "hosts": [
-      "WS-FIN-01"
-    ],
-    "user": [
-      "alice@example.test"
-    ]
-  },
-  "user": {
-    "name": "alice@example.test"
-  }
-}
+{"@timestamp": "2026-09-21T00:00:33.394736+00:00", "carbonblack": {"edr": {"command_line": "\"c:\\program files\\Fabrikam\\update.exe\"", "computer_name": "SRV-OPS-01", "event_type": "proc", "expect_followon_w_md5": false, "filtering_known_dlls": false, "link_parent": "https://cb-01.example.test/#analyze/0000001f-0000-05dc-01dd-494b758411e0/1", "link_process": "https://cb-01.example.test/#analyze/0000001f-0000-07d4-01dd-495c390ce1e0/0", "link_sensor": "https://cb-01.example.test/#/host/31", "md5": "90A22F0022EB9B544F2731AA76C9C3C3", "parent_create_time": 1789941633, "parent_guid": "0000001f-0000-05dc-01dd-494b758411e0", "parent_md5": "CC528C115378F7E5EB404837962C2206", "parent_path": "c:\\windows\\explorer.exe", "parent_pid": 1500, "parent_process_guid": "0000001f-0000-05dc-01dd-494b758411e0", "path": "c:\\program files\\Fabrikam\\update.exe", "pid": 2004, "process_guid": "0000001f-0000-07d4-01dd-495c390ce1e0", "process_path": "c:\\program files\\Fabrikam\\update.exe", "sensor_id": 31, "sha256": "357DA3610A6743839006711F24AB657BAEBF808A58EFE5761F742A4F9A75F2AD", "timestamp": 1789948833.394736, "username": "svc-monitor1@example.test"}}, "ecs": {"version": "8.11.0"}, "event": {"action": "ingress.event.procstart", "dataset": "carbonblack_edr.log", "kind": "event", "original": "{\"cb_server\": \"cb-01.example.test\", \"command_line\": \"\\\"c:\\\\program files\\\\Fabrikam\\\\update.exe\\\"\", \"computer_name\": \"SRV-OPS-01\", \"event_type\": \"proc\", \"expect_followon_w_md5\": false, \"filtering_known_dlls\": false, \"link_parent\": \"https://cb-01.example.test/#analyze/0000001f-0000-05dc-01dd-494b758411e0/1\", \"link_process\": \"https://cb-01.example.test/#analyze/0000001f-0000-07d4-01dd-495c390ce1e0/0\", \"link_sensor\": \"https://cb-01.example.test/#/host/31\", \"md5\": \"90A22F0022EB9B544F2731AA76C9C3C3\", \"parent_create_time\": 1789941633.394736, \"parent_guid\": \"0000001f-0000-05dc-01dd-494b758411e0\", \"parent_md5\": \"CC528C115378F7E5EB404837962C2206\", \"parent_path\": \"c:\\\\windows\\\\explorer.exe\", \"parent_pid\": 1500, \"parent_process_guid\": \"0000001f-0000-05dc-01dd-494b758411e0\", \"path\": \"c:\\\\program files\\\\Fabrikam\\\\update.exe\", \"pid\": 2004, \"process_guid\": \"0000001f-0000-07d4-01dd-495c390ce1e0\", \"process_path\": \"c:\\\\program files\\\\Fabrikam\\\\update.exe\", \"sensor_id\": 31, \"sha256\": \"357DA3610A6743839006711F24AB657BAEBF808A58EFE5761F742A4F9A75F2AD\", \"timestamp\": 1789948833.394736, \"type\": \"ingress.event.procstart\", \"username\": \"svc-monitor1@example.test\"}"}, "observer": {"name": "cb-01.example.test", "product": "Carbon Black EDR", "type": "edr", "vendor": "VMWare"}, "tags": ["carbonblack_edr-log", "forwarded", "preserve_original_event"]}
 ```
-
-## Format and coverage
-
-All 84 native field positions across the five complete JSON examples in the [Carbon Black EDR Event Forwarder schema](https://developer.carbonblack.com/reference/enterprise-response/connectors/event-forwarder/event-schema/) are represented: 14/14 `childproc`, 20/20 `procstart`, 14/14 `regmod`, 16/16 `filemod` and 20/20 `netconn`. Values, field types and cross-event identifiers follow those examples. The scope excludes other endpoint event types, alerts, LEEF output, proxy-specific `netconn` fields and transport headers. The vendor schema does not pin these examples to a current EDR release, so this is a profile of the documented Event Forwarder JSON, not a claim of compatibility with every EDR version.
-
-**KUMA compatibility:** The KUMA 4.2 Carbon Black EDR entry names a Syslog-CEF normalizer. This pack emits the Event Forwarder's native JSON stream, which that CEF normalizer cannot parse. Configure a JSON ingestion path for this pack. Carbon Black states that CEF output is available through its native rsyslog templates, not through Event Forwarder; this generator does not synthesize that separate CEF stream.
 
 ## References
 
-- [Carbon Black EDR Event Forwarder data formats](https://developer.carbonblack.com/reference/enterprise-response/connectors/event-forwarder/event-schema/) - complete native JSON examples and field meanings.
-- [Broadcom: EDR Syslog CEF output](https://knowledge.broadcom.com/external/article/285764) - CEF is a separate native rsyslog export, not Event Forwarder output.
-- [KUMA 4.2 supported data sources](https://support.kaspersky.ru/kuma/4.2/255782) - Carbon Black EDR Syslog-CEF normalizer entry.
+- [Carbon Black Event Forwarder legacy processor](https://github.com/carbonblack/cb-event-forwarder/blob/develop/pkg/protobufmessageprocessor/legacy_pb_message_processor.go)
+- [Process GUID conversion](https://github.com/carbonblack/cb-event-forwarder/blob/develop/pkg/utils/utils.go)
+- [Sensor event protobuf](https://github.com/carbonblack/cb-event-forwarder/blob/develop/pkg/sensorevents/sensor_events.proto)
+- [Elastic Carbon Black EDR ingest pipeline](https://github.com/elastic/integrations/blob/main/packages/carbonblack_edr/data_stream/log/elasticsearch/ingest_pipeline/default.yml)

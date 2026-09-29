@@ -1,91 +1,120 @@
-{%- set step = vars.step -%}
-{%- set chain = step.startswith('chain_') -%}
-{%- set epoch = timestamp.timestamp()|int -%}
-{%- if step == 'routine_start' -%}
-  {%- do shared.pop('to_chain', none) -%}
-  {%- do shared.pop('to_childproc', none) -%}
-  {%- do shared.pop('to_regmod', none) -%}
-  {%- do shared.pop('to_filemod', none) -%}
-  {%- do shared.pop('chain_process', none) -%}
-  {%- do shared.pop('routine_child_process', none) -%}
-  {%- set count = shared.get('routine_count', 0) + 1 -%}
-  {%- if count % 11 == 0 -%}{%- do shared.set('to_childproc', true) -%}
-  {%- elif count % 7 == 0 -%}{%- do shared.set('to_regmod', true) -%}
-  {%- elif count % 3 == 0 -%}{%- do shared.set('to_filemod', true) -%}{%- endif -%}
-  {%- if count >= params.anomaly_interval_events -%}
-    {%- do shared.set('routine_count', 0) -%}
-    {%- if params.anomaly_mode -%}{%- do shared.set('to_chain', true) -%}{%- endif -%}
-  {%- else -%}{%- do shared.set('routine_count', count) -%}{%- endif -%}
-  {%- set actors = [
-    {'host':'WS-ENG-01','sensor':11,'prefix':'0000000b','user':'engineer@example.test','path':'c:\\program files\\browser\\browser.exe','parent_path':'c:\\windows\\explorer.exe','remote_ip':'198.51.100.10','domain':'updates.example.test'},
-    {'host':'WS-HR-02','sensor':12,'prefix':'0000000c','user':'hr@example.test','path':'c:\\program files\\collab\\collab.exe','parent_path':'c:\\windows\\explorer.exe','remote_ip':'198.51.100.11','domain':'chat.example.test'},
-    {'host':'WS-OPS-03','sensor':13,'prefix':'0000000d','user':'operator@example.test','path':'c:\\program files\\monitor\\agent.exe','parent_path':'c:\\windows\\services.exe','remote_ip':'198.51.100.12','domain':'telemetry.example.test'},
-    {'host':'WS-FIN-04','sensor':14,'prefix':'0000000e','user':'analyst@example.test','path':'c:\\program files\\browser\\browser.exe','parent_path':'c:\\windows\\explorer.exe','remote_ip':'198.51.100.13','domain':'portal.example.test'},
-    {'host':params.chain_host,'sensor':params.chain_sensor_id,'prefix':'00000007','user':params.chain_user,'path':'c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe','parent_path':'c:\\windows\\explorer.exe','remote_ip':'198.51.100.14','domain':'updates.example.test','cmdline':'"c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe" -NoProfile -File C:\\ProgramData\\Contoso\\health.ps1'}
-  ] -%}
-  {%- set actor = module.rand.choice(actors) -%}
-  {%- set process_guid = actor.prefix ~ '-0000-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(12) -%}
-  {%- set parent_guid = actor.prefix ~ '-0000-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(12) -%}
-  {%- set ctx = {'host':actor.host,'sensor':actor.sensor,'user':actor.user,'path':actor.path,'parent_path':actor.parent_path,'remote_ip':actor.remote_ip,'domain':actor.domain,'local_ip':'10.20.10.' ~ actor.sensor,'local_port':module.rand.number.integer(40000, 60000),'remote_port':443,'pid':module.rand.number.integer(2000, 9000),'parent_pid':1500,'guid':process_guid,'parent_guid':parent_guid,'md5':module.rand.string.hex(32)|upper,'parent_md5':module.rand.string.hex(32)|upper,'cmdline':actor.get('cmdline', '"' ~ actor.path ~ '"')} -%}
-  {%- do shared.set('routine_process', ctx) -%}
-{%- elif step == 'chain_childproc' -%}
-  {%- set prefix = '00000007' -%}
-  {%- set process_guid = prefix ~ '-0000-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(12) -%}
-  {%- set parent_guid = prefix ~ '-0000-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(12) -%}
-  {%- set path = 'c:\\windows\\system32\\windowspowershell\\v1.0\\powershell.exe' -%}
-  {%- set parent_path = 'c:\\program files\\microsoft office\\root\\office16\\winword.exe' -%}
-  {%- set ctx = {'host':params.chain_host,'sensor':params.chain_sensor_id,'user':params.chain_user,'path':path,'parent_path':parent_path,'remote_ip':'198.51.100.77','domain':'','local_ip':params.chain_local_ip,'local_port':module.rand.number.integer(40000, 60000),'remote_port':443,'pid':module.rand.number.integer(2000, 9000),'parent_pid':1840,'guid':process_guid,'parent_guid':parent_guid,'md5':'E3F7D643F0133A6BCB598EAD3B4F1C76','parent_md5':'6DC27F4A5FD57F6C917F3E63F2C4E37F','cmdline':'"' ~ path ~ '" -NoProfile -WindowStyle Hidden -File C:\\ProgramData\\Contoso\\maint.ps1'} -%}
-  {%- do shared.set('chain_process', ctx) -%}
-{%- else -%}
-  {%- set ctx = shared.get('chain_process') if chain else shared.get('routine_child_process') if step == 'routine_child_start' else shared.get('routine_process') -%}
+{# Legacy Event Forwarder JSON, normalized like Elastic carbonblack_edr.
+   Fixed host slots plus one extra episode process. Histories live in the
+   process objects and disappear when their process ends. #}
+{%- set ts=timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now=ts.timestamp() -%}
+{%- set interval=params.anomaly_interval_hours * 3600 -%}
+{%- macro guid(sensor,pid,created) -%}
+  {%- set ft=(created|int + 11644473600)*10000000 + ((created-created|int)*1000000)|round|int * 10 -%}
+  {{- '%08x-%04x-%04x-%04x-%012x'|format(sensor,pid//65536,pid%65536,ft//281474976710656,ft%281474976710656) -}}
+{%- endmacro -%}
+{%- macro schedule(first=false) -%}
+  {%- set width=[interval/4,21600]|min -%}
+  {%- set lo=now if first else now+interval-width/2 -%}
+  {%- set hi=now+[interval,86400]|min if first else now+interval+width/2 -%}
+  {%- set candidates=[] -%}{%- set weights=[] -%}
+  {%- for _ in range(96) -%}
+    {%- set at=module.rand.number.floating(lo,hi) -%}
+    {%- set h=module.datetime.datetime.fromtimestamp(at,module.datetime.timezone.utc).hour -%}
+    {%- set w=1.0 if 8<=h<18 else 0.01369863 -%}
+    {%- do candidates.append(at) -%}{%- do weights.append(w if first else w*w+0.001) -%}
+  {%- endfor -%}
+  {{- module.rand.weighted_choice(candidates,weights) -}}
+{%- endmacro -%}
+{%- if shared.get('processes') is none -%}
+  {%- do module.pydantic_core.SchemaValidator({'type':'typed-dict','fields':{
+    'anomaly_mode':{'type':'typed-dict-field','schema':{'type':'bool','strict':true}},
+    'anomaly_interval_hours':{'type':'typed-dict-field','schema':{'type':'float','ge':2,'le':8760}}
+  }}).validate_python(params) -%}
+  {%- do shared.update({'processes':{},'episode_due':schedule(true)|float,'last_actor':-1,'pid':2000,'parent_time':now-7200}) -%}
 {%- endif -%}
-{%- set process_link = params.link_base ~ '/#analyze/' ~ ctx.guid ~ '/1' -%}
-{%- set parent_link = params.link_base ~ '/#analyze/' ~ ctx.parent_guid ~ '/1' -%}
-{%- set sensor_link = params.link_base ~ '/#/host/' ~ ctx.sensor -%}
-{%- if step == 'routine_start' or step == 'routine_child_start' or step == 'chain_procstart' -%}
-  {%- set native = {'cb_server':params.cb_server,'command_line':ctx.cmdline,'computer_name':ctx.host,'event_type':'proc','expect_followon_w_md5':false,'link_parent':parent_link,'link_process':process_link,'link_sensor':sensor_link,'md5':ctx.md5,'parent_create_time':epoch-3 if step == 'routine_child_start' else epoch-120,'parent_md5':ctx.parent_md5,'parent_path':ctx.parent_path,'parent_process_guid':ctx.parent_guid,'path':ctx.path,'pid':ctx.pid,'process_guid':ctx.guid,'sensor_id':ctx.sensor,'timestamp':epoch,'type':'ingress.event.procstart','username':ctx.user} -%}
-  {%- set category = 'process' -%}
-  {%- set event_type = ['start'] -%}
-{%- elif step.endswith('childproc') -%}
-  {%- set child_guid = ctx.guid if chain else ctx.guid[:8] ~ '-0000-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(12) -%}
-  {%- set child_link = process_link if chain else params.link_base ~ '/#analyze/' ~ child_guid ~ '/1' -%}
-  {%- set child_md5 = ctx.md5 if chain else module.rand.string.hex(32)|upper -%}
-  {%- set parent_process_guid = ctx.parent_guid if chain else ctx.guid -%}
-  {%- set parent_process_link = parent_link if chain else process_link -%}
-  {%- set parent_pid = ctx.parent_pid if chain else ctx.pid -%}
-  {%- if not chain -%}
-    {%- set child_path = 'c:\\windows\\system32\\conhost.exe' if 'powershell' in ctx.path else ctx.path -%}
-    {%- set child_ctx = {'host':ctx.host,'sensor':ctx.sensor,'user':ctx.user,'path':child_path,'parent_path':ctx.path,'remote_ip':ctx.remote_ip,'domain':ctx.domain,'local_ip':ctx.local_ip,'local_port':ctx.local_port,'remote_port':ctx.remote_port,'pid':module.rand.number.integer(9001, 16000),'parent_pid':ctx.pid,'guid':child_guid,'parent_guid':ctx.guid,'md5':child_md5,'parent_md5':ctx.md5,'cmdline':'"' ~ child_path ~ '"'} -%}
-    {%- do shared.set('routine_child_process', child_ctx) -%}
+{%- set processes=shared.get('processes') -%}
+{%- macro create(slot,ai,episode) -%}
+  {%- set actor=samples.hosts[ai] -%}
+  {%- set app=samples.applications.pick() -%}
+  {%- set pid=shared.get('pid')+4 -%}{%- if pid>60000 -%}{%- set pid=2000 -%}{%- endif -%}{%- do shared.set('pid',pid) -%}
+  {%- set steps=['reg','file','net'] if episode else module.rand.weighted_choice([['net','file'],['file','net'],['reg','net'],['file','reg','net'],['reg','file','net']],[40,35,15,9,1]) -%}
+  {%- set c={'ai':ai,'host':actor.host,'sensor':actor.sensor,'user':actor.user,'local_ip':actor.local_ip,
+    'pid':pid,'guid':guid(actor.sensor,pid,now),'start':now,'parent_guid':guid(actor.sensor,1500,shared.get('parent_time')),
+    'parent_pid':1500,'parent_time':shared.get('parent_time'),'parent_path':app.parent_path,
+    'path':app.path,'md5':module.hashlib.md5(app.path.encode()).hexdigest()|upper,'sha256':module.hashlib.sha256(app.path.encode()).hexdigest()|upper,
+    'remote_ip':app.remote_ip,'domain':app.domain,'local_port':module.rand.number.integer(49152,65535),
+    'steps':steps,'due':now+module.rand.number.floating(3,15),'expires':now+module.rand.number.floating(600,1200),
+    'reg':false,'file':false,'reg_prefix':false,'file_prefix':false,'episode':episode,'completed':false} -%}
+  {%- do processes.update({slot:c}) -%}
+{%- endmacro -%}
+{%- set choice=namespace(slot=none,kind=none) -%}
+{%- if params.anomaly_mode and now>=shared.get('episode_due') and -1 not in processes -%}
+  {%- set eligible=[] -%}
+  {%- for i in range(samples.hosts|length) if not samples.hosts[i].auto and i!=shared.get('last_actor') -%}{%- do eligible.append(i) -%}{%- endfor -%}
+  {%- set ai=module.rand.choice(eligible) -%}
+  {{- create(-1,ai,true) -}}
+  {%- do shared.update({'episode_due':schedule()|float,'last_actor':ai}) -%}
+  {%- set choice.slot=-1 -%}{%- set choice.kind='procstart' -%}
+{%- else -%}
+  {# Finish expired processes before beginning new work. #}
+  {%- for slot,c in processes.items() if now>=c.expires -%}
+    {%- set choice.slot=slot -%}{%- set choice.kind='delreg' if c.reg else 'delfile' if c.file else 'procend' -%}{%- break -%}
+  {%- endfor -%}
+  {%- if choice.slot is none -%}
+    {%- set pick=namespace(at=now+1) -%}
+    {%- for slot,c in processes.items() if c.steps and c.due<=now and c.due<pick.at -%}
+      {%- set pick.at=c.due -%}{%- set choice.slot=slot -%}
+    {%- endfor -%}
+    {%- if choice.slot is not none -%}
+      {%- set c=processes[choice.slot] -%}
+      {%- set choice.kind=c.steps.pop(0) -%}
+      {%- do c.update({'due':now+module.rand.number.floating(3,15)}) -%}
+    {%- endif -%}
   {%- endif -%}
-  {%- set native = {'cb_server':params.cb_server,'child_process_guid':child_guid,'computer_name':ctx.host,'created':true,'event_type':'childproc','link_child':child_link,'link_process':parent_process_link,'link_sensor':sensor_link,'md5':child_md5,'pid':parent_pid,'process_guid':parent_process_guid,'sensor_id':ctx.sensor,'timestamp':epoch,'type':'ingress.event.childproc'} -%}
-  {%- set category = 'process' -%}
-  {%- set event_type = ['start'] -%}
-{%- elif step.endswith('regmod') -%}
-  {%- set registry_path = '\\registry\\user\\s-1-5-21-1000-1000-1000-1001\\software\\microsoft\\windows\\currentversion\\run\\updater' if chain else '\\registry\\user\\s-1-5-21-1000-1000-1000-' ~ (ctx.sensor + 1000) ~ '\\software\\contoso\\settings\\lastsync' -%}
-  {%- set native = {'action':'writeval','actiontype':2,'cb_server':params.cb_server,'computer_name':ctx.host,'event_type':'regmod','link_process':process_link,'link_sensor':sensor_link,'md5':ctx.md5,'path':registry_path,'pid':ctx.pid,'process_guid':ctx.guid,'sensor_id':ctx.sensor,'timestamp':epoch,'type':'ingress.event.regmod'} -%}
-  {%- set category = 'registry' -%}
-  {%- set event_type = ['change'] -%}
-{%- elif step.endswith('filemod') -%}
-  {%- set file_path = 'c:\\users\\alice\\appdata\\roaming\\updater\\cache.dat' if chain else 'c:\\users\\' ~ ctx.user.split('@')[0] ~ '\\appdata\\local\\temp\\session-cache.dat' -%}
-  {%- set native = {'action':'lastwrite','actiontype':8,'cb_server':params.cb_server,'computer_name':ctx.host,'event_type':'filemod','filetype':0,'filetype_name':'Unknown','link_process':process_link,'link_sensor':sensor_link,'md5':ctx.md5,'path':file_path,'pid':ctx.pid,'process_guid':ctx.guid,'sensor_id':ctx.sensor,'timestamp':epoch,'type':'ingress.event.filemod'} -%}
-  {%- set category = 'file' -%}
-  {%- set event_type = ['change'] -%}
+  {%- if choice.slot is none -%}
+    {%- set eligible=[] -%}
+    {%- for i in range(samples.hosts|length) if samples.hosts[i].auto == ('automation' in tags) -%}{%- do eligible.append(i) -%}{%- endfor -%}
+    {%- set ai=module.rand.choice(eligible) -%}{%- set choice.slot=ai -%}
+    {%- if ai not in processes -%}{{- create(ai,ai,false) -}}{%- set choice.kind='procstart' -%}
+    {%- else -%}{%- set choice.kind='net' -%}{%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set c=processes[choice.slot] -%}
+{%- set kind=choice.kind -%}
+{%- set base=params.link_base.rstrip('/') ~ '/' -%}
+{%- set native={'cb_server':params.cb_server,'computer_name':c.host,'sensor_id':c.sensor,'timestamp':now,
+  'process_guid':c.guid,'pid':c.pid,'process_path':c.path,'md5':c.md5,'sha256':c.sha256,
+  'link_process':base ~ '#analyze/' ~ c.guid ~ '/0','link_sensor':base ~ '#/host/' ~ c.sensor} -%}
+{%- if kind in ['procstart','procend'] -%}
+  {%- do native.update({'event_type':'proc','type':'ingress.event.' ~ kind,'path':c.path,'command_line':'"' ~ c.path ~ '"',
+    'parent_path':c.parent_path,'parent_pid':c.parent_pid,'parent_create_time':c.parent_time,'parent_guid':c.parent_guid,'parent_process_guid':c.parent_guid,
+    'parent_md5':module.hashlib.md5(c.parent_path.encode()).hexdigest()|upper,'filtering_known_dlls':false,'expect_followon_w_md5':false,
+    'link_parent':base ~ '#analyze/' ~ c.parent_guid ~ '/1','username':c.user}) -%}
+{%- elif kind in ['reg','delreg'] -%}
+  {%- set path='\\registry\\user\\s-1-5-21-1000-1000-1000-' ~ (1000+c.sensor) ~ '\\software\\contoso\\sessions\\' ~ c.pid -%}
+  {%- do native.update({'event_type':'regmod','type':'ingress.event.regmod','path':path,'action':'writeval' if kind=='reg' else 'delval','actiontype':2 if kind=='reg' else 8,'tamper':false,'tamper_sent':false}) -%}
+  {%- do c.update({'reg':kind=='reg'}) -%}
+  {%- if kind=='reg' -%}{%- do c.update({'reg_prefix':true}) -%}{%- endif -%}
+{%- elif kind in ['file','delfile'] -%}
+  {%- set path='c:\\users\\' ~ c.user.split('@')[0] ~ '\\appdata\\local\\temp\\session-' ~ c.pid ~ '.dat' -%}
+  {%- do native.update({'event_type':'filemod','type':'ingress.event.filemod','path':path,'action':'lastwrite' if kind=='file' else 'delete','actiontype':8 if kind=='file' else 4,'filetype':0,'filetype_name':'Unknown','tamper':false,'tamper_sent':false}) -%}
+  {%- do c.update({'file':kind=='file'}) -%}
+  {%- if kind=='file' and c.reg_prefix -%}{%- do c.update({'file_prefix':true}) -%}{%- endif -%}
 {%- else -%}
-  {%- set native = {'cb_server':params.cb_server,'computer_name':ctx.host,'direction':'outbound','domain':ctx.domain,'event_type':'netconn','ipv4':ctx.remote_ip,'link_process':process_link,'link_sensor':sensor_link,'local_ip':ctx.local_ip,'local_port':ctx.local_port,'md5':ctx.md5,'pid':ctx.pid,'port':ctx.remote_port,'process_guid':ctx.guid,'protocol':6,'remote_ip':ctx.remote_ip,'remote_port':ctx.remote_port,'sensor_id':ctx.sensor,'timestamp':epoch,'type':'ingress.event.netconn'} -%}
-  {%- set category = 'network' -%}
-  {%- set event_type = ['connection'] -%}
+  {%- set remote=c.remote_ip -%}{%- set domain=c.domain -%}
+  {%- if c.file_prefix and now-c.start<=600 -%}
+    {%- if c.episode and not c.completed -%}{%- do c.update({'completed':true}) -%}
+    {%- else -%}{%- set remote='10.20.1.20' -%}{%- set domain='inventory.example.test' -%}{%- endif -%}
+  {%- endif -%}
+  {%- do native.update({'event_type':'netconn','type':'ingress.event.netconn','direction':'outbound','domain':domain,'ipv4':remote,'port':443,'protocol':6,
+    'remote_ip':remote,'remote_port':443,'local_ip':c.local_ip,'local_port':c.local_port}) -%}
 {%- endif -%}
-{%- set process_id = ctx.parent_guid if step == 'chain_childproc' else ctx.guid -%}
-{%- set process_pid = ctx.parent_pid if step == 'chain_childproc' else ctx.pid -%}
-{%- set process_path = ctx.parent_path if step == 'chain_childproc' else ctx.path -%}
-{%- set process = {'entity_id':process_id,'pid':process_pid,'executable':process_path} -%}
-{%- if step == 'routine_start' or step == 'routine_child_start' or step == 'chain_procstart' -%}{%- do process.update({'command_line':ctx.cmdline,'parent':{'entity_id':ctx.parent_guid,'executable':ctx.parent_path}}) -%}{%- endif -%}
-{%- set out = {'@timestamp':timestamp.isoformat(),'ecs':{'version':'8.17.0'},'event':{'action':native.type,'category':[category],'dataset':'carbon_black_edr.event_forwarder','kind':'event','original':native|tojson,'type':event_type},'host':{'name':ctx.host},'observer':{'name':params.cb_server,'product':'EDR','vendor':'Carbon Black'},'user':{'name':ctx.user},'process':process,'related':{'hosts':[ctx.host],'user':[ctx.user]},'carbon_black':{'edr':native}} -%}
-{%- if category == 'network' -%}
-  {%- do out.update({'source':{'ip':ctx.local_ip,'port':ctx.local_port},'destination':{'ip':ctx.remote_ip,'port':ctx.remote_port},'network':{'direction':'outbound','transport':'tcp'}}) -%}
-  {%- do out.related.update({'ip':[ctx.local_ip,ctx.remote_ip]}) -%}
-{%- elif category == 'file' -%}{%- do out.update({'file':{'path':native.path}}) -%}
-{%- elif category == 'registry' -%}{%- do out.update({'registry':{'path':native.path}}) -%}
+{%- if kind=='procend' -%}{%- do processes.pop(choice.slot) -%}{%- endif -%}
+{# The ingress pipeline moves cb_server/type to observer/event and keeps
+   other source fields. It does not populate ECS host/process/user here. #}
+{%- set parsed=dict(native) -%}{%- do parsed.pop('cb_server') -%}{%- do parsed.pop('type') -%}
+{%- if 'parent_create_time' in parsed -%}{%- do parsed.update({'parent_create_time':parsed.parent_create_time|int}) -%}{%- endif -%}
+{%- set out={'@timestamp':ts.isoformat(),'ecs':{'version':'8.11.0'},'event':{'action':native.type,'kind':'event','dataset':'carbonblack_edr.log','original':native|tojson},
+  'observer':{'name':params.cb_server,'vendor':'VMWare','product':'Carbon Black EDR','type':'edr'},'carbonblack':{'edr':parsed},'tags':['carbonblack_edr-log','forwarded','preserve_original_event']} -%}
+{%- if native.event_type in ['filemod','regmod','netconn'] -%}
+  {%- do out.event.update({'category':[{'filemod':'file','regmod':'registry','netconn':'network'}[native.event_type]],'type':['connection','start'] if native.event_type=='netconn' else ['change']}) -%}
 {%- endif -%}
-{{- out | tojson -}}
+{%- if native.event_type=='regmod' -%}{%- do out.update({'registry':{'path':native.path[10:]}}) -%}{%- endif -%}
+{%- if native.event_type=='netconn' -%}{%- do out.update({'network':{'iana_number':'6'}}) -%}{%- endif -%}
+{{- out|tojson -}}
