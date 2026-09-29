@@ -2,19 +2,33 @@
 
 Generates the structured server log of one MongoDB Community 7.0 `mongod` (log file in the JSON format of `logv2`, default verbosity, `slowms` 100, SCRAM-SHA-256 authorization) as it is shipped by the Elastic `mongodb.log` integration. Each output line is ECS JSON; `event.original` holds the native log line byte for byte and `mongodb.log.*` holds its parsed fields as the Elastic ingest pipeline produces them.
 
+## Volume and Timing
+
+Line volume follows a UTC hour-of-day curve, about 39,000 lines per day with ±3% day-to-day variation; lines fall at random times inside each band.
+
+| UTC hours | Lines/s |
+|---|---:|
+| 08-19 | 0.70 |
+| 07-08, 19-21 | 0.40 |
+| 21-07 | 0.20 |
+
+Service traffic makes up about 91% of the lines. People open sessions in business hours: at the peak (08-18 UTC) about one session per person per hour, 0.4 of that at 07-08 and 18-19 and 0.05 at night. The billing worker connects about every 25 minutes in the day and less often at night, the reporting job runs about five times a day at any hour.
+
+The lines of one moment follow each other within seconds: a connection's `client metadata` comes a median 1.0 s after its `Connection accepted` in the day (90th percentile 3.3 s) and 2.6 s at night (9.6 s); logins, first commands and the batches of one export are spaced the same way. `durationMillis`, `elapsedMillis` and the authentication metrics keep the server-side timing in milliseconds.
+
 ## Event Types Covered
 
-Shares are measured from the final 72-hour default capture with `anomaly_mode: false` (13,717 lines, about 4,600 per day).
+Shares over 14 days with `anomaly_mode: false` (552,413 lines).
 
 | `id` | `msg` | Component | Meaning | Share | ECS `event.type` |
 |---:|---|---|---|---:|---|
-| 51803 | `Slow query` | `COMMAND` | Read above 100 ms, or a `getMore` batch of an export | 34.2% | `info` |
-| 22943 | `Connection accepted` | `NETWORK` | New client connection, with the open-connection count | 15.1% | `info` |
-| 51800 | `client metadata` | `NETWORK` | Driver handshake document of the connection | 15.1% | `info` |
-| 22944 | `Connection ended` | `NETWORK` | Connection closed, with the open-connection count | 15.1% | `info` |
-| 5286306 | `Successfully authenticated` | `ACCESS` | SCRAM-SHA-256 login succeeded | 10.0% | `access` |
-| 6788700 | `Received first command on ingress connection since session start or auth handshake` | `NETWORK` | First command after the login, with the delay | 10.0% | `info` |
-| 5286307 | `Failed to authenticate` | `ACCESS` | Wrong password, `AuthenticationFailed` (18) | 0.56% | `access` |
+| 51803 | `Slow query` | `COMMAND` | Read above 100 ms: `find` 65.2%, `aggregate` 5.9%, `getMore` batch of an export 0.13% | 71.3% | `info` |
+| 22943 | `Connection accepted` | `NETWORK` | New client connection, with the open-connection count | 5.9% | `info` |
+| 51800 | `client metadata` | `NETWORK` | Driver handshake document of the connection | 5.9% | `info` |
+| 22944 | `Connection ended` | `NETWORK` | Connection closed, with the open-connection count | 5.9% | `info` |
+| 5286306 | `Successfully authenticated` | `ACCESS` | SCRAM-SHA-256 login succeeded | 5.4% | `access` |
+| 6788700 | `Received first command on ingress connection since session start or auth handshake` | `NETWORK` | First command after the login, with the delay | 5.4% | `info` |
+| 5286307 | `Failed to authenticate` | `ACCESS` | Wrong password, `AuthenticationFailed` (18) | 0.03% | `access` |
 
 `Slow query` lines come from `find` and `aggregate` operations above 100 ms and from `getMore` batches of export cursors:
 
@@ -22,17 +36,18 @@ Shares are measured from the final 72-hour default capture with `anomaly_mode: f
 |---|---|---|---|
 | Point and range `find` | order and catalog services, people | `sales.orders`, `crm.customers`, `billing.*`, `inventory.stock_movements`, `catalog.products`, `sales.carts` | mostly `IXSCAN`, some `COLLSCAN` |
 | `aggregate` with `$group` | reporting job, billing worker, people | `sales.orders`, `crm.customers`, `billing.invoices`, `inventory.stock_movements`, `catalog.products` | `COLLSCAN` or `IXSCAN`, `queryFramework: sbe` |
-| Export `getMore` (16 MiB batches) | reporting job, DBAs, analysts | `crm.customers` (all documents or one segment), `sales.orders` (returned), `billing.invoices` (disputed) | `COLLSCAN`, `originatingCommand` is the opening `find` |
+| Export `getMore` (16 MiB batches) | reporting job, DBAs, analysts | `crm.customers` (all documents, one segment, one region or churned customers), `sales.orders` (returned), `billing.invoices` (disputed) | `COLLSCAN`, `originatingCommand` is the opening `find` |
 
 ## Workload Model
 
-The generator runs a bounded event simulation of the server's clients. Every delay is exponential or lognormal and every choice is random; both modes run the same processes, and an episode adds one session without pausing, shifting or replacing any background activity. Rates are chosen assumptions, not vendor-measured frequencies.
+Rates are chosen assumptions, not vendor-measured frequencies. Both modes run the same activity; an episode adds one session and does not pause, shift or cancel any session, job or pool activity.
 
-- **Service pools:** `orders-api` (two instances, six connections each), `catalog-service` (four) and `mongodb_exporter` (one) keep pooled connections that close after a lognormal lifetime (median 40 minutes, 6 hours for the exporter) and reopen on demand after a lognormal delay (median 15 s). Each reopen logs accept, client metadata, a successful authentication and the first command. The services' slow reads follow a service hour-of-day curve (night about a third of the day rate).
-- **Batch jobs:** `billing-worker` (PyMongo) connects about every 25 minutes during the day, `nightly-reports` (Go driver) about every 5 hours at any time; each run opens the driver's two monitoring connections plus one authenticated connection, runs a few aggregations (reports also run exports) and closes all connections.
-- **People:** two DBAs (`mongosh`) and two analysts (MongoDB Compass), each at its own workstation address, open sessions as a Poisson process thinned by a business-hours curve (peak mean gap 55 minutes, night about 4% of the peak). A session opens two monitoring connections and one authenticated connection, runs a lognormal number of reads (median 4) with lognormal think times (median 40 s), and 5% of reads are exports. Sessions of one person may overlap.
-- **Wrong passwords:** a person's first attempt fails with probability 0.12 and each retry with 0.5 (up to six failures); 8% of sessions start from a stale remembered password (every attempt fails until it is corrected, retry failure 0.7, up to nine). Retries follow after a lognormal delay (median 9 s, sigma 0.45); after any failure the person gives up with probability 0.1. Service instances occasionally (mean every 36 hours each) fail two to twelve times in a row with a stale secret before a working connection. A failed attempt closes its connections within milliseconds. Three or more failures of one address within 30 minutes, failures followed by a success, and give-ups are ordinary in both modes (77 failed logins and 26 such three-failure windows across all addresses in the default `false` capture, 26 to 59 per 72 hours over six `false` captures).
-- Connection ids continue from a high counter (the server has been up for weeks), and the service pools and their monitoring connections are already open when the capture starts, so some `Connection ended` lines close connections accepted before the window.
+- **Service pools:** `orders-api` (four instances, six pooled connections each), `catalog-service` (two instances, four each) and `mongodb_exporter` (one) keep pooled connections. Their slow reads make up most of the log; an `orders-api` instance reads about 1.4 times as often as a `catalog-service` instance. An idle pooled connection closes after a median of 13 minutes (the exporter's after about two hours) and reopens on demand a median 15 s later, logging accept, client metadata, a successful authentication and the first command.
+- **Batch jobs:** `billing-worker` (PyMongo) and `nightly-reports` (Go driver): each run opens the driver's two monitoring connections plus one authenticated connection, runs a few aggregations (reports also run exports) and closes all connections.
+- **People:** two DBAs (`mongosh`) and two analysts (MongoDB Compass), each at its own workstation address, about 11 sessions per person per day. A session opens two monitoring connections and one authenticated connection, runs a lognormal number of reads (median 4) with lognormal think times (median 40 s), and 5% of reads are exports. Sessions of one person may overlap.
+- **Exports:** `crm.customers` (all documents, one segment, one region, churned customers), returned `sales.orders` and disputed `billing.invoices`. The result of a region or churned-customer export fits into one 16 MiB `getMore` batch; the others take several. The four people export about 12 times a day together (`crm.customers` about 8), the reporting job about 4 times.
+- **Wrong passwords:** a person mistypes a first attempt with probability 0.07 and each retry with 0.35 (up to six failures); 3% of sessions start from an outdated remembered password (every attempt fails until it is corrected, retry failure 0.6, up to eight). Retries follow after a lognormal delay (median 9 s); after any failure the person gives up with probability 0.1. About 16% of people's logins fail (about 8 a day across the four); a single failure before a success is the most common, and three or more happen about six times a week. A service instance that still holds a rotated secret fails 1 to 12 times in a row (each extra failure less likely, 15 s apart) before it connects, about 1.5 times a day across the instances. Over all logins, 0.55% fail.
+- Connection ids continue from a high counter (the server has been up for weeks), and the service pools and their monitoring connections are already open when the log starts, so some `Connection ended` lines close connections accepted earlier.
 
 ## Selected Source Profile
 
@@ -53,22 +68,26 @@ The line format and the attribute order of every modelled message follow the `r7
 
 `event.template.params.anomaly_mode` defaults to `true`. With `false`, only background is produced.
 
-An episode is one session of one of the four people, from that person's own workstation and account, that starts with repeated wrong passwords and then reads a customer export:
+An episode is one extra session of one of the four people, from that person's own workstation and account, that starts with repeated wrong passwords and then reads a customer export:
 
-1. Three (55%), four (30%) or five (15%) connect attempts, each a monitoring pair plus one connection with `Failed to authenticate` for the person's user, closed within milliseconds; retries follow the ordinary retry delay (median 9 s), and the person does not give up.
+1. Three (55%), four (30%) or five (15%) connect attempts, each a monitoring pair plus one connection with `Failed to authenticate` for the person's user, closed right away; retries follow the ordinary retry delay (median 9 s), and the person does not give up.
 2. `Successfully authenticated` of the same user from the same address, `Received first command ...`.
-3. Zero to two ordinary reads, then an export of `crm.customers` (all documents or one segment), started at the latest 20 minutes after the first failure: consecutive `Slow query` `getMore` lines with `COLLSCAN` and 16 MiB batches.
+3. Zero to two ordinary reads, then an export of the customers of one region or of the churned customers from `crm.customers`, started at the latest 20 minutes after the first failure: the whole result after the first 101 documents arrives in one `getMore` batch, one `Slow query` line with `cursorExhausted: true`.
 4. More ordinary reads, then `Connection ended` for the session's connections.
+
+The person's ordinary sessions go on as usual. The episode's lines take the place of an equal number of service slow-query lines around it, so the daily volume and the hour curve are the same as in background.
 
 Linking fields: the client address in `remote` / `client`, `user`, `conn<N>` / `connectionId` and `uuid` of each connection, the metadata `doc`, the session `lsid`, and the `cursorid` of the export.
 
-Recurrence: the first episode starts within the first min(interval, 24 hours) of the window, at a time drawn from the people's hour curve, plus a random delay (exponential, mean 6 minutes). Each next episode is due one interval after the actual start of the previous one; its start is drawn in a window of width w = min(interval / 4, 6 hours) centred on the due time, weighted by the squared people curve plus a small floor, and then delayed the same way. Missed intervals are not replayed. The interval is `anomaly_interval_hours` (default 24, minimum 6). At intervals of 8 hours or less some episodes necessarily fall outside business hours.
+Recurrence: the first episode starts within the first min(interval, 24 hours) of the log, at a time drawn from the people's hour curve. Each next episode is due one interval after the actual start of the previous one; its start is drawn in a window of width w = min(interval / 4, 6 hours) centred on the due time, weighted by the squared people curve plus a small floor. Missed intervals are not replayed. The interval is `anomaly_interval_hours` (default 24, minimum 6). At intervals of 8 hours or less some episodes necessarily fall outside business hours.
 
-Variation: the person rotates (never the same as the previous episode) and is otherwise drawn uniformly, as all four have the same background session rate. Failure count, delays, connection ids, ports, `uuid`, `lsid`, `cursorid`, the export filter and the reads come from the same draws as background.
+Variation: the person rotates (never the same as the previous episode) and is otherwise drawn uniformly, as all four have the same session rate. The failure count, delays, connection ids, ports, `uuid`, `lsid`, `cursorid`, the export (region or churned customers, with the background weights of these two exports) and the reads come from the same draws as background.
 
-Every event type, address, user, user-address pair, namespace and export shape of an episode also occurs in background of both modes: failure runs of three or more followed by a success, and exports of `crm.customers` by all four people, are ordinary. Only the complete order within 30 minutes is kept out of background: when an ordinary `crm.customers` `getMore` would complete it (three failures of one user from one address, then a success of that user, then the `getMore` within 30 minutes of the first failure), that `getMore` line is not written; the export's timing and its other lines are unchanged.
+Every event type, address, user, user-address pair, namespace and export shape of an episode also occurs in background of both modes: runs of three or more failures followed by a success, and single-batch exports of `crm.customers` by all four people, are ordinary. Only the complete order within 30 minutes is kept out of background: when an ordinary `crm.customers` `getMore` would complete it (three failures of one user from one address, then a success of that user, then the `getMore` within 30 minutes of the first failure), an export that has not logged a batch yet reads returned orders or disputed invoices instead (with that person's usual weights), and a later batch of an export already under way is not written. This happens about once a week.
 
-Possible detection: per client address, at least three `Failed to authenticate` of one user followed by `Successfully authenticated` of that user and, within 30 minutes of the first failure, a `getMore` on a sensitive collection from that address; join the `conn<N>` of the success to the export lines. The log does not show why the logins failed or where the exported documents went.
+With `anomaly_mode: true` each episode adds its own records, so counts of the chain's parts (runs of three or more failed logins of one person followed by a success, single-batch customer exports) are about one per episode higher: at the default interval about one more such failure run a day, on top of about six a week in background.
+
+Possible detection: per client address, at least three `Failed to authenticate` of one user followed by `Successfully authenticated` of that user and, within 30 minutes of the first failure, a `getMore` on a sensitive collection from that address; join the `conn<N>` of the success to the export line. The log does not show why the logins failed or where the exported documents went.
 
 ## Parameters
 
@@ -79,11 +98,11 @@ Edit `event.template.params` in `generator.yml`. Invalid values stop rendering w
 | Name | Default | Purpose and constraints |
 |---|---|---|
 | `db_host` | `mongo-01.corp.example` | Server host name in `host.name`; ASCII letters, digits, `.` and `-` |
-| `log_timezone` | `+00:00` | Server time zone offset used in `t.$date` and for the hour-of-day curves, `[+-]HH:MM` |
+| `log_timezone` | `+00:00` | Server time zone offset written in `t.$date`, `[+-]HH:MM`; the hour curves stay in UTC |
 | `anomaly_interval_hours` | `24` | Episode interval in hours of source time, number from 6 to 8,760 |
 | `anomaly_mode` | `true` | `true` adds episodes to background, `false` produces background only |
 
-Clients, collections, queries and exports are defined in `samples/clients.json`, `samples/collections.json`, `samples/queries.json` and `samples/exports.json`. `clients.json` needs two or more `shell` or `compass` clients.
+Clients, collections, queries and exports are defined in `samples/clients.json`, `samples/collections.json`, `samples/queries.json` and `samples/exports.json`. `clients.json` needs two or more `shell` or `compass` clients, and each of them needs a single-batch `crm.customers` export and an export of another collection in `exports.json`.
 
 ### Output Parameters
 
@@ -91,49 +110,40 @@ The shipped file output needs no substitutions. To deliver elsewhere, replace th
 
 ## Usage
 
-From the content-packs repository root:
+Live generation at the configured rate, from the content-packs repository root:
 
 ```bash
-# Batch sample
-eventum generate --path generators/database-mongodb-log/generator.yml --id database-mongodb-log --live-mode false --keep-order true
-
-# Live generation, about 4,600 lines per day
 eventum generate --path generators/database-mongodb-log/generator.yml --id database-mongodb-log --live-mode true --keep-order true
 ```
 
-Output goes to `generators/database-mongodb-log/output/events.json`. Keep `--keep-order true`: `connectionCount` and the connection lifecycle depend on the line order. The shipped input is unbounded; to check recurrence, set finite `input[0].cron.start` and `end` covering at least two intervals.
+Batch generation: set `start` and `end` of the `oscillator` in all seven `patterns/*.yml` files to the same range, with `start` at 00:00 UTC so the hour bands stay in place (for example `start: "2026-09-21T00:00:00Z"` and `end: "2026-09-24T00:00:00Z"`), then run:
 
-## Validation
+```bash
+eventum generate --path generators/database-mongodb-log/generator.yml --id database-mongodb-log --live-mode false --keep-order true
+```
 
-Final 72-hour captures (2026-09-21 to 2026-09-24, one input tick per second), each checked line by line by a checker for the native byte form (field order, padding, `t.$date`, no `svc`), the per-message attribute order, the ECS mirror, connection state (`connectionId`, `uuid`, `connectionCount` arithmetic, no line after `Connection ended`, first command and slow queries only after a successful login) and the chain:
+Output goes to `generators/database-mongodb-log/output/events.json`. Keep `--keep-order true`: `connectionCount` and the connection lifecycle depend on the line order.
 
-| Capture | Lines | Complete chains | Gaps between episode starts | Episode spans |
-|---|---:|---:|---|---|
-| Default 24 h, `true` | 14,196 | 3 | 25.43 h, 23.44 h | 56 to 208 s |
-| Default, `false` | 13,717 | 0 | - | - |
-| Four more default `false` | 14,507 to 14,818 | 0 | - | - |
-| Custom 12 h, `true` | 14,658 | 5 | 11.11 to 13.24 h | 52 to 167 s |
-| Custom 12 h, `false` | 14,081 | 0 | - | - |
+The hour curves are sums of `time_patterns` files under `patterns/`: `service-floor` (00-24 UTC), `service-day` (07-21) and `service-core` (08-19) for service lines, `people-floor`, `people-day` (07-19) and `people-core` (08-18) for people's sessions, and `jobs` for report runs and stale-secret series. To change the volume, scale the `ratio` of the three service files by the same factor; a lower volume stretches the gaps between the lines of one moment. To move the working day to another time zone, shift the `low` / `high` bounds of the day and core files. Episode start hours follow the shipped people curve even if you reshape the pattern files.
 
-- The person rotates between consecutive episodes; every user-address pair of an episode also logs in and reads `crm.customers` exports in background.
-- The first default episode started at 03:30 UTC: the first start is drawn from the people curve, which gives the hours 00-06 about a 2% chance, and later starts stay within 3 hours of the previous phase. The custom episodes started between 00:01 and 12:55 UTC.
-- Near misses over the six `false` captures (180 three-failure-then-success prefixes, export starts per 15 minutes after the first failure; exact = same address and `crm.customers`, other = same address and another collection, elsewhere = `crm.customers` from another address): 0-15 min 0 / 13 / 22, 15-30 min 0 / 6 / 12, 30-45 min 2 / 2 / 11, 45-60 min 1 / 1 / 6. Exact completions inside the window are removed by the rule above (about 15 over 18 days, estimated from the same-address export mix); the other two counts are not changed by it and fall off with session length.
-- A calibrated on/off comparison (per-address and per-user gaps and minima, failure runs and give-ups, chain sub-sequences, daily counts, rotation, connection holds, periodicity, constants and mix; five `false` reference captures) finds no difference tied to episodes in the default pair: its verdict is SUSPECT only on two background-level checks, phase concentration of failure lines (in that background capture five separate stale-password and retry runs on different days fell into the same minute-of-hour bin; fresh captures peak at 11-19%) and `connectionId` increasing by exactly one per accepted connection, which is what a standalone mongod writes. The custom pair adds a SUSPECT on two retry gaps inside episodes (2.5 s) below the smallest of 551 background gaps (2.9 s); both come from the same retry-delay distribution as background (medians 8.7 s and 9.2 s) and the tail test is not significant after correction.
+Performance: about 1,500 lines per second in batch mode on one core.
 
-## Limitations and Assumptions
+## Limitations
 
 - No raw 7.0 log line of these message ids was found in vendor material; the byte form comes from the tagged formatter and log-site source, and the padding style is confirmed by the raw 4.4.4 fixture of the Elastic integration. Raw parity with a live server is not established.
 - Values are synthetic: driver versions, query shapes, `queryHash` / `planCacheKey`, durations, lock counts, `storage` read sizes and `cpuNanos` are plausible, not measured. Durations of collection scans scale with collection size.
 - Not modelled: TLS, load balancer, replica-set and sharding messages, startup and shutdown, `hello`-only connections outside driver monitoring, writes and their slow-operation lines, `Slow query` for commands other than `find`, `aggregate` and `getMore`, the 6.3+ session-workflow slow-response line, errors other than a wrong password, and the Enterprise audit log (a different stream).
-- Speculative authentication is assumed for every client; `isSpeculative` is `true` on failures as well. Service pools do not restart within the window, so their monitoring connections are never logged.
-- A mongod writes every line; here the collector emits at most one line per second, so `event.created` trails `@timestamp` by up to about 30 seconds during export bursts (26.6 s at most in the final default capture).
+- Speculative authentication is assumed for every client; `isSpeculative` is `true` on failures as well. Service pools do not restart, so their monitoring connections are never logged.
+- Lines that a server writes within milliseconds of each other (a connection's accept, metadata and login, consecutive batches of one export) are about a second apart in the day and a few seconds at night, so the gaps between their timestamps are longer than `durationMillis` and `elapsedMillis` imply.
+- The hour curves are in UTC and repeat every day: there is no weekly cycle, so weekends look like weekdays.
+- With `anomaly_mode: true` each episode adds its own records, so counts of the chain's parts are about one per episode higher than in background (see Anomaly Chain).
 
 ## Sample Output
 
-The first wrong password of the first episode, line 443 of the final default `true` capture, as written by the file output (a background failure by the same person looks the same):
+The final step of the first episode of a default run: `analyst_ivan` exports the far-east customers of `crm.customers` in one `getMore` batch, 33 s after a successful login that followed three failed logins within 58 s.
 
 ```json
-{"@timestamp": "2026-09-21T03:30:11.577Z", "data_stream": {"dataset": "mongodb.log", "namespace": "default", "type": "logs"}, "ecs": {"version": "8.11.0"}, "event": {"category": ["database"], "created": "2026-09-21T03:30:17.584Z", "dataset": "mongodb.log", "ingested": "2026-09-21T03:30:18.784Z", "kind": "event", "module": "mongodb", "original": "{\"t\":{\"$date\":\"2026-09-21T03:30:11.577+00:00\"},\"s\":\"I\",  \"c\":\"ACCESS\",   \"id\":5286307, \"ctx\":\"conn52779\",\"msg\":\"Failed to authenticate\",\"attr\":{\"client\":\"10.30.1.22:61889\",\"isSpeculative\":true,\"isClusterMember\":false,\"mechanism\":\"SCRAM-SHA-256\",\"user\":\"dba_oleg\",\"db\":\"admin\",\"error\":\"AuthenticationFailed: SCRAM authentication failed, storedKey mismatch\",\"result\":18,\"metrics\":{\"conversation_duration\":{\"micros\":7400,\"summary\":[{\"step\":1,\"step_total\":2,\"duration_micros\":90},{\"step\":2,\"step_total\":2,\"duration_micros\":231}]}},\"doc\":{\"application\":{\"name\":\"mongosh 2.3.0\"},\"driver\":{\"name\":\"nodejs|mongosh\",\"version\":\"6.8.0|2.3.0\"},\"platform\":\"Node.js v20.16.0, LE\",\"os\":{\"name\":\"darwin\",\"architecture\":\"arm64\",\"version\":\"23.6.0\",\"type\":\"Darwin\"}},\"extraInfo\":{}}}", "type": ["access"]}, "host": {"name": "mongo-01.corp.example"}, "input": {"type": "logfile"}, "log": {"file": {"path": "/var/log/mongodb/mongod.log"}, "level": "I"}, "message": "Failed to authenticate", "mongodb": {"log": {"attr": {"client": "10.30.1.22:61889", "isSpeculative": true, "isClusterMember": false, "mechanism": "SCRAM-SHA-256", "user": "dba_oleg", "db": "admin", "error": "AuthenticationFailed: SCRAM authentication failed, storedKey mismatch", "result": 18, "metrics": {"conversation_duration": {"micros": 7400, "summary": [{"step": 1, "step_total": 2, "duration_micros": 90}, {"step": 2, "step_total": 2, "duration_micros": 231}]}}, "doc": {"application": {"name": "mongosh 2.3.0"}, "driver": {"name": "nodejs|mongosh", "version": "6.8.0|2.3.0"}, "platform": "Node.js v20.16.0, LE", "os": {"name": "darwin", "architecture": "arm64", "version": "23.6.0", "type": "Darwin"}}, "extraInfo": {}}, "component": "ACCESS", "context": "conn52779", "id": 5286307}}, "tags": ["preserve_original_event"]}
+{"@timestamp": "2026-09-21T14:12:10.799Z", "data_stream": {"dataset": "mongodb.log", "namespace": "default", "type": "logs"}, "ecs": {"version": "8.11.0"}, "event": {"category": ["database"], "created": "2026-09-21T14:12:11.330Z", "dataset": "mongodb.log", "ingested": "2026-09-21T14:12:11.867Z", "kind": "event", "module": "mongodb", "original": "{\"t\":{\"$date\":\"2026-09-21T14:12:10.799+00:00\"},\"s\":\"I\",  \"c\":\"COMMAND\",  \"id\":51803,   \"ctx\":\"conn89847\",\"msg\":\"Slow query\",\"attr\":{\"type\":\"command\",\"ns\":\"crm.customers\",\"appName\":\"MongoDB Compass\",\"command\":{\"getMore\":6208691475638660086,\"collection\":\"customers\",\"lsid\":{\"id\":{\"$uuid\":\"c25abd1e-cf0c-432c-bbd3-4a051fc380cb\"}},\"$db\":\"crm\"},\"originatingCommand\":{\"find\":\"customers\",\"filter\":{\"address.region\":\"far-east\"},\"lsid\":{\"id\":{\"$uuid\":\"c25abd1e-cf0c-432c-bbd3-4a051fc380cb\"}},\"$db\":\"crm\"},\"planSummary\":\"COLLSCAN\",\"cursorid\":6208691475638660086,\"keysExamined\":0,\"docsExamined\":116411,\"nBatches\":1,\"cursorExhausted\":true,\"numYields\":103,\"nreturned\":5997,\"queryFramework\":\"classic\",\"reslen\":12257781,\"locks\":{\"FeatureCompatibilityVersion\":{\"acquireCount\":{\"r\":104}},\"Global\":{\"acquireCount\":{\"r\":104}}},\"storage\":{\"data\":{\"bytesRead\":206906,\"timeReadingMicros\":7900}},\"cpuNanos\":106188935,\"remote\":\"10.30.2.50:50368\",\"protocol\":\"op_msg\",\"durationMillis\":150}}", "type": ["info"]}, "host": {"name": "mongo-01.corp.example"}, "input": {"type": "logfile"}, "log": {"file": {"path": "/var/log/mongodb/mongod.log"}, "level": "I"}, "message": "Slow query", "mongodb": {"log": {"attr": {"type": "command", "ns": "crm.customers", "appName": "MongoDB Compass", "command": {"getMore": 6208691475638660086, "collection": "customers", "lsid": {"id": {"$uuid": "c25abd1e-cf0c-432c-bbd3-4a051fc380cb"}}, "$db": "crm"}, "originatingCommand": {"find": "customers", "filter": {"address.region": "far-east"}, "lsid": {"id": {"$uuid": "c25abd1e-cf0c-432c-bbd3-4a051fc380cb"}}, "$db": "crm"}, "planSummary": "COLLSCAN", "cursorid": 6208691475638660086, "keysExamined": 0, "docsExamined": 116411, "nBatches": 1, "cursorExhausted": true, "numYields": 103, "nreturned": 5997, "queryFramework": "classic", "reslen": 12257781, "locks": {"FeatureCompatibilityVersion": {"acquireCount": {"r": 104}}, "Global": {"acquireCount": {"r": 104}}}, "storage": {"data": {"bytesRead": 206906, "timeReadingMicros": 7900}}, "cpuNanos": 106188935, "remote": "10.30.2.50:50368", "protocol": "op_msg", "durationMillis": 150}, "component": "COMMAND", "context": "conn89847", "id": 51803}}, "tags": ["preserve_original_event"]}
 ```
 
 ## References
