@@ -44,35 +44,48 @@ Authentication and accounting go to **two files**; a collector reads both and pa
 
 ## Event Types
 
-Measured in the final default-on 120-hour capture (6,007 lines, starting 2026-09-21 00:00 UTC):
+Shares over seven days with `anomaly_mode: true` (194,582 lines):
 
 | Action | Native line | Share | ECS category |
 | --- | --- | ---: | --- |
-| `accept` | `Accepted user: ...` | 29.4% | `authentication` |
-| `connect` | `Connect: ...` (Accounting Start) | 29.4% | `session` |
-| `disconnect` | `Disconnect: ... N seconds` (Accounting Stop) | 29.3% | `session` |
-| `reject` | `Rejected user: ...` | 11.8% | `authentication` |
+| `accept` | `Accepted user: ...` | 31.8% | `authentication` |
+| `connect` | `Connect: ...` (Accounting Start) | 31.2% | `session` |
+| `disconnect` | `Disconnect: ... N seconds` (Accounting Stop) | 31.2% | `session` |
+| `reject` | `Rejected user: ...` | 5.7% | `authentication` |
 
-The site has 36 users and 50 client devices (`samples/clients.json`; 14 users carry a laptop and a phone) and six access points of one SSID (`samples/access_points.json`). Each device is an independent random process with its own activity weight and preferred access points: an idle gap (lognormal, thinned by an office-hours curve in UTC), one authentication attempt, an accounting Start 0-3 seconds after the accept, and a Stop after a lognormal session (median about 35 minutes). `Acct-Session-Time` equals the actual Start-to-Stop time; the framed IP is the device's fixed lease; `NAS-Port` is the association ID (RFC 3580), new for each attempt. About 12% of attempts start with one to eight mistyped passwords a few seconds apart, each extra reject half as likely as the previous count, and 15% of them give up; about 2% come from a device with a stale saved password that is rejected 2 to 14 times, every few tens of minutes, until it is updated. All rates are synthetic, not measured FreeRADIUS statistics. Each one-second tick emits at most one line; a tick with nothing due is silent. The log starts with no open sessions, and sessions still open at the end of a finite run have no Stop.
+The site has 726 users with 1,000 client devices (`samples/clients.json`; 274 users carry a laptop and a phone) and 30 access points of one SSID (`samples/access_points.json`). Each device has its own activity level (within a factor of four of the others) and one to three preferred neighbouring access points.
+
+Volume is about 27,800 lines a day and follows a fixed hour-of-day curve in UTC: 0.06 lines/s from 00:00 to 05:00, rising through 06:00-08:00 to 0.6 lines/s from 08:00 to 16:00, then tapering hour by hour to 0.08 lines/s at 23:00. The daily total varies by about 2%. Up to about 690 sessions are open at the same time in office hours.
+
+Each authentication attempt belongs to one device:
+
+- 93.5% succeed at once: `Accepted user`, then the accounting Start a few seconds later (median 3 s).
+- 5% start with one to eight mistyped passwords a few seconds apart, each extra reject half as likely as the previous count; 15% of these users give up, the rest are accepted.
+- 1.5% come from a device with a stale saved password, rejected 2 to 14 times about every 20 minutes (fewer retries more likely) until it is updated and accepted.
+- 1.5% of accepts have no accounting Start (the client does not complete the association).
+
+Sessions last a lognormal time (10th/50th/90th percentile about 12 minutes, 36 minutes and 1.8 hours, at most about 12 hours); `Acct-Session-Time` in the Stop equals the actual Start-to-Stop time. The framed IP is the device's fixed lease; `NAS-Port` is the association ID (RFC 3580), new for each attempt. A device has at most one attempt or session at a time. All rates are synthetic, not measured FreeRADIUS statistics. The log starts with no open sessions, and sessions still open at the end of a finite run have no Stop.
 
 ## Anomaly Chain
 
 Password guessing that succeeds from a device's usual station, then a network session:
 
-1. Five to eight `Rejected user` lines for one user and calling station, seconds apart.
+1. Five to eight `Rejected user` lines for one user and calling station, seconds apart and all within about six minutes.
 2. `Accepted user` for the same user and station.
-3. `Connect` (Accounting Start) for that user, station and NAS port, 0-3 seconds later, with the device's framed IP and one of its access points.
+3. `Connect` (Accounting Start) for that user, station and NAS port, a few seconds later, with the device's framed IP and one of its access points.
 4. `Disconnect` (Accounting Stop) after an ordinary session length; `Acct-Session-Time` is the real elapsed time.
 
 Linking fields: `user.name` + `source.mac` (`Calling-Station-Id`), `radius.nas_port` across the accept and accounting lines, and the Start/Stop pair on the station. The selected formats carry no `Acct-Session-Id`, so a session is the Start/Stop pair of one station.
 
-Recurrence: with `anomaly_mode: true` (the default) the first episode starts within `min(anomaly_interval_hours, 24 h)` of the first event, at an hour drawn from the background office-hours curve. Each next episode is due `anomaly_interval_hours` after the actual start of the previous one and starts inside a window of `w = min(interval / 4, 6 h)` centred on that due time, weighted by the squared office-hours curve plus a small floor, so start hours do not drift and missed intervals are never caught up. Consecutive starts are therefore `interval ± w/2` apart (24 ± 3 h by default). With a short interval the window is narrow (2 h at 8 h) and some due times fall at night, so a share of episodes then starts outside office hours. Each episode picks a device with the background activity weights among devices that are idle and whose own next attempt comes after the episode ends, never the previous episode's user. Its reject count is drawn from the tail (five to eight) of the same mistyped-password law as background bursts; its reject gaps, port, access point and session length are drawn like background. The device's own traffic is neither suspended nor moved.
+Recurrence: with `anomaly_mode: true` (the default) the first episode starts within `min(anomaly_interval_hours, 24 h)` of the first line, at an hour drawn from the volume curve. Each next episode is due `anomaly_interval_hours` after the actual start of the previous one and starts inside a window of `w = min(interval / 4, 6 h)` centred on that due time, weighted by the squared volume curve plus a small floor, so start hours do not drift far and missed intervals are never caught up. Consecutive starts are `interval ± w/2` apart (24 ± 3 h by default). An episode that first falls at night keeps the next ones near that hour and moves towards office hours by about an hour a day; with a short interval (8 h) some episodes fall at night as well.
 
-Everything the chain uses also occurs in ordinary traffic of both modes: every user|station pair, the same access points, reject bursts seconds apart, runs of five to eight rejects, four rejects followed by an accept and a Start, and sessions of the same length distribution. Only the complete ordered chain is absent from background: an ordinary attempt whose Start would complete five rejects of its user and station within ten minutes ends silently, as a user who gives up: after its last reject, or before its accept when it has no reject of its own. No line is added or changed, so reject-run lengths keep the burst law. In five background-only 120-hour captures, bursts of rejects seconds apart had lengths 4/5/6/7/8 = 86/40/21/7/1; 86-88% of two- to four-reject bursts ended in an accept, and no burst of five or more did. No Start came within 600 seconds of its fifth-last reject; the shortest such spans were 638, 662 and 709 seconds, with 4 between 600 and 900 seconds and 8 between 900 and 1,200 over 600 hours.
+Each episode uses a device chosen with the ordinary activity levels among devices that have no attempt or session open, never the previous episode's user. Its reject count comes from the tail (five to eight) of the mistyped-password law above; its reject gaps, port, access point and session length are drawn like ordinary ones. The episode's lines come on top of ordinary traffic, and the device's own sessions before and after it are unchanged.
+
+Everything the chain uses also occurs in ordinary traffic of both modes: every user and station pair, every station and access point pair, runs of five to eight rejects seconds apart followed by an accept, and sessions of the same length distribution. Only the complete chain is absent from ordinary traffic: an accept that follows five or more rejects of its user and station within ten minutes (about 25 a day) is never followed by an accounting Start in that window.
 
 Detection idea: at least five `Rejected user` lines for the same user and calling station within ten minutes, followed by `Accepted user` and an accounting Start for that pair; alert on the Start and follow the session to its Stop.
 
-With `anomaly_mode: false`, only background is generated.
+With `anomaly_mode: false`, only ordinary traffic is generated.
 
 ## Parameters
 
@@ -96,31 +109,37 @@ The shipped output writes `output/events.json` and uses no `${params.*}` or `${s
 
 ## Usage
 
-Live mode, one line per second at most, until stopped:
+Live generation at the configured rate, until stopped:
 
 ```bash
 eventum generate --path generators/identity-freeradius/generator.yml --id freeradius --live-mode true
 ```
 
-Batch mode: add `start` and `end` to `input[0].cron` in a copy of `generator.yml`, then:
+Batch generation: set `start` and `end` of the `oscillator` in every `patterns/*.yml` file to the same range, with `start` at 00:00 UTC so the hour curve stays in place (for example `start: "2026-09-01T00:00:00Z"` and `end: "2026-09-08T00:00:00Z"`), then run:
 
 ```bash
-eventum generate --path generator.yml --id freeradius --live-mode false --keep-order true
+eventum generate --path generators/identity-freeradius/generator.yml --id freeradius --live-mode false --keep-order true
 ```
+
+The hour curve is the sum of the ten `time_patterns` files under `patterns/`, each adding a flat rate over one UTC hour range. To change the volume, scale the `ratio` of every pattern file by the same factor. Episode start hours follow the shipped curve even if you reshape the pattern files.
+
+Performance: about 3,000 lines per second in batch mode on one core.
 
 ## Limitations
 
 - No raw output from a running FreeRADIUS 3.2.10 server was available. The accounting lines follow the tagged `log_accounting` formats verbatim; the authentication lines follow the custom `auth_siemaudit` instance above, built with tagged `linelog` syntax but not exercised on a daemon. Compatibility with syslog-oriented FreeRADIUS parsers is not claimed.
 - One RADIUS server, one controller and one SSID; no roaming within a session, no Interim-Update, no NAS reboots.
-- Office hours are in UTC, with no weekday cycle.
-- In background, five or more rejects of one user and station within ten minutes are never followed by an accept and Start within that window; this is the chain itself. A detector with a lower threshold or a longer window also matches background near misses.
+- The hour curve is in UTC and repeats every day, with no weekday cycle.
+- Lines of one attempt are seconds apart rather than milliseconds: the accounting Start follows its accept after a median 3 s, and at night after up to about three minutes.
+- An accept that follows five or more rejects of its user and station within ten minutes is never followed by an accounting Start in ordinary traffic, while other accepts miss their Start only 1.5% of the time. A detector with a lower threshold or a longer window also matches ordinary near misses.
+- With `anomaly_mode: true` each episode adds its own lines, so counts of the chain parts (runs of five or more rejects, such runs followed by an accept) are about one per episode higher than in ordinary traffic: about seven more a week at the default interval, on top of roughly 175 runs of five or more rejects a week.
 
 ## Sample output
 
-Chain Start of the first episode of the final default-on capture, copied unchanged:
+Accounting Start that completes an episode of a default run (`anomaly_mode: true`):
 
 ```json
-{"@timestamp": "2026-09-21T19:56:53.334+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "connect", "category": ["session"], "dataset": "freeradius.linelog", "kind": "event", "module": "freeradius", "original": "Connect: [ekaterina.romanova] (did 06-1B-2C-41-10-A2:corp-wifi cli 02-4C-1A-EE-32-EA port 117 ip 10.50.1.223)", "outcome": "success", "type": ["start"]}, "host": {"name": "radius-01"}, "message": "Connect: [ekaterina.romanova] (did 06-1B-2C-41-10-A2:corp-wifi cli 02-4C-1A-EE-32-EA port 117 ip 10.50.1.223)", "radius": {"acct_status_type": "Start", "called_station_id": "06-1B-2C-41-10-A2:corp-wifi", "calling_station_id": "02-4C-1A-EE-32-EA", "client_shortname": "wlc-01", "framed_ip_address": "10.50.1.223", "nas_port": 117}, "service": {"name": "radiusd"}, "source": {"ip": "10.50.1.223", "mac": "02-4C-1A-EE-32-EA"}, "user": {"name": "ekaterina.romanova"}}
+{"@timestamp": "2026-09-04T08:18:12.849+00:00", "ecs": {"version": "8.17.0"}, "event": {"action": "connect", "category": ["session"], "dataset": "freeradius.linelog", "kind": "event", "module": "freeradius", "original": "Connect: [matvey.titov] (did 06-1B-2C-41-2F-95:corp-wifi cli 02-4C-1A-7E-8C-C3 port 224 ip 10.50.7.129)", "outcome": "success", "type": ["start"]}, "host": {"name": "radius-01"}, "message": "Connect: [matvey.titov] (did 06-1B-2C-41-2F-95:corp-wifi cli 02-4C-1A-7E-8C-C3 port 224 ip 10.50.7.129)", "radius": {"acct_status_type": "Start", "called_station_id": "06-1B-2C-41-2F-95:corp-wifi", "calling_station_id": "02-4C-1A-7E-8C-C3", "client_shortname": "wlc-01", "framed_ip_address": "10.50.7.129", "nas_port": 224}, "service": {"name": "radiusd"}, "source": {"ip": "10.50.7.129", "mac": "02-4C-1A-7E-8C-C3"}, "user": {"name": "matvey.titov"}}
 ```
 
 ## References
