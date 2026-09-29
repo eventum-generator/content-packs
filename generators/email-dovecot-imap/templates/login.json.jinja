@@ -1,9 +1,11 @@
 {#- Dovecot 2.3.20 imap-login/pop3-login lines in a UTC RFC 3164-style
-    syslog envelope. Input ticks every second; a tick renders at most one
-    login and is dropped when nothing is due. All activity comes from a
-    time-ordered queue of independent processes: mail clients, webmail
-    sessions, password changes, new devices, scanners and, when
-    anomaly_mode is true, the recurring anomaly episode. -#}
+    syslog envelope. The input sets the rate and the hour-of-day curve;
+    every timestamp becomes exactly one login. Each timestamp takes the
+    earliest due timed step (a retry after a rejected password, the
+    second login of a client polling IMAP and POP3 together, webmail
+    and internet-scanner attempts, anomaly episode steps) and, when
+    none is due, the reconnect of the mail client whose own schedule
+    is earliest. -#}
 {#- Jinja has no raise statement: a missing-key lookup aborts the render
     with the message as the key. -#}
 {%- macro invalid(message) -%}
@@ -17,12 +19,15 @@
 {#- Chain window: four failures, an IMAP success and a POP3 success of
     one mailbox and client IP, counted from the first failure. -#}
 {%- set window = 900 -%}
-{#- UTC daytime load curve of the background; also weights episode
+{#- UTC hour-of-day load relative to the peak hour. It repeats the
+    patterns/*.yml input files (uniform floor plus a beta(6.5, 6)
+    daytime curve); the input alone sets the login rate, this table
+    scales client schedules and webmail arrivals and weights episode
     start times. -#}
-{%- macro curve(t) -%}
-  {%- set h = (t % 86400) / 3600 -%}
-  {{- [0.25 + 0.75 * module.math.sin(module.math.pi * (h - 5) / 15) if 5 < h < 20 else 0.25, 0.25] | max -}}
-{%- endmacro -%}
+{%- set hourly = [0.25, 0.25, 0.253, 0.263, 0.289, 0.34, 0.419, 0.526, 0.652, 0.779,
+    0.891, 0.971, 1.0, 0.976, 0.902, 0.791, 0.659, 0.527, 0.414, 0.331, 0.281, 0.258,
+    0.251, 0.25] -%}
+{%- macro curve(t) -%}{{- hourly[(t // 3600) % 24] -}}{%- endmacro -%}
 {#- A start time in [lo, lo + width): drawn by rejection with weight
     curve (first episode) or curve^2 + 0.05 (later episodes). -#}
 {%- macro draw_start(lo, width, squared) -%}
@@ -36,7 +41,7 @@
   {{- pick.t -}}
 {%- endmacro -%}
 {%- set load = curve(now) | float -%}
-{%- if shared.get('heap') is none -%}
+{%- if shared.get('tq') is none -%}
   {%- set ipv4 = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}' -%}
   {%- if params.anomaly_mode is not boolean -%}
     {{- invalid('anomaly_mode must be a boolean') -}}
@@ -69,9 +74,12 @@
       {%- do personal.append(users[-1]) -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- if personal | length < 4 -%}
-    {{- invalid('mailboxes sample needs at least four personal mailboxes') -}}
+  {%- if personal | length < 4 or users | length > 700 -%}
+    {{- invalid('mailboxes sample needs 4 to 700 mailboxes, at least four personal') -}}
   {%- endif -%}
+  {#- Mailbox scale: webmail logins, password changes and new clients
+      grow with the number of mailboxes (275 in the shipped sample). -#}
+  {%- set scale = users | length / 275 -%}
   {%- set pool = [] -%}
   {%- for prefix in ['198.51.100.', '203.0.113.'] -%}
     {%- for i in range(1, 255) -%}
@@ -88,8 +96,7 @@
       poll rates, recurring hostile hosts) is fixed for a mail domain;
       all activity on top of it is random in every run. -#}
   {%- set org = module.random.Random('dovecot-org:' ~ params.mail_domain) -%}
-  {%- set desks = org.sample(range(10, 1000), users | length * 4) -%}
-  {%- set heap = [] -%}
+  {%- set desks = org.sample(range(10, 3010), users | length * 4) -%}
   {%- set np = personal | length -%}
   {%- set has = {'ws': org.sample(range(np), (np * 0.85) | round | int),
       'mobile': org.sample(range(np), (np * 0.75) | round | int),
@@ -123,6 +130,10 @@
     {%- do org.shuffle(bag) -%}
     {%- do bags.update({kind: bag}) -%}
   {%- endfor -%}
+  {#- tq: timed steps due at a given second; fq: every idle client by
+      its next reconnect time. -#}
+  {%- set tq = [] -%}
+  {%- set fq = [] -%}
   {%- for user, kind in slots -%}
     {%- set proto = bags[kind].pop() -%}
     {%- set desk = desks[loop.index0] -%}
@@ -130,36 +141,48 @@
     {#- IMAP clients reconnect every few minutes; POP3 accounts poll on a
         longer send/receive schedule. -#}
     {%- set gap = org.lognormvariate(ln(1200), 0.7) if proto == 'imap' else org.lognormvariate(ln(2700), 0.4) -%}
+    {#- A phone leaves through a few carrier NAT addresses; a laptop's
+        home connection has one of two public addresses. Both sets are
+        fixed for the organisation and shared with other subscribers.
+        'used' holds when the phone last took each carrier address. -#}
+    {%- set nat = org.sample(pool, org.randint(2, 4)) if kind == 'mobile' else org.sample(pool, 2) -%}
+    {%- set used = {} -%}
+    {%- for a in nat -%}{%- do used.update({a: now}) -%}{%- endfor -%}
     {%- set device = {'u': user.u, 'kind': kind, 'proto': proto, 'office': office,
-        'ip': rand.choice(pool) if kind == 'mobile' else office, 'g': gap,
-        'home': org.choice(pool), 'stale': 0, 'fl': 0, 'gone': false, 'last': 0} -%}
+        'ip': rand.choice(nat) if kind == 'mobile' else office, 'g': gap,
+        'nat': nat, 'used': used, 'home': nat[0], 'stale': 0, 'fl': 0, 'gone': false, 'last': 0} -%}
     {%- do user.devs.append(device) -%}
-    {%- do hq.heappush(heap, [now + (num.floating(0, 2 * gap) | int), num.floating(0, 1), {'k': 'dev', 'd': device}]) -%}
+    {#- A mailbox's steady public addresses: the carrier addresses of its
+        phone, each taken at least about once a day. -#}
+    {%- if kind == 'mobile' -%}{%- do user.update({'fixed': nat}) -%}{%- endif -%}
+    {%- do hq.heappush(fq, [now + (num.floating(0, 2 * gap) | int), num.floating(0, 1), {'k': 'dev', 'd': device}]) -%}
   {%- endfor -%}
   {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
   {%- set first_start = draw_start(now, [interval, 86400] | min, false) | int -%}
-  {%- do shared.update({'heap': heap, 'users': users, 'personal': personal, 'pool': pool,
-      'hostile': hostile, 'repeat': org.sample(hostile, 24),
-      'chains': {}, 'public_seen': {}, 'pid': num.integer(2000, 400000),
-      'clock': {'web': now + (num.exponential(1 / 150) | int),
+  {%- do shared.update({'tq': tq, 'fq': fq, 'users': users, 'personal': personal, 'pool': pool,
+      'hostile': hostile, 'repeat': org.sample(hostile, 24), 'scale': scale,
+      'hist': {}, 'public_seen': {}, 'addrs': {}, 'pid': num.integer(2000, 400000),
+      'clock': {'web': now + (num.exponential(scale / 30) | int),
                 'brute': now + (num.exponential(1 / 6000) | int),
                 'spray': now + (num.exponential(1 / 3600) | int),
                 'probe': now + (num.exponential(1 / 360) | int),
-                'pw': now + (num.exponential(1 / 18000) | int),
-                'setup': now + (num.exponential(1 / 36000) | int),
+                'pw': now + (num.exponential(scale / 3600) | int),
+                'setup': now + (num.exponential(scale / 7200) | int),
                 'cleanup': now + 600,
                 'ep_start': first_start},
       'last_ep': {'u': none, 'ip': none}}) -%}
 {%- endif -%}
-{%- set heap = shared.get('heap') -%}
+{%- set tq = shared.get('tq') -%}
+{%- set fq = shared.get('fq') -%}
 {%- set clock = shared.get('clock') -%}
 {%- set pool = shared.get('pool') -%}
 {%- set users = shared.get('users') -%}
-{#- Per mailbox|IP: open partial chains [next step, first failure time],
-    as a detector matching the chain would hold them (steps 0-3
-    failures, 4 IMAP success, 5 POP3 success; at most 8 kept; a
-    completion clears the pair). -#}
-{%- set chains = shared.get('chains') -%}
+{%- set scale = shared.get('scale') -%}
+{#- Per mailbox|IP, what an exhaustive matcher of the chain would need:
+    the times of the last four failures ('f') and the earliest time a
+    chain ending at the latest IMAP success can have started ('r').
+    Episode rows update it too, and a completion does not reset it. -#}
+{%- set hist = shared.get('hist') -%}
 {#- Hostile source of a scan: a recurring host, a residential proxy from
     the same ranges as roaming clients, or a one-off host. -#}
 {%- set scanner = rand.choice(shared.get('repeat')) if rand.chance(0.6)
@@ -172,18 +195,19 @@
     draws serve ordinary traffic and the anomaly episode. -#}
 {%- set tries = [1, 2, 3, 4, 5] -%}
 {%- set try_weights = [50, 25, 13, 7, 5] -%}
-{#- Process clocks. Each is an independent Poisson process; none waits
-    for, or is moved by, another process or an episode. -#}
+{#- Process clocks in source time. Each is an independent Poisson
+    process; none waits for, or is moved by, another process or an
+    episode. Arrivals queue their first login as a step due now. -#}
 {%- if clock.web <= now -%}
   {%- set user = rand.choice(users) -%}
   {%- set left = rand.weighted_choice(tries, try_weights) if rand.chance(0.06) else 0 -%}
-  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'web', 'u': user.u, 'left': left}]) -%}
-  {%- do clock.update({'web': now + 1 + (num.exponential(load / 150) | int)}) -%}
+  {%- do hq.heappush(tq, [now, num.floating(0, 1), {'k': 'web', 'u': user.u, 'left': left}]) -%}
+  {%- do clock.update({'web': now + 1 + (num.exponential(load * scale / 30) | int)}) -%}
 {%- endif -%}
 {%- if clock.brute <= now -%}
   {%- set target = rand.choice(users).u if rand.chance(0.6) else rand.choice(spray_names) ~ '@' ~ params.mail_domain -%}
   {%- set n = [3, num.lognormal(ln(10), 0.7) | int] | max -%}
-  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'scan', 'ip': scanner, 't': [target] * n, 'i': 0, 'md': 6}]) -%}
+  {%- do hq.heappush(tq, [now, num.floating(0, 1), {'k': 'scan', 'ip': scanner, 't': [target] * n, 'i': 0, 'md': 6}]) -%}
   {%- do clock.update({'brute': now + 1 + (num.exponential(1 / 6000) | int)}) -%}
 {%- endif -%}
 {%- if clock.spray <= now -%}
@@ -198,13 +222,13 @@
     {%- do targets.append(name) -%}
     {%- if rand.chance(0.15) -%}{%- do targets.append(name) -%}{%- endif -%}
   {%- endfor -%}
-  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'scan', 'ip': scanner, 't': targets, 'i': 0, 'md': 60}]) -%}
+  {%- do hq.heappush(tq, [now, num.floating(0, 1), {'k': 'scan', 'ip': scanner, 't': targets, 'i': 0, 'md': 60}]) -%}
   {%- do clock.update({'spray': now + 1 + (num.exponential(1 / 3600) | int)}) -%}
 {%- endif -%}
 {%- if clock.probe <= now -%}
   {#- Background internet noise: a single guess at a common name. -#}
   {%- set target = rand.choice(users).u if rand.chance(0.3) else rand.choice(spray_names) ~ '@' ~ params.mail_domain -%}
-  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'scan', 'ip': scanner, 't': [target], 'i': 0, 'md': 4}]) -%}
+  {%- do hq.heappush(tq, [now, num.floating(0, 1), {'k': 'scan', 'ip': scanner, 't': [target], 'i': 0, 'md': 4}]) -%}
   {%- do clock.update({'probe': now + 1 + (num.exponential(1 / 360) | int)}) -%}
 {%- endif -%}
 {%- if clock.pw <= now -%}
@@ -216,83 +240,128 @@
       {%- do device.update({'stale': now + (num.lognormal(ln(1500), 0.9) | int)}) -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- do clock.update({'pw': now + 1 + (num.exponential(1 / 18000) | int)}) -%}
+  {%- do clock.update({'pw': now + 1 + (num.exponential(scale / 3600) | int)}) -%}
 {%- endif -%}
 {%- if clock.setup <= now -%}
-  {#- A new client replaces an old one; its first logins may carry typos. -#}
+  {#- A new client; its first logins may carry typos. A new phone
+      replaces the mailbox's phone and keeps its carrier addresses; any
+      other new client replaces an old one when the mailbox already has
+      three, preferring one of the same kind and never the phone. -#}
   {%- set user = rand.choice(shared.get('personal')) -%}
-  {%- if user.devs | length >= 3 -%}
-    {%- set old = rand.choice(user.devs) -%}
+  {%- set kind = rand.weighted_choice(['mobile', 'laptop', 'ws'], [70, 20, 10]) -%}
+  {%- set same = user.devs | selectattr('kind', 'equalto', kind) | list -%}
+  {%- set others = user.devs | rejectattr('kind', 'equalto', 'mobile') | list -%}
+  {%- set old = same[0] if kind == 'mobile' and same
+      else rand.choice(same or others) if user.devs | length >= 3 and (same or others) else none -%}
+  {%- if old is not none -%}
     {%- do old.update({'gone': true}) -%}
     {%- do user.devs.remove(old) -%}
   {%- endif -%}
-  {%- set kind = rand.weighted_choice(['mobile', 'laptop', 'ws'], [70, 20, 10]) -%}
   {%- set proto = rand.weighted_choice(['imap', 'dual', 'pop3'], [70, 20, 10]) if kind == 'ws'
       else rand.weighted_choice(['imap', 'dual', 'pop3'], [50, 30, 20]) if kind == 'laptop'
       else rand.weighted_choice(['imap', 'pop3'], [80, 20]) -%}
-  {%- set desk = num.integer(1000, 1499) -%}
+  {%- set desk = num.integer(3010, 3499) -%}
   {%- set office = '10.20.' ~ (10 + desk // 250) ~ '.' ~ (desk % 250 + 1) -%}
+  {%- set keep = old is not none and old.kind == 'mobile' -%}
+  {%- set nat = old.nat if keep else module.random.sample(pool, num.integer(2, 4)) if kind == 'mobile'
+      else module.random.sample(pool, 2) -%}
+  {%- set used = old.used if keep else {} -%}
+  {%- for a in nat if a not in used -%}{%- do used.update({a: now}) -%}{%- endfor -%}
   {%- set device = {'u': user.u, 'kind': kind, 'proto': proto, 'office': office,
-      'ip': rand.choice(pool) if kind == 'mobile' else office,
+      'ip': rand.choice(nat) if kind == 'mobile' else office, 'nat': nat, 'used': used,
       'g': num.lognormal(ln(1200), 0.7) if proto == 'imap' else num.lognormal(ln(2700), 0.4),
-      'home': rand.choice(pool), 'stale': 0, 'gone': false, 'last': 0,
+      'home': nat[0], 'stale': 0, 'gone': false, 'last': 0,
       'fl': rand.weighted_choice(tries, try_weights) if proto != 'pop3' and rand.chance(0.45) else 0} -%}
   {%- do user.devs.append(device) -%}
-  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'dev', 'd': device}]) -%}
-  {%- do clock.update({'setup': now + 1 + (num.exponential(1 / 36000) | int)}) -%}
+  {%- do hq.heappush(fq, [now, num.floating(0, 1), {'k': 'dev', 'd': device}]) -%}
+  {%- do clock.update({'setup': now + 1 + (num.exponential(scale / 7200) | int)}) -%}
 {%- endif -%}
 {%- if clock.cleanup <= now -%}
-  {%- for key in chains | list -%}
-    {%- if chains[key][-1][1] < now - window -%}
-      {%- do chains.pop(key) -%}
+  {%- for key in hist | list -%}
+    {%- if hist[key].t < now - window -%}
+      {%- do hist.pop(key) -%}
     {%- endif -%}
   {%- endfor -%}
   {%- do clock.update({'cleanup': now + 600}) -%}
 {%- endif -%}
 {%- if params.anomaly_mode and clock.ep_start <= now -%}
-  {#- Episode: a mailbox whose own clients have already logged in over
-      IMAP and POP3 from public addresses, and an external address; both
-      differ from the previous episode's, and the address is not one the
-      mailbox's clients use right now. The next episode is due one
+  {#- Episode: a mailbox whose own clients log in over IMAP and POP3
+      from public addresses, and one of its phone's carrier addresses;
+      both differ from the previous episode's. The next episode is due one
       interval after this actual start; the start is drawn in a window
       of min(interval / 4, 6 h) centred on that due time, weighted
       towards busy hours. -#}
   {%- set last = shared.get('last_ep') -%}
   {%- set seen = shared.get('public_seen') -%}
+  {#- Mailboxes whose own clients have logged in over IMAP and POP3 from
+      public addresses, then (early in a run) mailboxes whose roaming
+      clients poll both. -#}
   {%- set candidates = [] -%}
-  {%- set capable = [] -%}
-  {%- set roaming = [] -%}
-  {%- for user in users -%}
-    {%- if user.u != last.u and seen.get(user.u ~ '|imap') -%}
-      {%- do roaming.append(user) -%}
-      {%- if seen.get(user.u ~ '|pop3') -%}{%- do candidates.append(user) -%}{%- endif -%}
+  {%- set able = [] -%}
+  {%- for user in users if user.u != last.u -%}
+    {%- if seen.get(user.u ~ '|imap') and seen.get(user.u ~ '|pop3') -%}
+      {%- do candidates.append(user) -%}
     {%- endif -%}
-    {#- Early in a run few clients have roamed yet: fall back to a mailbox
-        with a roaming client that polls POP3. -#}
-    {%- for device in user.devs if user.u != last.u and device.kind != 'ws' and device.proto != 'imap' -%}
-      {%- if loop.first -%}{%- do capable.append(user) -%}{%- endif -%}
+    {%- set protos = [] -%}
+    {%- for device in user.devs if device.kind != 'ws' -%}{%- do protos.append(device.proto) -%}{%- endfor -%}
+    {%- if 'dual' in protos or ('imap' in protos and 'pop3' in protos) -%}
+      {%- do able.append(user) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- The address is a carrier address of the mailbox's phone, one that
+      reconnects at least about hourly in working hours (a shared
+      address the attacker also leaves through; such a phone takes each
+      of its addresses about daily), used by the mailbox's own clients
+      earlier in the run and by none of them right now; a mailbox
+      without such an address is skipped. At the start of a run, until
+      some phone has left an address it used, the episode waits. -#}
+  {%- set addrs = shared.get('addrs') -%}
+  {%- set pick = namespace(u=none, ip=none) -%}
+  {%- for group in [candidates, able] -%}
+    {%- for user in module.random.sample(group, group | length) if pick.u is none -%}
+      {%- set own = [] -%}
+      {%- for device in user.devs -%}{%- do own.append(device.ip) -%}{%- endfor -%}
+      {%- set usable = [] -%}
+      {%- for device in user.devs if device.kind == 'mobile' and device.g <= 3600 -%}
+        {%- for a in device.nat if a in user.get('fixed', []) and a != last.ip and a not in own
+            and a in addrs.get(user.u, []) -%}{%- do usable.append(a) -%}{%- endfor -%}
+      {%- endfor -%}
+      {%- if usable -%}
+        {%- set pick.u = user -%}{%- set pick.ip = rand.choice(usable) -%}
+      {%- endif -%}
     {%- endfor -%}
   {%- endfor -%}
-  {%- set candidates = candidates or capable or roaming or users -%}
-  {%- set user = rand.choice(candidates) -%}
-  {%- set own = [] -%}
-  {%- for device in user.devs -%}{%- do own.append(device.ip) -%}{%- endfor -%}
-  {%- set ip = namespace(v=rand.choice(pool)) -%}
-  {%- for _ in range(50) -%}
-    {%- if ip.v != last.ip and ip.v not in own -%}{%- break -%}{%- endif -%}
-    {%- set ip.v = rand.choice(pool) -%}
-  {%- endfor -%}
-  {%- do last.update({'u': user.u, 'ip': ip.v}) -%}
-  {%- do hq.heappush(heap, [now, num.floating(0, 1), {'k': 'ep', 'u': user.u, 'ip': ip.v, 's': 0}]) -%}
-  {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
-  {%- set width = [interval // 4, 21600] | min -%}
-  {%- do clock.update({'ep_start': draw_start(now + interval - width // 2, width, true) | int}) -%}
+  {%- if pick.u is none -%}
+    {%- do clock.update({'ep_start': now + 60}) -%}
+  {%- else -%}
+    {%- do last.update({'u': pick.u.u, 'ip': pick.ip}) -%}
+    {%- do hq.heappush(tq, [now, num.floating(0, 1), {'k': 'ep', 'u': pick.u.u, 'ip': pick.ip, 's': 0}]) -%}
+    {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
+    {%- set width = [interval // 4, 21600] | min -%}
+    {%- do clock.update({'ep_start': draw_start(now + interval - width // 2, width, true) | int}) -%}
+  {%- endif -%}
 {%- endif -%}
-{#- Pop due work until one login is produced. -#}
+{#- True when a POP3 success of this mailbox and IP now would complete
+    four failures, an IMAP success and a POP3 success within the chain
+    window. -#}
+{%- macro completes(key) -%}
+  {%- set h = hist.get(key) -%}
+  {{- 'y' if h and h.r is not none and now - h.r <= window else '' -}}
+{%- endmacro -%}
+{#- Take the earliest due timed step, else the client whose reconnect is
+    earliest (even if it is not due yet). A client removed in the
+    meantime, or a POP3 login the guard leaves out, passes the
+    timestamp on to the next choice. -#}
 {%- set out = namespace(done=false, u=none, ip=none, proto='imap', ok=true, att=1, ep=false) -%}
-{%- for _ in range(16) -%}
-  {%- if out.done or not heap or heap[0][0] > now -%}{%- break -%}{%- endif -%}
-  {%- set item = hq.heappop(heap)[2] -%}
+{%- for _ in range(64) -%}
+  {%- if out.done -%}{%- break -%}{%- endif -%}
+  {%- if tq and tq[0][0] <= now -%}
+    {%- set item = hq.heappop(tq)[2] -%}
+  {%- elif fq -%}
+    {%- set item = hq.heappop(fq)[2] -%}
+  {%- else -%}
+    {%- break -%}
+  {%- endif -%}
   {%- if item.k == 'dev' -%}
     {%- set d = item.d -%}
     {%- if d.gone -%}{%- continue -%}{%- endif -%}
@@ -310,14 +379,25 @@
         {%- do d.update({'rw': backoff}) -%}
         {%- set wait = backoff * num.lognormal(0, 0.3) -%}
       {%- endif -%}
-      {%- do hq.heappush(heap, [now + 1 + (wait | int), num.floating(0, 1), item]) -%}
+      {%- do hq.heappush(tq, [now + 1 + (wait | int), num.floating(0, 1), item]) -%}
     {%- else -%}
-      {%- if d.kind == 'mobile' and rand.chance(0.25) -%}
-        {%- do d.update({'ip': rand.choice(pool)}) -%}
+      {%- if d.kind == 'mobile' -%}
+        {#- The phone changes carrier address now and then, and takes one
+            it has not had for 18 hours at its next reconnect. -#}
+        {%- set lapsed = namespace(a=none, t=now - 64800) -%}
+        {%- for a in d.nat -%}
+          {%- if d.used[a] < lapsed.t -%}{%- set lapsed.a = a -%}{%- set lapsed.t = d.used[a] -%}{%- endif -%}
+        {%- endfor -%}
+        {%- if lapsed.a is not none -%}
+          {%- do d.update({'ip': lapsed.a}) -%}
+        {%- elif rand.chance(0.25) -%}
+          {%- do d.update({'ip': rand.choice(d.nat)}) -%}
+        {%- endif -%}
+        {%- do d.used.update({d.ip: now}) -%}
       {%- elif d.kind == 'laptop' and rand.chance(0.3) -%}
         {#- The laptop moves between the office, the VPN and its owner's
             home connection, whose public address changes now and then. -#}
-        {%- if rand.chance(0.03) -%}{%- do d.update({'home': rand.choice(pool)}) -%}{%- endif -%}
+        {%- if rand.chance(0.03) -%}{%- do d.update({'home': rand.choice(d.nat)}) -%}{%- endif -%}
         {%- set place = rand.weighted_choice(['office', 'vpn', 'home'], [45, 20, 35]) -%}
         {%- do d.update({'ip': d.office if place == 'office' else d.home if place == 'home'
             else '10.8.' ~ num.integer(0, 3) ~ '.' ~ num.integer(2, 254)}) -%}
@@ -330,34 +410,26 @@
         {%- do d.update({'fl': rand.weighted_choice(tries, try_weights) - 1}) -%}
         {%- set out.done = true -%}
         {%- set out.u = d.u -%}{%- set out.ip = d.ip -%}{%- set out.proto = 'imap' -%}{%- set out.ok = false -%}
-        {%- do hq.heappush(heap, [now + 1 + (num.lognormal(ln(12), 0.7) | int), num.floating(0, 1), item]) -%}
+        {%- do hq.heappush(tq, [now + 1 + (num.lognormal(ln(12), 0.7) | int), num.floating(0, 1), item]) -%}
       {%- else -%}
         {%- do d.update({'last': now, 'rw': 0}) -%}
         {%- set first = 'pop3' if d.proto == 'pop3' or (d.proto == 'dual' and rand.chance(0.35)) else 'imap' -%}
         {#- Guard: a POP3 login that would complete the chain for this
-            mailbox and IP is dropped; its time and the client's
-            schedule stay as they are. -#}
-        {%- set open = namespace(v=false) -%}
-        {%- for p in chains.get(d.u ~ '|' ~ d.ip, []) if p[0] == 5 and now - p[1] <= window -%}
-          {%- set open.v = true -%}
-        {%- endfor -%}
-        {%- if not (first == 'pop3' and open.v) -%}
+            mailbox and IP is left out; the client's schedule stays as
+            it is. -#}
+        {%- if not (first == 'pop3' and completes(d.u ~ '|' ~ d.ip)) -%}
           {%- set out.done = true -%}
           {%- set out.u = d.u -%}{%- set out.ip = d.ip -%}{%- set out.proto = first -%}{%- set out.ok = true -%}
         {%- endif -%}
         {%- if d.proto == 'dual' -%}
-          {%- do hq.heappush(heap, [now + 1 + (num.lognormal(ln(15), 1.0) | int), num.floating(0, 1),
+          {%- do hq.heappush(tq, [now + 1 + (num.lognormal(ln(15), 1.0) | int), num.floating(0, 1),
               {'k': 'p2', 'u': d.u, 'ip': d.ip, 'proto': 'imap' if first == 'pop3' else 'pop3'}]) -%}
         {%- endif -%}
-        {%- do hq.heappush(heap, [now + 5 + ((num.lognormal(ln(d.g), 0.6) / load) | int), num.floating(0, 1), item]) -%}
+        {%- do hq.heappush(fq, [now + 5 + ((num.lognormal(ln(d.g), 0.6) / load) | int), num.floating(0, 1), item]) -%}
       {%- endif -%}
     {%- endif -%}
   {%- elif item.k == 'p2' -%}
-    {%- set open = namespace(v=false) -%}
-    {%- for p in chains.get(item.u ~ '|' ~ item.ip, []) if p[0] == 5 and now - p[1] <= window -%}
-      {%- set open.v = true -%}
-    {%- endfor -%}
-    {%- if not (item.proto == 'pop3' and open.v) -%}
+    {%- if not (item.proto == 'pop3' and completes(item.u ~ '|' ~ item.ip)) -%}
       {%- set out.done = true -%}
       {%- set out.u = item.u -%}{%- set out.ip = item.ip -%}{%- set out.proto = item.proto -%}{%- set out.ok = true -%}
     {%- endif -%}
@@ -367,7 +439,7 @@
     {%- set out.ok = item.left == 0 -%}
     {%- if item.left > 0 -%}
       {%- do item.update({'left': item.left - 1}) -%}
-      {%- do hq.heappush(heap, [now + 1 + (num.lognormal(ln(10), 0.6) | int), num.floating(0, 1), item]) -%}
+      {%- do hq.heappush(tq, [now + 1 + (num.lognormal(ln(10), 0.6) | int), num.floating(0, 1), item]) -%}
     {%- endif -%}
   {%- elif item.k == 'scan' -%}
     {%- set out.done = true -%}
@@ -376,7 +448,7 @@
     {%- set out.att = rand.weighted_choice([1, 2, 3], [70, 20, 10]) -%}
     {%- do item.update({'i': item.i + 1}) -%}
     {%- if item.i < item.t | length -%}
-      {%- do hq.heappush(heap, [now + (num.lognormal(ln(item.md), 0.8) | int), num.floating(0, 1), item]) -%}
+      {%- do hq.heappush(tq, [now + (num.lognormal(ln(item.md), 0.8) | int), num.floating(0, 1), item]) -%}
     {%- endif -%}
   {%- elif item.k == 'ep' -%}
     {#- Four mistyped-looking IMAP failures, the IMAP success, then a POP3
@@ -392,11 +464,12 @@
       {%- set wait = [num.lognormal(ln(15), 1.0), 300] | min -%}
     {%- endif -%}
     {%- if item.s < 5 -%}
-      {%- do hq.heappush(heap, [now + 1 + (wait | int), num.floating(0, 1), {'k': 'ep', 'u': item.u, 'ip': item.ip, 's': item.s + 1}]) -%}
+      {%- do hq.heappush(tq, [now + 1 + (wait | int), num.floating(0, 1), {'k': 'ep', 'u': item.u, 'ip': item.ip, 's': item.s + 1}]) -%}
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
 {%- if not out.done -%}
+  {#- Unreachable with any client in the organisation. -#}
   {{- dispatch.drop() -}}
 {%- endif -%}
 {%- set user = out.u -%}
@@ -405,28 +478,24 @@
 {%- set result = 'success' if out.ok else 'failure' -%}
 {%- if out.ok and not out.ep and not client.startswith('10.') -%}
   {%- do shared.get('public_seen').update({user ~ '|' ~ protocol: true}) -%}
+  {%- set used = shared.get('addrs').setdefault(user, []) -%}
+  {%- if client not in used -%}
+    {%- do used.append(client) -%}
+    {%- if used | length > 8 -%}{%- do used.pop(0) -%}{%- endif -%}
+  {%- endif -%}
 {%- endif -%}
 {%- set key = user ~ '|' ~ client -%}
-{%- set step = 'F' if not out.ok else 'I' if protocol == 'imap' else 'P' -%}
-{%- set kept = [] -%}
-{%- set m = namespace(done=false) -%}
-{%- for p in chains.get(key, []) if now - p[1] <= window -%}
-  {%- if m.done -%}
-  {%- elif step == ('F' if p[0] < 4 else 'I' if p[0] == 4 else 'P') -%}
-    {%- if p[0] == 5 -%}
-      {%- set m.done = true -%}
-    {%- else -%}
-      {%- do kept.append([p[0] + 1, p[1]]) -%}
-    {%- endif -%}
-  {%- else -%}
-    {%- do kept.append(p) -%}
+{%- set h = hist.get(key) -%}
+{%- if not out.ok -%}
+  {%- if h is none -%}
+    {%- set h = {'f': [], 'r': none, 't': now} -%}
+    {%- do hist.update({key: h}) -%}
   {%- endif -%}
-{%- endfor -%}
-{%- if step == 'F' and not m.done -%}{%- do kept.append([1, now]) -%}{%- endif -%}
-{%- if kept and not m.done -%}
-  {%- do chains.update({key: kept[-8:]}) -%}
-{%- else -%}
-  {%- do chains.pop(key, none) -%}
+  {%- do h.f.append(now) -%}
+  {%- if h.f | length > 4 -%}{%- do h.f.pop(0) -%}{%- endif -%}
+  {%- do h.update({'t': now}) -%}
+{%- elif h is not none and protocol == 'imap' and h.f | length == 4 -%}
+  {%- do h.update({'r': h.f[0], 't': now}) -%}
 {%- endif -%}
 {%- set session_id = module.base64.b64encode(module.os.urandom(12)).decode('ascii') -%}
 {%- set details = 'user=<' ~ user ~ '>, method=PLAIN, rip=' ~ client
@@ -459,7 +528,7 @@
       'auth_attempts': attempts, 'auth_duration_seconds': secs}) -%}
 {%- endif -%}
 {%- set record = {
-    '@timestamp': timestamp.isoformat(),
+    '@timestamp': timestamp.replace(microsecond=0).isoformat(),
     'ecs': {'version': '8.17.0'},
     'event': {'kind': 'event', 'category': ['authentication'],
         'type': ['start'] if result == 'success' else ['denied'],
