@@ -1,20 +1,25 @@
 {#- Cisco IOS remote TCP syslog, as the Elastic Cisco IOS integration
-    stores it. One input tick per second; each tick emits the earliest due
-    record at the tick time plus a random millisecond, or drops.
-    Independent background processes: business flows, odd-port denies,
-    internet probes on EDGE_FILTER, per-pair retries to restricted
-    management servers, per-administrator SSH sessions (typos, give-ups,
-    configuration, temporary ACL permits and their removal), a config
-    backup poller and interface flaps. Times are epoch seconds. -#}
+    stores it. Every input timestamp yields exactly one record at that
+    time. A small queue holds scheduled records of independent
+    background processes - per-pair retries to restricted management
+    servers, odd-port denies, per-administrator SSH sessions (typos,
+    give-ups, configuration, temporary ACL permits and their removal),
+    a config backup poller and interface flaps - and episode steps; once
+    due, a queued record takes over the next timestamp of any input.
+    Otherwise an `office` timestamp becomes a business connection through
+    the ACL and a `wan` timestamp an internet probe denied by EDGE_FILTER.
+    Times are epoch seconds. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
-{%- set now = module.builtins.int(ts.timestamp()) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_due')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set tf = ts.timestamp() -%}
+{%- set now = module.builtins.int(tf) -%}
 {%- set hq = module.heapq -%}
 {#- Chain window: a denied flow to a restricted server on 443, three
     failed logins, a successful login and a configuration change from the
     same address, then a permitted flow from it to that server. -#}
 {%- set window = 1800 -%}
 {%- set hour = 3600 -%}
+{%- set day = 86400 -%}
+{%- set need = ['deny443', 'fail', 'fail', 'fail', 'succ', 'cfgi', 'allow443'] -%}
 {%- macro ln(med, sig) -%}
   {{- [module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig)), 1] | max -}}
 {%- endmacro -%}
@@ -26,15 +31,18 @@
   {%- do shared.set('seq', s) -%}
   {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
 {%- endmacro -%}
+{%- macro hr(t) -%}
+  {{- ((t + shared.get('tzoff')) // hour) % 24 -}}
+{%- endmacro -%}
 {%- macro pick_start(lo, span) -%}
-  {#- Time in [lo, lo + span) with its UTC hour weighted by the admin
+  {#- Time in [lo, lo + span) with its hour weighted by the admin
       activity curve squared plus a small floor. -#}
   {%- set curve = shared.get('curve') -%}
   {%- set top = (curve | max) ** 2 + 0.02 -%}
   {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
   {%- for _ in range(500) if not r.ok -%}
     {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
-    {%- if module.rand.number.floating(0, top) < curve[(c // hour) % 24] ** 2 + 0.02 -%}
+    {%- if module.rand.number.floating(0, top) < curve[hr(c) | int] ** 2 + 0.02 -%}
       {%- set r.v = c -%}
       {%- set r.ok = true -%}
     {%- endif -%}
@@ -45,6 +53,13 @@
   {#- Random free ACE sequence number ahead of the logged deny 100. -#}
   {%- set used = shared.get('resv') | map(attribute='seq') | list -%}
   {{- module.rand.choice(range(41, 100) | reject('in', used) | list) -}}
+{%- endmacro -%}
+{%- macro fails() -%}
+  {#- Failed attempts before a login: one or two mistyped passwords, or
+      a run of three (sometimes followed by a mistype or two) when the SSH
+      client first offers a saved password that is not valid on this
+      router. -#}
+  {{- module.rand.weighted_choice([0, 1, 2, 3, 4, 5], [826, 50, 14, 80, 20, 10]) -}}
 {%- endmacro -%}
 {%- macro session(ai, t0, nf, ok, act, pi, seq, test, ep, cap) -%}
   {#- Queue one SSH session of account ai: nf failed attempts, then a
@@ -62,7 +77,6 @@
     {%- do g.v.append(ln(45, 0.9) | int) -%}
     {%- set g.ok = cap == 0 or (g.v | sum) <= cap -%}
   {%- endfor -%}
-  {%- set acct = shared.get('accts')[ai] -%}
   {%- set vty = module.rand.weighted_choice([0, 1, 2, 3, 4], [45, 25, 15, 10, 5]) -%}
   {%- set t = namespace(v=t0, i=0) -%}
   {%- if ep -%}
@@ -109,9 +123,6 @@
     {%- endif -%}
   {%- endif -%}
 {%- endmacro -%}
-{%- macro fails() -%}
-  {{- module.rand.weighted_choice([0, 1, 2, 3, 4, 5], [820, 110, 45, 15, 7, 3]) -}}
-{%- endmacro -%}
 {%- if shared.get('queue') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'router_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 7}},
@@ -120,16 +131,23 @@
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 4, 'le': 8760}}
   }} -%}
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
-  {#- Admin activity by UTC hour (relative rate, peak 1). -#}
-  {%- do shared.update({'queue': [], 'seq': 0, 'curve': [0.08, 0.06, 0.06, 0.08, 0.15, 0.35, 0.7, 0.95, 1.0, 1.0, 0.95, 0.9, 0.95, 1.0, 0.9, 0.7, 0.45, 0.3, 0.22, 0.18, 0.14, 0.12, 0.1, 0.09]}) -%}
+  {#- Admin activity by hour of the generator timezone (relative rate,
+      peak 1): the band sum of patterns/office-*.yml, whose hourly
+      business rate is proportional to 0.15 + 0.85 * curve. -#}
+  {%- do shared.update({'queue': [], 'seq': 0, 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()), 'biz_left': 0, 'biz': none, 'wan_left': 0, 'wan_src': none, 'curve': [0.082, 0.082, 0.082, 0.082, 0.082, 0.388, 0.694, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.694, 0.388, 0.388, 0.184, 0.184, 0.184, 0.184, 0.082, 0.082]}) -%}
   {%- set accts = [] -%}
   {%- set pairs = [] -%}
+  {#- Episodes use the most active administrators (weight 0.8 or more),
+      whose failed logins occur in any few days of background. -#}
+  {%- set elig = [] -%}
   {%- for row in samples.admins -%}
+    {%- if row.weight >= 0.8 -%}{%- do elig.append(loop.index0) -%}{%- endif -%}
     {%- do accts.append({'user': row.user, 'ip': row.ip, 'w': row.weight}) -%}
     {%- do pairs.append({'c': row.ip, 's': row.target}) -%}
     {{- push(now + ex(2 * hour / row.weight) | int, {'k': 'adm', 'a': loop.index0}) -}}
   {%- endfor -%}
   {%- do accts.append({'user': 'oxidized', 'ip': '10.30.1.50', 'w': 0}) -%}
+  {%- do accts.append({'user': 'ansible', 'ip': '10.30.1.51', 'w': 0}) -%}
   {%- for row in samples.restricted -%}
     {%- do pairs.append({'c': row.client, 's': row.server}) -%}
   {%- endfor -%}
@@ -143,34 +161,36 @@
   {%- set sv = [] -%}
   {%- set svw = [] -%}
   {%- for row in samples.services -%}{%- do sv.append([row.ip, row.port]) -%}{%- do svw.append(row.weight) -%}{%- endfor -%}
-  {{- push(now + ex(6) | int, {'k': 'biz'}) -}}
   {{- push(now + ex(240) | int, {'k': 'odd'}) -}}
-  {{- push(now + ex(75) | int, {'k': 'scan'}) -}}
   {{- push(now + ex(3600) | int, {'k': 'nms'}) -}}
+  {{- push(now + module.rand.number.integer(1, 900), {'k': 'cc'}) -}}
   {{- push(now + ex(10 * hour) | int, {'k': 'flap'}) -}}
   {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-  {%- do shared.update({'accts': accts, 'pairs': pairs, 'cl': cl, 'clw': clw, 'sv': sv, 'svw': svw, 'resv': [], 'active': [], 'recent': [], 'mt': {}, 'msg_seq': module.rand.number.integer(100000, 2000000), 'peer': params.router_ip ~ ':' ~ module.rand.number.integer(20000, 60999), 'ep_last': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
+  {%- do shared.update({'accts': accts, 'pairs': pairs, 'nadm': samples.admins | length, 'elig': elig, 'tracked': accts[:samples.admins | length] | map(attribute='ip') | list, 'cl': cl, 'clw': clw, 'sv': sv, 'svw': svw, 'resv': [], 'active': [], 'recent': {}, 'recent_q': module.collections.deque(), 'mt': {}, 'msg_seq': module.rand.number.integer(100000, 2000000), 'peer': params.router_ip ~ ':' ~ module.rand.number.integer(20000, 60999), 'ep_last': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
 {%- endif -%}
 {%- set queue = shared.get('queue') -%}
 {%- set accts = shared.get('accts') -%}
 {%- set pairs = shared.get('pairs') -%}
 {%- set curve = shared.get('curve') -%}
 {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
-{#- Episode: at the first tick at or after its drawn start, plus a
-    lognormal delay, the workstation of an administrator other than the
-    previous episode's (weighted like background sessions) tries its
-    restricted server on 443 and is denied; the administrator's account
-    then fails three to five times from that workstation, logs in, inserts
-    a temporary permit for exactly that pair, the change is notified and
-    the flow is permitted. Removal follows the background hold and is
-    done by any administrator. The first start falls within the first
+{#- Episode: at the first timestamp at or after its drawn start, plus a
+    lognormal delay, the workstation of one of the most active
+    administrators, other than the previous episode's (weighted like
+    background sessions), tries its restricted server on 443 and is
+    denied; the administrator's account then fails three to five times
+    from that workstation (the tail of the mistype law), logs in, inserts a temporary permit for
+    exactly that pair, the change is notified and the flow is permitted:
+    a reactive self-permit session, as in background, with at least
+    three failures. It is an extra session; background sessions go on.
+    Removal follows the background hold and is done by any
+    administrator. The first start falls within the first
     min(interval, 24 h); each later one in a window of min(interval / 4,
-    6 h) centred one interval after the actual start, both weighted by the
-    admin curve squared. Missed episodes are not replayed. -#}
+    6 h) centred one interval after the actual start, both weighted by
+    the admin curve squared. Missed episodes are not replayed. -#}
 {%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
   {%- set resv = shared.get('resv') | map(attribute='p') | list -%}
-  {%- set cand = range(accts | length - 1) | reject('in', resv) | reject('equalto', shared.get('ep_last')) | list -%}
-  {%- if not cand -%}{%- set cand = range(accts | length - 1) | reject('in', resv) | list -%}{%- endif -%}
+  {%- set elig = range(shared.get('nadm')) | select('in', shared.get('elig')) | reject('in', resv) | list -%}
+  {%- set cand = elig | reject('equalto', shared.get('ep_last')) | list -%}
   {%- if cand -%}
     {%- set wts = [] -%}
     {%- for i in cand -%}{%- do wts.append(accts[i].w) -%}{%- endfor -%}
@@ -178,7 +198,7 @@
     {%- set seq = free_seq() | int -%}
     {%- do shared.get('resv').append({'p': ai, 'seq': seq}) -%}
     {%- set start = now + (ln(60, 1.0) | int) -%}
-    {%- set nf = module.rand.weighted_choice([3, 4, 5], [15, 7, 3]) -%}
+    {%- set nf = module.rand.weighted_choice([3, 4, 5], [80, 20, 10]) -%}
     {{- session(ai, start, nf, true, 'permit', ai, seq, true, true, window - 300) -}}
     {%- set w = [interval // 4, 6 * hour] | min -%}
     {%- do shared.update({'ep_last': ai, 'ep_due': pick_start(start + interval - w // 2, w) | int}) -%}
@@ -186,51 +206,41 @@
     {%- do shared.set('ep_due', now + 600) -%}
   {%- endif -%}
 {%- endif -%}
-{%- if now < queue[0][0] -%}
-  {%- do shared.set('next_due', queue[0][0]) -%}
-  {{- dispatch.drop() -}}
-{%- endif -%}
+{#- The earliest due queued record takes this timestamp; control items
+    popped on the way schedule further records. -#}
 {%- set out = namespace(row=none) -%}
-{%- for _ in range(32) if out.row is none and queue and queue[0][0] <= now -%}
+{%- for _ in range(40) if out.row is none and queue and queue[0][0] <= now -%}
   {%- set top = hq.heappop(queue) -%}
   {%- set due = top[0] -%}
   {%- set item = top[2] -%}
-  {%- set c = curve[(due // hour) % 24] -%}
+  {%- set c = curve[hr(due) | int] -%}
   {%- if item.k == 'row' -%}
     {%- set out.row = item -%}
-  {%- elif item.k == 'biz' -%}
-    {#- Business connections to permitted services, with short bursts. -#}
-    {{- push(due + ex(6) | int, item) -}}
-    {%- if module.rand.chance(0.15 + 0.85 * c) -%}
-      {%- set src = module.rand.weighted_choice(shared.get('cl'), shared.get('clw')) -%}
-      {%- set svc = module.rand.weighted_choice(shared.get('sv'), shared.get('svw')) -%}
-      {%- set t = namespace(v=due) -%}
-      {%- for _ in range(module.rand.weighted_choice([1, 2, 3], [75, 18, 7])) -%}
-        {{- push(t.v, {'k': 'row', 'kind': 'flow', 'src': src, 'dst': svc[0], 'dport': svc[1], 'acl': params.acl_name}) -}}
-        {%- set t.v = t.v + (ln(3, 1.0) | int) -%}
-      {%- endfor -%}
-    {%- endif -%}
   {%- elif item.k == 'odd' -%}
     {{- push(due + ex(240) | int, item) -}}
     {%- if module.rand.chance(0.3 + 0.7 * c) -%}
       {{- push(due, {'k': 'row', 'kind': 'flow', 'src': module.rand.weighted_choice(shared.get('cl'), shared.get('clw')), 'dst': module.rand.choice(shared.get('sv'))[0], 'dport': module.rand.weighted_choice([23, 135, 139, 5985, 8080], [15, 25, 20, 25, 15]), 'acl': params.acl_name}) -}}
     {%- endif -%}
-  {%- elif item.k == 'scan' -%}
-    {#- Unsolicited internet TCP to the outside address, denied. -#}
-    {{- push(due + ex(75) | int, item) -}}
-    {%- set src = module.rand.choice(['198.51.100.', '203.0.113.']) ~ module.rand.number.integer(1, 254) -%}
-    {%- set port = module.rand.weighted_choice([22, 23, 443, 445, 3389, 5060, 8080], [25, 20, 12, 15, 14, 6, 8]) -%}
-    {%- set t = namespace(v=due) -%}
-    {%- for _ in range(module.rand.weighted_choice([1, 2, 3, 4], [70, 16, 9, 5])) -%}
-      {{- push(t.v, {'k': 'row', 'kind': 'flow', 'src': src, 'dst': '192.0.2.10', 'dport': port, 'acl': 'EDGE_FILTER'}) -}}
-      {%- set t.v = t.v + (ln(2, 1.0) | int) -%}
-    {%- endfor -%}
   {%- elif item.k == 'retry' -%}
-    {#- A client application retrying a restricted management server. -#}
-    {{- push(due + ex(1200) | int, item) -}}
+    {#- A client application retrying a restricted management server.
+        When an administrator's own workstation is denied, the
+        administrator sometimes logs in and grants the pair a temporary
+        permit (reactive self-permit), then retries. -#}
+    {{- push(due + ex(600 if item.p < shared.get('nadm') else 1200) | int, item) -}}
     {%- if module.rand.chance(0.35 + 0.65 * c) -%}
       {%- set p = pairs[item.p] -%}
       {{- push(due, {'k': 'row', 'kind': 'flow', 'src': p.c, 'dst': p.s, 'dport': 443, 'acl': params.acl_name}) -}}
+      {%- set resv = shared.get('resv') | map(attribute='p') | list -%}
+      {%- if item.p < shared.get('nadm') and item.p not in resv and module.rand.chance(0.005) -%}
+        {%- set nf = fails() | int -%}
+        {%- if nf == 0 or module.rand.chance(0.9) -%}
+          {%- set seq = free_seq() | int -%}
+          {%- do shared.get('resv').append({'p': item.p, 'seq': seq}) -%}
+          {{- session(item.p, due + (ln(90, 0.8) | int), nf, true, 'permit', item.p, seq, true, false, 0) -}}
+        {%- else -%}
+          {{- session(item.p, due + (ln(90, 0.8) | int), nf, false, 'none', none, none, false, false, 0) -}}
+        {%- endif -%}
+      {%- endif -%}
     {%- endif -%}
   {%- elif item.k == 'adm' -%}
     {#- Session arrival of one administrator, thinned by the curve. -#}
@@ -239,7 +249,7 @@
     {%- if module.rand.chance(c) -%}
       {%- set nf = fails() | int -%}
       {%- set ok = nf == 0 or module.rand.chance(0.9) -%}
-      {%- set act = module.rand.weighted_choice(['none', 'cfg', 'permit'], [40, 35, 25]) if ok else 'none' -%}
+      {%- set act = module.rand.weighted_choice(['none', 'cfg', 'permit'], [32, 40, 28]) if ok else 'none' -%}
       {%- set pi = none -%}
       {%- set seq = none -%}
       {%- if act == 'permit' -%}
@@ -261,20 +271,26 @@
     {%- endif -%}
   {%- elif item.k == 'rm' -%}
     {#- Removal of a temporary permit by any administrator. -#}
-    {%- set ws = accts[:-1] | map(attribute='w') | list -%}
+    {%- set ws = accts[:shared.get('nadm')] | map(attribute='w') | list -%}
     {%- set ai = module.rand.weighted_choice(range(ws | length) | list, ws) -%}
     {{- session(ai, due, fails() | int, true, 'remove', item.p, item.seq, false, false, 0) -}}
   {%- elif item.k == 'nms' -%}
-    {#- Config backup poller; after a password change it gives up after
-        three failed attempts on a poll. -#}
+    {#- Config backup poller; now and then (for example while its stored
+        credential is out of date) it gives up after three failed
+        attempts on a poll. -#}
     {{- push(due + ex(3600) | int, item) -}}
-    {%- set nf = 3 if module.rand.chance(0.12) else (1 if module.rand.chance(0.04) else 0) -%}
+    {%- set nf = 3 if module.rand.chance(0.015) else (1 if module.rand.chance(0.015) else 0) -%}
     {%- set t = namespace(v=due) -%}
     {%- for _ in range(nf) -%}
-      {{- push(t.v, {'k': 'row', 'kind': 'fail', 'a': accts | length - 1}) -}}
+      {{- push(t.v, {'k': 'row', 'kind': 'fail', 'a': shared.get('nadm')}) -}}
       {%- set t.v = t.v + (ln(20, 0.5) | int) -%}
     {%- endfor -%}
-    {%- if nf < 3 -%}{{- push(t.v, {'k': 'row', 'kind': 'succ', 'a': accts | length - 1}) -}}{%- endif -%}
+    {%- if nf < 3 -%}{{- push(t.v, {'k': 'row', 'kind': 'succ', 'a': shared.get('nadm')}) -}}{%- endif -%}
+  {%- elif item.k == 'cc' -%}
+    {#- Configuration compliance job: a read-only SSH login every 15
+        minutes with a little jitter (show commands are not logged). -#}
+    {{- push(due + 900 + module.rand.number.integer(-30, 30), item) -}}
+    {{- push(due, {'k': 'row', 'kind': 'succ', 'a': shared.get('nadm') + 1}) -}}
   {%- elif item.k == 'flap' -%}
     {{- push(due + ex(10 * hour) | int, item) -}}
     {%- set ifc = 'GigabitEthernet0/' ~ module.rand.number.integer(1, 3) -%}
@@ -282,44 +298,74 @@
     {{- push(due + (ln(40, 1.0) | int), {'k': 'row', 'kind': 'line', 'ifc': ifc, 'up': true}) -}}
   {%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', queue[0][0] if queue else now + 1) -%}
-{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- if out.row is none and 'wan' in tags -%}
+  {#- Unsolicited internet TCP to the outside address, denied. A scanner
+      sends one to four probes to one port; consecutive WAN timestamps
+      continue the current scanner until its count is used up. -#}
+  {%- if shared.get('wan_left') > 0 -%}
+    {%- do shared.set('wan_left', shared.get('wan_left') - 1) -%}
+  {%- else -%}
+    {%- set src = module.rand.choice(['198.51.100.', '203.0.113.']) ~ module.rand.number.integer(1, 254) -%}
+    {%- set port = module.rand.weighted_choice([22, 23, 443, 445, 3389, 5060, 8080], [25, 20, 12, 15, 14, 6, 8]) -%}
+    {%- do shared.update({'wan_src': [src, port], 'wan_left': module.rand.weighted_choice([1, 2, 3, 4], [70, 16, 9, 5]) - 1}) -%}
+  {%- endif -%}
+  {%- set out.row = {'kind': 'flow', 'src': shared.get('wan_src')[0], 'dst': '192.0.2.10', 'dport': shared.get('wan_src')[1], 'acl': 'EDGE_FILTER'} -%}
+{%- elif out.row is none -%}
+  {#- Business connection to a permitted service; a client opens one to
+      three connections, carried by consecutive office timestamps. -#}
+  {%- if shared.get('biz_left') > 0 -%}
+    {%- do shared.set('biz_left', shared.get('biz_left') - 1) -%}
+  {%- else -%}
+    {%- do shared.update({'biz': [module.rand.weighted_choice(shared.get('cl'), shared.get('clw')), module.rand.weighted_choice(shared.get('sv'), shared.get('svw'))], 'biz_left': module.rand.weighted_choice([1, 2, 3], [75, 18, 7]) - 1}) -%}
+  {%- endif -%}
+  {%- set out.row = {'kind': 'flow', 'src': shared.get('biz')[0], 'dst': shared.get('biz')[1][0], 'dport': shared.get('biz')[1][1], 'acl': params.acl_name} -%}
+{%- endif -%}
 {%- set row = out.row -%}
 {%- set kind = row.kind -%}
-{%- set ms = module.rand.number.integer(0, 999) -%}
-{%- set tf = now + ms / 1000 -%}
+{%- set ms = ts.microsecond // 1000 -%}
 {%- set mt = shared.get('mt') -%}
-{%- set tracked = accts[:-1] | map(attribute='ip') | list -%}
+{%- set tracked = shared.get('tracked') -%}
 {%- set x = namespace(ip=none, cls=none, dst=none) -%}
 {%- set ext = {} -%}
 {%- set ios = {} -%}
 {%- set ev_type = ['info'] -%}
 {%- set action = none -%}
 {%- if kind == 'flow' -%}
-  {%- set src = row.src -%}
-  {%- set dst = row.dst -%}
-  {%- set dport = row.dport -%}
+  {%- set f = namespace(src=row.src, dst=row.dst, dport=row.dport) -%}
   {%- set acl = row.acl -%}
-  {%- set active = shared.get('active') | selectattr('c', 'equalto', src) | selectattr('s', 'equalto', dst) | list -%}
-  {%- set permitted = acl == params.acl_name and ((dport == 443 and active) or [dst, dport] in shared.get('sv')) -%}
-  {#- Guard: a background permitted flow that would complete the chain
-      for its source inside the window is not logged (the host did not
-      connect); everything else keeps its time. -#}
-  {%- if permitted and dport == 443 and src in tracked and not row.get('ep') -%}
-    {%- for p in mt.get(src, []) if p[0] == 6 and p[2] == dst and tf - p[1] <= window -%}
-      {{- dispatch.drop() -}}
+  {%- set active = shared.get('active') | selectattr('c', 'equalto', f.src) | selectattr('s', 'equalto', f.dst) | list -%}
+  {%- set permitted = acl == params.acl_name and ((f.dport == 443 and active) or [f.dst, f.dport] in shared.get('sv')) -%}
+  {#- Guard: a background permitted 443 flow that would complete the
+      chain for its source inside the window goes to another service
+      instead, drawn like a business connection; time and source are
+      kept. -#}
+  {%- if permitted and f.dport == 443 and f.src in tracked and not row.get('ep') -%}
+    {%- for a in mt.get(f.src, []) if a[2] == 6 and a[1] == f.dst and tf - a[0] <= window -%}
+      {%- if loop.first -%}
+        {%- set svc = module.rand.weighted_choice(shared.get('sv'), shared.get('svw')) -%}
+        {%- set f.dst = svc[0] -%}
+        {%- set f.dport = svc[1] -%}
+      {%- endif -%}
     {%- endfor -%}
   {%- endif -%}
+  {%- set src = f.src -%}
+  {%- set dst = f.dst -%}
+  {%- set dport = f.dport -%}
   {#- One first-packet record per ACL, action and five-tuple inside the
       five-minute log interval: a colliding source port is redrawn. -#}
-  {%- set recent = shared.get('recent') | selectattr('t', 'gt', now - 300) | list -%}
-  {%- set keys = recent | map(attribute='key') | list -%}
+  {%- set recent = shared.get('recent') -%}
+  {%- set rq = shared.get('recent_q') -%}
+  {%- for _ in range(64) if rq and rq[0][0] <= now - 300 -%}
+    {%- set old = rq.popleft() -%}
+    {%- if recent.get(old[1]) == old[0] -%}{%- do recent.pop(old[1]) -%}{%- endif -%}
+  {%- endfor -%}
   {%- set sp = namespace(v=module.rand.number.integer(49152, 65535)) -%}
-  {%- for _ in range(20) if (acl ~ permitted ~ src ~ sp.v ~ dst ~ dport) in keys -%}
+  {%- for _ in range(20) if (acl ~ permitted ~ src ~ sp.v ~ dst ~ dport) in recent -%}
     {%- set sp.v = module.rand.number.integer(49152, 65535) -%}
   {%- endfor -%}
-  {%- do recent.append({'key': acl ~ permitted ~ src ~ sp.v ~ dst ~ dport, 't': now}) -%}
-  {%- do shared.set('recent', recent[-512:]) -%}
+  {%- set rkey = acl ~ permitted ~ src ~ sp.v ~ dst ~ dport -%}
+  {%- do recent.update({rkey: now}) -%}
+  {%- do rq.append([now, rkey]) -%}
   {%- set sport = sp.v -%}
   {%- set fac, sev, code = 'SEC', 6, 'IPACCESSLOGP' -%}
   {%- set msg = 'list ' ~ acl ~ ' ' ~ ('permitted' if permitted else 'denied') ~ ' tcp ' ~ src ~ '(' ~ sport ~ ') -> ' ~ dst ~ '(' ~ dport ~ '), 1 packet' -%}
@@ -372,31 +418,23 @@
   {%- set fac, sev, code = 'LINEPROTO', 5, 'UPDOWN' -%}
   {%- set msg = 'Line protocol on Interface ' ~ row.ifc ~ ', changed state to ' ~ ('up' if row.up else 'down') -%}
 {%- endif -%}
-{#- Chain tracker for administrator workstations, same semantics as a
-    streaming ordered matcher keyed by address: every denied 443 flow
-    opens a partial, rows advance partials in order, a partial older
-    than the window is dropped, completion resets the address. -#}
+{#- Chain tracker for administrator workstations, as an ordered matcher
+    keyed by address that keeps every binding: each denied 443 flow opens
+    an anchor [time, server, next step]; a row of the next step's kind
+    advances it; an anchor lives for the window from its denied flow and
+    is not reset by a completion, so the episode's own steps keep
+    guarding later flows. -#}
 {%- if x.ip in tracked -%}
-  {%- set parts = mt.get(x.ip, []) | selectattr('1', 'ge', tf - window) | list -%}
-  {%- set st = namespace(new=[], done=false) -%}
-  {%- for p in parts if not st.done -%}
-    {%- set need = ['deny443', 'fail', 'fail', 'fail', 'succ', 'cfgi', 'allow443'][p[0]] -%}
-    {%- if x.cls == need and (p[0] < 6 or x.dst == p[2]) -%}
-      {%- if p[0] == 6 -%}
-        {%- set st.done = true -%}
-      {%- else -%}
-        {%- do st.new.append([p[0] + 1, p[1], p[2]]) -%}
-      {%- endif -%}
+  {%- set st = namespace(new=[]) -%}
+  {%- for a in mt.get(x.ip, []) if tf - a[0] <= window -%}
+    {%- if a[2] < 6 and x.cls == need[a[2]] -%}
+      {%- do st.new.append([a[0], a[1], a[2] + 1]) -%}
     {%- else -%}
-      {%- do st.new.append(p) -%}
+      {%- do st.new.append(a) -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- if st.done -%}
-    {%- do mt.update({x.ip: []}) -%}
-  {%- else -%}
-    {%- if x.cls == 'deny443' -%}{%- do st.new.append([1, tf, x.dst]) -%}{%- endif -%}
-    {%- do mt.update({x.ip: st.new[-8:]}) -%}
-  {%- endif -%}
+  {%- if x.cls == 'deny443' -%}{%- do st.new.append([tf, x.dst, 1]) -%}{%- endif -%}
+  {%- do mt.update({x.ip: st.new[-24:]}) -%}
 {%- endif -%}
 {%- set mseq = shared.get('msg_seq') + 1 + module.rand.weighted_choice([0, 1, 2, 3, 5], [60, 20, 10, 6, 4]) -%}
 {%- do shared.set('msg_seq', mseq) -%}
