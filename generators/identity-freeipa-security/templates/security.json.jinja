@@ -1,52 +1,68 @@
 {#- One FreeIPA server's 389 Directory Server security log (JSON, one
-    object per line, written by json-c). Each one-second tick emits at
-    most one record: the earliest due one. Users, service accounts,
-    administrators and stray clients are independent random processes;
-    the anomaly episode only queues its own records for one user and
-    never touches the background. -#}
-{%- set now = timestamp.timestamp() | int -%}
+    object per line, written by json-c). The input sets the rate and
+    the hour-of-day curve; every timestamp becomes exactly one record.
+    A timestamp takes the earliest due record of an open session (the
+    next wrong password, the success, a denied modification, the next
+    retry of a stale service password). When none is due it opens a
+    new session: timestamps tagged `people` open user logins,
+    anonymous binds and Directory Manager sessions, timestamps tagged
+    `service` open lookup-account re-binds and the other automated
+    traffic. The anomaly episode opens one login session of its own
+    for an idle user and never touches the background. -#}
+{%- set now = timestamp.timestamp() -%}
+{%- set sec = now | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set window = 600 -%}
 {%- set sfx = params.directory_suffix | lower -%}
-{%- set people = ['anna.ivanova', 'pavel.smirnov', 'olga.kim', 'dmitry.orlov',
-    'maria.petrova', 'sergey.volkov', 'elena.sokolova', 'ivan.popov',
-    'natalia.lebedeva', 'alexey.kozlov', 'irina.novikova', 'mikhail.morozov',
-    'tatiana.egorova', 'andrey.pavlov', 'yulia.fedorova', 'nikolai.stepanov',
-    'ksenia.nikolaeva', 'roman.makarov', 'svetlana.zakharova', 'artem.zaitsev',
-    'daria.solovyova', 'kirill.borisov', 'ekaterina.romanova', 'maxim.vasiliev',
-    'polina.gusev', 'denis.titov', 'victoria.kuzmina', 'oleg.belov',
-    'anastasia.komarova', 'vladimir.orlov', 'john.miller', 'sarah.jones',
-    'david.clark', 'emma.wilson', 'lucas.martin', 'sofia.garcia',
-    'noah.brown', 'mia.davis', 'liam.taylor', 'chloe.moore', 'ethan.white',
-    'grace.hall', 'oliver.king', 'zoe.wright'] -%}
-{%- set app_defs = {
-    'gitlab': ['10.20.3.11', true, 'gitlab'],
-    'jenkins': ['10.20.3.12', false, 'jenkins'],
-    'grafana': ['10.20.3.13', true, 'grafana'],
-    'vpn': ['10.20.3.14', true, 'openvpn'],
-    'nextcloud': ['10.20.3.15', false, 'nextcloud'],
-    'portal': ['10.20.3.16', true, 'selfservice']} -%}
-{%- set admin_hosts = ['10.20.5.21', '10.20.5.22', '10.20.5.23'] -%}
-{%- set disabled = [['boris.gromov', 'nextcloud'], ['alina.frolova', 'vpn']] -%}
+
+{#- Hour-of-day load of people (UTC), relative to the daily mean. It
+    repeats the rates of patterns/people-*.yml and only places episode
+    starts; the input alone sets the record rate. -#}
+{%- set hcurve = [0.25] * 7 + [1.6] * 10 + [0.7] * 4 + [0.25] * 3 -%}
+{%- macro hload(t) -%}{{ hcurve[((t | int) // 3600) % 24] }}{%- endmacro -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [module.random.lognormvariate(module.math.log(median), sigma) | round | int, 1] | max -}}
+{%- endmacro -%}
 
 {%- if not shared.get('initialized', false) -%}
   {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {#- One fixed organisation: per-user activity and application mix come
       from a fixed seed, so every run models the same directory and only
-      behaviour is random. -#}
+      behaviour is random. Weights are bounded, so every user and every
+      user/application pair logs in every few days at least. -#}
   {%- set rnd = module.random.Random(4617) -%}
-  {%- set users = {} -%}
-  {%- set app_names = app_defs.keys() | list -%}
-  {%- for p in people -%}
-    {%- set n = rnd.choice([1, 2, 2, 3, 3, 4]) -%}
-    {%- set apps = rnd.sample(app_names, n) -%}
-    {%- set aw = [] -%}
-    {%- for a in apps -%}{%- do aw.append(rnd.lognormvariate(0, 0.9)) -%}{%- endfor -%}
-    {%- do users.update({p: {'w': rnd.lognormvariate(0, 0.8), 'apps': apps, 'aw': aw}}) -%}
+  {%- set apps = {} -%}
+  {%- set app_names = [] -%}
+  {%- for i in range(samples.applications | length) -%}
+    {%- set r = samples.applications[i] -%}
+    {%- do app_names.append(r.name) -%}
+    {%- do apps.update({r.name: {'ip': r.ip, 'op': 1 if r.starttls == 'true' else 0,
+        'sys': 'uid=' ~ r.sysaccount ~ ',cn=sysaccounts,cn=etc,' ~ sfx}}) -%}
   {%- endfor -%}
-  {%- set uw = [] -%}
-  {%- for p in people -%}{%- do uw.append(users[p].w) -%}{%- endfor -%}
+  {%- set users = [] -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- for i in range(samples.users | length) -%}
+    {%- set ua = rnd.sample(app_names, rnd.choice([1, 2, 2, 3, 3, 4])) -%}
+    {%- set aw = [] -%}
+    {%- for a in ua -%}{%- do aw.append([[rnd.lognormvariate(0, 0.7), 0.5] | max, 2.0] | min) -%}{%- endfor -%}
+    {%- set w = [[rnd.lognormvariate(0, 0.7), 0.4] | max, 2.5] | min -%}
+    {%- set acc.w = acc.w + w -%}
+    {%- do cum.append(acc.w) -%}
+    {%- do users.append({'uid': samples.users[i].uid, 'apps': ua, 'aw': aw}) -%}
+  {%- endfor -%}
+  {%- set admins = [] -%}
+  {%- set admin_w = [] -%}
+  {%- for i in range(samples.admin_hosts | length) -%}
+    {%- do admins.append(samples.admin_hosts[i].ip) -%}
+    {%- do admin_w.append(samples.admin_hosts[i].weight | int) -%}
+  {%- endfor -%}
+  {%- set disabled = [] -%}
+  {%- for i in range(samples.disabled_accounts | length) -%}
+    {%- do disabled.append([samples.disabled_accounts[i].uid, samples.disabled_accounts[i].application]) -%}
+  {%- endfor -%}
   {%- set counter = module.random.randint(20000, 400000) -%}
   {%- set pools = {} -%}
   {%- for a in app_names -%}
@@ -56,226 +72,295 @@
     {%- endfor -%}
     {%- do pools.update({a: slots}) -%}
   {%- endfor -%}
-  {%- do shared.update({'initialized': true, 'users': users, 'uw': uw,
-      'q': [], 'fails': {}, 'reset': {}, 'conns': {}, 'pools': pools,
-      'broken': {}, 'counter': counter, 'last_new': now, 'sid': 0,
-      'next_due': now + (interval * 3600) | int, 'start_at': none,
-      'last_user': none}) -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'cum': cum, 'total': acc.w,
+      'apps': apps, 'app_names': app_names, 'admins': admins, 'admin_w': admin_w,
+      'disabled': disabled, 'heap': [], 'seq': 0, 'fails': {}, 'busy': {},
+      'pools': pools, 'broken': {}, 'lock': {}, 'counter': counter, 'last_new': now,
+      'scheduled': false, 'start_at': none, 'last_user': none}) -%}
 {%- endif -%}
 {%- set users = shared.get('users') -%}
-{%- set q = shared.get('q') -%}
+{%- set apps = shared.get('apps') -%}
+{%- set heap = shared.get('heap') -%}
 {%- set fails = shared.get('fails') -%}
-{%- set reset = shared.get('reset') -%}
-{%- set conns = shared.get('conns') -%}
+{%- set busy = shared.get('busy') -%}
 {%- set pools = shared.get('pools') -%}
 {%- set broken = shared.get('broken') -%}
-{%- macro hload(h) -%}{{ 1.6 if 7 <= h < 17 else (0.7 if 17 <= h < 21 else 0.25) }}{%- endmacro -%}
-{%- set load = (hload(timestamp.astimezone(utc).hour) | float) / 0.89 -%}
-
-{%- macro gap(median, sigma) -%}
-{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
-{%- endmacro -%}
-
-{%- macro put(at, ev, dn, ip, msg, conn, op=0, root=false, episode=false, svc=none, keep=none, sess=none) -%}
-  {%- do q.append({'due': at, 'ev': ev, 'dn': dn, 'ip': ip, 'msg': msg, 'conn': conn,
-      'op': op, 'root': root, 'episode': episode, 'svc': svc, 'keep': keep, 'sess': sess}) -%}
-{%- endmacro -%}
+{%- set lock = shared.get('lock') -%}
 
 {%- macro udn(uid) -%}{{ 'uid=' ~ uid ~ ',cn=users,cn=accounts,' ~ sfx }}{%- endmacro -%}
+
+{#- FreeIPA's default lockout for user entries (global policy: six
+    failed binds, each within 60 s of the previous one, lock the entry
+    for 600 s; a success clears the count). A locked entry is refused
+    before the bind is processed, and such a refusal writes no record.
+    Service accounts and Directory Manager are not Kerberos principals
+    and are never locked. Returns -1 while the entry is locked,
+    otherwise the failures a failed bind now would add to. -#}
+{%- macro prior(dn) -%}
+  {%- set st = lock.get(dn) -%}
+  {%- if st is none -%}0
+  {%- elif st[0] >= 6 and sec < st[1] + 600 -%}-1
+  {%- elif sec - st[1] <= 60 -%}{{ st[0] }}
+  {%- else -%}0
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro rec(ev, dn, ip, msg, conn, op=0, root=false) -%}
+  {%- do shared.set('rec', {'ev': ev, 'dn': dn, 'ip': ip, 'msg': msg, 'conn': conn, 'op': op, 'root': root}) -%}
+{%- endmacro -%}
+
+{#- A session is a list of records and the pauses after each of them;
+    it holds one place in the queue at a time, due at the moment its
+    next record may be written at the earliest. -#}
+{%- macro push(at, s) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(heap, [at, n, s]) -%}
+{%- endmacro -%}
+{%- macro open(s) -%}
+  {%- if s.user -%}{%- do busy.update({s.user: busy.get(s.user, 0) + 1}) -%}{%- endif -%}
+  {{- push(now, s) -}}
+{%- endmacro -%}
 
 {#- A user logging in to one application that authenticates with an
     LDAP simple bind: one new connection per attempt (StartTLS first on
     some applications, so the bind is op 1). k wrong passwords come
-    first; the session ends in a success or gives up. -#}
-{%- macro login(uid, app, k, succeed, typo, episode=false) -%}
-  {%- set a = app_defs[app] -%}
-  {%- set op = 1 if a[1] else 0 -%}
-  {%- set t = namespace(at=now) -%}
+    first; the session ends in a success or gives up. An episode keeps
+    its five wrong passwords within the first four minutes. -#}
+{%- macro login(u, app, k, succeed, typo, ep=false) -%}
+  {%- set a = apps[app] -%}
+  {%- set uid = u.uid -%}
+  {%- set s = {'recs': [], 'gaps': [], 'i': 0, 'ep': ep, 'user': uid, 'svc': none, 'conn': none, 'stale': none} -%}
   {%- if typo -%}
     {%- set i = module.random.randint(1, uid | length - 2) -%}
     {%- set bad = uid[:i - 1] ~ uid[i] ~ uid[i - 1] ~ uid[i + 1:] -%}
     {%- if bad != uid -%}
-      {{- put(t.at, 'BIND_FAILED', udn(bad), a[0], 'NO_SUCH_ENTRY', 'new', op, episode=episode) -}}
-      {%- set t.at = t.at + gap(14, 0.8) | int -%}
+      {{- rec('BIND_FAILED', udn(bad), a.ip, 'NO_SUCH_ENTRY', 'new', a.op) -}}
+      {%- do s.recs.append(shared.get('rec')) -%}{%- do s.gaps.append(gap(14, 0.8) | int) -%}
     {%- endif -%}
   {%- endif -%}
+  {%- set g = namespace(gaps=[]) -%}
+  {%- for _ in range(50) -%}
+    {%- set g.gaps = [] -%}
+    {%- for i in range(k) -%}{%- do g.gaps.append(gap(12, 0.8) | int) -%}{%- endfor -%}
+    {%- if not ep or g.gaps | sum <= 240 -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
   {%- for i in range(k) -%}
-    {{- put(t.at, 'BIND_FAILED', udn(uid), a[0], 'INVALID_PASSWORD', 'new', op, episode=episode) -}}
-    {%- set t.at = t.at + gap(12, 0.8) | int -%}
+    {{- rec('BIND_FAILED', udn(uid), a.ip, 'INVALID_PASSWORD', 'new', a.op) -}}
+    {%- do s.recs.append(shared.get('rec')) -%}{%- do s.gaps.append(g.gaps[i]) -%}
   {%- endfor -%}
   {%- if succeed -%}
-    {%- set sid = none -%}
-    {%- if app == 'portal' and module.rand.chance(0.07) -%}
-      {%- set sid = shared.get('sid') + 1 -%}{%- do shared.set('sid', sid) -%}
-    {%- endif -%}
-    {{- put(t.at, 'BIND_SUCCESS', udn(uid), a[0], '', 'new', op, episode=episode, keep=sid) -}}
-    {%- if sid is not none -%}
-      {%- set target = udn(uid) if module.rand.chance(0.7)
-          else 'cn=' ~ module.rand.choice(['admins', 'editors', 'trust admins', 'ipausers']) ~ ',cn=groups,cn=accounts,' ~ sfx -%}
-      {{- put(t.at + gap(25, 0.9) | int, 'AUTHZ_ERROR', udn(uid), a[0],
-          'target_dn=(' ~ (target | replace(sfx, params.directory_suffix)) ~ ')', 'sess', episode=episode, sess=sid) -}}
+    {{- rec('BIND_SUCCESS', udn(uid), a.ip, '', 'new', a.op) -}}
+    {%- do s.recs.append(shared.get('rec')) -%}
+    {%- if app == 'portal' and module.random.random() < 0.07 -%}
+      {#- The self-service portal then tries a modification the user may
+          not make, on the same connection. -#}
+      {%- set target = udn(uid) if module.random.random() < 0.7
+          else 'cn=' ~ module.random.choice(['admins', 'editors', 'trust admins', 'ipausers']) ~ ',cn=groups,cn=accounts,' ~ sfx -%}
+      {%- do s.gaps.append(gap(25, 0.9) | int) -%}
+      {{- rec('AUTHZ_ERROR', udn(uid), a.ip, 'target_dn=(' ~ (target | replace(sfx, params.directory_suffix)) ~ ')', 'sess') -}}
+      {%- do s.recs.append(shared.get('rec')) -%}
     {%- endif -%}
   {%- endif -%}
+  {%- if s.recs -%}{{- open(s) -}}{%- endif -%}
 {%- endmacro -%}
 
-{#- 1. People: one merged Poisson stream of independent users, weighted
-    per user and per application, modulated by office hours. -#}
-{%- if module.rand.chance(0.011 * load) -%}
-  {%- set uid = module.rand.weighted_choice(people, shared.get('uw')) -%}
-  {%- set app = module.rand.weighted_choice(users[uid].apps, users[uid].aw) -%}
-  {%- set typo = module.rand.chance(0.012) -%}
-  {%- if module.rand.chance(0.07) -%}
-    {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [52, 22, 11, 7, 5, 3]) -%}
-    {{- login(uid, app, k, k <= 4 and module.rand.chance(0.9), typo) -}}
-  {%- else -%}
-    {{- login(uid, app, 0, true, typo) -}}
-  {%- endif -%}
-{%- endif -%}
+{#- Draw a user by activity weight: binary search over the cumulative
+    weights. -#}
+{%- macro draw_user() -%}
+  {{- module.bisect.bisect_right(shared.get('cum'), module.random.random() * shared.get('total')) -}}
+{%- endmacro -%}
 
-{#- 2. Service accounts: each application re-binds its lookup account on
-    pooled connections at random times. -#}
-{%- for app, a in app_defs.items() -%}
-  {%- if module.rand.chance(1 / 600) -%}
-    {{- put(now, 'BIND_SUCCESS', 'uid=' ~ a[2] ~ ',cn=sysaccounts,cn=etc,' ~ sfx, a[0], '', 'pool', svc=app) -}}
-  {%- endif -%}
-{%- endfor -%}
-{%- if module.rand.chance(0.00012) -%}
-  {#- The provisioning account touching an attribute it may not write. -#}
-  {%- set tgt = module.rand.choice(people) -%}
-  {{- put(now, 'AUTHZ_ERROR', 'uid=selfservice,cn=sysaccounts,cn=etc,' ~ sfx, app_defs.portal[0],
-      'target_dn=(uid=' ~ tgt ~ ',cn=users,cn=accounts,' ~ params.directory_suffix ~ ')', 'pool', svc='portal') -}}
-{%- endif -%}
-
-{#- 3. A stale service password after a rotation: the application keeps
-    reconnecting with the old one until someone fixes its config. -#}
-{%- if module.rand.chance(0.000006) -%}
-  {%- set app = module.rand.choice(app_defs.keys() | list) -%}
-  {%- if broken.get(app, 0) < now -%}
-    {%- set a = app_defs[app] -%}
-    {%- set until = now + gap(1500, 0.8) | int -%}
-    {%- do broken.update({app: until}) -%}
-    {%- set t = namespace(at=now) -%}
-    {%- for i in range(200) if t.at < until -%}
-      {{- put(t.at, 'BIND_FAILED', 'uid=' ~ a[2] ~ ',cn=sysaccounts,cn=etc,' ~ sfx, a[0], 'INVALID_PASSWORD', 'new', 1 if a[1] else 0) -}}
-      {%- set t.at = t.at + gap(40, 0.5) | int -%}
-    {%- endfor -%}
-  {%- endif -%}
-{%- endif -%}
-
-{#- 4. Administrators binding as Directory Manager from their hosts
-    (ldapmodify -ZZ -D "cn=Directory Manager" -W), with typos. -#}
-{%- if module.rand.chance(0.00008 * load) -%}
-  {%- set ip = module.rand.weighted_choice(admin_hosts, [5, 3, 1]) -%}
-  {%- set t = namespace(at=now) -%}
-  {%- set k = module.rand.weighted_choice([0, 1, 2, 3, 4], [80, 12, 5, 2, 1]) -%}
-  {%- for i in range(k) -%}
-    {{- put(t.at, 'BIND_FAILED', 'cn=directory manager', ip, 'INVALID_PASSWORD', 'new', 1, root=true) -}}
-    {%- set t.at = t.at + gap(12, 0.8) | int -%}
-  {%- endfor -%}
-  {%- if k == 0 or module.rand.chance(0.9) -%}
-    {%- for i in range(module.rand.weighted_choice([1, 2, 3, 4], [50, 25, 15, 10])) -%}
-      {{- put(t.at, 'BIND_SUCCESS', 'cn=directory manager', ip, '', 'new', 1, root=true) -}}
-      {%- set t.at = t.at + gap(90, 1.0) | int -%}
-    {%- endfor -%}
-  {%- endif -%}
-{%- endif -%}
-
-{#- 5. Disabled accounts whose old devices still try to sign in. -#}
-{%- for d in disabled -%}
-  {%- if module.rand.chance(0.00012) -%}
-    {%- set t = namespace(at=now) -%}
-    {%- for i in range(module.rand.weighted_choice([1, 2, 3, 4], [45, 30, 15, 10])) -%}
-      {{- put(t.at, 'BIND_FAILED', udn(d[0]), app_defs[d[1]][0], 'ACCOUNT_LOCKED', 'new', 1) -}}
-      {%- set t.at = t.at + gap(8, 0.7) | int -%}
-    {%- endfor -%}
-  {%- endif -%}
-{%- endfor -%}
-
-{#- 6. Anonymous binds (rootDSE discovery) and uncleanly closed
-    connections from ordinary clients. -#}
-{%- if module.rand.chance(0.0006 * load) -%}
-  {%- set ip = module.rand.choice(['10.20.9.5', '10.20.3.11', '10.20.5.21'])
-      if module.rand.chance(0.4) else '10.20.12.' ~ module.random.randint(20, 240) -%}
-  {{- put(now, 'BIND_SUCCESS', '', ip, 'ANONYMOUS_BIND', 'new', 0) -}}
-{%- endif -%}
-{%- if module.rand.chance(0.0002) -%}
-  {%- set pool_ips = ['10.20.3.11', '10.20.3.12', '10.20.3.13', '10.20.3.14', '10.20.3.15',
-      '10.20.3.16', '10.20.5.21', '10.20.5.22', '10.20.9.5'] -%}
-  {%- set ip = module.rand.choice(pool_ips) if module.rand.chance(0.6)
-      else '10.20.12.' ~ module.random.randint(20, 240) -%}
-  {{- put(now, 'TCP_ERROR', none, ip, module.rand.weighted_choice([
-      'Bad Ber Tag or uncleanly closed connection - B1', 'Ber peak tag - B3',
-      'Ber Too Big (nsslapd-maxbersize) - B2'], [95, 4, 1]), 'new') -}}
-{%- endif -%}
-
-{#- 7. Episode: due by source time. At the due time the start is drawn
-    from the background hour-of-day curve within min(interval / 4, 6 h)
-    after it; the next due time counts from the actual start, never
-    catching up. -#}
-{%- if params.anomaly_mode and now >= shared.get('next_due') and shared.get('start_at') is none -%}
-  {%- set top = now - now % 3600 -%}
-  {%- set slots = [] -%}{%- set sw = [] -%}
-  {%- for k in range(8) -%}
-    {%- set a = [top + k * 3600, now] | max -%}
-    {%- set b = [top + (k + 1) * 3600, now + ([interval * 900, 21600] | min) | int] | min -%}
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first record, its hour drawn from the
+    people hour-of-day curve. Each later start is due one interval
+    after the actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor, so start hours never drift. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
     {%- if b > a -%}
-      {%- do slots.append([a, b]) -%}
-      {%- do sw.append((hload(module.datetime.datetime.fromtimestamp(a, utc).hour) | float) * (b - a)) -%}
+      {%- set h = (hload(a) | float) / 1.6 -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- set slot = module.rand.weighted_choice(slots, sw) -%}
-  {%- do shared.set('start_at', module.random.randint(slot[0], slot[1] - 1)) -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and not shared.get('scheduled') -%}
+  {%- do shared.update({'scheduled': true, 'start_at':
+      pick_start(sec, sec + (([interval, 24] | min) * 3600) | int, false) | int}) -%}
 {%- endif -%}
-{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
-  {#- Same per-user and per-application weights as ordinary logins;
-      the previous episode's user and anyone mid-session sit this one
-      out, so episodes rotate and never merge with a real session. -#}
-  {%- set busy = q | map(attribute='dn') | list -%}
-  {%- set ep = namespace(c=[], w=[]) -%}
-  {%- for p in people -%}
-    {%- if p != shared.get('last_user') and udn(p) not in busy -%}
-      {%- set ep.c = ep.c + [p] -%}{%- set ep.w = ep.w + [users[p].w] -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and sec >= shared.get('start_at') -%}
+  {#- Password guessing through one of the user's own applications:
+      five wrong passwords, each on a new connection, then a success.
+      The user and application are drawn with the ordinary login
+      weights among users with no open session and no recent wrong
+      password there or within the last minute anywhere; the previous
+      episode's user sits this one out. -#}
+  {%- set pick = namespace(u=none, app=none) -%}
+  {%- for _ in range(64) -%}
+    {%- set u = users[draw_user() | int] -%}
+    {%- if u.uid != shared.get('last_user') and not busy.get(u.uid) and (prior(udn(u.uid)) | int) == 0 -%}
+      {%- set app = module.rand.weighted_choice(u.apps, u.aw) -%}
+      {%- set recent = fails.get(udn(u.uid) ~ '|' ~ apps[app].ip, []) | select('ge', now - window - 0.002) | list -%}
+      {%- if not recent -%}{%- set pick.u = u -%}{%- set pick.app = app -%}{%- break -%}{%- endif -%}
     {%- endif -%}
   {%- endfor -%}
-  {%- if ep.c -%}
-    {%- set uid = module.rand.weighted_choice(ep.c, ep.w) -%}
-    {%- set app = module.rand.weighted_choice(users[uid].apps, users[uid].aw) -%}
-    {%- if not fails.get(udn(uid) ~ '|' ~ app_defs[app][0]) -%}
-      {{- login(uid, app, 5, true, false, true) -}}
-      {%- do shared.update({'last_user': uid, 'start_at': none,
-          'next_due': now + (interval * 3600) | int}) -%}
-    {%- endif -%}
+  {%- if pick.u is not none -%}
+    {{- login(pick.u, pick.app, 5, true, false, true) -}}
+    {%- set due = sec + (interval * 3600) | int -%}
+    {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
+    {%- do shared.update({'last_user': pick.u.uid, 'start_at': pick_start(due - half, due + half, true) | int}) -%}
   {%- endif -%}
 {%- endif -%}
 
-{#- 8. Emit the earliest due record, otherwise nothing. -#}
-{%- set sel = namespace(i=-1, due=now + 1) -%}
-{%- for e in q -%}
-  {%- if e.due <= now and e.due < sel.due -%}{%- set sel.i = loop.index0 -%}{%- set sel.due = e.due -%}{%- endif -%}
-{%- endfor -%}
-{%- if sel.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set e = q.pop(sel.i) -%}
+{#- 2. The earliest due record of an open session, otherwise a new
+    session opened by the timestamp's population. -#}
+{%- if not (heap and heap[0][0] <= now) -%}
+  {%- set r = module.random.random() -%}
+  {%- if 'service' in tags -%}
+    {%- set app = module.random.choice(shared.get('app_names')) -%}
+    {%- set a = apps[app] -%}
+    {%- set s = {'recs': [], 'gaps': [], 'i': 0, 'ep': false, 'user': none, 'svc': app, 'conn': none, 'stale': none} -%}
+    {%- set d = module.random.choice(shared.get('disabled')) -%}
+    {%- set dp = (prior(udn(d[0])) | int) if r < 0.007 and not busy.get(d[0]) else -1 -%}
+    {%- if r < 0.007 and not 0 <= dp < 6 -%}{%- set r = 0.5 -%}{%- endif -%}
+    {%- if r < 0.007 -%}
+      {#- A disabled account whose old device still tries to sign in.
+          Its failures count towards the lockout like any other. -#}
+      {%- do s.update({'user': d[0]}) -%}
+      {%- for i in range([module.rand.weighted_choice([1, 2, 3, 4], [45, 30, 15, 10]), 6 - dp] | min) -%}
+        {{- rec('BIND_FAILED', udn(d[0]), apps[d[1]].ip, 'ACCOUNT_LOCKED', 'new', 1) -}}
+        {%- do s.recs.append(shared.get('rec')) -%}{%- do s.gaps.append(gap(8, 0.7) | int) -%}
+      {%- endfor -%}
+    {%- elif r < 0.015 -%}
+      {#- A connection closed uncleanly or with a malformed request. -#}
+      {%- set pool_ips = ['10.20.3.11', '10.20.3.12', '10.20.3.13', '10.20.3.14', '10.20.3.15',
+          '10.20.3.16', '10.20.5.21', '10.20.5.22', '10.20.9.5'] -%}
+      {%- set ip = module.random.choice(pool_ips) if module.random.random() < 0.6
+          else '10.20.12.' ~ module.random.randint(20, 240) -%}
+      {{- rec('TCP_ERROR', none, ip, module.rand.weighted_choice([
+          'Bad Ber Tag or uncleanly closed connection - B1', 'Ber peak tag - B3',
+          'Ber Too Big (nsslapd-maxbersize) - B2'], [95, 4, 1]), 'new') -}}
+      {%- do s.recs.append(shared.get('rec')) -%}
+    {%- elif r < 0.019 -%}
+      {#- The provisioning account touching an attribute it may not write. -#}
+      {%- do s.update({'svc': 'portal'}) -%}
+      {{- rec('AUTHZ_ERROR', apps.portal.sys, apps.portal.ip,
+          'target_dn=(uid=' ~ module.random.choice(users).uid ~ ',cn=users,cn=accounts,' ~ params.directory_suffix ~ ')', 'pool') -}}
+      {%- do s.recs.append(shared.get('rec')) -%}
+    {%- elif r < 0.0192 and broken.get(app, 0) < now -%}
+      {#- A stale service password after a rotation: the application
+          keeps reconnecting with the old one until its configuration
+          is fixed, and its pooled re-binds fail meanwhile. -#}
+      {%- set until = now + gap(1500, 0.8) | int -%}
+      {%- do broken.update({app: until}) -%}
+      {%- do s.update({'stale': until}) -%}
+      {{- rec('BIND_FAILED', a.sys, a.ip, 'INVALID_PASSWORD', 'new', a.op) -}}
+      {%- do s.recs.append(shared.get('rec')) -%}
+    {%- else -%}
+      {#- A lookup account re-binding on one of its pooled connections. -#}
+      {{- rec('BIND_SUCCESS', a.sys, a.ip, '', 'pool') -}}
+      {%- do s.recs.append(shared.get('rec')) -%}
+    {%- endif -%}
+    {{- open(s) -}}
+  {%- elif r < 0.0018 -%}
+    {#- An administrator binding as Directory Manager from an admin host
+        (ldapmodify -ZZ -D "cn=Directory Manager" -W), with typos. -#}
+    {%- set ip = module.rand.weighted_choice(shared.get('admins'), shared.get('admin_w')) -%}
+    {%- set s = {'recs': [], 'gaps': [], 'i': 0, 'ep': false, 'user': none, 'svc': none, 'conn': none, 'stale': none} -%}
+    {%- set k = module.rand.weighted_choice([0, 1, 2, 3, 4], [80, 12, 5, 2, 1]) -%}
+    {%- for i in range(k) -%}
+      {{- rec('BIND_FAILED', 'cn=directory manager', ip, 'INVALID_PASSWORD', 'new', 1, true) -}}
+      {%- do s.recs.append(shared.get('rec')) -%}{%- do s.gaps.append(gap(12, 0.8) | int) -%}
+    {%- endfor -%}
+    {%- if k == 0 or module.random.random() < 0.9 -%}
+      {%- for i in range(module.rand.weighted_choice([1, 2, 3, 4], [50, 25, 15, 10])) -%}
+        {{- rec('BIND_SUCCESS', 'cn=directory manager', ip, '', 'new', 1, true) -}}
+        {%- do s.recs.append(shared.get('rec')) -%}{%- do s.gaps.append(gap(90, 1.0) | int) -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {{- open(s) -}}
+  {%- elif r < 0.0368 -%}
+    {#- An anonymous bind (rootDSE discovery) from monitoring, an
+        application or a workstation. -#}
+    {%- set ip = module.random.choice(['10.20.9.5', '10.20.3.11', '10.20.5.21'])
+        if module.random.random() < 0.4 else '10.20.12.' ~ module.random.randint(20, 240) -%}
+    {{- rec('BIND_SUCCESS', '', ip, 'ANONYMOUS_BIND', 'new', 0) -}}
+    {{- open({'recs': [shared.get('rec')], 'gaps': [], 'i': 0, 'ep': false, 'user': none, 'svc': none, 'conn': none, 'stale': none}) -}}
+  {%- else -%}
+    {#- A user login: user by weight, one of the user's applications by
+        weight; a user already signing in, locked out, or with five
+        quick failures just now does not start another. 7% start with
+        wrong passwords (one far more often than two, two than three);
+        wrong passwords stop at the lockout, and a user whose quick
+        failures reach five gives up, otherwise usually gets in (90%).
+        1.2% start with a mistyped user name. -#}
+    {%- set pick = namespace(u=none, p=0) -%}
+    {%- for _ in range(64) -%}
+      {%- set u = users[draw_user() | int] -%}
+      {%- set p = prior(udn(u.uid)) | int -%}
+      {%- if not busy.get(u.uid) and 0 <= p < 5 -%}
+        {%- set pick.u = u -%}{%- set pick.p = p -%}{%- break -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if pick.u is none -%}
+      {{- rec('BIND_SUCCESS', '', '10.20.9.5', 'ANONYMOUS_BIND', 'new', 0) -}}
+      {{- open({'recs': [shared.get('rec')], 'gaps': [], 'i': 0, 'ep': false, 'user': none, 'svc': none, 'conn': none, 'stale': none}) -}}
+    {%- else -%}
+      {%- set u = pick.u -%}
+      {%- set app = module.rand.weighted_choice(u.apps, u.aw) -%}
+      {%- set typo = module.random.random() < 0.012 -%}
+      {%- if module.random.random() < 0.07 -%}
+        {%- set k = [module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [52, 22, 11, 7, 5, 3]), 6 - pick.p] | min -%}
+        {{- login(u, app, k, pick.p + k <= 4 and module.random.random() < 0.9, typo) -}}
+      {%- else -%}
+        {{- login(u, app, 0, true, typo) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set s = module.heapq.heappop(heap)[2] -%}
+{%- set e = s.recs[s.i] -%}
 {%- set ev = e.ev -%}
 {%- set msg = e.msg -%}
-{%- set key = (e.dn or '') ~ '|' ~ e.ip -%}
+{%- set st = namespace(done=false) -%}
 
 {#- A service account whose password is stale cannot bind. -#}
-{%- if ev == 'BIND_SUCCESS' and e.svc and broken.get(e.svc, 0) > now -%}
+{%- if ev == 'BIND_SUCCESS' and e.conn == 'pool' and broken.get(s.svc, 0) > now -%}
   {%- set ev = 'BIND_FAILED' -%}{%- set msg = 'INVALID_PASSWORD' -%}
 {%- endif -%}
 
-{#- Wrong passwords per (DN, client) in the last 10 minutes. Guard on
-    the final chain step only: an ordinary success after five of them
-    is not written. The episode's own success resets the count. -#}
-{%- set recent = (fails.get(key, []) | select('ge', [now - window, reset.get(key, 0) + 1] | max) | list) -%}
-{%- if ev == 'BIND_FAILED' and msg == 'INVALID_PASSWORD' -%}
-  {%- do recent.append(now) -%}
-{%- endif -%}
-{%- if recent -%}{%- do fails.update({key: recent[-30:]}) -%}{%- elif key in fails -%}{%- do fails.pop(key) -%}{%- endif -%}
-{%- if ev == 'BIND_SUCCESS' and not e.episode and recent | length >= 5 -%}{{ dispatch.drop() }}{%- endif -%}
-{%- if ev == 'BIND_SUCCESS' and e.episode -%}
-  {%- do reset.update({key: now}) -%}
-  {%- if fails.get(key) -%}{%- do fails.pop(key) -%}{%- endif -%}
+{#- Wrong passwords per (DN, client) in the last 10 minutes, episode
+    ones included (2 ms of slack for the millisecond @timestamp).
+    Outside episodes, a success that would follow five of them is one
+    more wrong password instead, and the session gives up there. -#}
+{%- if e.dn -%}
+  {%- set key = e.dn ~ '|' ~ e.ip -%}
+  {%- set recent = fails.get(key, []) | select('ge', now - window - 0.002) | list -%}
+  {%- if ev == 'BIND_SUCCESS' and not s.ep and recent | length >= 5 -%}
+    {%- set ev = 'BIND_FAILED' -%}{%- set msg = 'INVALID_PASSWORD' -%}{%- set st.done = true -%}
+  {%- endif -%}
+  {%- if ev == 'BIND_FAILED' and msg == 'INVALID_PASSWORD' -%}{%- do recent.append(now) -%}{%- endif -%}
+  {%- if recent -%}{%- do fails.update({key: recent[-8:]}) -%}{%- elif key in fails -%}{%- do fails.pop(key) -%}{%- endif -%}
+  {#- The lockout count of a user entry (a mistyped name has no entry). -#}
+  {%- if ',cn=users,cn=accounts,' in e.dn and ev.startswith('BIND_') and msg != 'NO_SUCH_ENTRY' -%}
+    {%- set lk = lock.get(e.dn, [0, 0]) -%}
+    {%- if ev == 'BIND_SUCCESS' -%}
+      {%- if lk[0] -%}{%- do lock.update({e.dn: [0, lk[1]]}) -%}{%- endif -%}
+    {%- else -%}
+      {%- set c = 0 if sec > lk[1] + 60 else lk[0] -%}
+      {%- do lock.update({e.dn: [[c + 1, 6] | min, sec]}) -%}
+      {%- if c + 1 >= 5 and not s.ep and not st.done and s.i + 1 < s.recs | length and s.recs[s.i + 1].ev != 'BIND_FAILED' -%}
+        {%- set st.done = true -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
 {%- endif -%}
 
 {#- Connection numbers: one server-wide counter that also counts the
@@ -283,38 +368,48 @@
     binds from SSSD and the IPA framework). -#}
 {%- macro bump() -%}
   {%- set idle = now - shared.get('last_new') -%}
-  {%- set c = shared.get('counter') + 1 + (module.rand.number.lognormal(module.math.log(1 + idle * 0.05), 0.6) | int) -%}
+  {%- set c = shared.get('counter') + 1 + (module.random.lognormvariate(module.math.log(1 + idle * 0.05), 0.6) | int) -%}
   {%- do shared.update({'counter': c, 'last_new': now}) -%}
 {%- endmacro -%}
 {%- set cn = namespace(id=0, op=e.op) -%}
 {%- if e.conn == 'new' -%}
   {{- bump() -}}{%- set cn.id = shared.get('counter') -%}
 {%- elif e.conn == 'pool' -%}
-  {%- set slots = pools[e.svc] -%}
-  {%- set s = module.random.randrange(slots | length) -%}
-  {%- if ev != 'AUTHZ_ERROR' and module.rand.chance(0.25) -%}
+  {%- set slots = pools[s.svc] -%}
+  {%- set si = module.random.randrange(slots | length) -%}
+  {%- if ev != 'AUTHZ_ERROR' and module.random.random() < 0.25 -%}
     {{- bump() -}}
-    {%- set cn.op = 1 if app_defs[e.svc][1] else 0 -%}
-    {%- do slots.pop(s) -%}{%- do slots.insert(s, [shared.get('counter'), cn.op]) -%}
+    {%- set cn.op = apps[s.svc].op -%}
+    {%- do slots.pop(si) -%}{%- do slots.insert(si, [shared.get('counter'), cn.op]) -%}
   {%- else -%}
-    {%- set cn.op = slots[s][1] + 1 + (module.rand.number.lognormal(module.math.log(12), 1.0) | int) -%}
-    {%- set keep_id = slots[s][0] -%}{%- do slots.pop(s) -%}{%- do slots.insert(s, [keep_id, cn.op]) -%}
+    {%- set cn.op = slots[si][1] + 1 + (module.random.lognormvariate(module.math.log(12), 1.0) | int) -%}
+    {%- set keep_id = slots[si][0] -%}{%- do slots.pop(si) -%}{%- do slots.insert(si, [keep_id, cn.op]) -%}
   {%- endif -%}
-  {%- set cn.id = slots[s][0] -%}
+  {%- set cn.id = slots[si][0] -%}
 {%- else -%}
-  {%- set c = conns.pop(e.sess, none) -%}
-  {%- if c is none -%}{{ dispatch.drop() }}{%- endif -%}
-  {%- set cn.id = c[0] -%}{%- set cn.op = c[1] + module.rand.weighted_choice([1, 2, 3, 4], [30, 35, 20, 15]) -%}
+  {%- set cn.id = s.conn[0] -%}{%- set cn.op = s.conn[1] + module.rand.weighted_choice([1, 2, 3, 4], [30, 35, 20, 15]) -%}
 {%- endif -%}
-{%- if e.keep is not none and ev == 'BIND_SUCCESS' -%}
-  {%- do conns.update({e.keep: [cn.id, cn.op]}) -%}
+{%- if ev == 'BIND_SUCCESS' -%}{%- do s.update({'conn': [cn.id, cn.op]}) -%}{%- endif -%}
+
+{#- Queue the session's next record, or close it. -#}
+{%- if s.stale is not none -%}
+  {%- set nxt = now + gap(40, 0.5) | int -%}
+  {%- if nxt < s.stale -%}{{- push(nxt, s) -}}{%- else -%}{%- set st.done = true -%}{%- endif -%}
+{%- elif not st.done and s.i + 1 < s.recs | length -%}
+  {{- push(now + s.gaps[s.i], s) -}}
+  {%- do s.update({'i': s.i + 1}) -%}
+{%- else -%}
+  {%- set st.done = true -%}
+{%- endif -%}
+{%- if st.done and s.user -%}
+  {%- set left = busy.get(s.user, 1) - 1 -%}
+  {%- if left > 0 -%}{%- do busy.update({s.user: left}) -%}{%- else -%}{%- do busy.pop(s.user, none) -%}{%- endif -%}
 {%- endif -%}
 
-{%- set ns = module.random.randint(0, 999999999) -%}
-{%- set dt = module.datetime.datetime.fromtimestamp(now, utc) -%}
-{%- set nsd = '%09d' | format(ns) -%}
+{%- set dt = timestamp.astimezone(utc) -%}
+{%- set nsd = ('%06d' | format(dt.microsecond)) ~ ('%03d' | format(module.random.randint(0, 999))) -%}
 {%- set date = '[' ~ dt.strftime('%d/%b/%Y:%H:%M:%S') ~ '.' ~ nsd ~ ' +0000] ' -%}
-{%- set utc_time = now ~ '.' ~ nsd -%}
+{%- set utc_time = sec ~ '.' ~ nsd -%}
 {%- macro js(v) -%}{{ (v | tojson) | replace('/', '\\/') }}{%- endmacro -%}
 {%- if ev == 'TCP_ERROR' -%}
   {%- set raw = '{ "date": ' ~ js(date) ~ ', "utc_time": ' ~ js(utc_time) ~ ', "event": ' ~ js(ev)

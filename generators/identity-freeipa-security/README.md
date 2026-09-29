@@ -4,54 +4,61 @@ Generates the security log that the 389 Directory Server of one FreeIPA server w
 
 ## Event Types
 
-Shares measured on the final default capture (108 h, `anomaly_mode: true`, 9,657 records):
+Shares over four days with the default settings (`anomaly_mode: true`, 33,232 records, about 8,300 a day):
 
 | Native `event` | `msg` | Actor | Share | Category |
 |---|---|---|---:|---|
-| `BIND_SUCCESS` | empty | user (via an application) | 43.11% (4163) | authentication |
-| `BIND_SUCCESS` | empty | service account | 39.75% (3839) | authentication |
-| `BIND_FAILED` | `INVALID_PASSWORD` | user | 6.29% (607) | authentication |
-| `BIND_FAILED` | `INVALID_PASSWORD` | service account | 3.57% (345) | authentication |
-| `BIND_SUCCESS` | `ANONYMOUS_BIND` | anonymous (empty DN) | 2.35% (227) | authentication |
-| `BIND_FAILED` | `ACCOUNT_LOCKED` | disabled user | 2.09% (202) | authentication |
-| `TCP_ERROR` | `Bad Ber Tag or uncleanly closed connection - B1` | client address only | 0.78% (75) | network |
-| `BIND_FAILED` | `NO_SUCH_ENTRY` | mistyped user name | 0.59% (57) | authentication |
-| `AUTHZ_ERROR` | `target_dn=(...)` | service account | 0.51% (49) | iam |
-| `AUTHZ_ERROR` | `target_dn=(...)` | user | 0.45% (43) | iam |
-| `BIND_SUCCESS` | empty | `cn=directory manager` | 0.40% (39) | authentication |
-| `BIND_FAILED` | `INVALID_PASSWORD` | `cn=directory manager` | 0.05% (5) | authentication |
-| `TCP_ERROR` | `Ber peak tag - B3` / `Ber Too Big (nsslapd-maxbersize) - B2` | client address only | 0.06% (6) | network |
+| `BIND_SUCCESS` | empty | user (via an application) | 53.42% | authentication |
+| `BIND_SUCCESS` | empty | service account | 34.43% | authentication |
+| `BIND_FAILED` | `INVALID_PASSWORD` | user | 7.50% | authentication |
+| `BIND_SUCCESS` | `ANONYMOUS_BIND` | anonymous (empty DN) | 2.12% | authentication |
+| `BIND_FAILED` | `NO_SUCH_ENTRY` | mistyped user name | 0.74% | authentication |
+| `AUTHZ_ERROR` | `target_dn=(...)` | user | 0.64% | iam |
+| `BIND_FAILED` | `ACCOUNT_LOCKED` | disabled user | 0.46% | authentication |
+| `TCP_ERROR` | `Bad Ber Tag or uncleanly closed connection - B1` | client address only | 0.24% | network |
+| `BIND_SUCCESS` | empty | `cn=directory manager` | 0.18% | authentication |
+| `AUTHZ_ERROR` | `target_dn=(...)` | service account | 0.13% | iam |
+| `BIND_FAILED` | `INVALID_PASSWORD` | service account | 0.08% | authentication |
+| `BIND_FAILED` | `INVALID_PASSWORD` | `cn=directory manager` | 0.03% | authentication |
+| `TCP_ERROR` | `Ber peak tag - B3` / `Ber Too Big (nsslapd-maxbersize) - B2` | client address only | 0.01% | network |
 
-The security log records simple binds, SASL EXTERNAL binds and their failures, authorization errors (`err=50`) and malformed or uncleanly closed connections. SASL/GSSAPI binds (SSSD clients, the IPA web framework) are not written to it, so the traffic here is the part of a FreeIPA directory that authenticates with passwords: applications that check user passwords by binding as the user, their lookup accounts under `cn=sysaccounts,cn=etc`, administrators using `cn=Directory Manager`, anonymous rootDSE reads, and stray clients. Users, applications, addresses and rates are an assumed mid-size organisation, not measured production data. Every user, application address and user|address pair the chain uses occurs in ordinary background in both modes. No field labels an episode.
+The security log records simple binds, SASL EXTERNAL binds and their failures, authorization errors (`err=50`) and malformed or uncleanly closed connections. SASL/GSSAPI binds (SSSD clients, the IPA web framework) are not written to it, so the traffic here is the part of a FreeIPA directory that authenticates with passwords: applications that check user passwords by binding as the user, their lookup accounts under `cn=sysaccounts,cn=etc`, administrators using `cn=Directory Manager`, anonymous rootDSE reads, and stray clients. Users, applications, addresses and rates are an assumed mid-size organisation, not measured production data. Every user, application address and user|address pair the chain uses occurs in ordinary traffic in both modes. No field labels an episode.
 
-## Background Model
+## Volume and Activity
 
-Each one-second tick emits at most one record: the earliest due one, otherwise nothing. The organisation (44 users, each with 1-4 of six LDAP-authenticating applications and fixed random per-user and per-application weights) comes from a fixed seed; behaviour is random.
+About 8,300 records a day. Two populations make them, with UTC hours:
 
-- **User logins**: one merged Poisson stream (0.011 per second, scaled by an office-hours factor: 07:00-17:00 UTC 1.80, 17:00-21:00 0.79, night 0.28). A login picks a user by weight and one of that user's applications by weight; the application's address is `client_ip`. Each attempt is a new connection, op 1 behind StartTLS (GitLab, Grafana, VPN, portal) or op 0. 7% of logins start with 1-6 wrong passwords (weights 52/22/11/7/5/3, gaps log-normal, median 12 s); after at most four the user usually gets in (90%), after five or six the user gives up. 1.2% start with a mistyped user name (`NO_SUCH_ENTRY`). 7% of self-service portal logins are followed on the same connection by a denied modification (`AUTHZ_ERROR`, own entry or a group).
-- **Lookup accounts**: every application re-binds its `uid=<app>,cn=sysaccounts,cn=etc` account at random (Poisson, mean 10 min, any hour) on one of 2-4 pooled connections, whose op numbers grow; a quarter of re-binds open a new connection. The provisioning account occasionally hits `AUTHZ_ERROR` on a user entry.
-- **Stale service password** (about one incident every two days): one application keeps reconnecting with an old password every ~40 s for a log-normal duration (median 25 min); its pooled re-binds fail as well until the incident ends.
-- **Directory Manager**: about seven administrator sessions a day from three admin hosts, 20% starting with 1-4 typos, then 1-4 binds minutes apart; `root_dn` is `true` on every attempt, successful or not, as in `bind.c`.
-- **Disabled accounts**: two former users whose devices still try (`ACCOUNT_LOCKED`, bursts of 1-4).
-- **Anonymous binds** (`BIND_SUCCESS` / `ANONYMOUS_BIND`, empty DN) and **TCP errors** (B1, rarely B3 and B2) from monitoring, applications and workstations.
+| Population | 00-07 | 07-17 | 17-21 | 21-24 |
+|---|---:|---:|---:|---:|
+| People (user logins, administrators, anonymous binds), records/s | 0.017 | 0.108 | 0.047 | 0.017 |
+| Automated clients (lookup accounts, disabled devices, stray connections), records/s | 0.036 | 0.036 | 0.036 | 0.036 |
+
+Daily volume varies by about 3%. The organisation (200 users in `samples/users.csv`, each with 1-4 of the six LDAP-authenticating applications in `samples/applications.csv`, with fixed per-user and per-application weights) is the same in every run; behaviour is random.
+
+- **User logins** (about 4,400 a day, 22 per user on average): a login picks a user by weight and one of that user's applications by weight; the application's address is `client_ip`. Each attempt is a new connection, op 1 behind StartTLS (GitLab, Grafana, VPN, portal) or op 0. 7% of logins start with 1-6 wrong passwords (weights 52/22/11/7/5/3, retyped after a median of about 20 s); after at most four the user usually gets in (90%), after five or six the user gives up. FreeIPA's default lockout applies to every user account: six failures, each within a minute of the previous one and across all applications, lock the account for 10 minutes, and a locked account produces no records until the lock expires. A user does not start a new login while another one is in progress, while locked, or right after five quick failures; failures still within a minute of earlier ones count towards the six, so such a login stops at the lockout and gives up once the quick failures reach five. About 7 accounts a day are locked this way. 1.2% start with a mistyped user name (`NO_SUCH_ENTRY`). 7% of self-service portal logins are followed on the same connection by a denied modification (`AUTHZ_ERROR`, own entry or a group).
+- **Lookup accounts**: every application re-binds its `uid=<app>,cn=sysaccounts,cn=etc` account about every three minutes, any hour, on one of 2-4 pooled connections whose op numbers grow; a quarter of re-binds open a new connection. The provisioning account occasionally hits `AUTHZ_ERROR` on a user entry (about 9 a day).
+- **Stale service password** (about one incident every two days): one application keeps reconnecting with an old password every ~40 s for a median 25 minutes; its pooled re-binds fail as well until the incident ends. Service accounts are not Kerberos principals, so the lockout does not apply to them and the failures go on for the whole incident.
+- **Directory Manager**: about ten administrator sessions a day from the three admin hosts in `samples/admin_hosts.csv`, mostly in office hours, 20% starting with 1-4 typos, then 1-4 binds minutes apart; `root_dn` is `true` on every attempt, successful or not, as in `bind.c`.
+- **Disabled accounts**: the two former users in `samples/disabled_accounts.csv` whose devices still try (`ACCOUNT_LOCKED`, about 20 bursts of 1-4 a day). These failures count towards the lockout as well, so a device never logs more than six of them within a minute of each other.
+- **Anonymous binds** (`BIND_SUCCESS` / `ANONYMOUS_BIND`, empty DN, about 160 a day) and **TCP errors** (B1, rarely B3 and B2, about 27 a day) from monitoring, applications and workstations.
 
 `conn_id` is one server-wide counter that grows between logged connections by the number of unlogged (GSSAPI) connections, so its step varies.
 
-Over 108 h an `anomaly_mode: false` capture holds 22-27 windows in which one DN failed five times from one address within 10 minutes without a success, 19-39 logins that succeeded after exactly four wrong passwords, and 326-449 wrong-password pairs by the same DN and address within 60 s.
+Ordinary traffic holds, per day, about 20-40 windows in which one DN failed five times from one address within 10 minutes without a success (about 29 on average), 16-31 logins that succeeded after exactly four wrong passwords (about 24), 260-450 wrong-password pairs by the same DN and address within 60 s (about 330), and 1-15 lockouts (about 7).
 
 ## Anomaly Chain
 
-`anomaly_mode` defaults to `true`. With `false` the generator emits the background only and the complete chain never occurs.
+`anomaly_mode` defaults to `true`. With `false` the generator emits ordinary traffic only and the complete chain never occurs.
 
 Sequence, all for one user U through one application A that U normally uses (so `client_ip` is A's address): five `BIND_FAILED` / `INVALID_PASSWORD` binds for U's DN, each on a new connection, then `BIND_SUCCESS` for the same DN, all within 10 minutes: password guessing through an application that stops one attempt short of FreeIPA's default lockout (six failures), and then gets in.
 
 Linking fields: `dn` and `client_ip` in all six records; `conn_id` differs per attempt and grows; `op_id` is the application's usual 0 or 1; `root_dn` is `false`.
 
-Recurrence: an episode becomes due every `anomaly_interval_hours` of source time (default 24, minimum 6), first one interval after generation starts. At the due time the start is drawn within the following min(interval / 4, 6 h) - 6 h at the default - from the background load curve (clock-hour slots weighted by the office-hours factor and their length, uniform inside a slot), so episodes lean towards the hours of ordinary logins and start with a random delay after they are due; the gap between starts is one interval plus 0 to min(interval / 4, 6 h). The next due time counts from the actual start, so a late episode never causes catch-up. In the final captures episodes started at 05:53, 11:40 and 14:02 UTC at the default interval (gaps 29.8 and 26.4 h) and twelve times at 8 h (gaps 8.0-10.0 h); episodes spanned 39-158 s.
+Recurrence: the first episode starts within min(`anomaly_interval_hours`, 24 h) of the start of generation, at an hour drawn from the people activity curve above. Every later episode is due one interval after the previous start and starts within a window of min(interval / 4, 6 h) centred on that due time, favouring busy hours strongly (squared activity plus a small floor), so start hours do not drift and a late episode never causes catch-up. At the default interval (24 h, window 6 h) about four in five episodes start in office hours (07-17 UTC), the rest in the evening or at night; an episode that starts late tends to be followed by others near the same hour. Consecutive episodes are about 21-27 h apart; at 8 h, about 7.4-9 h apart, including night starts. An episode spans about 1-4 minutes.
 
-Variation: U differs from the previous episode's user and is picked by the same per-user weights as ordinary logins, and A by U's own application weights; a user with records still queued sits that moment out, so an episode never merges with a real login. Gaps follow the ordinary retry law; a portal episode can be followed by a denied modification like any portal login. A bind changes no directory state, so there is nothing to restore.
+Variation: U differs from the previous episode's user and is picked by the same per-user weights as ordinary logins, and A by U's own application weights; a user in the middle of a login, with a recent wrong password at A, or with a wrong password anywhere in the last minute sits that moment out, so an episode never merges with a real login and its five failures never reach the lockout. Pauses between attempts follow the ordinary retype law; a portal episode can be followed by a denied modification like any portal login. U's own logins go on as usual during and after the episode. A bind changes no directory state, so there is nothing to restore.
 
-Detection idea: five or more wrong passwords for one DN from one client within 10 minutes followed by a success (successful brute force under the lockout threshold). Each fragment occurs in background: repeated failures by the same DN and address within a minute, successes after one to four failures, five or six failures that end without success, and stale service passwords that fail for half an hour. Only the complete run is kept out of the background: an ordinary success for a DN and address with five wrong passwords in the preceding 10 minutes is not written.
+Detection idea: five or more wrong passwords for one DN from one client within 10 minutes followed by a success (successful brute force under the lockout threshold). Each fragment occurs in ordinary traffic: repeated failures by the same DN and address within a minute, successes after one to four failures, five or six failures that end without success, and stale service passwords that fail for half an hour. Only the complete run is kept out of ordinary traffic: a login or re-bind that already had five wrong passwords for its DN and address in the preceding 10 minutes fails once more instead of succeeding (about three user logins and two lookup-account re-binds a day).
 
 ## Parameters
 
@@ -86,31 +93,38 @@ A parser for the native log needs `event.original`, one JSON object per line.
 
 ## Usage
 
-Live mode:
+Live generation at the configured rate, until stopped:
 
 ```bash
 eventum generate --path generators/identity-freeipa-security/generator.yml --id freeipa --live-mode true
 ```
 
-Batch mode needs a bounded input: add `start` and `end` to the `cron` input, then run:
+Batch generation: set `start` and `end` of the `oscillator` in every `patterns/*.yml` file to the same range, with `start` at 00:00 UTC so the hour curve stays in place (for example `start: "2026-10-01T00:00:00Z"` and `end: "2026-10-08T00:00:00Z"`), then run:
 
 ```bash
-eventum generate --path generators/identity-freeipa-security/generator.yml --id freeipa --live-mode false
+eventum generate --path generators/identity-freeipa-security/generator.yml --id freeipa --live-mode false --keep-order true
 ```
+
+The people hour curve is the sum of `patterns/people-base.yml`, `people-day.yml` and `people-office.yml`, each adding a flat rate over one UTC hour range; `patterns/service.yml` is the flat automated rate. To change the volume, scale the `ratio` of every pattern file by the same factor. Episode start hours follow the shipped curve even if you reshape the pattern files.
+
+Performance: about 1,400 records/s on one core (14 days, 116,000 records, in 82 s).
 
 ## Limitations
 
 - The record layout follows the 389-ds-base source (main branch, 2026) and two raw lines in the 389 DS design pages; no complete production capture from a FreeIPA server was available. Older 389-ds-base 2.x releases may differ in detail (for example `utc_time` as a whole number in the 2022 design example).
-- FreeIPA's own lockout (`ipa-lockout`, six failures by default) rejects binds before 389 DS checks the password; whether those rejections reach the security log is not documented, so the background stops at six failures and lockout rejections are not modelled. `ACCOUNT_LOCKED` stands for accounts disabled through `nsAccountLock`.
+- After six quick failures (each within a minute of the previous one) a user account is locked for 10 minutes and produces no records: the directory refuses its binds before checking them and writes nothing to this log. Only the default global password policy is modelled (no per-group policies, no administrator unlocks), and Kerberos failures, which count towards the same lockout on a real server, are not part of this log. `ACCOUNT_LOCKED` stands for accounts disabled through `nsAccountLock`, not for the lockout.
 - Only `SIMPLE` binds are generated. `SIMPLE/MFA` (OTP), `TLSCLIENTAUTH`, `LDAPI`, `CERT_MAP_FAILED` and `HAPROXY_SUCCESS` exist in the source but are not modelled.
-- Clocks are UTC (`+0000`); one server; IPv4 only; one record per second at most. Rates, users and applications are training assumptions.
+- Retries within one login are a little slower than typical retyping: wrong passwords of one login follow each other after a median of about 20 s in office hours and 28 s at night.
+- In ordinary traffic a DN and address never succeed after five wrong passwords within 10 minutes; a real directory also sees forgetful users do exactly that, so a detector for the chain has no false positives here.
+- With `anomaly_mode: true` each episode adds its own records, so counts of the chain parts (runs of five wrong passwords by one DN and address, successes after wrong passwords) are about one per episode higher than in ordinary traffic.
+- Clocks are UTC (`+0000`); one server; IPv4 only; the hour curve repeats every day, with no weekday cycle. Rates, users and applications are training assumptions.
 
 ## Sample Output
 
-The success that completes the first episode, copied byte for byte from the final default capture (line 2439; the five failures are lines 2433 and 2435-2438, each on a new `conn_id`):
+The success that completes an episode; the five wrong passwords for the same DN and address came at 15:44:54-15:46:03, each on a new `conn_id`:
 
 ```json
-{"@timestamp": "2026-09-27T05:53:53.769Z", "ecs": {"version": "8.17.0"}, "event": {"action": "bind_success", "category": ["authentication"], "dataset": "freeipa.security", "kind": "event", "module": "freeipa", "original": "{ \"date\": \"[27\\/Sep\\/2026:05:53:53.769065469 +0000] \", \"utc_time\": \"1790488433.769065469\", \"event\": \"BIND_SUCCESS\", \"dn\": \"uid=liam.taylor,cn=users,cn=accounts,dc=example,dc=test\", \"bind_method\": \"SIMPLE\", \"root_dn\": false, \"client_ip\": \"10.20.3.15\", \"server_ip\": \"10.20.0.10\", \"ldap_version\": 3, \"conn_id\": 364118, \"op_id\": 0, \"msg\": \"\" }", "outcome": "success", "type": ["start"]}, "freeipa": {"security": {"bind_method": "SIMPLE", "client_ip": "10.20.3.15", "conn_id": 364118, "dn": "uid=liam.taylor,cn=users,cn=accounts,dc=example,dc=test", "event": "BIND_SUCCESS", "ldap_version": 3, "msg": "", "op_id": 0, "root_dn": false, "server_ip": "10.20.0.10"}}, "host": {"ip": ["10.20.0.10"], "name": "ipa-01.example.test"}, "log": {"file": {"path": "/var/log/dirsrv/slapd-EXAMPLE-TEST/security"}}, "related": {"ip": ["10.20.3.15", "10.20.0.10"], "user": ["liam.taylor"]}, "source": {"ip": "10.20.3.15"}, "user": {"name": "liam.taylor"}}
+{"@timestamp": "2026-10-02T15:46:14.148Z", "ecs": {"version": "8.17.0"}, "event": {"action": "bind_success", "category": ["authentication"], "dataset": "freeipa.security", "kind": "event", "module": "freeipa", "original": "{ \"date\": \"[02\\/Oct\\/2026:15:46:14.148015846 +0000] \", \"utc_time\": \"1790955974.148015846\", \"event\": \"BIND_SUCCESS\", \"dn\": \"uid=thomas.scott,cn=users,cn=accounts,dc=example,dc=test\", \"bind_method\": \"SIMPLE\", \"root_dn\": false, \"client_ip\": \"10.20.3.13\", \"server_ip\": \"10.20.0.10\", \"ldap_version\": 3, \"conn_id\": 369251, \"op_id\": 1, \"msg\": \"\" }", "outcome": "success", "type": ["start"]}, "freeipa": {"security": {"bind_method": "SIMPLE", "client_ip": "10.20.3.13", "conn_id": 369251, "dn": "uid=thomas.scott,cn=users,cn=accounts,dc=example,dc=test", "event": "BIND_SUCCESS", "ldap_version": 3, "msg": "", "op_id": 1, "root_dn": false, "server_ip": "10.20.0.10"}}, "host": {"ip": ["10.20.0.10"], "name": "ipa-01.example.test"}, "log": {"file": {"path": "/var/log/dirsrv/slapd-EXAMPLE-TEST/security"}}, "related": {"ip": ["10.20.3.13", "10.20.0.10"], "user": ["thomas.scott"]}, "source": {"ip": "10.20.3.13"}, "user": {"name": "thomas.scott"}}
 ```
 
 ## References
