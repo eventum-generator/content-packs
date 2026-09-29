@@ -27,7 +27,7 @@ Sequence, one episode (a checkpoint stuck behind a locked differencing disk):
 1. `18014` and `18012` for one VM: a checkpoint is cancelled and fails.
 2. `19100` for the same VM: the background disk merge fails with 0x80070020 (file in use).
 3. The backup job retries; the retry fails (`18012`, sometimes preceded by `18014`) and the merge fails again (`19100`).
-4. A third retry fails the same way (`18012`, `19100`). In 30% of episodes a fourth failed attempt without a merge failure follows; after that the series ends as a background series would.
+4. The third attempt fails the same way (`18012`, `19100`). In 30% of episodes a fourth failed attempt without a merge failure follows; after that the series ends as a background series would.
 
 Linking fields: `winlog.user_data.VmId` (also `VmName`, `host.name`). Retry delays and within-attempt delays follow the background distributions. The chain spans a few minutes to over 2 hours, about 15 minutes in the median.
 
