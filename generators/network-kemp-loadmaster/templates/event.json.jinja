@@ -1,10 +1,12 @@
 {#- One LoadMaster ESP virtual service publishing a webmail portal.
-    Every one-second tick emits at most one record: the earliest due
-    record of any open client session, otherwise nothing. Users start
-    sessions as independent random processes; the anomaly episode is
-    one extra session built by the same code. -#}
+    Every input timestamp emits one record: the earliest due record
+    of an open client session or anonymous client, otherwise the
+    first record of a new session of a free user drawn by activity
+    weight. The anomaly episode is one session built by the same
+    code. -#}
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
+{%- set heapq = module.heapq -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
 {%- set ecp_paths = ['/ecp/', '/ecp/PersonalSettings/HomePage.aspx',
     '/ecp/Organize/AutomaticReplies.slab', '/ecp/UsersGroups/Mailboxes.slab',
@@ -19,13 +21,10 @@
     'Mozilla/5.0 (iPhone; CPU iPhone OS 17_6 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.6 Mobile/15E148 Safari/604.1'] -%}
 {%- set probe_agents = ['curl/8.5.0', 'python-requests/2.31.0',
     'Microsoft Office/16.0 (Windows NT 10.0; Microsoft Outlook 16.0.17928; Pro)'] -%}
-{%- set lmax = 1.6 -%}
-{%- set hour = timestamp.astimezone(utc).hour -%}
-{#- Office-hours intensity, mean over a day about 1.0. -#}
-{%- macro load_at(h) -%}
-{{- 1.6 if 7 <= h < 17 else (0.9 if 17 <= h < 21 else 0.33) -}}
-{%- endmacro -%}
-{%- set load = load_at(hour) | float -%}
+{#- Hourly record volume of patterns/ (UTC hours), mean 1.0. -#}
+{%- set loads = [0.43, 0.43, 0.46, 0.54, 0.68, 0.87, 1.1, 1.34, 1.56, 1.74,
+    1.85, 1.87, 1.81, 1.68, 1.49, 1.27, 1.04, 0.84, 0.67, 0.55, 0.47, 0.44,
+    0.43, 0.43] -%}
 {#- Chain window of the detector (first denial to /ecp/ request),
     shared by the background guard. -#}
 {%- set chain_s = 1800 -%}
@@ -38,7 +37,7 @@
     {%- set lo = [hh * 3600, a] | max -%}
     {%- set hi = [hh * 3600 + 3600, b] | min -%}
     {%- if hi > lo -%}
-      {%- set c = load_at(hh % 24) | float -%}
+      {%- set c = loads[hh % 24] -%}
       {%- do slots.append([lo, hi]) -%}
       {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
     {%- endif -%}
@@ -54,72 +53,81 @@
 {{- [[module.rand.number.lognormal(module.math.log(median), sigma) | round | int, 1] | max, cap] | min -}}
 {%- endmacro -%}
 
+{#- Every user carries a fixed activity weight (bounded log-normal,
+    seeded by the user name, so it is the same in every run); the more
+    active half is the pool of episode users. -#}
 {%- if not shared.get('initialized', false) -%}
   {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {%- set users = [] -%}
+  {%- set cum = [] -%}
+  {%- set tier = [] -%}
+  {%- set tier_cum = [] -%}
+  {%- set acc = namespace(all=0.0, tier=0.0) -%}
   {%- for i in range(samples.users | length) -%}
     {%- set row = samples.users[i] -%}
-    {%- do users.append({'name': row.name, 'home': row.home_ip,
-        'ua': module.rand.choice(user_agents),
-        'next': now + module.rand.number.exponential(params.sessions_per_user_day * lmax / 86400) | int}) -%}
+    {%- set w = [[module.random.Random(row.name).lognormvariate(0, 0.45), 0.5] | max, 2.2] | min -%}
+    {%- set u = {'name': row.name, 'home': row.home_ip,
+        'ua': module.rand.choice(user_agents), 'w': w} -%}
+    {%- do users.append(u) -%}
+    {%- set acc.all = acc.all + w -%}
+    {%- do cum.append(acc.all) -%}
+    {%- if w >= 1.0 -%}
+      {%- do tier.append(u) -%}
+      {%- set acc.tier = acc.tier + w -%}
+      {%- do tier_cum.append(acc.tier) -%}
+    {%- endif -%}
   {%- endfor -%}
-  {%- set amin = users | map(attribute='next') | min -%}
-  {%- do shared.update({'initialized': true, 'users': users, 'queue': [],
-      'q_min': none, 'a_min': amin, 'busy': {}, 'partial': {}, 'logon_at': {}, 'seq': 0,
+  {%- do shared.update({'initialized': true, 'users': users, 'cum': cum,
+      'tier': tier, 'tier_cum': tier_cum, 'heap': [], 'busy': {},
+      'den': {}, 'lon': {}, 'logon_at': {}, 'seq': 0, 'emit': 0,
       'probe_next': now + module.rand.number.exponential(params.probes_per_day / 86400) | int,
-      'next_due': none,
       'start_at': pick_time(now, now + ([interval, 24] | min * 3600) | int,
           false) | int,
       'last_chain_user': none}) -%}
 {%- endif -%}
-{%- set queue = shared.get('queue') -%}
+{%- set heap = shared.get('heap') -%}
 {%- set busy = shared.get('busy') -%}
 
 {%- macro add(rec) -%}
   {%- do shared.set('seq', shared.get('seq') + 1) -%}
-  {%- do rec.update({'n': shared.get('seq')}) -%}
-  {%- do queue.append(rec) -%}
-  {%- if shared.get('q_min') is none or rec.due < shared.get('q_min') -%}
-    {%- do shared.set('q_min', rec.due) -%}
-  {%- endif -%}
+  {%- do heapq.heappush(heap, (rec.due, shared.get('seq'), rec)) -%}
 {%- endmacro -%}
 
-{#- A complete client session planned at its start. `fails` and
-    `ecp` are forced only for the episode. -#}
+{#- A complete client session planned at its start. The episode
+    session has three to five denials, logs on from the user's office
+    address and opens one /ecp/ page among its first three requests
+    (`chain`); its early gaps are capped so that request stays inside
+    the chain window. -#}
 {%- macro plan(u, t0, ep=false, fails=none) -%}
   {%- set s = namespace(t=t0, port=module.rand.number.integer(49152, 65535),
-      rs=module.rand.choice(params.real_servers), last=none) -%}
-  {%- set ip = u.home if module.rand.chance(0.7) else external_ip() -%}
-  {%- set base = {'u': u.name, 'ip': ip, 'ua': u.ua, 'ep': ep} -%}
+      rs=module.rand.choice(params.real_servers)) -%}
+  {%- set ip = u.home if ep or module.rand.chance(0.7) else external_ip() -%}
+  {%- set base = {'u': u.name, 'ip': ip, 'ua': u.ua} -%}
   {%- do busy.update({u.name: true}) -%}
   {%- set recs = [] -%}
   {%- do recs.append(dict(base, c=2, due=s.t, port=s.port)) -%}
   {%- set s.t = s.t + module.rand.number.integer(0, 1) -%}
   {%- do recs.append(dict(base, c=15, due=s.t, port=s.port, method='GET', path='/owa/')) -%}
   {%- set k = fails if fails is not none else module.rand.weighted_choice(
-      [0, 1, 2, 3, 4, 5], [79, 10, 5, 3, 2, 1]) -%}
+      [0, 1, 2, 3, 4, 5], [96, 2.4, 0.8, 0.4, 0.25, 0.15]) -%}
   {%- for i in range(k) -%}
-    {%- set s.t = s.t + gap(9, 0.75, 240) | int -%}
+    {%- set s.t = s.t + gap(9, 0.75, 60 if ep else 240) | int -%}
     {%- do recs.append(dict(base, c=9, due=s.t)) -%}
   {%- endfor -%}
   {%- if not ep and k > 0 and module.rand.chance(0.15) -%}
     {#- The user gives up without logging on. -#}
   {%- else -%}
-    {%- set s.t = s.t + gap(8, 0.7, 180) | int -%}
+    {%- set s.t = s.t + gap(8, 0.7, 60 if ep else 180) | int -%}
     {%- do recs.append(dict(base, c=100, due=s.t)) -%}
     {%- set s.t = s.t + module.rand.number.integer(0, 1) -%}
     {%- do recs.append(dict(base, c=8, due=s.t)) -%}
     {%- set s.t = s.t + module.rand.number.integer(0, 1) -%}
     {%- do recs.append(dict(base, c=4, due=s.t, port=s.port, rs=s.rs)) -%}
     {%- set n = [[module.rand.number.lognormal(module.math.log(7), 0.9) | int, 1] | max, 80] | min -%}
-    {%- if ep -%}{%- set n = [n, 3] | max -%}{%- endif -%}
-    {%- set forced = [] -%}
-    {%- if ep -%}
-      {%- set m = module.rand.weighted_choice([1, 2, 3], [45, 35, 20]) -%}
-      {%- set forced = module.random.sample(range(1, [n, 6] | min), [m, ([n, 6] | min) - 1] | min) -%}
-    {%- endif -%}
+    {%- set forced = module.rand.weighted_choice([0, 1, 2], [45, 35, 20]) if ep else -1 -%}
+    {%- set n = [n, forced + 1] | max -%}
     {%- for j in range(n) -%}
-      {%- set s.t = s.t + gap(18, 1.3, 1500) | int -%}
+      {%- set s.t = s.t + gap(18, 1.3, 120 if j <= forced else 1500) | int -%}
       {%- if module.rand.chance(0.12) -%}
         {%- set s.port = module.rand.number.integer(49152, 65535) -%}
         {%- do recs.append(dict(base, c=2, due=s.t, port=s.port)) -%}
@@ -130,13 +138,14 @@
         {%- endif -%}
         {%- do recs.append(dict(base, c=4, due=s.t, port=s.port, rs=s.rs)) -%}
       {%- endif -%}
-      {%- if j in forced or module.rand.chance(0.05) -%}
+      {%- if j == forced or module.rand.chance(0.05) -%}
         {%- set path = module.rand.choice(ecp_paths) -%}
       {%- else -%}
         {%- set path = module.rand.weighted_choice(owa_paths, owa_weights) -%}
       {%- endif -%}
       {%- set method = 'POST' if path in ['/owa/service.svc', '/owa/ev.owa2'] else 'GET' -%}
-      {%- do recs.append(dict(base, c=14, due=s.t, port=s.port, path=path, method=method)) -%}
+      {%- do recs.append(dict(base, c=14, due=s.t, port=s.port, path=path, method=method,
+          chain=(j == forced))) -%}
     {%- endfor -%}
     {%- if module.rand.chance(0.55) -%}
       {%- set s.t = s.t + gap(40, 1.0, 1200) | int -%}
@@ -152,114 +161,103 @@
   {%- for r in recs -%}{{- add(r) -}}{%- endfor -%}
 {%- endmacro -%}
 
-{#- 1. User session arrivals (thinned Poisson process per user). -#}
-{%- if now >= shared.get('a_min') -%}
-  {%- set users = shared.get('users') -%}
-  {%- for u in users -%}
-    {%- if now >= u.next -%}
-      {%- if not busy.get(u.name, false) and module.rand.chance(load / lmax) -%}
-        {{- plan(u, now) -}}
-      {%- endif -%}
-      {%- do u.update({'next': now + [module.rand.number.exponential(params.sessions_per_user_day * lmax / 86400) | int, 1] | max}) -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- do shared.set('a_min', users | map(attribute='next') | min) -%}
-{%- endif -%}
-
-{#- 2. Anonymous clients: TLS handshakes that time out or send one
+{#- Anonymous client: a TLS handshake that times out or sends one
     unauthenticated request. -#}
-{%- if now >= shared.get('probe_next') -%}
-  {%- set pip = external_ip() -%}
-  {%- set pport = module.rand.number.integer(1024, 65535) -%}
-  {%- set pbase = {'u': none, 'ip': pip, 'ua': module.rand.choice(probe_agents), 'ep': false, 'port': pport} -%}
-  {{- add(dict(pbase, c=2, due=now)) -}}
+{%- macro probe(t0) -%}
+  {%- set pbase = {'u': none, 'ip': external_ip(), 'ua': module.rand.choice(probe_agents),
+      'port': module.rand.number.integer(1024, 65535)} -%}
+  {{- add(dict(pbase, c=2, due=t0)) -}}
   {%- if module.rand.chance(0.35) -%}
-    {{- add(dict(pbase, c=3, due=now + gap(25, 0.6, 300) | int)) -}}
+    {{- add(dict(pbase, c=3, due=t0 + gap(25, 0.6, 300) | int)) -}}
   {%- else -%}
-    {{- add(dict(pbase, c=15, due=now + module.rand.number.integer(0, 2), method='GET',
+    {{- add(dict(pbase, c=15, due=t0 + module.rand.number.integer(0, 2), method='GET',
         path=module.rand.weighted_choice(['/', '/owa/', '/autodiscover/autodiscover.xml', '/ecp/'], [30, 35, 25, 10]))) -}}
   {%- endif -%}
-  {%- do shared.set('probe_next', now + [module.rand.number.exponential(params.probes_per_day / 86400) | int, 1] | max) -%}
-{%- endif -%}
+{%- endmacro -%}
 
-{#- 3. Episode: the first starts within min(interval, 24 h), its time
+{#- 1. Episode: the first starts within min(interval, 24 h), its time
     drawn from the load curve; each later one in a window of
     min(interval / 4, 6 h) centred on its due time (previous start
-    plus the interval), weighted by the squared load curve. A
-    different, idle user each time. -#}
-{%- if params.anomaly_mode -%}
-  {%- if now >= shared.get('start_at') -%}
-    {%- set free = [] -%}
-    {%- for u in shared.get('users') -%}
-      {%- if not busy.get(u.name, false) and u.name != shared.get('last_chain_user') -%}
-        {%- do free.append(u) -%}
-      {%- endif -%}
-    {%- endfor -%}
-    {%- if free -%}
-      {%- set cu = module.rand.choice(free) -%}
-      {{- plan(cu, now, true, module.rand.weighted_choice([3, 4, 5], [50, 30, 20])) -}}
-      {%- set due = now + (interval * 3600) | int -%}
-      {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
-      {%- do shared.update({'last_chain_user': cu.name, 'next_due': due,
-          'start_at': pick_time(due - half, due + half, true) | int}) -%}
+    plus the interval), weighted by the squared load curve. A free
+    user of the active half, never the previous episode's user. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {%- set tier = shared.get('tier') -%}
+  {%- set tier_cum = shared.get('tier_cum') -%}
+  {%- set pk = namespace(u=none) -%}
+  {%- for i in range(20) -%}
+    {%- set c = tier[module.bisect.bisect_right(tier_cum, module.random.random() * tier_cum[-1])] -%}
+    {%- if not busy.get(c.name, false) and c.name != shared.get('last_chain_user') -%}
+      {%- set pk.u = c -%}
+      {%- break -%}
     {%- endif -%}
+  {%- endfor -%}
+  {%- if pk.u -%}
+    {{- plan(pk.u, now, true, module.rand.weighted_choice([3, 4, 5], [50, 30, 20])) -}}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+    {%- do shared.update({'last_chain_user': pk.u.name,
+        'start_at': pick_time(due - half, due + half, true) | int}) -%}
   {%- endif -%}
 {%- endif -%}
 
-{#- 4. Emit the earliest due record, or nothing. -#}
-{%- if shared.get('q_min') is none or now < shared.get('q_min') -%}
-  {{- dispatch.drop() -}}
+{#- 2. Anonymous clients arrive at a flat rate. -#}
+{%- if now >= shared.get('probe_next') -%}
+  {%- set pt = shared.get('probe_next') -%}
+  {{- probe(pt) -}}
+  {%- do shared.set('probe_next', pt + [module.rand.number.exponential(params.probes_per_day / 86400) | int, 1] | max) -%}
 {%- endif -%}
-{%- set best = namespace(i=0) -%}
-{%- for r in queue -%}
-  {%- if r.due < queue[best.i].due or (r.due == queue[best.i].due and r.n < queue[best.i].n) -%}
-    {%- set best.i = loop.index0 -%}
+
+{#- 3. Nothing due: a free user, drawn by activity weight, starts a
+    session. -#}
+{%- if not heap or heap[0][0] > now -%}
+  {%- set users = shared.get('users') -%}
+  {%- set cum = shared.get('cum') -%}
+  {%- set pk = namespace(u=none) -%}
+  {%- for i in range(20) -%}
+    {%- set c = users[module.bisect.bisect_right(cum, module.random.random() * cum[-1])] -%}
+    {%- if not busy.get(c.name, false) -%}
+      {%- set pk.u = c -%}
+      {%- break -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if pk.u -%}
+    {{- plan(pk.u, now) -}}
+  {%- else -%}
+    {{- probe(now) -}}
   {%- endif -%}
-{%- endfor -%}
-{%- set r = queue.pop(best.i) -%}
-{%- do shared.set('q_min', (queue | map(attribute='due') | min) if queue else none) -%}
+{%- endif -%}
+
+{#- 4. Emit the earliest due record. -#}
+{%- set r = heapq.heappop(heap)[2] -%}
+{%- do shared.set('emit', shared.get('emit') + 1) -%}
+{%- set emit_n = shared.get('emit') -%}
 {%- if r.get('last') -%}{%- do busy.update({r.u: false}) -%}{%- endif -%}
 {%- set path = r.get('path') -%}
-{%- if r.c == 8 -%}
-  {%- do shared.get('logon_at').update({r.u: now}) -%}
-{%- endif -%}
-{#- Per-user replica of the chain detector: partial matches
-    [next step, first denial time, address]. Steps: denial, denial,
-    denial, logon, /ecp/ request, one address, the first denial at
-    most chain_s before the current record; completion starts over. -#}
-{%- if r.u and (r.c in [8, 9] or (r.c == 14 and path in ecp_paths)) -%}
-  {%- set pm = shared.get('partial') -%}
-  {%- set parts = pm.get(r.u, []) | selectattr('1', 'ge', now - chain_s) | list -%}
-  {%- set st = namespace(done=false, new=[]) -%}
-  {%- if r.c == 14 -%}
-    {%- set ready = parts | selectattr('0', 'equalto', 4)
-        | selectattr('2', 'equalto', r.ip) | list -%}
-    {%- if ready and not r.ep -%}
-      {#- Guard on the final chain step: an ordinary request that would
-          complete the chain opens a mailbox page instead. -#}
+{#- Per-user replica of the chain detector over emitted records: a
+    request for /ecp/ completes a chain when, from its address, three
+    denials (the first at most chain_s earlier) and then a logon came
+    before it. Completion does not reset the history. Only the
+    episode's own request may complete; any other becomes a request
+    for a mailbox page at the same time. -#}
+{%- if r.u -%}
+  {%- if r.c == 9 -%}
+    {%- set den = shared.get('den') -%}
+    {%- set lst = den.get(r.u, []) | selectattr('0', 'ge', now - chain_s) | list -%}
+    {%- do lst.append((now, emit_n, r.ip)) -%}
+    {%- do den.update({r.u: lst[-16:]}) -%}
+  {%- elif r.c == 8 -%}
+    {%- set lon = shared.get('lon') -%}
+    {%- do lon.update({r.u: (lon.get(r.u, []) + [(emit_n, r.ip)])[-4:]}) -%}
+    {%- do shared.get('logon_at').update({r.u: now}) -%}
+  {%- elif r.c == 14 and path in ecp_paths and not r.get('chain') -%}
+    {%- set dd = shared.get('den').get(r.u, []) | selectattr('2', 'equalto', r.ip)
+        | selectattr('0', 'ge', now - chain_s) | list -%}
+    {%- if dd | length >= 3 and shared.get('lon').get(r.u, [])
+        | selectattr('1', 'equalto', r.ip) | selectattr('0', 'gt', dd[2][1]) | list -%}
       {%- set path = module.rand.weighted_choice(owa_paths, owa_weights) -%}
-      {%- do r.update({'method': 'POST' if path in ['/owa/service.svc', '/owa/ev.owa2'] else 'GET'}) -%}
-      {%- set st.new = parts -%}
-    {%- elif ready -%}
-      {%- set st.done = true -%}
-    {%- else -%}
-      {%- set st.new = parts -%}
+      {%- do r.update({'path': path,
+          'method': 'POST' if path in ['/owa/service.svc', '/owa/ev.owa2'] else 'GET'}) -%}
     {%- endif -%}
-  {%- else -%}
-    {%- for p in parts -%}
-      {%- if p[2] == r.ip and ((r.c == 9 and p[0] in [1, 2])
-          or (r.c == 8 and p[0] == 3)) -%}
-        {%- do st.new.append([p[0] + 1, p[1], p[2]]) -%}
-      {%- else -%}
-        {%- do st.new.append(p) -%}
-      {%- endif -%}
-    {%- endfor -%}
-    {%- if r.c == 9 -%}{%- do st.new.append([1, now, r.ip]) -%}{%- endif -%}
-  {%- endif -%}
-  {%- if st.done or not st.new -%}
-    {%- do pm.pop(r.u, none) -%}
-  {%- else -%}
-    {%- do pm.update({r.u: st.new[-8:]}) -%}
   {%- endif -%}
 {%- endif -%}
 
@@ -327,7 +325,7 @@
     'code': r.c | string, 'severity': sevs[r.c], 'dataset': 'kemp_loadmaster.esp',
     'kind': 'event', 'module': 'kemp_loadmaster', 'original': raw} -%}
 {%- if meta[3] -%}{%- do event.update({'outcome': meta[3]}) -%}{%- endif -%}
-{%- set doc = {'@timestamp': timestamp.astimezone(utc).isoformat(),
+{%- set doc = {'@timestamp': timestamp.astimezone(utc).replace(microsecond=0).isoformat(),
     'ecs': {'version': '8.17.0'}, 'event': event,
     'observer': {'hostname': params.device_name, 'product': 'LoadMaster',
         'vendor': 'Progress Kemp', 'type': 'load-balancer'},
