@@ -1,14 +1,18 @@
 {#- Staffcop Enterprise 5.8 Syslog connector, native key-value lines.
-    Every one-second tick emits at most one record: the earliest due
-    step of an active work bout. Employees start bouts independently
-    (Poisson, per-employee rate, personal working-hours curve); a bout
-    is a few screenshots in one application, sometimes closed by a
-    Stat record. The anomaly episode is one extra bout sequence of a
-    finance employee and never touches the background. -#}
+    The input sets the volume and the hour/weekday curve; every
+    timestamp yields exactly one record: the earliest due step of an
+    open work bout (episode steps first on ties), otherwise the first
+    screenshot of a new bout of an employee drawn by personal rate and
+    working-hours load. A bout is a few screenshots in one application,
+    sometimes closed by a Stat record; finance staff also run short
+    browser bouts exchanging documents through cloud storage. The
+    anomaly episode is an extra pair of bouts of one finance employee
+    and never touches the background. -#}
 {%- set now = timestamp.timestamp() | int -%}
+{%- set ts = timestamp.replace(microsecond=0) -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
-{%- set window = 2700 -%}
+{%- set window = 1800 -%}
 {%- set p_fin = params.policy_finance -%}
 {%- set p_ps = params.policy_printscreen -%}
 {%- set p_cloud = params.policy_cloud -%}
@@ -31,55 +35,95 @@
 {%- set browsers = ['chrome', 'msedge'] -%}
 {%- set office = ['excel', '1cv8', 'winword', 'outlook', 'explorer'] -%}
 
+{#- Working-hours load (0..1) at hour h of the log clock: a night
+    floor and a light daytime band every day, plus the weekday
+    working-day bands. Mirrors the input time patterns. -#}
+{%- macro band_load(h, weekend) -%}
+  {%- set v = 0.04 + (0.06 if 8 <= h < 20 else 0) -%}
+  {%- if not weekend -%}
+    {%- set v = v + (0.14 if 7 <= h < 20.5 else 0) + (0.4 if 8 <= h < 19 else 0)
+        + (0.38 if (9 <= h < 13 or 14 <= h < 18) else 0) -%}
+  {%- endif -%}
+  {{- v -}}
+{%- endmacro -%}
+
+{#- Load of the whole office at epoch second t. -#}
+{%- macro curve_at(t) -%}
+  {%- set d = module.datetime.datetime.fromtimestamp(t, utc) -%}
+  {{- band_load(d.hour + d.minute / 60, d.weekday() >= 5) -}}
+{%- endmacro -%}
+
+{#- Episode start drawn in [lo, hi) by 10-minute slots weighted by the
+    office load to the given power plus a small floor. -#}
+{%- macro plan_start(lo, hi, power) -%}
+  {%- set slots = [] -%}
+  {%- set sw = [] -%}
+  {%- for s in range(lo, hi, 600) -%}
+    {%- do slots.append(s) -%}
+    {%- do sw.append((curve_at(s + 300) | float) ** power + 0.001) -%}
+  {%- endfor -%}
+  {%- set s = module.rand.weighted_choice(slots, sw) -%}
+  {{- s + module.rand.number.integer(0, [hi - s, 600] | min - 1) -}}
+{%- endmacro -%}
+
 {%- if not shared.get('initialized', false) -%}
   {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {%- set users = [] -%}
   {%- for row in samples.employees -%}
+    {%- set fin = row.finance == 'yes' -%}
+    {%- if fin -%}
+      {%- set rate = module.rand.number.clamp(module.rand.number.lognormal(module.math.log(9.0), 0.2), 7.5, 11.0) -%}
+    {%- else -%}
+      {%- set rate = module.rand.number.clamp(module.rand.number.lognormal(module.math.log(5.0), 0.3), 3.5, 7.0) -%}
+    {%- endif -%}
     {%- do users.append({'user': row.user, 'computer': row.computer,
-        'ip': row.ip, 'dept': row.department, 'fin': row.finance == 'yes',
-        'rate': module.rand.number.lognormal(module.math.log(5.0), 0.4),
-        'shift': module.rand.number.clamp(module.rand.number.gauss(0, 0.7), -2, 2)}) -%}
+        'ip': row.ip, 'dept': row.department, 'fin': fin, 'rate': rate,
+        'shift': module.rand.number.clamp(module.rand.number.gauss(0, 0.5), -1.5, 1.5)}) -%}
   {%- endfor -%}
-  {%- set total = namespace(v=0) -%}
-  {%- for u in users -%}{%- set total.v = total.v + u.rate -%}{%- endfor -%}
-  {%- do shared.update({'initialized': true, 'users': users,
-      'rate_sum': total.v, 'bouts': [], 'seq': {},
+  {%- set first_end = now + ([interval, 24] | min * 3600) | int -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'tabs': {},
+      'bouts': [], 'trk': {},
       'id': module.rand.number.integer(400000, 900000),
       'dumps': [now + module.rand.number.integer(1, 300)],
-      'next_due': now + (interval * 3600) | int, 'episode_wait': false,
+      'next_at': plan_start(now, first_end, 1) | int,
       'last_actor': none}) -%}
 {%- endif -%}
 {%- set users = shared.get('users') -%}
 {%- set bouts = shared.get('bouts') -%}
-{%- set seq = shared.get('seq') -%}
+{%- set trk = shared.get('trk') -%}
+{%- set weekend = timestamp.weekday() >= 5 -%}
+{%- set hour = timestamp.hour + timestamp.minute / 60 -%}
 
-{#- Working-hours intensity of one employee (0..1), on the log clock
-    shifted by the employee's personal offset; weekends are quiet. -#}
-{%- macro load(u) -%}
-  {%- set h = (timestamp.hour + timestamp.minute / 60 + u.shift) % 24 -%}
-  {%- if h < 7 -%}{%- set v = 0.02 -%}
-  {%- elif h < 9 -%}{%- set v = 0.02 + (h - 7) / 2 * 0.98 -%}
-  {%- elif h < 13 -%}{%- set v = 1.0 -%}
-  {%- elif h < 14 -%}{%- set v = 0.55 -%}
-  {%- elif h < 18 -%}{%- set v = 1.0 -%}
-  {%- elif h < 20 -%}{%- set v = 1.0 - (h - 18) / 2 * 0.9 -%}
-  {%- elif h < 23 -%}{%- set v = 0.1 - (h - 20) / 3 * 0.08 -%}
-  {%- else -%}{%- set v = 0.02 -%}{%- endif -%}
-  {{- v * (0.08 if timestamp.weekday() >= 5 else 1.0) -}}
-{%- endmacro -%}
+{#- Cumulative employee weights (rate x own shifted load) for this
+    quarter hour; at most 192 cached tables. -#}
+{%- set qb = (96 if weekend else 0) + timestamp.hour * 4 + timestamp.minute // 15 -%}
+{%- set tabs = shared.get('tabs') -%}
+{%- if qb not in tabs -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(v=0) -%}
+  {%- set hq = (qb % 96) / 4 + 0.125 -%}
+  {%- for u in users -%}
+    {%- set acc.v = acc.v + u.rate * (band_load((hq + u.shift) % 24, weekend) | float) -%}
+    {%- do cum.append(acc.v) -%}
+  {%- endfor -%}
+  {%- do tabs.update({qb: cum}) -%}
+{%- endif -%}
+{%- set cum = tabs[qb] -%}
 
 {%- macro gap_in() -%}
 {{- [module.rand.number.lognormal(module.math.log(40), 0.8) | round | int, 1] | max -}}
 {%- endmacro -%}
 
 {#- Policies matched by one screenshot of employee u in app; forced
-    policies are added on top of the same independent draws. -#}
-{%- macro draw(u, app, out, force) -%}
-  {%- set fp = (fin_prob_fin if u.fin else fin_prob_other).get(app, 0) -%}
+    policies are added on top of the same independent draws. A
+    document-exchange screenshot shows a cloud storage page, often with
+    finance documents. -#}
+{%- macro draw(u, app, out, force, exchange) -%}
+  {%- set fp = 0.5 if exchange else (fin_prob_fin if u.fin else fin_prob_other).get(app, 0) -%}
   {%- if p_fin in force or module.rand.chance(fp) -%}{%- do out.append(p_fin) -%}{%- endif -%}
-  {%- if p_ps in force or module.rand.chance(0.012) -%}{%- do out.append(p_ps) -%}{%- endif -%}
+  {%- if p_ps in force or module.rand.chance(0.045 if u.fin else 0.012) -%}{%- do out.append(p_ps) -%}{%- endif -%}
   {%- if app in browsers -%}
-    {%- if p_cloud in force or module.rand.chance(0.12) -%}{%- do out.append(p_cloud) -%}{%- endif -%}
+    {%- if p_cloud in force or module.rand.chance(0.9 if exchange else 0.12) -%}{%- do out.append(p_cloud) -%}{%- endif -%}
     {%- if module.rand.chance(0.07 if app == 'chrome' else 0.05) -%}{%- do out.append(p_social) -%}{%- endif -%}
   {%- endif -%}
   {%- if app == 'telegram' and module.rand.chance(0.45) -%}{%- do out.append(p_msg) -%}{%- endif -%}
@@ -90,7 +134,7 @@
     finance policy on web and mail activity (bank and tax portals). -#}
 {%- macro stat_draw(u, app, seen, out) -%}
   {%- for p in seen -%}
-    {%- if module.rand.chance(0.85) -%}{%- do out.append(p) -%}{%- endif -%}
+    {%- if p not in out and module.rand.chance(0.85) -%}{%- do out.append(p) -%}{%- endif -%}
   {%- endfor -%}
   {%- if u.fin and (app in browsers or app == 'outlook') and p_fin not in out
       and module.rand.chance(0.6) -%}
@@ -98,107 +142,102 @@
   {%- endif -%}
 {%- endmacro -%}
 
-{#- 1. Independent bout arrivals, thinned by each employee's load. -#}
-{%- if module.rand.chance(shared.get('rate_sum') / 3600) -%}
-  {%- set w = [] -%}
-  {%- set tot = namespace(v=0) -%}
+{#- 1. Episode start: planned time reached; the next start is planned
+    around actual start + interval (no catch-up). -#}
+{%- set ep_new = none -%}
+{%- if params.anomaly_mode and now >= shared.get('next_at') -%}
+  {%- set cand = [] -%}
+  {%- set cw = [] -%}
   {%- for u in users -%}
-    {%- set x = u.rate * (load(u) | float) -%}
-    {%- do w.append(x) -%}{%- set tot.v = tot.v + x -%}
-  {%- endfor -%}
-  {%- if tot.v > 0 and module.rand.chance(tot.v / shared.get('rate_sum')) -%}
-    {%- set ui = module.rand.weighted_choice(range(users | length) | list, w) -%}
-    {%- set d = apps_by_dept[users[ui].dept] -%}
-    {%- do bouts.append({'u': ui, 'app': module.rand.weighted_choice(d[0], d[1]),
-        'left': 1 + module.rand.number.exponential(1 / 2.5) | int,
-        'stat': module.rand.chance(0.35), 'seen': [], 'due': now,
-        'plan': none}) -%}
-  {%- endif -%}
-{%- endif -%}
-
-{#- 2. Episode: due by source time; the start hazard follows the mean
-    working-hours load of finance staff (mean delay 45 min at full
-    load); next due from the actual start, no catch-up. -#}
-{%- if params.anomaly_mode -%}
-  {%- if not shared.get('episode_wait') and now >= shared.get('next_due') -%}
-    {%- do shared.set('episode_wait', true) -%}
-  {%- endif -%}
-  {%- if shared.get('episode_wait') -%}
-    {%- set cand = [] -%}
-    {%- set cw = [] -%}
-    {%- set tot = namespace(v=0, r=0) -%}
-    {%- for u in users -%}
-      {%- if u.fin -%}
-        {%- set x = u.rate * (load(u) | float) -%}
-        {%- set tot.v = tot.v + x -%}{%- set tot.r = tot.r + u.rate -%}
-        {%- if u.user != shared.get('last_actor') -%}
-          {%- do cand.append(loop.index0) -%}{%- do cw.append(x) -%}
-        {%- endif -%}
-      {%- endif -%}
-    {%- endfor -%}
-    {%- if tot.v > 0 and module.rand.chance(tot.v / tot.r / 2700) -%}
-      {%- set ui = module.rand.weighted_choice(cand, cw) -%}
-      {%- set u = users[ui] -%}
-      {%- set d = apps_by_dept[u.dept] -%}
-      {%- set ow = [] -%}
-      {%- for a in office -%}{%- do ow.append(d[1][d[0].index(a)] if a in d[0] else 0) -%}{%- endfor -%}
-      {%- set bw = [] -%}
-      {%- for a in browsers -%}{%- do bw.append(d[1][d[0].index(a)] if a in d[0] else 0) -%}{%- endfor -%}
-      {%- set doc_app = module.rand.weighted_choice(office, ow) -%}
-      {%- set web_app = module.rand.weighted_choice(browsers, bw) -%}
-      {%- set g = namespace(a=0, b=0, c=0) -%}
-      {%- for attempt in range(10) -%}
-        {%- if attempt == 0 or g.a + g.b + g.c > 1500 -%}
-          {%- set g.a = gap_in() | int -%}
-          {%- set g.b = [module.rand.number.lognormal(module.math.log(150), 0.7) | round | int, 1] | max -%}
-          {%- set g.c = gap_in() | int -%}
-        {%- endif -%}
-      {%- endfor -%}
-      {%- do bouts.append({'u': ui, 'app': doc_app, 'left': 0, 'stat': false,
-          'seen': [], 'due': now, 'plan': [
-            {'at': now, 'kind': 'Screenshot', 'app': doc_app, 'force': [p_fin]},
-            {'at': now + g.a, 'kind': 'Screenshot', 'app': doc_app, 'force': [p_ps]},
-            {'at': now + g.a + g.b, 'kind': 'Screenshot', 'app': web_app, 'force': [p_cloud]},
-            {'at': now + g.a + g.b + g.c, 'kind': 'Stat', 'app': web_app, 'force': [p_cloud, p_fin]}]}) -%}
-      {%- do shared.update({'episode_wait': false, 'last_actor': u.user,
-          'next_due': now + (interval * 3600) | int}) -%}
+    {%- if u.fin and u.user != shared.get('last_actor') -%}
+      {%- do cand.append(loop.index0) -%}
+      {%- do cw.append(u.rate * (band_load((hour + u.shift) % 24, weekend) | float)) -%}
     {%- endif -%}
+  {%- endfor -%}
+  {%- set ui = module.rand.weighted_choice(cand, cw) -%}
+  {%- set d = apps_by_dept[users[ui].dept] -%}
+  {%- set ow = [] -%}
+  {%- for a in office -%}{%- do ow.append(d[1][d[0].index(a)] if a in d[0] else 0) -%}{%- endfor -%}
+  {%- set bw = [] -%}
+  {%- for a in browsers -%}{%- do bw.append(d[1][d[0].index(a)] if a in d[0] else 0) -%}{%- endfor -%}
+  {%- set doc_app = module.rand.weighted_choice(office, ow) -%}
+  {%- set web_app = module.rand.weighted_choice(browsers, bw) -%}
+  {%- set budget = 1200 if (curve_at(now) | float) >= 0.2 else 600 -%}
+  {%- set g = namespace(a=0, b=0, c=0) -%}
+  {%- for attempt in range(10) -%}
+    {%- if attempt == 0 or g.a + g.b + g.c > budget -%}
+      {%- set g.a = gap_in() | int -%}
+      {%- set g.b = [module.rand.number.lognormal(module.math.log(150), 0.7) | round | int, 1] | max -%}
+      {%- set g.c = gap_in() | int -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if g.a + g.b + g.c > budget -%}
+    {%- set g.a = 40 -%}{%- set g.b = 150 -%}{%- set g.c = 40 -%}
   {%- endif -%}
+  {%- set ep_new = {'u': ui, 'kind': 'ep', 'start': now, 'end': now + budget, 'due': now, 'seen': [], 'plan': [
+      {'gap': 0, 'act': 'Screenshot', 'app': doc_app, 'force': [p_fin]},
+      {'gap': g.a, 'act': 'Screenshot', 'app': doc_app, 'force': [p_ps]},
+      {'gap': g.b, 'act': 'Screenshot', 'app': web_app, 'force': [p_cloud]},
+      {'gap': g.c, 'act': 'Stat', 'app': web_app, 'force': [p_cloud, p_fin]}]} -%}
+  {%- set w = ([interval / 4, 6] | min * 3600) | int -%}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- do shared.update({'last_actor': users[ui].user,
+      'next_at': plan_start(due - w // 2, due + w // 2, 2) | int}) -%}
 {%- endif -%}
 
-{#- 3. Earliest due bout step, otherwise nothing. -#}
-{%- set pick = namespace(i=-1, due=now + 1) -%}
-{%- for b in bouts -%}
-  {%- if b.due <= now and b.due < pick.due -%}
-    {%- set pick.i = loop.index0 -%}{%- set pick.due = b.due -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
+{#- 2. Pick the record: the new episode, else a due episode step, else
+    the earliest due background bout step, else a new background bout.
+    The cap keeps the list bounded: with 64 open bouts the earliest is
+    served even if not yet due. -#}
+{%- set pick = namespace(i=-1, due=now + 1, ep=false) -%}
+{%- if ep_new is none -%}
+  {%- for b in bouts -%}
+    {%- set is_ep = b.kind == 'ep' -%}
+    {%- if (b.due <= now or bouts | length >= 64)
+        and ((is_ep and not pick.ep) or pick.i < 0
+             or (is_ep == pick.ep and b.due < pick.due)) -%}
+      {%- set pick.i = loop.index0 -%}{%- set pick.due = b.due -%}{%- set pick.ep = is_ep -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
 
-{%- set b = bouts[pick.i] -%}
-{%- set u = users[b.u] -%}
 {%- set pols = [] -%}
-{%- if b.plan is not none -%}
+{%- if ep_new is not none or (pick.i >= 0 and pick.ep) -%}
+  {#- Episode step: forced policies on top of the ordinary draws. -#}
+  {%- if ep_new is not none -%}
+    {%- set b = ep_new -%}
+    {%- do bouts.append(b) -%}
+    {%- set bi = bouts | length - 1 -%}
+  {%- else -%}
+    {%- set b = bouts[pick.i] -%}
+    {%- set bi = pick.i -%}
+  {%- endif -%}
+  {%- set u = users[b.u] -%}
   {%- set step = b.plan.pop(0) -%}
-  {%- set action = step.kind -%}
+  {%- set action = step.act -%}
   {%- set app = step.app -%}
   {%- set episode = true -%}
   {%- if action == 'Screenshot' -%}
-    {{- draw(u, app, pols, step.force) -}}
+    {{- draw(u, app, pols, step.force, app in browsers) -}}
     {%- if app in browsers -%}{%- do b.update({'seen': pols | list}) -%}{%- endif -%}
   {%- else -%}
     {%- for p in step.force -%}{%- do pols.append(p) -%}{%- endfor -%}
-    {%- for p in b.seen -%}
-      {%- if p not in pols and module.rand.chance(0.85) -%}{%- do pols.append(p) -%}{%- endif -%}
-    {%- endfor -%}
+    {{- stat_draw(u, app, b.seen, pols) -}}
   {%- endif -%}
-  {%- if b.plan -%}{%- do b.update({'due': b.plan[0].at}) -%}{%- else -%}{%- do bouts.pop(pick.i) -%}{%- endif -%}
-{%- else -%}
+  {%- if b.plan -%}
+    {%- do b.update({'due': [now + b.plan[0].gap, b.end] | min}) -%}
+  {%- else -%}
+    {%- do bouts.pop(bi) -%}
+  {%- endif -%}
+{%- elif pick.i >= 0 -%}
+  {#- Next step of an open background bout. -#}
+  {%- set b = bouts[pick.i] -%}
+  {%- set u = users[b.u] -%}
   {%- set app = b.app -%}
   {%- set episode = false -%}
   {%- if b.left > 0 -%}
     {%- set action = 'Screenshot' -%}
-    {{- draw(u, app, pols, []) -}}
+    {{- draw(u, app, pols, [], b.kind == 'ex') -}}
     {%- for p in pols -%}{%- if p not in b.seen -%}{%- do b.seen.append(p) -%}{%- endif -%}{%- endfor -%}
     {%- do b.update({'left': b.left - 1}) -%}
     {%- if b.left > 0 or b.stat -%}
@@ -209,42 +248,58 @@
     {{- stat_draw(u, app, b.seen, pols) -}}
     {%- do bouts.pop(pick.i) -%}
   {%- endif -%}
+{%- else -%}
+  {#- New background bout; its first screenshot is this record. -#}
+  {%- set ui = module.bisect.bisect_right(cum, module.rand.number.floating(0, cum[-1])) -%}
+  {%- set ui = [ui, users | length - 1] | min -%}
+  {%- set u = users[ui] -%}
+  {%- set d = apps_by_dept[u.dept] -%}
+  {%- set episode = false -%}
+  {%- if u.fin and module.rand.chance(0.15) -%}
+    {%- set bw = [] -%}
+    {%- for a in browsers -%}{%- do bw.append(d[1][d[0].index(a)]) -%}{%- endfor -%}
+    {%- set b = {'u': ui, 'kind': 'ex', 'app': module.rand.weighted_choice(browsers, bw),
+        'left': 1 + module.rand.number.exponential(1.0) | int,
+        'stat': module.rand.chance(0.85), 'seen': []} -%}
+  {%- else -%}
+    {%- set b = {'u': ui, 'kind': 'bg', 'app': module.rand.weighted_choice(d[0], d[1]),
+        'left': 1 + module.rand.number.exponential(1 / 2.5) | int,
+        'stat': module.rand.chance(0.35), 'seen': []} -%}
+  {%- endif -%}
+  {%- set app = b.app -%}
+  {%- set action = 'Screenshot' -%}
+  {{- draw(u, app, pols, [], b.kind == 'ex') -}}
+  {%- for p in pols -%}{%- do b.seen.append(p) -%}{%- endfor -%}
+  {%- do b.update({'left': b.left - 1}) -%}
+  {%- if b.left > 0 or b.stat -%}
+    {%- do b.update({'due': now + gap_in() | int}) -%}
+    {%- do bouts.append(b) -%}
+  {%- endif -%}
 {%- endif -%}
 
-{#- Per-employee chain tracker (finance screenshot -> PrintScreen ->
-    cloud storage -> Stat with cloud and finance policies). Guard on
-    the final step only: an ordinary Stat that would complete the full
-    ordered chain loses its finance policy. -#}
-{%- macro matches(i, action, pols) -%}
-  {%- if i == 0 -%}{{ action == 'Screenshot' and p_fin in pols }}
-  {%- elif i == 1 -%}{{ action == 'Screenshot' and p_ps in pols }}
-  {%- elif i == 2 -%}{{ action == 'Screenshot' and p_cloud in pols }}
-  {%- else -%}{{ action == 'Stat' and p_cloud in pols and p_fin in pols }}{%- endif -%}
-{%- endmacro -%}
-{%- set parts = [] -%}
-{%- for p in seq.get(u.user, []) -%}
-  {%- if now - p[1] <= window -%}{%- do parts.append(p) -%}{%- endif -%}
-{%- endfor -%}
-{%- if not episode and matches(3, action, pols) == 'True' -%}
-  {%- if parts | selectattr(0, 'equalto', 3) | list -%}
-    {%- do pols.remove(p_fin) -%}
-  {%- endif -%}
+{#- Per-employee chain tracker with all-bindings semantics: the latest
+    start time of a partial at stage 1, 2 and 3 (finance screenshot ->
+    PrintScreen -> cloud storage). Guard on the final step only: an
+    ordinary Stat with cloud and finance policies that would complete
+    the ordered chain within the window loses its finance policy. -#}
+{%- set tr = trk.get(u.user) or [none, none, none] -%}
+{%- macro live(t) -%}{{ t is not none and now - t <= window }}{%- endmacro -%}
+{%- set shot = action == 'Screenshot' -%}
+{%- if not episode and not shot and p_cloud in pols and p_fin in pols
+    and live(tr[2]) == 'True' -%}
+  {%- do pols.remove(p_fin) -%}
 {%- endif -%}
-{%- set nxt = [] -%}
-{%- set fin = namespace(done=false) -%}
-{%- for p in parts -%}
-  {%- if not fin.done -%}
-    {%- if matches(p[0], action, pols) == 'True' -%}
-      {%- if p[0] == 3 -%}{%- set fin.done = true -%}
-      {%- else -%}{%- do nxt.append([p[0] + 1, p[1]]) -%}{%- endif -%}
-    {%- else -%}{%- do nxt.append(p) -%}{%- endif -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- if fin.done -%}
-  {%- do seq.pop(u.user, none) -%}
+{%- set nb = tr[0] if shot and p_ps in pols and live(tr[0]) == 'True' else none -%}
+{%- set nc = tr[1] if shot and p_cloud in pols and live(tr[1]) == 'True' else none -%}
+{%- set na = now if shot and p_fin in pols else (tr[0] if live(tr[0]) == 'True' else none) -%}
+{%- set ob = tr[1] if live(tr[1]) == 'True' else none -%}
+{%- set oc = tr[2] if live(tr[2]) == 'True' else none -%}
+{%- set nb = ob if nb is none else (nb if ob is none else [nb, ob] | max) -%}
+{%- set nc = oc if nc is none else (nc if oc is none else [nc, oc] | max) -%}
+{%- if na is none and nb is none and nc is none -%}
+  {%- do trk.pop(u.user, none) -%}
 {%- else -%}
-  {%- if matches(0, action, pols) == 'True' -%}{%- do nxt.append([1, now]) -%}{%- endif -%}
-  {%- if nxt -%}{%- do seq.update({u.user: nxt[-8:]}) -%}{%- else -%}{%- do seq.pop(u.user, none) -%}{%- endif -%}
+  {%- do trk.update({u.user: [na, nb, nc]}) -%}
 {%- endif -%}
 
 {#- Server event id (other event types consume ids too) and the
@@ -253,7 +308,11 @@
 {%- do shared.set('id', event_id) -%}
 {%- set dumps = shared.get('dumps') -%}
 {%- set target = now + module.rand.number.lognormal(module.math.log(15), 1.0) | int -%}
-{%- for i in range(40) -%}
+{%- if dumps[-1] < now - 3600 -%}
+  {%- do dumps.clear() -%}
+  {%- do dumps.append(now + module.rand.number.integer(1, 300)) -%}
+{%- endif -%}
+{%- for i in range(60) -%}
   {%- if dumps[-1] < target -%}
     {%- do dumps.append(dumps[-1] + 300 + module.rand.number.lognormal(module.math.log(2), 0.5) | round | int) -%}
   {%- endif -%}
@@ -267,12 +326,12 @@
 {%- set shuffled = module.rand.shuffle(pols) if pols | length > 1 else pols -%}
 {%- macro clock(t) -%}{{ t.strftime('%b ') ~ ('%2d' % t.day) ~ t.strftime(' %H:%M:%S') }}{%- endmacro -%}
 {%- set line = clock(dump_time) ~ ' ' ~ params.syslog_host ~ ' staffcop: id="' ~ event_id
-    ~ '" time="' ~ clock(timestamp) ~ '" event="' ~ action ~ '" computer="' ~ u.computer
+    ~ '" time="' ~ clock(ts) ~ '" event="' ~ action ~ '" computer="' ~ u.computer
     ~ '" ip="' ~ u.ip ~ '" user="' ~ u.user ~ '" app="' ~ app ~ '"' -%}
 {%- set text = namespace(v=line) -%}
 {%- for p in shuffled -%}{%- set text.v = text.v ~ ' policy_' ~ loop.index ~ '="' ~ p ~ '"' -%}{%- endfor -%}
 {%- set line = text.v -%}
-{%- set payload = {'@timestamp': timestamp.isoformat(), 'ecs': {'version': '8.17.0'},
+{%- set payload = {'@timestamp': ts.isoformat(), 'ecs': {'version': '8.17.0'},
     'event': {'kind': 'event', 'category': ['host'], 'type': ['info'], 'action': action,
       'id': event_id | string, 'created': dump_time.isoformat(),
       'dataset': 'staffcop.syslog', 'original': line},
