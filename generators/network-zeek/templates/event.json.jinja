@@ -1,25 +1,36 @@
 {#- Zeek 8 conn/dns/http/ssl records from one sensor, as ECS JSON with the
     compact native JSON line in event.original.
 
-    One collector poll every two seconds reads the earliest completed
-    record, or nothing. Flows are planned ahead into a pending queue:
-    protocol records complete before their delayed connection summary.
+    Every input timestamp is one collector read of one completed record;
+    event.created is that timestamp. Each timestamp takes, in order:
+    the next due episode step, else the next due step of a background
+    sync job, else the earliest connection summary whose close timer has
+    expired, else a new background flow. A new flow is
+    placed so that its protocol record completed shortly before the read
+    and is emitted at once; its connection summary is queued until the
+    close timer expires.
 
-    Background: one merged Poisson stream of independent clients. Each
-    tick draws a client by its own weight and accepts it with a
-    probability that follows its own hour-of-day curve (the shared curve
-    shifted by up to 3 h). A client keeps up to three resolved names for
-    their TTL, talks to any of them over TLS or HTTP, and re-resolves a
-    known name or looks up a new one.
+    Background: the client of a new flow is drawn by its own weight times
+    its own hour-of-day shape (the shared shape shifted by up to 4.5 h), so
+    each client keeps its own daily rhythm inside the input curve. A
+    client keeps up to three resolved names for their TTL, talks to any of
+    them over TLS or HTTP, and re-resolves a known name or looks up a new
+    one. One shared recursive resolver answers cached names with the
+    remaining TTL and caches a fixed zone TTL per name on a miss. A TLS
+    connection to a watched name whose answer is older than
+    the chain window sometimes starts a sync job of the episode's law
+    without its lookup: more TLS, a re-resolution and an upload.
 
     Episode (anomaly_mode): one rotated client resolves a fresh node name
     of the watched domain, makes 5-7 TLS connections to it, resolves it
-    again and uploads a large body with POST. The episode only adds flows;
-    it never touches the background queue, cache or history.
+    again and uploads a large body with POST. Each step takes over the
+    first timestamp at or after its planned time; the episode never
+    touches the background queue order, cache or client choice.
 
     Guard: a background POST that would complete that ordered sequence
     (same client, same name, within the chain window from the first DNS
-    answer) keeps its time and body but gets a 503 answer. -#}
+    answer, episode steps included) keeps its time and body but gets a
+    503 answer. -#}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set clock = timestamp.astimezone(utc).timestamp() -%}
 {%- set window = 1800 -%}
@@ -43,25 +54,57 @@
       {%- if label | length > 63 or not module.re.fullmatch('[a-z0-9](?:[a-z0-9-]*[a-z0-9])?', label) -%}{{ dispatch.exhaust() }}{%- endif -%}
     {%- endfor -%}
   {%- endfor -%}
-  {#- Office-hours activity by UTC hour; each client runs it shifted. -#}
-  {%- set curve = [0.22, 0.2, 0.2, 0.2, 0.22, 0.28, 0.4, 0.6, 0.85, 1.0, 1.0, 0.95,
+  {#- Office-hours shape of one client by hour; each client runs it
+      shifted by its own offset. -#}
+  {%- set shape = [0.22, 0.2, 0.2, 0.2, 0.22, 0.28, 0.4, 0.6, 0.85, 1.0, 1.0, 0.95,
       0.85, 0.92, 1.0, 0.97, 0.88, 0.7, 0.52, 0.4, 0.33, 0.28, 0.25, 0.23] -%}
+  {#- Relative hourly rate of the input (patterns/background-*.yml) by
+      hour of the generator timezone; episode starts are weighted by its
+      square plus a small floor. -#}
+  {%- set curve = [0.219, 0.225, 0.243, 0.281, 0.341, 0.42, 0.516, 0.62, 0.726, 0.825, 0.908, 0.968,
+      1.0, 1.0, 0.967, 0.903, 0.814, 0.705, 0.587, 0.471, 0.368, 0.289, 0.24, 0.221] -%}
   {%- set weights = [] -%}
-  {%- set shifts = {} -%}
+  {%- set shifts = [] -%}
+  {%- set uploads = {} -%}
   {%- for ip in clients -%}
-    {%- do weights.append(module.rand.number.lognormal(0, 0.7)) -%}
-    {%- do shifts.update({ip: module.rand.number.floating(-3, 3)}) -%}
+    {#- Skewed activity, bounded so that no client dominates the sensor
+        and none falls silent. -#}
+    {%- do weights.append(module.rand.number.clamp(module.rand.number.lognormal(0, 1.1), 0.5, 3.0)) -%}
+    {%- do shifts.append(module.rand.number.floating(-4.5, 4.5)) -%}
+    {#- Share of the client's HTTP requests that are uploads: most
+        clients upload now and then, a few do so routinely. -#}
+    {%- do uploads.update({ip: module.rand.number.clamp(module.rand.number.lognormal(module.math.log(0.22), 0.7), 0.04, 0.6)}) -%}
   {%- endfor -%}
   {%- do shared.update({'initialized': true, 'clients': clients, 'weights': weights,
-      'shifts': shifts, 'curve': curve, 'pending': [], 'dns_cache': {}, 'hist': {},
-      'ep_at': none, 'ep_client': none, 'ep_ip': none}) -%}
+      'shifts': shifts, 'uploads': uploads, 'shape': shape, 'curve': curve, 'tzoff': timestamp.utcoffset().total_seconds(),
+      'queue': [], 'seq': 0, 'slot': none, 'cum': none, 'dns_cache': {}, 'resolver': {}, 'hist': {},
+      'bursts': [], 'bursting': {}, 'ep': none, 'ep_at': none, 'ep_client': none, 'ep_ip': none}) -%}
 {%- endif -%}
 
 {%- set clients = shared.get('clients') -%}
-{%- set curve = shared.get('curve') -%}
-{%- set pending = shared.get('pending') -%}
+{%- set queue = shared.get('queue') -%}
+{%- set bursts = shared.get('bursts') -%}
 {%- set cache = shared.get('dns_cache') -%}
 {%- set hist = shared.get('hist') -%}
+{%- set local = clock + shared.get('tzoff') -%}
+
+{#- Client shares for this ten-minute slot: weight times the client's own
+    shifted shape at the slot midpoint, as cumulative sums. -#}
+{%- set slot = (local // 600) | int -%}
+{%- if shared.get('slot') != slot -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(v=0) -%}
+  {%- set mid = (slot * 600 + 300) / hour -%}
+  {%- for w in shared.get('weights') -%}
+    {%- set acc.v = acc.v + w * shared.get('shape')[((mid + shared.get('shifts')[loop.index0]) | int) % 24] -%}
+    {%- do cum.append(acc.v) -%}
+  {%- endfor -%}
+  {%- do shared.update({'slot': slot, 'cum': cum}) -%}
+  {#- Forget resolver entries expired for more than two hours. -#}
+  {%- set resolver = shared.get('resolver') -%}
+  {%- for name in resolver | list if resolver[name].exp < clock - 2 * hour -%}{%- do resolver.pop(name) -%}{%- endfor -%}
+{%- endif -%}
+{%- set cum = shared.get('cum') -%}
 
 {%- macro rid(prefix) -%}
 {#- Opaque Zeek-like UID/FUID: prefix plus 16-17 base62 characters. -#}
@@ -69,12 +112,13 @@
 {%- endmacro -%}
 
 {%- macro pick_start(lo, span) -%}
-{#- Time in [lo, lo + span) with its UTC hour weighted by curve^2 + 0.02. -#}
+{#- Time in [lo, lo + span) with its local hour weighted by curve^2 + 0.02. -#}
+{%- set curve = shared.get('curve') -%}
 {%- set top = (curve | max) ** 2 + 0.02 -%}
 {%- set r = namespace(v=lo + module.rand.number.floating(0, span), ok=false) -%}
 {%- for _ in range(400) if not r.ok -%}
   {%- set c = lo + module.rand.number.floating(0, span) -%}
-  {%- if module.rand.number.floating(0, top) < curve[((c // hour) | int) % 24] ** 2 + 0.02 -%}
+  {%- if module.rand.number.floating(0, top) < curve[(((c + shared.get('tzoff')) // 3600) | int) % 24] ** 2 + 0.02 -%}
     {%- set r.v = c -%}{%- set r.ok = true -%}
   {%- endif -%}
 {%- endfor -%}
@@ -92,43 +136,36 @@
   {%- endif -%}
 {%- endmacro -%}
 
-{#- Plan one flow: protocol record plus connection summary into pending.
-    spec: src, protocol, start, name, ip, and for http optional method
-    and status. Returns nothing; fills spec.ts with the protocol time. -#}
+{#- Plan one flow read at spec.emit: its protocol record completed
+    shortly before the read and goes into spec.native; its connection
+    summary is queued until the close timer expires. spec: src,
+    protocol, emit, name, ip, and for http method, status and body.
+    Also sets spec.expires for a positive DNS answer. -#}
 {%- macro plan(spec) -%}
+  {%- set utc = module.datetime.timezone.utc -%}
   {%- set src = spec.src -%}
   {%- set protocol = spec.protocol -%}
-  {#- Zeek JSON doubles carry at most six decimals: microsecond times. -#}
-  {%- set start = spec.start | round(6) -%}
   {%- set uid = rid('C') -%}
   {%- set src_port = module.rand.number.integer(32768, 60999) -%}
-  {%- set f = namespace(name=spec.name, dst=params.dns_server_ip, dest_port=53, orig=0, resp=0, duration=0, proto_ts=start, ready=start, native={}, request='', response='') -%}
+  {%- set f = namespace(dst=params.dns_server_ip, dest_port=53, orig=0, resp=0, rel_proto=0, rel_ready=0, rel_header=0, extra=0, native={}) -%}
+  {#- 1. Durations relative to the first packet. -#}
   {%- if protocol == 'dns' -%}
     {%- set ok = spec.ip is not none -%}
-    {%- set ttl = module.rand.choice([1800, 3600, 7200]) -%}
-    {%- set rtt_us = module.rand.number.clamp(module.rand.number.lognormal(module.math.log(12000), 0.5), 1000, 120000) | int -%}
-    {%- set f.duration = rtt_us / 1000000 -%}
-    {%- set f.ready = start + f.duration -%}
+    {#- The resolver answers a name it holds from its cache with the
+        remaining TTL (fast); otherwise it recurses and caches the zone's
+        TTL for that name. -#}
+    {%- set resolver = shared.get('resolver') -%}
+    {%- set held = resolver.get(spec.name) -%}
+    {%- set hit = ok and held is not none and held.exp - spec.emit >= 3 -%}
+    {%- set rtt_us = (module.rand.number.clamp(module.rand.number.lognormal(module.math.log(900), 0.4), 200, 5000) if hit
+        else module.rand.number.clamp(module.rand.number.lognormal(module.math.log(12000), 0.5), 1000, 120000)) | int -%}
+    {%- set f.rel_ready = rtt_us / 1000000 -%}
     {#- One question; compressed A answer or uncompressed authority SOA. -#}
-    {%- set f.orig = 18 + f.name | length -%}
+    {%- set f.orig = 18 + spec.name | length -%}
     {%- set f.resp = f.orig + (16 if ok else 3 * params.internal_domain | length + 50) -%}
-    {%- set f.native = {'ts': start, 'uid': uid, 'id.orig_h': src, 'id.orig_p': src_port, 'id.resp_h': f.dst, 'id.resp_p': 53,
-      'proto': 'udp', 'trans_id': module.rand.number.integer(0, 65535)} -%}
-    {%- if ok -%}{%- do f.native.update({'rtt': f.duration}) -%}{%- endif -%}
-    {%- do f.native.update({'query': f.name,
-      'qclass': 1, 'qclass_name': 'C_INTERNET', 'qtype': 1, 'qtype_name': 'A', 'rcode': 0 if ok else 3,
-      'rcode_name': 'NOERROR' if ok else 'NXDOMAIN', 'AA': false, 'TC': false, 'RD': true, 'RA': ok, 'Z': 0}) -%}
-    {%- if ok -%}
-      {%- do f.native.update({'answers': [spec.ip], 'TTLs': [ttl | float]}) -%}
-      {%- do spec.update({'expires': f.ready + ttl}) -%}
-    {%- endif -%}
-    {%- do f.native.update({'rejected': false}) -%}
-    {%- set conn_ready = start + 10 -%}
-    {%- set orig_pkts = 1 -%}{%- set resp_pkts = 1 -%}
-    {%- set orig_ip_bytes = f.orig + 28 -%}{%- set resp_ip_bytes = f.resp + 28 -%}
   {%- else -%}
     {%- set f.dst = spec.ip -%}
-    {%- set f.proto_ts = (start + spec.get('connect_us', module.rand.number.clamp(module.rand.number.lognormal(module.math.log(25000), 0.4), 1000, 180000) | int) / 1000000) | round(6) -%}
+    {%- set f.rel_proto = (module.rand.number.clamp(module.rand.number.lognormal(module.math.log(25000), 0.4), 1000, 180000) | int) / 1000000 -%}
     {%- if protocol == 'http' -%}
       {%- set f.dest_port = 80 -%}
       {%- set method = spec.method -%}
@@ -139,44 +176,79 @@
       {%- set message = {200: 'OK', 304: 'Not Modified', 404: 'Not Found', 503: 'Service Unavailable'}[status] -%}
       {%- set body = spec.body if method == 'POST' else 0 -%}
       {%- set response_body = 0 if status == 304 else (module.rand.number.integer(20, 160) if method == 'POST' and status == 200 else (256 if status in [404, 503] else {'/health': 200, '/index.html': 14000, '/api/items': 8400}[uri])) -%}
-      {%- set f.request = method ~ ' ' ~ uri ~ ' HTTP/1.1\r\nHost: ' ~ f.name ~ '\r\nUser-Agent: curl/8.5.0\r\nConnection: close\r\n' -%}
-      {%- if status == 304 -%}{%- set f.request = f.request ~ 'If-None-Match: "v1"\r\n' -%}{%- endif -%}
-      {%- if body > 0 -%}{%- set f.request = f.request ~ 'Content-Type: application/octet-stream\r\nContent-Length: ' ~ body ~ '\r\n' -%}{%- endif -%}
-      {%- set f.request = f.request ~ '\r\n' -%}
+      {%- set request = method ~ ' ' ~ uri ~ ' HTTP/1.1\r\nHost: ' ~ spec.name ~ '\r\nUser-Agent: curl/8.5.0\r\nConnection: close\r\n' -%}
+      {%- if status == 304 -%}{%- set request = request ~ 'If-None-Match: "v1"\r\n' -%}{%- endif -%}
+      {%- if body > 0 -%}{%- set request = request ~ 'Content-Type: application/octet-stream\r\nContent-Length: ' ~ body ~ '\r\n' -%}{%- endif -%}
+      {%- set request = request ~ '\r\n' -%}
+      {#- The IMF-fixdate Date value is always 29 bytes. -#}
+      {%- set head = 'HTTP/1.1 ' ~ status ~ ' ' ~ message ~ '\r\nDate: ' -%}
+      {%- set tail = '\r\nConnection: close\r\n' -%}
+      {%- if method == 'GET' and status in [200, 304] -%}{%- set tail = tail ~ 'ETag: "v1"\r\n' -%}{%- endif -%}
+      {%- if status != 304 -%}{%- set tail = tail ~ 'Content-Type: ' ~ content_type ~ '\r\nContent-Length: ' ~ response_body ~ '\r\n' -%}{%- endif -%}
+      {%- set tail = tail ~ '\r\n' -%}
       {#- Receive the request body before creating response headers. -#}
-      {%- set f.orig = f.request | length + body -%}
+      {%- set f.orig = request | length + body -%}
+      {%- set f.resp = head | length + 29 + tail | length + response_body -%}
       {%- set processing_us = module.rand.number.integer(10000, 120000) -%}
       {%- set link_mbps = module.rand.number.integer(10, 40) -%}
-      {%- set header_at = f.proto_ts + (f.orig * 8 / link_mbps + processing_us) / 1000000 -%}
-      {%- set date = module.datetime.datetime.fromtimestamp(header_at, utc).strftime('%a, %d %b %Y %H:%M:%S GMT') -%}
-      {%- set f.response = 'HTTP/1.1 ' ~ status ~ ' ' ~ message ~ '\r\nDate: ' ~ date ~ '\r\nConnection: close\r\n' -%}
-      {%- if method == 'GET' and status in [200, 304] -%}{%- set f.response = f.response ~ 'ETag: "v1"\r\n' -%}{%- endif -%}
-      {%- if status != 304 -%}{%- set f.response = f.response ~ 'Content-Type: ' ~ content_type ~ '\r\nContent-Length: ' ~ response_body ~ '\r\n' -%}{%- endif -%}
-      {%- set f.response = f.response ~ '\r\n' -%}
-      {%- set f.resp = f.response | length + response_body -%}
+      {%- set f.rel_header = f.rel_proto + (f.orig * 8 / link_mbps + processing_us) / 1000000 -%}
       {#- Selected uncompressed Content-Length messages, 10-40 Mbit/s link. -#}
       {%- set transaction_us = processing_us + ((f.orig + f.resp) * 8 / link_mbps) | int -%}
-      {%- set f.ready = f.proto_ts + transaction_us / 1000000 -%}
-      {%- set f.native = {'ts': f.proto_ts, 'uid': uid, 'id.orig_h': src, 'id.orig_p': src_port, 'id.resp_h': f.dst, 'id.resp_p': 80,
-        'trans_depth': 1, 'method': method, 'host': f.name, 'uri': uri, 'version': '1.1', 'user_agent': 'curl/8.5.0',
+      {%- set f.rel_ready = f.rel_proto + transaction_us / 1000000 -%}
+    {%- else -%}
+      {%- set f.dest_port = 443 -%}
+      {%- set f.rel_ready = f.rel_proto + module.rand.number.integer(20000, 150000) / 1000000 -%}
+      {%- set f.orig = module.rand.number.integer(600, 5000) -%}
+      {%- set f.resp = module.rand.number.integer(3500, 14000) -%}
+      {%- set f.extra = module.rand.number.integer(10000, 400000) / 1000000 -%}
+    {%- endif -%}
+  {%- endif -%}
+  {#- 2. First packet: the protocol record completed 1 ms-1.9 s before the
+      read. Zeek JSON doubles carry at most six decimals. -#}
+  {%- set start = (spec.emit - module.rand.number.integer(1000, 1900000) / 1000000 - f.rel_ready) | round(6) -%}
+  {%- if protocol == 'dns' -%}
+    {%- set f.native = {'ts': start, 'uid': uid, 'id.orig_h': src, 'id.orig_p': src_port, 'id.resp_h': f.dst, 'id.resp_p': 53,
+      'proto': 'udp', 'trans_id': module.rand.number.integer(0, 65535)} -%}
+    {%- if ok -%}{%- do f.native.update({'rtt': f.rel_ready}) -%}{%- endif -%}
+    {%- do f.native.update({'query': spec.name,
+      'qclass': 1, 'qclass_name': 'C_INTERNET', 'qtype': 1, 'qtype_name': 'A', 'rcode': 0 if ok else 3,
+      'rcode_name': 'NOERROR' if ok else 'NXDOMAIN', 'AA': false, 'TC': false, 'RD': true, 'RA': ok, 'Z': 0}) -%}
+    {%- if ok -%}
+      {%- set answered = start + f.rel_ready -%}
+      {%- if hit -%}
+        {%- set ttl = (held.exp - answered) | int -%}
+      {%- else -%}
+        {%- set ttl = held.ttl if held is not none else module.rand.choice([1800, 3600, 7200]) -%}
+        {%- do resolver.update({spec.name: {'ttl': ttl, 'exp': answered + ttl}}) -%}
+      {%- endif -%}
+      {%- do f.native.update({'answers': [spec.ip], 'TTLs': [ttl | float]}) -%}
+      {%- do spec.update({'expires': answered + ttl}) -%}
+    {%- endif -%}
+    {%- do f.native.update({'rejected': false}) -%}
+    {%- set duration = f.rel_ready -%}
+    {%- set conn_ready = start + 10 -%}
+    {%- set orig_pkts = 1 -%}{%- set resp_pkts = 1 -%}
+    {%- set orig_ip_bytes = f.orig + 28 -%}{%- set resp_ip_bytes = f.resp + 28 -%}
+  {%- else -%}
+    {%- set proto_ts = (start + f.rel_proto) | round(6) -%}
+    {%- set ready = proto_ts + f.rel_ready - f.rel_proto -%}
+    {%- if protocol == 'http' -%}
+      {%- set date = module.datetime.datetime.fromtimestamp(proto_ts + f.rel_header - f.rel_proto, utc).strftime('%a, %d %b %Y %H:%M:%S GMT') -%}
+      {%- set f.native = {'ts': proto_ts, 'uid': uid, 'id.orig_h': src, 'id.orig_p': src_port, 'id.resp_h': f.dst, 'id.resp_p': 80,
+        'trans_depth': 1, 'method': method, 'host': spec.name, 'uri': uri, 'version': '1.1', 'user_agent': 'curl/8.5.0',
         'request_body_len': body, 'response_body_len': response_body, 'status_code': status, 'status_msg': message, 'tags': []} -%}
       {%- if body > 0 -%}{%- do f.native.update({'orig_fuids': [rid('F')], 'orig_mime_types': ['application/octet-stream']}) -%}{%- endif -%}
       {%- if response_body > 0 -%}{%- do f.native.update({'resp_fuids': [rid('F')], 'resp_mime_types': [content_type]}) -%}{%- endif -%}
     {%- else -%}
-      {%- set f.dest_port = 443 -%}
-      {%- set handshake_us = module.rand.number.integer(20000, 150000) -%}
-      {%- set f.ready = f.proto_ts + handshake_us / 1000000 -%}
       {#- No PSK, HRR or compatibility CCS. Only C/S visible before encrypted records. -#}
-      {%- set f.native = {'ts': f.proto_ts, 'uid': uid, 'id.orig_h': src, 'id.orig_p': src_port, 'id.resp_h': f.dst, 'id.resp_p': 443,
+      {%- set f.native = {'ts': proto_ts, 'uid': uid, 'id.orig_h': src, 'id.orig_p': src_port, 'id.resp_h': f.dst, 'id.resp_p': 443,
         'version': 'TLSv13', 'cipher': module.rand.choice(['TLS_AES_128_GCM_SHA256', 'TLS_AES_256_GCM_SHA384']),
-        'curve': 'x25519', 'server_name': f.name, 'resumed': false, 'established': true, 'ssl_history': 'Cs'} -%}
-      {%- set f.orig = module.rand.number.integer(600, 5000) -%}
-      {%- set f.resp = module.rand.number.integer(3500, 14000) -%}
+        'curve': 'x25519', 'server_name': spec.name, 'resumed': false, 'established': true, 'ssl_history': 'Cs'} -%}
     {%- endif -%}
     {#- FIN in both directions, then trailing ACK excluded from conn.duration. -#}
-    {%- set productive_end = (f.ready if protocol == 'http' else f.ready + module.rand.number.integer(10000, 400000) / 1000000) + 1000 / 1000000 -%}
-    {%- set f.duration = ((productive_end - start) * 1000000) | round | int / 1000000 -%}
-    {%- set conn_ready = start + f.duration + 5 -%}
+    {%- set productive_end = ready + f.extra + 1000 / 1000000 -%}
+    {%- set duration = ((productive_end - start) * 1000000) | round | int / 1000000 -%}
+    {%- set conn_ready = start + duration + 5 -%}
     {%- set orig_segments = (f.orig + 1447) // 1448 -%}{%- set resp_segments = (f.resp + 1447) // 1448 -%}
     {%- set orig_pkts = orig_segments + (resp_segments + 1) // 2 + 4 -%}
     {%- set resp_pkts = resp_segments + (orig_segments + 1) // 2 + 3 -%}
@@ -184,26 +256,147 @@
     {%- set resp_ip_bytes = f.resp + 60 + 52 * (resp_pkts - 1) -%}
   {%- endif -%}
   {%- set conn = {'ts': start, 'uid': uid, 'id.orig_h': src, 'id.orig_p': src_port, 'id.resp_h': f.dst, 'id.resp_p': f.dest_port,
-    'proto': 'udp' if protocol == 'dns' else 'tcp', 'service': protocol, 'duration': f.duration,
+    'proto': 'udp' if protocol == 'dns' else 'tcp', 'service': protocol, 'duration': duration,
     'orig_bytes': f.orig, 'resp_bytes': f.resp, 'conn_state': 'SF', 'local_orig': true,
     'local_resp': f.dst.startswith('10.'), 'missed_bytes': 0, 'history': 'Dd' if protocol == 'dns' else 'ShADadFf',
     'orig_pkts': orig_pkts, 'orig_ip_bytes': orig_ip_bytes, 'resp_pkts': resp_pkts, 'resp_ip_bytes': resp_ip_bytes, 'ip_proto': 17 if protocol == 'dns' else 6} -%}
-  {%- do pending.append({'dataset': protocol, 'ready': f.ready, 'native': f.native}) -%}
-  {%- do pending.append({'dataset': 'connection', 'ready': conn_ready, 'native': conn}) -%}
-  {%- do spec.update({'ts': f.native.ts}) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [conn_ready, shared.get('seq'), {'dataset': 'connection', 'native': conn}]) -%}
+  {%- do spec.update({'dataset': protocol, 'native': f.native}) -%}
 {%- endmacro -%}
 
-{#- 1. Background: at most one new flow per tick. -#}
-{%- set cand = module.rand.weighted_choice(clients, shared.get('weights')) -%}
-{%- set local_hour = ((clock / hour + shared.get('shifts')[cand]) | int) % 24 -%}
-{%- if pending | length < 64 and module.rand.chance(0.3 * curve[local_hour]) -%}
-  {%- set src = cand -%}
-  {%- set start = clock + module.rand.number.integer(0, 1999999) / 1000000 -%}
+{#- Guard history: watched-name DNS answers and TLS per client, by read
+    time, episode steps included. -#}
+{%- macro remember(spec) -%}
+  {%- if spec.protocol in ['dns', 'ssl'] and spec.name.endswith('.' ~ params.suspicious_name) -%}
+    {%- set kept = hist.get(spec.src, []) | selectattr('t', 'gt', clock - window - 60) | list -%}
+    {%- do kept.append({'t': clock, 'k': spec.protocol, 'n': spec.name}) -%}
+    {%- do hist.update({spec.src: kept[-48:]}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- A client's resolver cache after a positive DNS answer: the name's
+    new mapping (with its read time) plus up to two other live ones. -#}
+{%- macro resolved(spec) -%}
+  {%- if spec.ip is not none -%}
+    {%- set kept = cache.get(spec.src, []) | selectattr('expires', 'gt', clock) | rejectattr('name', 'equalto', spec.name) | list -%}
+    {%- do kept.append({'name': spec.name, 'ip': spec.ip, 'expires': spec.expires, 'at': clock}) -%}
+    {%- do cache.update({spec.src: kept[-3:]}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Guard on a successful background POST to a watched name: a DNS
+    answer for it, then 5 TLS to it, then another DNS for it, all read by
+    the same client within the chain window before this POST, turn the
+    answer into a 503. Time, target and body stay. -#}
+{%- macro guard(spec) -%}
+  {%- if spec.method == 'POST' and spec.status == 200 and spec.name.endswith('.' ~ params.suspicious_name) -%}
+    {%- set g = namespace(state=0, tls=0) -%}
+    {%- for e in hist.get(spec.src, []) if e.n == spec.name and e.t >= clock - window -%}
+      {%- if g.state == 0 and e.k == 'dns' -%}{%- set g.state = 1 -%}
+      {%- elif g.state == 1 and e.k == 'ssl' -%}{%- set g.tls = g.tls + 1 -%}{%- if g.tls >= 5 -%}{%- set g.state = 2 -%}{%- endif -%}
+      {%- elif g.state == 2 and e.k == 'dns' -%}{%- set g.state = 3 -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if g.state == 3 -%}{%- do spec.update({'status': 503}) -%}{%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Gaps of a beacon run: one log-normal gap after each of n TLS
+    connections (median 110 s), then before the upload (median 60 s),
+    scaled so that the run spans at most 1,400 s. -#}
+{%- macro run_gaps(out, n_tls) -%}
+  {%- for i in range(n_tls) -%}{%- do out.gaps.append(module.rand.number.lognormal(module.math.log(110), 0.45)) -%}{%- endfor -%}
+  {%- do out.gaps.append(module.rand.number.lognormal(module.math.log(70), 0.6)) -%}
+  {%- do out.gaps.append(module.rand.number.lognormal(module.math.log(60), 0.6)) -%}
+  {%- do out.update({'scale': [1.0, 1400 / (out.gaps | sum)] | min}) -%}
+{%- endmacro -%}
+
+{%- set em = namespace(spec=none) -%}
+
+{#- 1. Episode: first start in the first min(interval, 24 h), later ones in
+    a window of min(interval / 4, 6 h) centred one interval after the
+    actual start; hours weighted by curve^2 + 0.02, then a random delay.
+    No catch-up. Client (by its current background share) and
+    destination rotate. Step i + 1 is planned a log-normal gap after the
+    actual time of step i. -#}
+{%- if params.anomaly_mode -%}
+  {%- if shared.get('ep_at') is none -%}
+    {%- do shared.set('ep_at', (pick_start(clock, [interval, 24 * hour] | min) | float) + module.rand.number.exponential(1 / 240)) -%}
+  {%- endif -%}
+  {%- if shared.get('ep') is none and clock >= shared.get('ep_at') -%}
+    {%- set others = [] -%}{%- set ow = [] -%}
+    {%- for ip in clients if ip != shared.get('ep_client') -%}
+      {%- set i = clients.index(ip) -%}
+      {%- do others.append(ip) -%}{%- do ow.append(cum[i] - (cum[i - 1] if i > 0 else 0)) -%}
+    {%- endfor -%}
+    {%- set src = module.rand.weighted_choice(others, ow) -%}
+    {%- set dst = module.rand.choice(params.suspicious_ips | reject('equalto', shared.get('ep_ip')) | list) -%}
+    {%- set n_tls = module.rand.weighted_choice([5, 6, 7], [50, 30, 20]) -%}
+    {%- set run = {'gaps': []} -%}
+    {#- Planned span at most 1,400 s; waits for timestamps add the rest. -#}
+    {{- run_gaps(run, n_tls) -}}
+    {%- set w = [interval / 4, 6 * hour] | min -%}
+    {%- do shared.update({'ep': {'src': src, 'ip': dst, 'name': 'node-' ~ module.rand.string.hex(8) ~ '.' ~ params.suspicious_name,
+        'steps': ['dns'] + ['ssl'] * n_tls + ['dns', 'http'], 'gaps': run.gaps, 'scale': run.scale, 'i': 0, 'at': clock},
+        'ep_client': src, 'ep_ip': dst,
+        'ep_at': (pick_start(clock + interval - w / 2, w) | float) + module.rand.number.exponential(1 / 240)}) -%}
+  {%- endif -%}
+  {%- set ep = shared.get('ep') -%}
+  {%- if ep is not none and clock >= ep.at -%}
+    {%- set spec = {'src': ep.src, 'protocol': ep.steps[ep.i], 'emit': clock, 'name': ep.name, 'ip': ep.ip} -%}
+    {%- if spec.protocol == 'http' -%}
+      {%- do spec.update({'method': 'POST', 'status': 200, 'body': module.rand.number.integer(250000, 2000000)}) -%}
+    {%- endif -%}
+    {{- plan(spec) -}}
+    {{- remember(spec) -}}
+    {%- set em.spec = spec -%}
+    {%- if ep.i + 1 < ep.steps | length -%}
+      {%- do ep.update({'at': clock + ep.gaps[ep.i] * ep.scale, 'i': ep.i + 1}) -%}
+    {%- else -%}
+      {%- do shared.set('ep', none) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Next due step of a background beacon run (see 4). A TLS step whose
+    name has expired from the client's cache re-resolves it first. -#}
+{%- if em.spec is none and bursts and bursts[0][0] <= clock -%}
+  {%- set b = module.heapq.heappop(bursts)[2] -%}
+  {%- set step = b.steps[b.i] -%}
+  {%- set renew = step == 'ssl' and not (cache.get(b.src, []) | selectattr('name', 'equalto', b.name) | selectattr('expires', 'gt', clock) | list) -%}
+  {%- set spec = {'src': b.src, 'protocol': 'dns' if renew else step, 'emit': clock, 'name': b.name, 'ip': b.ip} -%}
+  {%- if step == 'http' -%}
+    {%- do spec.update({'method': 'POST', 'status': 200 if module.rand.chance(0.97) else 503, 'body': module.rand.number.integer(250000, 2000000)}) -%}
+    {{- guard(spec) -}}
+  {%- endif -%}
+  {{- plan(spec) -}}
+  {%- if spec.protocol == 'dns' -%}{{- resolved(spec) -}}{%- endif -%}
+  {{- remember(spec) -}}
+  {%- set em.spec = spec -%}
+  {%- if renew or b.i + 1 < b.steps | length -%}
+    {%- set due = clock + (module.rand.number.lognormal(module.math.log(3), 0.5) if renew else b.gaps[b.i] * b.scale) -%}
+    {%- if not renew -%}{%- do b.update({'i': b.i + 1}) -%}{%- endif -%}
+    {%- do shared.set('seq', shared.get('seq') + 1) -%}
+    {%- do module.heapq.heappush(bursts, [due, shared.get('seq'), b]) -%}
+  {%- else -%}
+    {%- do shared.get('bursting').pop(b.src, none) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Connection summary whose close timer has expired. -#}
+{%- if em.spec is none and queue and queue[0][0] <= clock -%}
+  {%- set em.spec = module.heapq.heappop(queue)[2] -%}
+{%- endif -%}
+
+{#- 4. New background flow. -#}
+{%- if em.spec is none -%}
+  {%- set src = clients[[module.bisect.bisect_right(cum, module.rand.number.floating(0, cum[-1])), clients | length - 1] | min] -%}
   {#- Up to three live name mappings per client, used concurrently. -#}
   {%- set entries = cache.get(src, []) -%}
-  {%- set live = entries | selectattr('expires', 'gt', start + 0.2) | list -%}
+  {%- set live = entries | selectattr('expires', 'gt', clock) | list -%}
   {%- set protocol = module.rand.weighted_choice(['dns', 'ssl', 'http'], [35, 45, 20]) if live else 'dns' -%}
-  {%- set spec = {'src': src, 'protocol': protocol, 'start': start} -%}
+  {%- set spec = {'src': src, 'protocol': protocol, 'emit': clock} -%}
   {%- if protocol == 'dns' -%}
     {#- Re-resolve a known name, or look up a new one. -#}
     {%- if entries and module.rand.chance(0.2 if live else 0.5) -%}
@@ -213,95 +406,42 @@
       {{- new_name(spec) -}}
     {%- endif -%}
     {{- plan(spec) -}}
-    {%- if spec.ip is not none -%}
-      {%- set kept = live | rejectattr('name', 'equalto', spec.name) | list -%}
-      {%- do kept.append({'name': spec.name, 'ip': spec.ip, 'expires': spec.expires}) -%}
-      {%- do cache.update({src: kept[-3:]}) -%}
-    {%- endif -%}
+    {{- resolved(spec) -}}
   {%- else -%}
     {%- set entry = module.rand.choice(live) -%}
     {%- do spec.update({'name': entry.name, 'ip': entry.ip}) -%}
     {%- if protocol == 'http' -%}
-      {%- set method = module.rand.weighted_choice(['GET', 'POST'], [75, 25]) -%}
+      {%- set method = 'POST' if module.rand.chance(shared.get('uploads')[src]) else 'GET' -%}
       {%- do spec.update({'method': method, 'status': 200 if module.rand.chance(0.97) else 503,
           'body': module.rand.number.integer(250000, 2000000)}) -%}
     {%- endif -%}
-    {%- if protocol == 'http' and spec.method == 'POST' and spec.status == 200 and spec.name.endswith('.' ~ params.suspicious_name) -%}
-      {#- Guard: DNS answer for this name, then 5 TLS to it, then another
-          DNS for it, all within the chain window before this POST. -#}
-      {%- do spec.update({'connect_us': module.rand.number.clamp(module.rand.number.lognormal(module.math.log(25000), 0.4), 1000, 180000) | int}) -%}
-      {%- set post_ts = (start | round(6) + spec.connect_us / 1000000) | round(6) -%}
-      {%- set g = namespace(state=0, tls=0) -%}
-      {%- for e in hist.get(src, []) | sort(attribute='t') if e.n == spec.name and e.t >= post_ts - window -%}
-        {%- if g.state == 0 and e.k == 'dns' -%}{%- set g.state = 1 -%}
-        {%- elif g.state == 1 and e.k == 'ssl' -%}{%- set g.tls = g.tls + 1 -%}{%- if g.tls >= 5 -%}{%- set g.state = 2 -%}{%- endif -%}
-        {%- elif g.state == 2 and e.k == 'dns' -%}{%- set g.state = 3 -%}
-        {%- endif -%}
-      {%- endfor -%}
-      {%- if g.state == 3 -%}{%- do spec.update({'status': 503}) -%}{%- endif -%}
+    {{- guard(spec) -}}
+    {{- plan(spec) -}}
+    {#- Sync job: a TLS connection to a watched name whose cached answer
+        is older than the chain window sometimes opens a run of the
+        episode's law: more TLS to it, a re-resolution and an upload,
+        each step taking over the first timestamp at or after its planned
+        time (step 2). -#}
+    {%- if protocol == 'ssl' and entry.name.endswith('.' ~ params.suspicious_name) and entry.at < clock - window and src not in shared.get('bursting') and module.rand.chance(0.25) -%}
+      {%- set n_tls = module.rand.weighted_choice([5, 6, 7], [50, 30, 20]) -%}
+      {%- set b = {'src': src, 'name': entry.name, 'ip': entry.ip, 'steps': ['ssl'] * n_tls + ['dns', 'http'], 'gaps': [], 'i': 1} -%}
+      {{- run_gaps(b, n_tls - 1) -}}
+      {%- do shared.set('seq', shared.get('seq') + 1) -%}
+      {%- do module.heapq.heappush(bursts, [clock + b.gaps[0] * b.scale, shared.get('seq'), b]) -%}
+      {%- do shared.get('bursting').update({src: true}) -%}
     {%- endif -%}
-    {{- plan(spec) -}}
   {%- endif -%}
-  {#- History of watched-name DNS/TLS per client, for the guard only. -#}
-  {%- if spec.name.endswith('.' ~ params.suspicious_name) and protocol in ['dns', 'ssl'] -%}
-    {%- set kept = hist.get(src, []) | selectattr('t', 'gt', clock - window - 60) | list -%}
-    {%- do kept.append({'t': spec.ts, 'k': protocol, 'n': spec.name}) -%}
-    {%- do hist.update({src: kept[-48:]}) -%}
-  {%- endif -%}
+  {{- remember(spec) -}}
+  {%- set em.spec = spec -%}
 {%- endif -%}
 
-{#- 2. Episode: first start in the first min(interval, 24 h), later ones in
-    a window of min(interval / 4, 6 h) centred one interval after the
-    actual start; hours weighted by curve^2 + 0.02, then a random delay.
-    No catch-up. Client and destination rotate. -#}
-{%- if params.anomaly_mode -%}
-  {%- if shared.get('ep_at') is none -%}
-    {%- do shared.set('ep_at', (pick_start(clock, [interval, 24 * hour] | min) | float) + module.rand.number.exponential(1 / 240)) -%}
-  {%- endif -%}
-  {%- if clock >= shared.get('ep_at') -%}
-    {%- set others = [] -%}{%- set ow = [] -%}
-    {%- for ip in clients if ip != shared.get('ep_client') -%}
-      {%- do others.append(ip) -%}{%- do ow.append(shared.get('weights')[clients.index(ip)]) -%}
-    {%- endfor -%}
-    {%- set src = module.rand.weighted_choice(others, ow) -%}
-    {%- set dst = module.rand.choice(params.suspicious_ips | reject('equalto', shared.get('ep_ip')) | list) -%}
-    {%- set name = 'node-' ~ module.rand.string.hex(8) ~ '.' ~ params.suspicious_name -%}
-    {%- set n_tls = module.rand.weighted_choice([5, 6, 7], [50, 30, 20]) -%}
-    {%- set gaps = [] -%}
-    {%- for i in range(n_tls) -%}{%- do gaps.append(module.rand.number.lognormal(module.math.log(110), 0.45)) -%}{%- endfor -%}
-    {%- do gaps.append(module.rand.number.lognormal(module.math.log(70), 0.6)) -%}
-    {%- do gaps.append(module.rand.number.lognormal(module.math.log(60), 0.6)) -%}
-    {%- set scale = [1.0, 1500 / (gaps | sum)] | min -%}
-    {%- set t = namespace(v=clock + module.rand.number.integer(0, 1999999) / 1000000) -%}
-    {%- set spec = {'src': src, 'protocol': 'dns', 'start': t.v, 'name': name, 'ip': dst} -%}
-    {{- plan(spec) -}}
-    {%- for i in range(n_tls) -%}
-      {%- set t.v = t.v + gaps[i] * scale -%}
-      {{- plan({'src': src, 'protocol': 'ssl', 'start': t.v, 'name': name, 'ip': dst}) -}}
-    {%- endfor -%}
-    {%- set t.v = t.v + gaps[n_tls] * scale -%}
-    {{- plan({'src': src, 'protocol': 'dns', 'start': t.v, 'name': name, 'ip': dst}) -}}
-    {%- set t.v = t.v + gaps[n_tls + 1] * scale -%}
-    {{- plan({'src': src, 'protocol': 'http', 'start': t.v, 'name': name, 'ip': dst, 'method': 'POST', 'status': 200,
-        'body': module.rand.number.integer(250000, 2000000)}) -}}
-    {%- set w = [interval / 4, 6 * hour] | min -%}
-    {%- do shared.update({'ep_client': src, 'ep_ip': dst,
-        'ep_at': (pick_start(clock + interval - w / 2, w) | float) + module.rand.number.exponential(1 / 240)}) -%}
-  {%- endif -%}
-{%- endif -%}
-
-{#- 3. Collector poll: emit the earliest completed record. -#}
-{%- set pending = pending | sort(attribute='ready') -%}
-{%- do shared.set('pending', pending) -%}
-{%- if not pending or pending[0].ready > clock -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set record = pending.pop(0) -%}
-{%- set native = record.native -%}
-{%- set protocol = record.dataset -%}
+{#- 5. The read record. -#}
+{%- set native = em.spec.native -%}
+{%- set protocol = em.spec.dataset -%}
 {%- set dataset = 'zeek.' ~ protocol -%}
 {%- set at = module.datetime.datetime.fromtimestamp(native.ts, utc).isoformat(timespec='microseconds') -%}
-{%- set read_ts = clock + module.rand.number.integer(1000, 1900000) / 1000000 -%}
-{%- set read_at = module.datetime.datetime.fromtimestamp(read_ts, utc).isoformat(timespec='microseconds') -%}
-{%- set ingest_at = module.datetime.datetime.fromtimestamp(read_ts + module.rand.number.lognormal(module.math.log(1.2), 0.5), utc).isoformat(timespec='microseconds') -%}
+{%- set read_at = module.datetime.datetime.fromtimestamp(clock, utc).isoformat(timespec='microseconds') -%}
+{%- set ingest_at = module.datetime.datetime.fromtimestamp(clock + module.rand.number.lognormal(module.math.log(1.2), 0.5), utc).isoformat(timespec='microseconds') -%}
 {%- set native_parts = [] -%}
 {%- for key, value in native.items() -%}{%- do native_parts.append((key | tojson) ~ ':' ~ (value | tojson)) -%}{%- endfor -%}
 {%- set raw = '{' ~ native_parts | join(',') ~ '}' -%}
