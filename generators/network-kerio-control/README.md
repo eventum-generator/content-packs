@@ -27,7 +27,7 @@ About 5,000 records per day from 32 users, one client address each.
 | 07-08, 17-20 | 0.033 | 0.016 |
 | 08-17 | 0.093 | 0.016 |
 
-Users browse on a working-day curve: 08:00-17:00 carries about 85% of their records, the shoulder hours about 12%, the night about 3%. The computers fetch updates and activation checks round the clock, attributed to the user of the computer. Daily volume varies by about 3%. Consecutive records are about 6 s apart in office hours (median), 14 s in the shoulder hours and about 40 s at night.
+Users browse on a working-day curve: 08:00-17:00 carries about 83-84% of their records, the shoulder hours about 13%, the night about 3%. The computers fetch updates and activation checks round the clock, attributed to the user of the computer. Daily volume varies by about 3%. Consecutive records are about 6 s apart in office hours (median), 14 s in the shoulder hours and about 40 s at night.
 
 Each user has a fixed propensity (log-normal, bounded to a factor of about 5 between the quietest and the busiest user), so some users hit blocked sites far more often than others, yet every user appears every day. The first quarter of the users in `samples/users.csv` (at least two; with the default 32 users: jsmith, mbrown, akowalski, dlee, epetrova, fgarcia, hmuller, ikhan) carry the highest propensities and take remote-access and tunnel clients regularly; the others do so rarely. What a user does:
 
@@ -49,7 +49,7 @@ Sequence, all for one user U at one client address:
 2. `DENY URL 'Deny anonymizers'` for another anonymizer host B (in 40% of episodes one more anonymizer denial follows).
 3. `ALLOW URL 'Log executable downloads'` of an installer from a tunnel-client host T (`tunnel_hosts`).
 
-Linking fields: `user.name` and `source.ip` in all steps; `url.domain` differs between steps 1 and 2 and belongs to `tunnel_hosts` in step 3. The steps span a few minutes to about half an hour, always within one hour.
+Linking fields: `user.name` and `source.ip` in all steps; `url.domain` differs between steps 1 and 2 and belongs to `tunnel_hosts` in step 3. The steps usually span a few minutes and always fall within one hour.
 
 Recurrence: the first episode starts within the first `anomaly_interval_hours` of the output (at most 24 h), at an hour drawn from the users' browsing curve. Each later episode starts within a window around one interval after the previous start (window width a quarter of the interval, at most 6 h), favouring busy browsing hours, so at the default 24 h most episodes fall in office hours and their hour drifts from day to day. The next interval counts from the actual start, so a late episode never causes catch-up. `anomaly_interval_hours` defaults to 24 (minimum 2).
 
