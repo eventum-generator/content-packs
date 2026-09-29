@@ -2,71 +2,112 @@
     syslog, one virtual appliance with a single Management interface and
     one public listener (internal Exchange hosts relay through RELAYLIST).
 
-    Four ticks per second each emit at most one log line, taken from a
-    due-queue fed by independent random processes: outbound mail per
-    internal user (thinned by the user's own working hours) and inbound
-    internet mail. The anomaly episode only adds its own messages to the
-    queue; it never suspends, delays or reshapes background mail.
+    Every timestamp yields exactly one log line. Messages in progress
+    keep their lines in a due-queue; a timestamp writes the earliest due
+    line, and when none is due it starts a new message of its own
+    population and writes that message's first line: `office`
+    timestamps start mail from internal users (picked by activity weight
+    and their own working hours), the others start internet mail. The
+    anomaly episode adds its own messages to the queue; their lines take
+    input timestamps like any other, so background mail keeps its shape.
 
     Line grammar follows the AsyncOS 16.5 "Text Mail Logs" examples;
     structured fields follow the Elastic cisco_secure_email_gateway
     ingest pipeline (default.yml, pipeline_text_mail_logs.yml). -#}
-{%- set now = timestamp.timestamp() | int -%}
-{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set now = timestamp.timestamp() -%}
+{%- set sec = now | int -%}
+{%- set interval = (params.anomaly_interval_hours | float * 3600) | int -%}
 {%- set big = params.large_message_bytes | int -%}
-{#- Chain window; the background guard adds a few seconds for lines that
-    a busy second pushes into the next one. -#}
+{#- Chain window: the first three episode messages are ready within 40
+    minutes (the detection allows 41 from the first To line). The
+    background guard adds a margin for lines that busy moments write
+    after their due time (at most about three minutes). -#}
 {%- set window = 2400 -%}
-{%- set guard = window + 10 -%}
+{%- set guard = 2460 + 300 -%}
 {%- set ifip = params.interface_ip -%}
+{%- set heapq = module.heapq -%}
+{#- Hourly rate of the office patterns (UTC), for episode placement. -#}
+{%- set office_h = [308, 308, 308, 308, 308, 308, 1083, 1813, 2256, 2699, 2699, 2699,
+    2699, 2699, 2699, 2256, 1813, 1083, 1083, 308, 308, 308, 308, 308] -%}
+
+{#- Draw an episode start second in [a, b): hourly slots weighted by the
+    office curve (sq: curve^2 + 0.05), uniform within a slot. -#}
+{%- macro draw_start(a, b, sq) -%}
+  {%- set top = office_h | max -%}
+  {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
+  {%- for hh in range(a // 3600, (b - 1) // 3600 + 1) -%}
+    {%- set lo = [a, hh * 3600] | max -%}
+    {%- set hi = [b, hh * 3600 + 3600] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = office_h[hh % 24] / top -%}
+      {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
+      {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set j = module.rand.weighted_choice(range(ws | length) | list, ws) -%}
+  {%- do shared.set('start_at', module.rand.number.integer(lows[j], highs[j] - 1)) -%}
+{%- endmacro -%}
 
 {%- if not shared.get('initialized', false) -%}
-  {%- if not (1 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
-  {%- if params.users | length < 4 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if not (1 <= params.anomaly_interval_hours | float <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if samples.users | length < 4 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
   {%- set mx = {params.internal_domain: none} -%}
   {%- set style = {} -%}
   {%- for d in params.partner_domains + params.freemail_domains -%}
     {%- do mx.update({d.domain: d.ip}) -%}
     {%- do style.update({d.domain: module.rand.weighted_choice(['postfix', 'exchange'], [60, 40])}) -%}
   {%- endfor -%}
+  {%- set names = samples.contact_names['name'] -%}
   {%- set contacts = [] -%}
   {%- for d in params.partner_domains -%}
-    {%- for n in module.rand.choices(params.contact_names, 5) | unique -%}
+    {%- for n in module.rand.choices(names, 5) | unique -%}
       {%- do contacts.append(n ~ '.' ~ module.rand.string.letters_lowercase(1) ~ '@' ~ d.domain) -%}
     {%- endfor -%}
   {%- endfor -%}
+  {#- Users are pinned in samples/users.json; their mail domain, personal
+      mailbox provider and relay host come from the parameters. -#}
+  {%- set fms = params.freemail_domains -%}
+  {%- set relays = params.relay_hosts -%}
   {%- set users = [] -%}
-  {%- set weights = [] -%}
-  {%- for name in params.users -%}
-    {%- set fm = module.rand.choice(params.freemail_domains).domain -%}
-    {%- do users.append({'addr': name ~ '@' ~ params.internal_domain,
-        'personal': name ~ module.rand.number.integer(70, 99) ~ '@' ~ fm,
+  {%- set cw = namespace(w=[], p=[], tw=0.0, tp=0.0) -%}
+  {%- set busy = [] -%}
+  {%- for i in range(samples.users | length) -%}
+    {%- set r = samples.users[i] -%}
+    {%- do users.append({'addr': r.name ~ '@' ~ params.internal_domain,
+        'personal': r.name ~ r.personal_suffix ~ '@' ~ fms[i % (fms | length)].domain,
         'contacts': module.rand.choices(contacts, module.rand.number.integer(2, 6)) | unique | list,
-        'relay': module.rand.choice(params.relay_hosts),
-        'shift': [module.rand.number.floating(5.0, 9.5), module.rand.number.floating(7.5, 10.5)]}) -%}
-    {%- do weights.append(module.rand.number.lognormal(0, 0.8)) -%}
+        'relay': relays[i % (relays | length)],
+        'shift': [r.shift_start | float, r.shift_hours | float]}) -%}
+    {%- set cw.tw = cw.tw + r.weight | float -%}{%- set cw.w = cw.w + [cw.tw] -%}
+    {%- set cw.tp = cw.tp + r.personal_weight | float -%}{%- set cw.p = cw.p + [cw.tp] -%}
+    {%- if r.personal_weight | float >= 0.5 -%}{%- do busy.append(i) -%}{%- endif -%}
   {%- endfor -%}
-  {%- do shared.update({'initialized': true, 'users': users, 'weights': weights,
+  {%- if busy | length < 2 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- do shared.update({'initialized': true, 'users': users, 'cum_w': cw.w, 'cum_p': cw.p, 'busy': busy,
       'contacts': contacts, 'mx': mx, 'style': style,
+      'subjects': samples.subjects['subject'], 'attachments': samples.attachments['name'],
       'mid': module.rand.number.integer(1000000, 90000000),
       'icid': module.rand.number.integer(1000000, 90000000),
       'dcid': module.rand.number.integer(100000, 9000000),
       'rcid': module.rand.number.integer(10000, 900000),
-      'seq': 0, 'q': [], 'big': {},
-      'next_due': now + (interval * 3600) | int, 'start_at': none, 'last_user': none}) -%}
+      'seq': 0, 'q': [], 'big': {}, 'prune_at': sec + 600,
+      'start_at': none, 'last_user': none}) -%}
+  {%- if params.anomaly_mode -%}
+    {#- First episode within min(interval, 24 h), hour from the curve. -#}
+    {{- draw_start(sec, sec + ([interval, 86400] | min), false) -}}
+  {%- endif -%}
 {%- endif -%}
 
 {%- set users = shared.get('users') -%}
 {%- set q = shared.get('q') -%}
 {%- set bigs = shared.get('big') -%}
 {%- set hod = (now % 86400) / 3600 -%}
-{%- set fresh = now != shared.get('last_sec') -%}
-{%- do shared.set('last_sec', now) -%}
-{%- if fresh and now % 600 == 0 -%}
+{%- if sec >= shared.get('prune_at') -%}
   {%- for k in bigs | list -%}
-    {%- set keep = bigs[k] | select('gt', now - 2 * guard) | list -%}
+    {%- set keep = bigs[k] | select('gt', sec - 2 * guard) | list -%}
     {%- if keep -%}{%- do bigs.update({k: keep}) -%}{%- else -%}{%- do bigs.pop(k) -%}{%- endif -%}
   {%- endfor -%}
+  {%- do shared.set('prune_at', sec + 600) -%}
 {%- endif -%}
 
 {%- macro gap(median, sigma) -%}
@@ -80,12 +121,23 @@
 {#- Queue one line: due second, level, text, parsed fields. -#}
 {%- macro enq(at, lvl, text, f) -%}
   {%- do shared.set('seq', shared.get('seq') + 1) -%}
-  {%- do module.bisect.insort(q, (at, shared.get('seq'), {'lvl': lvl, 'text': text, 'f': f, 'tok': shared.get('_tok')})) -%}
+  {%- do heapq.heappush(q, (at, shared.get('seq'), {'lvl': lvl, 'text': text, 'f': f, 'tok': shared.get('_tok')})) -%}
 {%- endmacro -%}
 
 {%- macro activity(u) -%}
   {%- set into = (hod - u.shift[0]) % 24 -%}
   {{- 1.0 if into < u.shift[1] else (0.35 if into < u.shift[1] + 3 else 0.08) -}}
+{%- endmacro -%}
+
+{#- Pick a user index by cumulative weight, thinned by the user's own
+    working hours (rejection sampling), into shared._pick. -#}
+{%- macro pick_active(cum) -%}
+  {%- set res = namespace(i=0) -%}
+  {%- for _ in range(60) -%}
+    {%- set res.i = [module.bisect.bisect(cum, module.rand.number.floating(0, cum[-1])), cum | length - 1] | min -%}
+    {%- if module.rand.chance(activity(users[res.i]) | float) -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('_pick', res.i) -%}
 {%- endmacro -%}
 
 {%- macro body_size() -%}
@@ -247,7 +299,7 @@
   {%- set size = namespace(v=body_size() | int) -%}
   {%- if kind != 'none' -%}
     {%- set n = module.rand.weighted_choice([1, 2, 3], [70, 22, 8]) -%}
-    {%- for i in range(n) -%}{%- do atts.append(module.rand.choice(params.attachment_names)) -%}{%- endfor -%}
+    {%- for i in range(n) -%}{%- do atts.append(module.rand.choice(shared.get('attachments'))) -%}{%- endfor -%}
     {%- set size.v = size.v + att_size(kind) | int -%}
   {%- endif -%}
   {{- lead_plan('out', size.v) -}}
@@ -271,7 +323,7 @@
   {%- if size.v >= big and rc.own -%}
     {%- do bigs.update({u.addr: (bigs.get(u.addr, []) + [ready_at])[-10:]}) -%}
   {%- endif -%}
-  {%- set subj = module.rand.weighted_choice(['', 'RE: ', 'FW: '], [55, 30, 15]) ~ module.rand.choice(params.subjects) -%}
+  {%- set subj = module.rand.weighted_choice(['', 'RE: ', 'FW: '], [55, 30, 15]) ~ module.rand.choice(shared.get('subjects')) -%}
   {{- mail(at, 'out', u.relay.ip, u.relay.name, 'yes', 'RELAY SG RELAYLIST match ' ~ u.relay.ip ~ ' SBRS rfc1918',
       u.addr, rc.v, size.v, atts, 'clean', subj, plan) -}}
 {%- endmacro -%}
@@ -295,143 +347,152 @@
   {%- do shared.set('_rcpts', out) -%}
 {%- endmacro -%}
 
-{#- Mail arrivals are drawn once per second. -#}
-{%- if fresh -%}
-
-{#- 1. Outbound background: one merged stream of independent users. -#}
-{%- set u = module.rand.weighted_choice(users, shared.get('weights')) -%}
-{%- if module.rand.chance(0.009 * activity(u) | float) -%}
-  {{- pick_rcpts(u) -}}
-  {%- set rcpts = shared.get('_rcpts') -%}
-  {%- if module.rand.chance(0.18) -%}
-    {#- A quick series to the same work recipients (split attachments,
-        forwards); the own personal mailbox gets its series below. -#}
-    {%- set rcpts = rcpts | rejectattr('a', 'equalto', u.personal) | list or [{'a': module.rand.choice(u.contacts), 'bad': false}] -%}
-    {%- set kind = module.rand.weighted_choice(['doc', 'files', 'none'], [35, 55, 10]) -%}
-    {%- set t = namespace(v=now) -%}
-    {%- for i in range(module.rand.weighted_choice([2, 3, 4, 5], [50, 30, 14, 6])) -%}
-      {{- outbound(u, t.v, rcpts, kind if module.rand.chance(0.85) else 'none') -}}
-      {%- set t.v = t.v + gap(160, 0.8) | int + 5 -%}
-    {%- endfor -%}
-  {%- else -%}
-    {{- outbound(u, now, rcpts, module.rand.weighted_choice(['none', 'doc', 'files'], [62, 32, 6])) -}}
-  {%- endif -%}
-{%- endif -%}
-
-{#- 1b. Every user now and then sends mail to the own personal mailbox
-    (files for home, travel documents), single or in a quick series,
-    small or large. Users are drawn uniformly, then thinned by their own
-    working hours. In a series each message draws its own content, so
-    two large messages in one series are common and three are rare; the
-    final-step guard in outbound() is only a backstop. -#}
-{%- set pu = module.rand.choice(users) -%}
-{%- if module.rand.chance(0.0019 * activity(pu) | float) -%}
-  {%- set rcpts = [{'a': pu.personal, 'bad': false}] -%}
-  {%- if module.rand.chance(0.1) -%}{%- do rcpts.append({'a': module.rand.choice(pu.contacts), 'bad': false}) -%}{%- endif -%}
-  {%- set n = module.rand.weighted_choice([1, 2, 3, 4], [65, 20, 11, 4]) -%}
-  {%- set t = namespace(v=now) -%}
-  {%- for i in range(n) -%}
-    {%- set kind = module.rand.weighted_choice(['none', 'doc', 'files'], [38, 32, 30] if n == 1 else [40, 25, 35]) -%}
-    {{- outbound(pu, t.v, rcpts, kind) -}}
-    {%- set t.v = t.v + gap(160, 0.8) | int + 5 -%}
+{#- 1. Episode: the first start falls within min(interval, 24 h) of the
+    first timestamp, hour drawn from the office curve; each later start
+    is due one interval after the actual previous start and falls in a
+    window of w = min(interval / 4, 6 h) centred on the due time,
+    weighted by curve^2 + 0.05. A user of the busy personal-mail tier,
+    other than the previous episode's and with no large mail to the own
+    mailbox near the episode (so the episode completes exactly one
+    chain), picked like personal mail (own working hours), sends three
+    large messages to the own personal mailbox inside the chain
+    window. -#}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {%- set pool = [] -%}
+  {%- for i in shared.get('busy') -%}
+    {%- if i != shared.get('last_user') and not (bigs.get(users[i].addr, []) | select('gt', sec - guard) | select('lt', sec + window + guard) | list) -%}
+      {%- do pool.append(i) -%}
+    {%- endif -%}
   {%- endfor -%}
+  {%- if not pool -%}{%- set pool = shared.get('busy') | reject('equalto', shared.get('last_user')) | list -%}{%- endif -%}
+  {%- set pk = namespace(i=pool[0]) -%}
+  {%- for _ in range(60) -%}
+    {%- set pk.i = module.rand.choice(pool) -%}
+    {%- if module.rand.chance(activity(users[pk.i]) | float) -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set eu = users[pk.i] -%}
+  {%- set n = 3 -%}
+  {#- Gaps follow the background series law; the three messages must fit
+      the chain window, so only a draw exceeding it is redrawn. -#}
+  {%- set g = namespace(v=[]) -%}
+  {%- for j in range(50) -%}
+    {%- if not g.v -%}
+      {%- set d = [] -%}
+      {%- for i in range(n - 1) -%}{%- do d.append(gap(160, 0.8) | int + 5) -%}{%- endfor -%}
+      {%- if d[0] + d[1] <= window - 300 -%}{%- set g.v = d -%}{%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set t = namespace(v=sec) -%}
+  {%- set rc = [{'a': eu.personal, 'bad': false}] -%}
+  {%- for i in range(n) -%}
+    {{- outbound(eu, t.v, rc, 'chain', true) -}}
+    {%- if i < n - 1 -%}{%- set t.v = t.v + (g.v[i] if g.v else 160) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('last_user', pk.i) -%}
+  {%- set half = ([interval // 4, 21600] | min) // 2 -%}
+  {%- set due = sec + interval -%}
+  {{- draw_start(due - half, due + half, true) -}}
 {%- endif -%}
 
-{#- 2. Inbound background: internet mail to internal users. -#}
-{%- set infac = 1.0 if 6 <= hod < 17 else 0.45 -%}
-{%- if module.rand.chance(0.011 * infac) -%}
-  {%- set r = module.rand.weighted_choice(users, shared.get('weights')) -%}
-  {%- set kind = module.rand.weighted_choice(['partner', 'freemail', 'personal', 'newsletter', 'reject', 'spam', 'virus'], [44, 11, 3, 17, 16, 8, 1]) -%}
-  {%- set rc = [{'a': r.addr, 'bad': false}] -%}
-  {%- if kind in ['partner', 'freemail'] and module.rand.chance(0.18) -%}
-    {%- set r2 = module.rand.choice(users) -%}
-    {%- if r2.addr != r.addr -%}{%- do rc.append({'a': r2.addr, 'bad': false}) -%}{%- endif -%}
-  {%- endif -%}
-  {%- set subj = module.rand.weighted_choice(['', 'RE: '], [60, 40]) ~ module.rand.choice(params.subjects) -%}
-  {%- set atts = [] -%}
-  {%- set size = namespace(v=body_size() | int) -%}
-  {%- if kind in ['partner', 'freemail', 'personal'] and module.rand.chance(0.3) -%}
-    {%- do atts.append(module.rand.choice(params.attachment_names)) -%}
-    {%- set size.v = size.v + att_size('doc') | int -%}
-  {%- endif -%}
-  {%- if kind == 'partner' -%}
-    {%- set s = module.rand.choice(r.contacts if module.rand.chance(0.7) else shared.get('contacts')) -%}
-    {%- set p = params.partner_domains | selectattr('domain', 'equalto', s.split('@')[1]) | first -%}
-    {%- set sb = sbrs_of(p.sbrs) -%}
-    {{- mail(now, 'in', p.ip, 'mx.' ~ p.domain, 'yes', 'ACCEPT SG UNKNOWNLIST match sbrs[-1.0:10.0] SBRS ' ~ sb, s, rc, size.v, atts, 'clean', subj) -}}
-  {%- elif kind in ['freemail', 'personal'] -%}
-    {%- if kind == 'personal' -%}
-      {%- set s = r.personal -%}
-    {%- else -%}
-      {%- set s = module.rand.choice(params.contact_names) ~ module.rand.number.integer(1, 999) ~ '@' ~ module.rand.choice(params.freemail_domains).domain -%}
-    {%- endif -%}
-    {%- set f = params.freemail_domains | selectattr('domain', 'equalto', s.split('@')[1]) | first -%}
-    {{- mail(now, 'in', f.ip, 'out.' ~ f.domain, 'yes', 'ACCEPT SG UNKNOWNLIST match sbrs[-1.0:10.0] SBRS ' ~ sbrs_of(f.sbrs), s, rc, size.v, atts, 'clean', subj) -}}
-  {%- elif kind == 'newsletter' -%}
-    {%- set nl = module.rand.choice(params.newsletter_senders) -%}
-    {%- set size.v = (module.rand.number.lognormal(module.math.log(60000), 0.6)) | int -%}
-    {{- mail(now, 'in', nl.ip, 'mta.' ~ nl.address.split('@')[1], 'yes', 'ACCEPT SG UNKNOWNLIST match sbrs[-1.0:10.0] SBRS ' ~ sbrs_of(nl.sbrs), nl.address, rc, size.v, [], 'bulk', module.rand.choice(['Weekly digest', 'Upcoming events', 'Your account summary', 'Special offer'])) -}}
-  {%- else -%}
-    {%- set cip = module.rand.choice(['192.0.2.', '198.18.', '198.19.']) -%}
-    {%- set cip = cip ~ module.rand.number.integer(1, 254) if cip == '192.0.2.' else cip ~ module.rand.number.integer(0, 255) ~ '.' ~ module.rand.number.integer(1, 254) -%}
-    {%- if kind == 'reject' -%}
-      {%- do shared.set('_tok', {}) -%}{%- set icid = '{I}' -%}
-      {%- set sb = '%.1f' | format(module.rand.number.floating(-9.8, -3.1)) -%}
-      {{- enq(now, 'Info', 'New SMTP ICID ' ~ icid ~ ' interface Management (' ~ ifip ~ ') address ' ~ cip ~ ' reverse dns host unknown verified no', {'log': {'connection_status': 'New', 'injection_connection_id': icid | string, 'interface': ifip, 'address': cip, 'verified': 'no'}, 'proto': 'smtp', 'dns': 'unknown', 'rel': [ifip, cip]}) -}}
-      {{- enq(now, 'Info', 'ICID ' ~ icid ~ ' REJECT SG BLOCKED_LIST match sbrs[-10.0:-3.0] SBRS ' ~ sb, {}) -}}
-      {{- enq(now + gap(1, 0.8) | int, 'Info', 'ICID ' ~ icid ~ ' close', {'log': {'connection_status': 'close', 'injection_connection_id': icid | string}}) -}}
-    {%- else -%}
-      {%- set sb = '%.1f' | format(module.rand.number.floating(-2.9, 0.9)) -%}
-      {%- set sg = 'SUSPECTLIST match sbrs[-3.0:-1.0]' if sb | float < -1.0 else 'UNKNOWNLIST match sbrs[-1.0:10.0]' -%}
-      {%- set s = module.rand.string.letters_lowercase(module.rand.number.integer(5, 9)) ~ '@' ~ module.rand.string.letters_lowercase(module.rand.number.integer(5, 8)) ~ '.test' -%}
-      {%- set v = 'virus' if kind == 'virus' else module.rand.weighted_choice(['positive', 'suspect'], [70, 30]) -%}
-      {%- if v == 'virus' -%}{%- set atts = [module.rand.choice(['invoice.zip', 'scan.htm', 'order.docm'])] -%}{%- endif -%}
-      {{- mail(now, 'in', cip, 'unknown', 'no', 'ACCEPT SG ' ~ sg ~ ' SBRS ' ~ sb, s, rc, (module.rand.number.lognormal(module.math.log(9000), 0.8)) | int + 600, atts, v, module.rand.choice(['Payment notice', 'Your parcel is waiting', 'Account verification', 'Invoice overdue'])) -}}
-    {%- endif -%}
-  {%- endif -%}
-{%- endif -%}
-
-{#- 3. Episode: due by source time, random start delay, then it begins
-    on an opportunity drawn like personal mail (uniform user, thinned by
-    working hours); next due counts from the actual start, no catch-up.
-    One rotated user sends three to five large messages to the own
-    personal mailbox, the first three inside the chain window. -#}
-{%- if params.anomaly_mode -%}
-  {%- if shared.get('start_at') is none and now >= shared.get('next_due') -%}
-    {%- do shared.set('start_at', now + (module.rand.number.exponential(1 / 600)) | int) -%}
-  {%- endif -%}
-  {%- if shared.get('start_at') is not none and now >= shared.get('start_at') -%}
-    {%- set eu = module.rand.choice(users) -%}
-    {%- if eu.addr != shared.get('last_user') and module.rand.chance(activity(eu) | float / 900) -%}
-      {%- set n = module.rand.weighted_choice([3, 4, 5], [55, 30, 15]) -%}
-      {#- Gaps follow the background series law; the first three messages
-          must fit the chain window, so only a draw exceeding it is
-          redrawn. -#}
-      {%- set g = namespace(v=[]) -%}
-      {%- for j in range(50) -%}
-        {%- if not g.v -%}
-          {%- set d = [] -%}
-          {%- for i in range(n - 1) -%}{%- do d.append(gap(160, 0.8) | int + 5) -%}{%- endfor -%}
-          {%- if d[0] + d[1] <= window - 120 -%}{%- set g.v = d -%}{%- endif -%}
-        {%- endif -%}
-      {%- endfor -%}
-      {%- set t = namespace(v=now) -%}
-      {%- set rc = [{'a': eu.personal, 'bad': false}] -%}
+{#- 2. No line due: start a new message of this timestamp's population. -#}
+{%- if not q or q[0][0] > now -%}
+  {%- if 'office' in tags -%}
+    {%- if module.rand.chance(0.07) -%}
+      {#- 2a. Mail to the user's own personal mailbox (files for home,
+          travel documents), single or in a quick series, small or large;
+          users picked by personal-mail weight and own working hours. In a
+          series each message draws its own content, so two large
+          messages in one series are common and three are rare; the
+          final-step guard in outbound() is only a backstop. -#}
+      {{- pick_active(shared.get('cum_p')) -}}
+      {%- set pu = users[shared.get('_pick')] -%}
+      {%- set rcpts = [{'a': pu.personal, 'bad': false}] -%}
+      {%- if module.rand.chance(0.1) -%}{%- do rcpts.append({'a': module.rand.choice(pu.contacts), 'bad': false}) -%}{%- endif -%}
+      {%- set n = module.rand.weighted_choice([1, 2, 3, 4], [65, 20, 11, 4]) -%}
+      {%- set t = namespace(v=sec) -%}
       {%- for i in range(n) -%}
-        {{- outbound(eu, t.v, rc, 'chain', true) -}}
-        {%- if i < n - 1 -%}{%- set t.v = t.v + (g.v[i] if g.v else 160) -%}{%- endif -%}
+        {%- set kind = module.rand.weighted_choice(['none', 'doc', 'files'], [38, 32, 30] if n == 1 else [40, 25, 35]) -%}
+        {{- outbound(pu, t.v, rcpts, kind) -}}
+        {%- set t.v = t.v + gap(160, 0.8) | int + 5 -%}
       {%- endfor -%}
-      {%- do shared.update({'start_at': none, 'last_user': eu.addr,
-          'next_due': now + (interval * 3600) | int}) -%}
+    {%- else -%}
+      {#- 2b. Work mail of one internal user, picked by activity weight and
+          own working hours. -#}
+      {{- pick_active(shared.get('cum_w')) -}}
+      {%- set u = users[shared.get('_pick')] -%}
+      {{- pick_rcpts(u) -}}
+      {%- set rcpts = shared.get('_rcpts') -%}
+      {%- if module.rand.chance(0.18) -%}
+        {#- A quick series to the same work recipients (split attachments,
+            forwards); the own personal mailbox gets its series in 2a. -#}
+        {%- set rcpts = rcpts | rejectattr('a', 'equalto', u.personal) | list or [{'a': module.rand.choice(u.contacts), 'bad': false}] -%}
+        {%- set kind = module.rand.weighted_choice(['doc', 'files', 'none'], [35, 55, 10]) -%}
+        {%- set t = namespace(v=sec) -%}
+        {%- for i in range(module.rand.weighted_choice([2, 3, 4, 5], [50, 30, 14, 6])) -%}
+          {{- outbound(u, t.v, rcpts, kind if module.rand.chance(0.85) else 'none') -}}
+          {%- set t.v = t.v + gap(160, 0.8) | int + 5 -%}
+        {%- endfor -%}
+      {%- else -%}
+        {{- outbound(u, sec, rcpts, module.rand.weighted_choice(['none', 'doc', 'files'], [62, 32, 6])) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- else -%}
+    {#- 2c. Internet mail to internal users. -#}
+    {%- set r = users[[module.bisect.bisect(shared.get('cum_w'), module.rand.number.floating(0, shared.get('cum_w')[-1])), users | length - 1] | min] -%}
+    {%- set kind = module.rand.weighted_choice(['partner', 'freemail', 'personal', 'newsletter', 'reject', 'spam', 'virus'], [44, 11, 3, 17, 16, 8, 0.15]) -%}
+    {%- set rc = [{'a': r.addr, 'bad': false}] -%}
+    {%- if kind in ['partner', 'freemail'] and module.rand.chance(0.18) -%}
+      {%- set r2 = module.rand.choice(users) -%}
+      {%- if r2.addr != r.addr -%}{%- do rc.append({'a': r2.addr, 'bad': false}) -%}{%- endif -%}
+    {%- endif -%}
+    {%- set subj = module.rand.weighted_choice(['', 'RE: '], [60, 40]) ~ module.rand.choice(shared.get('subjects')) -%}
+    {%- set atts = [] -%}
+    {%- set size = namespace(v=body_size() | int) -%}
+    {%- if kind in ['partner', 'freemail', 'personal'] and module.rand.chance(0.3) -%}
+      {%- do atts.append(module.rand.choice(shared.get('attachments'))) -%}
+      {%- set size.v = size.v + att_size('doc') | int -%}
+    {%- endif -%}
+    {%- if kind == 'partner' -%}
+      {%- set s = module.rand.choice(r.contacts if module.rand.chance(0.7) else shared.get('contacts')) -%}
+      {%- set p = params.partner_domains | selectattr('domain', 'equalto', s.split('@')[1]) | first -%}
+      {{- mail(sec, 'in', p.ip, 'mx.' ~ p.domain, 'yes', 'ACCEPT SG UNKNOWNLIST match sbrs[-1.0:10.0] SBRS ' ~ sbrs_of(p.sbrs), s, rc, size.v, atts, 'clean', subj) -}}
+    {%- elif kind in ['freemail', 'personal'] -%}
+      {%- if kind == 'personal' -%}
+        {%- set s = r.personal -%}
+      {%- else -%}
+        {%- set s = module.rand.choice(samples.contact_names['name']) ~ module.rand.number.integer(1, 999) ~ '@' ~ module.rand.choice(params.freemail_domains).domain -%}
+      {%- endif -%}
+      {%- set f = params.freemail_domains | selectattr('domain', 'equalto', s.split('@')[1]) | first -%}
+      {{- mail(sec, 'in', f.ip, 'out.' ~ f.domain, 'yes', 'ACCEPT SG UNKNOWNLIST match sbrs[-1.0:10.0] SBRS ' ~ sbrs_of(f.sbrs), s, rc, size.v, atts, 'clean', subj) -}}
+    {%- elif kind == 'newsletter' -%}
+      {%- set nl = module.rand.choice(params.newsletter_senders) -%}
+      {%- set size.v = (module.rand.number.lognormal(module.math.log(60000), 0.6)) | int -%}
+      {{- mail(sec, 'in', nl.ip, 'mta.' ~ nl.address.split('@')[1], 'yes', 'ACCEPT SG UNKNOWNLIST match sbrs[-1.0:10.0] SBRS ' ~ sbrs_of(nl.sbrs), nl.address, rc, size.v, [], 'bulk', module.rand.choice(['Weekly digest', 'Upcoming events', 'Your account summary', 'Special offer'])) -}}
+    {%- else -%}
+      {%- set cip = module.rand.choice(['192.0.2.', '198.18.', '198.19.']) -%}
+      {%- set cip = cip ~ module.rand.number.integer(1, 254) if cip == '192.0.2.' else cip ~ module.rand.number.integer(0, 255) ~ '.' ~ module.rand.number.integer(1, 254) -%}
+      {%- if kind == 'reject' -%}
+        {%- do shared.set('_tok', {}) -%}{%- set icid = '{I}' -%}
+        {%- set sb = '%.1f' | format(module.rand.number.floating(-9.8, -3.1)) -%}
+        {{- enq(sec, 'Info', 'New SMTP ICID ' ~ icid ~ ' interface Management (' ~ ifip ~ ') address ' ~ cip ~ ' reverse dns host unknown verified no', {'log': {'connection_status': 'New', 'injection_connection_id': icid | string, 'interface': ifip, 'address': cip, 'verified': 'no'}, 'proto': 'smtp', 'dns': 'unknown', 'rel': [ifip, cip]}) -}}
+        {{- enq(sec, 'Info', 'ICID ' ~ icid ~ ' REJECT SG BLOCKED_LIST match sbrs[-10.0:-3.0] SBRS ' ~ sb, {}) -}}
+        {{- enq(sec + gap(1, 0.8) | int, 'Info', 'ICID ' ~ icid ~ ' close', {'log': {'connection_status': 'close', 'injection_connection_id': icid | string}}) -}}
+      {%- else -%}
+        {%- set sb = '%.1f' | format(module.rand.number.floating(-2.9, 0.9)) -%}
+        {%- set sg = 'SUSPECTLIST match sbrs[-3.0:-1.0]' if sb | float < -1.0 else 'UNKNOWNLIST match sbrs[-1.0:10.0]' -%}
+        {%- set s = module.rand.string.letters_lowercase(module.rand.number.integer(5, 9)) ~ '@' ~ module.rand.string.letters_lowercase(module.rand.number.integer(5, 8)) ~ '.test' -%}
+        {%- set v = 'virus' if kind == 'virus' else module.rand.weighted_choice(['positive', 'suspect'], [70, 30]) -%}
+        {%- if v == 'virus' -%}{%- set atts = [module.rand.choice(['invoice.zip', 'scan.htm', 'order.docm'])] -%}{%- endif -%}
+        {{- mail(sec, 'in', cip, 'unknown', 'no', 'ACCEPT SG ' ~ sg ~ ' SBRS ' ~ sb, s, rc, (module.rand.number.lognormal(module.math.log(9000), 0.8)) | int + 600, atts, v, module.rand.choice(['Payment notice', 'Your parcel is waiting', 'Account verification', 'Invoice overdue'])) -}}
+      {%- endif -%}
     {%- endif -%}
   {%- endif -%}
 {%- endif -%}
 
-{%- endif -%}
-
-{#- 4. Emit the earliest due line, otherwise nothing. -#}
+{#- 3. Write the earliest due line. A new message always queues its first
+    line at the current second, so a line is always due here. -#}
 {%- if not q or q[0][0] > now -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set e = q.pop(0)[2] -%}
+{%- set e = heapq.heappop(q)[2] -%}
 {%- set f = e.f -%}
 {#- Connection and message IDs are taken when their first line is
     written, so every counter rises with log time. -#}
