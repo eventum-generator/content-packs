@@ -9,9 +9,11 @@
 {#- Chain window of the detector, from the first payroll read, in the
     millisecond clock of @timestamp. -#}
 {%- set chain_ms = 400000 -%}
-{#- One operation per 30-second input tick, at a random instant inside it. -#}
+{#- One operation per 30-second input tick, at a random instant of the
+    slot that the tick closes, so a live entry is never ahead of the
+    clock. -#}
 {%- set tick_ns = (timestamp.timestamp() | round | int) * E9 -%}
-{%- set now = tick_ns + module.rand.number.integer(0, 29499999999) -%}
+{%- set now = tick_ns - 30 * E9 + module.rand.number.integer(0, 29499999999) -%}
 {%- if not shared.get('identities') -%}
   {%- set people = [
     dict(actor='svc-api', ip='10.20.8.12', entity='49263c43-35ab-4df6-a747-1715203590ba'),
@@ -22,29 +24,34 @@
   {%- for person in people -%}
     {#- Logged in before the window, inside its first renewal sleep. -#}
     {%- set issue = now - module.rand.number.integer(600, 60000) * E9 - module.rand.number.integer(0, E9 - 1) -%}
-    {%- do person.update(dict(token='s.synthetic-service-' ~ loop.index, accessor='synthetic-accessor-' ~ loop.index, issue=issue, expires=issue + 86400 * E9, renew_due=issue + (renew_sleep() | int), last_renewal=none, port=module.rand.number.integer(32768, 60999), last_op=none, chain=[])) -%}
+    {%- do person.update(dict(token='s.synthetic-service-' ~ loop.index, accessor='synthetic-accessor-' ~ loop.index, issue=issue, expires=issue + 86400 * E9, renew_due=issue + (renew_sleep() | int), last_renewal=none, port=module.rand.number.integer(32768, 60999), last_op=none, payroll=[])) -%}
   {%- endfor -%}
   {%- set created = [] -%}
   {%- for secret in samples.secrets -%}
     {%- do created.append(nano(now - module.rand.number.integer(86400, 30 * 86400) * E9 - module.rand.number.integer(0, E9 - 1))) -%}
   {%- endfor -%}
-  {%- do shared.update(dict(identities=people, created=created, next_episode=tick_ns + module.rand.number.integer(0, [interval_ns, 86400 * E9] | min - 1), episode=none, last_episode_actor=-1, last_episode_first=-1, batches=[], delete_backlog=0, retries=[], device_salt='6e3d1588-aaf1-47ec-b267-29419a7c30e1', log_offset=0)) -%}
+  {%- do shared.update(dict(identities=people, created=created, next_episode=tick_ns + module.rand.number.integer(0, [interval_ns, 86400 * E9] | min - 1), episode=none, last_episode_actor=-1, last_episode_first=-1, batches=[], delete_backlog=0, delete_bag=[], retries=[], device_salt='6e3d1588-aaf1-47ec-b267-29419a7c30e1', log_offset=0)) -%}
 {%- endif -%}
 {%- set people = shared.get('identities') -%}
 {%- set batches = shared.get('batches') -%}
 {%- set retries = shared.get('retries') -%}
-{#- Chain guard: per actor, a replica of the detector's matcher over
-    emitted requests (three distinct payroll reads, then an audit
-    DELETE, the first read at most 400 s before it; completion resets
-    the actor; at most eight partial matches). An ordinary DELETE that
-    would complete it is not made: the attempt is dropped and the tick
-    goes to the next source. -#}
+{#- Chain guard. A detector completes the chain on an audit DELETE
+    when the actor made payroll reads of three distinct paths, in any
+    order and including an episode's own reads, at most 400 s before
+    it. Each actor keeps its payroll reads of the last 400 s, whatever
+    completed before. An ordinary DELETE that would complete the chain
+    is not made: the attempt is dropped and the tick goes to the next
+    source. -#}
 {%- set now_ms = now // 1000000 -%}
 {%- macro completes(person, t_ms, w_ms) -%}
-  {%- for p in person.chain -%}{%- if p[0] == 3 and t_ms - p[1] <= w_ms -%}1{%- endif -%}{%- endfor -%}
+  {%- set paths = [] -%}
+  {%- for p in person.payroll -%}
+    {%- if t_ms - p[0] <= w_ms and p[1] not in paths -%}{%- do paths.append(p[1]) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if paths | length >= 3 -%}1{%- endif -%}
 {%- endmacro -%}
 {#- Background processes draw identically in both modes. -#}
-{%- if module.rand.chance(0.0028) -%}
+{%- if module.rand.chance(0.00139) -%}
   {%- do shared.set('delete_backlog', shared.get('delete_backlog') + 1) -%}
 {%- endif -%}
 {%- if module.rand.chance(0.0042) and batches | length < 3 -%}
@@ -68,8 +75,9 @@
     {%- if loop.index0 != shared.get('last_episode_actor') and loop.index0 not in busy -%}{%- do eligible.append(loop.index0) -%}{%- endif -%}
   {%- endfor -%}
   {%- if eligible -%}
-    {%- set paths = module.json.loads(payroll_run(10, shared.get('last_episode_first'))) -%}
-    {%- do shared.set('episode', dict(index=module.rand.choice(eligible), paths=paths, position=0)) -%}
+    {#- Ten reads plus up to four spare ones. -#}
+    {%- set paths = module.json.loads(payroll_run(14, shared.get('last_episode_first'))) -%}
+    {%- do shared.set('episode', dict(index=module.rand.choice(eligible), paths=paths, position=0, pause_until=0)) -%}
     {%- do shared.set('last_episode_first', paths[0] - 12) -%}
   {%- endif -%}
 {%- endif -%}
@@ -98,7 +106,12 @@
 {#- 3. A new ordinary denied audit DELETE attempt. -#}
 {%- if selected.index < 0 and shared.get('delete_backlog') > 0 -%}
   {%- do shared.set('delete_backlog', shared.get('delete_backlog') - 1) -%}
-  {%- set attempt = module.rand.weighted_choice([0, 1, 2, 3], [30, 25, 25, 20]) -%}
+  {#- The attempting actor comes from a shuffled bag holding each of
+      the four actors twice. -#}
+  {%- if not shared.get('delete_bag') -%}
+    {%- do shared.set('delete_bag', module.random.sample([0, 0, 1, 1, 2, 2, 3, 3], 8)) -%}
+  {%- endif -%}
+  {%- set attempt = shared.get('delete_bag').pop() -%}
   {%- if not completes(people[attempt], now_ms, chain_ms) -%}
     {%- set selected.index = attempt -%}{%- set selected.kind = 'delete' -%}{%- set selected.origin = 'ordinary' -%}
   {%- endif -%}
@@ -116,11 +129,15 @@
   {%- for batch in batches -%}{%- if batch.position < batch.paths | length -%}{%- do running.append(batch) -%}{%- endif -%}{%- endfor -%}
   {%- do shared.set('batches', running) -%}
 {%- endif -%}
-{#- 5. The next step of an episode, paced like a batch. -#}
+{#- 5. The next step of an episode, paced like a batch: ten reads, a
+    pause of up to four minutes, then the DELETE. When slower traffic
+    spread the reads so far apart that fewer than three distinct ones
+    remain within the chain window, a spare read comes first. -#}
 {%- set episode = shared.get('episode') -%}
-{%- if selected.index < 0 and episode and module.rand.chance(0.8) -%}
+{%- if selected.index < 0 and episode and (episode.position < 10 or now >= episode.pause_until) and module.rand.chance(0.8) -%}
   {%- set selected.index = episode.index -%}
-  {%- if episode.position < 10 -%}
+  {%- set spare = episode.position >= 10 and episode.position < episode.paths | length and not completes(people[episode.index], now_ms, chain_ms) -%}
+  {%- if episode.position < 10 or spare -%}
     {%- set selected.kind = 'read' -%}
     {%- set selected.secret_index = episode.paths[episode.position] -%}
     {%- if episode.position == 0 -%}
@@ -128,6 +145,9 @@
           one interval after this actual first read. -#}
       {%- do shared.set('next_episode', now + interval_ns + module.rand.number.integer(-window_ns // 2, window_ns // 2)) -%}
       {%- do shared.set('last_episode_actor', episode.index) -%}
+    {%- endif -%}
+    {%- if episode.position == 9 -%}
+      {%- do episode.update(dict(pause_until=now + module.rand.number.integer(0, 240) * E9)) -%}
     {%- endif -%}
     {%- do episode.update(dict(position=episode.position + 1)) -%}
   {%- else -%}
@@ -168,23 +188,12 @@
   {%- set path = 'sys/audit/file' -%}
   {%- set operation = 'delete' -%}
 {%- endif -%}
-{#- Feed the emitted request to the chain replica. -#}
-{%- set payroll_read = selected.kind == 'read' and selected.secret_index >= 12 -%}
-{%- set parts = [] -%}
-{%- set m = namespace(done=false) -%}
-{%- for p in person.chain if now_ms - p[1] <= chain_ms -%}
-  {%- if p[0] == 3 and selected.kind == 'delete' -%}
-    {%- set m.done = true -%}{%- break -%}
-  {%- elif p[0] == 1 and payroll_read and path != p[2] -%}
-    {%- do parts.append([2, p[1], p[2], path]) -%}
-  {%- elif p[0] == 2 and payroll_read and path not in [p[2], p[3]] -%}
-    {%- do parts.append([3, p[1], p[2], p[3]]) -%}
-  {%- else -%}
-    {%- do parts.append(p) -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- if not m.done and payroll_read -%}{%- do parts.append([1, now_ms, path, none]) -%}{%- endif -%}
-{%- do person.update(dict(chain=[] if m.done else parts[-8:])) -%}
+{#- Keep the actor's payroll reads of the chain window for the guard;
+    one operation per 30 s bounds the list to 14 entries. -#}
+{%- set recent = [] -%}
+{%- for p in person.payroll if now_ms - p[0] <= chain_ms -%}{%- do recent.append(p) -%}{%- endfor -%}
+{%- if selected.kind == 'read' and selected.secret_index >= 12 -%}{%- do recent.append([now_ms, path]) -%}{%- endif -%}
+{%- do person.update(dict(payroll=recent)) -%}
 {%- set token = hmac(person.token) -%}
 {%- set accessor = hmac(person.accessor) -%}
 {%- set policies = ['default', 'training-reader'] -%}
