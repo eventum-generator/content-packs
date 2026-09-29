@@ -1,13 +1,14 @@
 {#- Microsoft-Windows-Hyper-V-VMMS-Admin checkpoint and merge failures
     (event IDs 18014, 18012, 19100) as Winlogbeat-style ECS JSON with the
-    raw event XML. One input tick per second; each tick emits the earliest
-    due record, stamped with its own microsecond time, or drops. Every VM
-    runs its own random schedule of failing checkpoint series; successful
-    checkpoints write nothing to the Admin channel. Times are in
+    raw event XML. Every input timestamp yields exactly one record: the
+    earliest queued record that is due (stamped with its own microsecond
+    time, never later than the input timestamp), otherwise the first
+    record of a new failing series on an idle VM. Successful checkpoints
+    and merges write nothing to the Admin channel. Times are in
     microseconds. -#}
 {%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
 {%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
-{%- if shared.get('queue') is not none and now < shared.get('next_due') and not (params.anomaly_mode and now >= shared.get('ep_start')) -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set hour = 3600000000 -%}
 {%- macro d(lo, med, sig, hi) -%}
   {#- Offset lognormal in seconds, truncated by redrawing; returns us. -#}
   {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
@@ -16,9 +17,8 @@
   {%- endfor -%}
   {{- module.builtins.int(([ns.v, hi] | min) * 1000000) -}}
 {%- endmacro -%}
-{#- Gap between failing series of one VM, retry delay after a failed
-    attempt, 18014 -> 18012 and 18012 -> 19100 delays. -#}
-{%- macro arrival_gap() -%}{{- d(60, 14400, 1.1, 259200) -}}{%- endmacro -%}
+{#- Retry delay after a failed attempt, 18014 -> 18012 and
+    18012 -> 19100 delays. -#}
 {%- macro retry_gap() -%}{{- d(20, 360, 1.0, 7200) -}}{%- endmacro -%}
 {%- macro fail_delay() -%}{{- d(0.00001, 0.00006, 0.8, 0.005) -}}{%- endmacro -%}
 {%- macro merge_delay() -%}{{- d(0.002, 0.02, 0.9, 2) -}}{%- endmacro -%}
@@ -28,10 +28,31 @@
 {%- set p_retry_fail = 0.5 -%}
 {%- set p_merge_only = 0.15 -%}
 {%- set p_merge_again = 0.55 -%}
-{#- Chain window: a background merge failure is withheld only when it
-    would complete 18014, 18012, 19100, 18012, 19100, 18012, 19100 on one
-    VM inside this window. -#}
+{#- Chain window: a merge failure is not logged (the merge succeeds)
+    only when it would complete 18014, 18012, 19100, 18012, 19100, 18012,
+    19100 on one VM inside this window; one second of margin covers the
+    millisecond rounding of @timestamp. -#}
 {%- set window = 21600000000 -%}
+{%- set window_g = window + 1000000 -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) whose local hour is weighted by the
+      failure-rate curve squared plus a small floor. -#}
+  {%- set curve = shared.get('curve') -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, 1.02) < curve[((c + shared.get('tzoff')) // hour) % 24] ** 2 + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
 {%- if shared.get('queue') is none -%}
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
@@ -40,49 +61,82 @@
   {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
   {%- set hosts = {} -%}
   {%- set vms = [] -%}
-  {%- set queue = [] -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(w=0) -%}
   {%- for row in samples.vms -%}
     {%- if row.host not in hosts -%}
       {%- set threads = [] -%}
       {%- for _ in range(module.rand.number.integer(6, 14)) -%}{%- do threads.append(4 * module.rand.number.integer(100, 4000)) -%}{%- endfor -%}
       {%- do hosts.update({row.host: {'pid': 4 * module.rand.number.integer(250, 2500), 'threads': threads, 'record': module.rand.number.integer(2000, 400000)}}) -%}
     {%- endif -%}
-    {%- do vms.append({'name': row.vm_name, 'id': row.vm_id, 'host': row.host, 'busy': false, 'ep_left': 0, 'ep_merges': 0, 'hist': []}) -%}
-    {%- do queue.append({'due': now + module.builtins.int(module.rand.number.floating(0, 1) * (arrival_gap() | int)), 'k': 'arr', 'v': loop.index0}) -%}
+    {#- Failure propensity of the VM, bounded within its tier: a VM
+        with recurring checkpoint trouble fails a few times a day, any
+        other VM about once in five to seven days. -#}
+    {%- if row.checkpoint_trouble -%}
+      {%- set w = 22 * ([[module.rand.number.lognormal(0, 0.2), 0.8] | max, 1.25] | min) -%}
+    {%- else -%}
+      {%- set w = 0.9 * ([[module.rand.number.lognormal(0, 0.3), 0.7] | max, 1.4] | min) -%}
+    {%- endif -%}
+    {%- set acc.w = acc.w + w -%}
+    {%- do cum.append(acc.w) -%}
+    {%- do vms.append({'name': row.vm_name, 'id': row.vm_id, 'host': row.host, 'trouble': row.checkpoint_trouble, 'w': w, 'busy': false, 'free': 0, 'ep_left': 0, 'ep_merges': 0, 'hist': []}) -%}
   {%- endfor -%}
-  {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000000) -%}
-  {%- do shared.update({'queue': queue, 'vms': vms, 'hosts': hosts, 'last_us': now - 1, 'next_due': queue | map(attribute='due') | min, 'ep_last_vm': none, 'ep_last_host': none, 'ep_start': now + 3600000000 + module.builtins.int(module.rand.number.floating(0, [3600000000, interval / 8] | min))}) -%}
+  {#- Relative hourly failure rate (local hours): backup window
+      22:00-05:00 against the daytime floor, as in patterns/. -#}
+  {%- set curve = [] -%}
+  {%- for h in range(24) -%}{%- do curve.append(1.0 if h < 5 or h >= 22 else 0.1667) -%}{%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'queue': [], 'seq': 0, 'vms': vms, 'hosts': hosts, 'cum': cum, 'idx': range(vms | length) | list, 'curve': curve, 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()) * 1000000, 'last_us': now - 1, 'ep_last_vm': none, 'ep_last_host': none}) -%}
+  {%- do shared.update({'ep_due': pick_start(now, [interval, 24 * hour] | min) | int, 'ep_end': now + ([interval, 24 * hour] | min)}) -%}
 {%- endif -%}
 {%- set queue = shared.get('queue') -%}
 {%- set vms = shared.get('vms') -%}
 {%- set hosts = shared.get('hosts') -%}
-{%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000000) -%}
-{#- Episode start: the first tick at or after due + random delay with an
-    idle VM that is neither the previous episode's VM nor on its host and
-    has logged nothing within the chain window (so that no earlier row can
-    complete the chain before the episode does). The
-    episode is one failing series of that VM: its attempts use the
-    background delays, but every attempt fails and the first three end in a
-    merge failure. The VM's own arrivals keep their schedule; an arrival
-    that finds a series running is skipped, as in the background. The next
-    due is one interval after this start; missed episodes are not replayed. -#}
-{%- if params.anomaly_mode and now >= shared.get('ep_start') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode start: the first timestamp at or after the planned start
+    with an idle VM with recurring checkpoint trouble (by failure
+    propensity) that is neither the previous episode's VM nor on its host
+    and whose records within the chain window hold no cancelled, failed
+    and merge-failed sequence (so that the chain completes only on the
+    episode's last merge failure). The episode is one failing series of
+    that VM: its attempts use the background delays, but the first three
+    fail with a merge failure. The next start is planned in a window of
+    min(interval / 4, 6 h) centred one interval after this start,
+    weighted by the curve squared; when no VM qualifies at the drawn
+    start, the start is drawn again, the same way, in the rest of that
+    window. Missed episodes are not replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {#- The episode is stamped from its planned start, which can lie
+      before this timestamp: the VM must have no record after it, and
+      the chain window is counted back from it. -#}
+  {%- set start = [shared.get('ep_due'), shared.get('last_us') + 1] | max -%}
   {%- set cand = [] -%}
-  {%- for i in range(vms | length) if not vms[i].busy and i != shared.get('ep_last_vm') and vms[i].host != shared.get('ep_last_host') and (not vms[i].hist or vms[i].hist[-1][0] < now - window) -%}{%- do cand.append(i) -%}{%- endfor -%}
+  {%- set cw = [] -%}
+  {%- for i in range(vms | length) if vms[i].trouble and not vms[i].busy and vms[i].free < start and i != shared.get('ep_last_vm') and vms[i].host != shared.get('ep_last_host') -%}
+    {%- set st = namespace(n=0) -%}
+    {%- for x in vms[i].hist if st.n < 3 -%}
+      {%- if x[0] >= start - window_g and x[1] == [18014, 18012, 19100][st.n] -%}{%- set st.n = st.n + 1 -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if st.n < 3 -%}
+      {%- do cand.append(i) -%}
+      {%- do cw.append(vms[i].w) -%}
+    {%- endif -%}
+  {%- endfor -%}
   {%- if cand -%}
-    {%- set vi = module.rand.choice(cand) -%}
-    {%- set start = now + module.rand.number.integer(0, 999999) -%}
-    {%- do vms[vi].update({'busy': true, 'ep_left': 3 if module.rand.chance(0.7) else 4}) -%}
-    {%- do queue.append({'due': start, 'k': 'att', 'v': vi, 'first': true}) -%}
-    {%- do shared.update({'ep_last_vm': vi, 'ep_last_host': vms[vi].host, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(0, [3600000000, interval / 8] | min)), 'next_due': [shared.get('next_due'), start] | min}) -%}
+    {%- set vi = module.rand.weighted_choice(cand, cw) -%}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {%- do vms[vi].update({'busy': true, 'ep_left': 4 if module.rand.chance(0.3) else 3, 'ep_merges': 0}) -%}
+    {%- do push(start, {'k': 'att', 'v': vi, 'first': true}) -%}
+    {%- do shared.update({'ep_last_vm': vi, 'ep_last_host': vms[vi].host, 'ep_due': pick_start(start + interval - w // 2, w) | int, 'ep_end': start + interval - w // 2 + w}) -%}
+  {%- elif shared.get('ep_end') - now > 1 -%}
+    {%- do shared.set('ep_due', pick_start(now + 1, shared.get('ep_end') - now - 1) | int) -%}
   {%- endif -%}
 {%- endif -%}
-{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- macro completes(hist, t) -%}
   {#- 'y' when a 19100 at t completes the chain over the VM history. -#}
   {%- set seq = [18014, 18012, 19100, 18012, 19100, 18012] -%}
   {%- set ns = namespace(found=false) -%}
-  {%- for i in range(hist | length) if not ns.found and hist[i][1] == 18014 and t - hist[i][0] <= window -%}
+  {%- for i in range(hist | length) if not ns.found and hist[i][1] == 18014 and t - hist[i][0] <= window_g -%}
     {%- set st = namespace(n=1) -%}
     {%- for j in range(i + 1, hist | length) if st.n < 6 -%}
       {%- if hist[j][1] == seq[st.n] -%}{%- set st.n = st.n + 1 -%}{%- endif -%}
@@ -92,37 +146,50 @@
   {{- 'y' if ns.found else '' -}}
 {%- endmacro -%}
 {%- set out = namespace(row=none, rec=0) -%}
-{%- for _ in range(24) if out.row is none and queue and (queue | map(attribute='due') | min) <= now -%}
-  {%- set pick = namespace(item=none) -%}
-  {%- for item in queue if pick.item is none or item.due < pick.item.due -%}{%- set pick.item = item -%}{%- endfor -%}
-  {%- set item = pick.item -%}
-  {%- do queue.remove(item) -%}
+{%- for _ in range(64) if out.row is none -%}
+  {%- if queue and queue[0][0] <= now -%}
+    {%- set top = module.heapq.heappop(queue) -%}
+    {%- set item = top[2] -%}
+    {%- set due = top[0] -%}
+  {%- else -%}
+    {#- Nothing due: a new failing series starts now on an idle VM,
+        drawn by failure propensity. -#}
+    {%- set pick = namespace(v=none) -%}
+    {%- for _ in range(12) if pick.v is none -%}
+      {%- set c = module.random.choices(shared.get('idx'), cum_weights=shared.get('cum'), k=1)[0] -%}
+      {%- if not vms[c].busy and vms[c].free < now -%}{%- set pick.v = c -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if pick.v is none -%}
+      {%- set idle = [] -%}
+      {%- for i in range(vms | length) if not vms[i].busy and vms[i].free < now -%}{%- do idle.append(i) -%}{%- endfor -%}
+      {%- set pick.v = module.rand.choice(idle) -%}
+    {%- endif -%}
+    {%- do vms[pick.v].update({'busy': true}) -%}
+    {%- set item = {'k': 'merge' if module.rand.chance(p_merge_only) else 'att', 'v': pick.v, 'first': true} -%}
+    {%- set due = now -%}
+  {%- endif -%}
   {%- set vm = vms[item.v] -%}
   {%- if item.k == 'row' -%}
     {%- set out.row = item -%}
-    {%- set out.rec = [item.due, shared.get('last_us') + 1] | max -%}
+    {%- set out.rec = [due, shared.get('last_us') + 1] | max -%}
     {%- do shared.set('last_us', out.rec) -%}
-  {%- elif item.k == 'arr' -%}
-    {%- do queue.append({'due': item.due + (arrival_gap() | int), 'k': 'arr', 'v': item.v}) -%}
-    {%- if not vm.busy -%}
-      {%- do vm.update({'busy': true}) -%}
-      {%- do queue.append({'due': item.due, 'k': 'merge' if module.rand.chance(p_merge_only) else 'att', 'v': item.v, 'first': true}) -%}
-    {%- endif -%}
   {%- elif item.k == 'merge' -%}
     {#- The background merge of an earlier checkpoint's disk fails on its
         own and VMMS may retry it after a delay. -#}
-    {%- if not completes(vm.hist, item.due) -%}
-      {%- do queue.append({'due': item.due, 'k': 'row', 'v': item.v, 'code': 19100, 'thr': module.rand.choice(hosts[vm.host].threads)}) -%}
-      {%- do vm.hist.append([item.due, 19100]) -%}
+    {%- if not completes(vm.hist, due) -%}
+      {%- do push(due, {'k': 'row', 'v': item.v, 'code': 19100, 'thr': module.rand.choice(hosts[vm.host].threads)}) -%}
+      {%- do vm.hist.append([due, 19100]) -%}
+      {%- do vm.update({'free': [vm.free, due] | max}) -%}
     {%- endif -%}
     {%- if module.rand.chance(p_merge_again) -%}
-      {%- do queue.append({'due': item.due + (retry_gap() | int), 'k': 'merge', 'v': item.v}) -%}
+      {%- set nd = due + (retry_gap() | int) -%}
+      {%- do push(nd, {'k': 'merge', 'v': item.v}) -%}
     {%- else -%}
       {%- do vm.update({'busy': false}) -%}
     {%- endif -%}
   {%- elif item.k == 'retry' -%}
     {%- if vm.ep_left > 0 or module.rand.chance(p_retry_fail) -%}
-      {%- do queue.append({'due': item.due, 'k': 'att', 'v': item.v, 'first': false}) -%}
+      {%- do push(due, {'k': 'att', 'v': item.v, 'first': false}) -%}
     {%- else -%}
       {%- do vm.update({'busy': false}) -%}
     {%- endif -%}
@@ -131,37 +198,39 @@
         same VMMS worker thread, then an optional 19100. -#}
     {%- set episode = vm.ep_left > 0 -%}
     {%- set thr = module.rand.choice(hosts[vm.host].threads) -%}
-    {%- set t = namespace(v=item.due) -%}
+    {%- set t = namespace(v=due) -%}
     {%- if (episode and item.first) or module.rand.chance(p_cancel) -%}
-      {%- do queue.append({'due': t.v, 'k': 'row', 'v': item.v, 'code': 18014, 'thr': thr}) -%}
+      {%- do push(t.v, {'k': 'row', 'v': item.v, 'code': 18014, 'thr': thr}) -%}
       {%- do vm.hist.append([t.v, 18014]) -%}
       {%- set t.v = t.v + (fail_delay() | int) -%}
     {%- endif -%}
-    {%- do queue.append({'due': t.v, 'k': 'row', 'v': item.v, 'code': 18012, 'thr': thr}) -%}
+    {%- do push(t.v, {'k': 'row', 'v': item.v, 'code': 18012, 'thr': thr}) -%}
     {%- do vm.hist.append([t.v, 18012]) -%}
+    {%- do vm.update({'free': [vm.free, t.v] | max}) -%}
     {%- set forced = episode and vm.ep_merges < 3 -%}
     {%- if forced or module.rand.chance(p_merge) -%}
       {%- set mt = t.v + (merge_delay() | int) -%}
-      {%- if episode or not completes(vm.hist, mt) -%}
-        {%- do queue.append({'due': mt, 'k': 'row', 'v': item.v, 'code': 19100, 'thr': thr if module.rand.chance(0.5) else module.rand.choice(hosts[vm.host].threads)}) -%}
+      {%- if forced or not completes(vm.hist, mt) -%}
+        {%- do push(mt, {'k': 'row', 'v': item.v, 'code': 19100, 'thr': thr if module.rand.chance(0.5) else module.rand.choice(hosts[vm.host].threads)}) -%}
         {%- do vm.hist.append([mt, 19100]) -%}
-        {%- if episode -%}{%- do vm.update({'ep_merges': vm.ep_merges + 1}) -%}{%- endif -%}
+        {%- do vm.update({'free': [vm.free, mt] | max}) -%}
+        {%- if forced -%}{%- do vm.update({'ep_merges': vm.ep_merges + 1}) -%}{%- endif -%}
       {%- endif -%}
     {%- endif -%}
     {%- if episode -%}
       {%- do vm.update({'ep_left': vm.ep_left - 1}) -%}
-      {%- if vm.ep_left == 0 -%}{%- do vm.update({'ep_merges': 0}) -%}{%- endif -%}
     {%- endif -%}
     {%- if vm.ep_left > 0 or module.rand.chance(p_retry) -%}
-      {%- do queue.append({'due': t.v + (retry_gap() | int), 'k': 'retry', 'v': item.v}) -%}
+      {%- set nd = t.v + (retry_gap() | int) -%}
+      {%- do push(nd, {'k': 'retry', 'v': item.v}) -%}
     {%- else -%}
       {%- do vm.update({'busy': false}) -%}
     {%- endif -%}
   {%- endif -%}
   {#- Bounded history: rows older than the chain window are dropped. -#}
-  {%- for _ in range(vm.hist | length) if vm.hist and item.due - vm.hist[0][0] > window -%}{%- do vm.hist.pop(0) -%}{%- endfor -%}
+  {%- for _ in range(vm.hist | length) if vm.hist and due - vm.hist[0][0] > window_g -%}{%- do vm.hist.pop(0) -%}{%- endfor -%}
 {%- endfor -%}
-{%- do shared.set('next_due', (queue | map(attribute='due') | min) if queue else now + 1000000) -%}
+{#- Never reached in practice: every new series logs a record. -#}
 {%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set row = out.row -%}
 {%- set rec = out.rec -%}
