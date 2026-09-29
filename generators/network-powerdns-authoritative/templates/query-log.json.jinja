@@ -6,9 +6,11 @@
       <%b %d %H:%M:%S> Remote <ip> wants '<qname>|<qtype>', do = <0|1>, \
         bufsize = <maxreplylen>[ (<edns size>)]: packetcache <HIT|MISS>
 
-    Each render emits at most one query, taken from a due-queue fed by
-    independent per-client random processes. The anomaly episode only
-    adds rows for one client; it never touches the background queue. -#}
+    Every timestamp is exactly one query. The inputs set the rate: a
+    `resolver` timestamp is one question of a recursive resolver, a
+    `direct` timestamp starts a short session of a directly connected
+    host. The later questions of a session (and of an episode) wait in
+    a queue and take the next timestamps of either stream once due. -#}
 {%- set now = timestamp.timestamp() | int -%}
 {%- set utc = module.datetime.timezone.utc -%}
 {%- set interval = params.anomaly_interval_hours | float -%}
@@ -17,22 +19,26 @@
     `a_steps` A questions for distinct names in that zone, all from one
     client within `window` seconds of the SOA. -#}
 {%- set a_steps = 10 -%}
-{%- set n_steps = 2 + a_steps -%}
 {%- set window = 300 -%}
 {%- set udp_threshold = 1232 -%}
 {%- set cache_ttl = 20 -%}
+{#- Direct-client session starts per UTC hour, relative to the peak
+    (patterns/direct-*.yml: 0.02/s all day plus 0.04/s 08-18 UTC). -#}
+{%- set direct_curve = [0.333, 0.333, 0.333, 0.333, 0.333, 0.333, 0.333,
+    0.333, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.333, 0.333,
+    0.333, 0.333, 0.333, 0.333] -%}
 
 {#- Draw an episode start in [a, b): 10-minute slots weighted by the
-    background hour curve (sq: curve^2 + 0.05), uniform within a slot. -#}
+    direct-client hour curve (sq: curve^2 + 0.05), uniform within a
+    slot. -#}
 {%- macro draw_start(a, b, sq) -%}
-  {%- set curve = shared.get('curve') -%}
   {%- set base = (a // 600) * 600 -%}
   {%- set lows = [] -%}{%- set highs = [] -%}{%- set ws = [] -%}
   {%- for i in range((b - base) // 600 + 1) -%}
     {%- set lo = [a, base + i * 600] | max -%}
     {%- set hi = [b, base + (i + 1) * 600] | min -%}
     {%- if hi > lo -%}
-      {%- set c = curve[((base + i * 600) % 86400) // 600] -%}
+      {%- set c = direct_curve[((base + i * 600) % 86400) // 3600] -%}
       {%- do lows.append(lo) -%}{%- do highs.append(hi) -%}
       {%- do ws.append((hi - lo) * (c * c + 0.05 if sq else c)) -%}
     {%- endif -%}
@@ -62,56 +68,54 @@
   {%- if (resolvers + direct) | unique | list | length != (resolvers + direct) | length -%}
     {{ module.math.sqrt(-1) }}
   {%- endif -%}
-  {#- Per client: weight, own active window [start h, length h,
+  {#- Per client: bounded weight, own active window [start h, length h,
       off-hours factor] and EDNS profile. Resolvers send EDNS with DO;
       direct clients are dig-like (EDNS 1232 or 4096) or plain scripts
       without EDNS. -#}
   {%- set weight = {} -%}{%- set day = {} -%}{%- set edns = {} -%}
   {%- for ip in resolvers + direct -%}
-    {%- do weight.update({ip: module.rand.number.lognormal(0, 0.8)}) -%}
+    {%- do weight.update({ip: [[module.rand.number.lognormal(0, 0.6), 0.5] | max, 2.0] | min}) -%}
     {%- do day.update({ip: [module.rand.number.floating(0, 24),
         module.rand.number.floating(6, 14),
-        module.rand.number.floating(0.1, 0.6)]}) -%}
+        module.rand.number.floating(0.2, 0.6)]}) -%}
     {%- if ip in resolvers -%}
       {%- do edns.update({ip: module.rand.weighted_choice([1232, 4096], [80, 20])}) -%}
     {%- else -%}
       {%- do edns.update({ip: module.rand.weighted_choice([1232, 4096, -1], [55, 15, 30])}) -%}
     {%- endif -%}
   {%- endfor -%}
-  {#- Episode hour curve per 10-minute slot of the UTC day: weighted sum
-      of the direct clients' activity factors, max 1. -#}
-  {%- set curve = [] -%}
+  {#- Client pick weights per 10-minute slot of the UTC day: weight
+      times the client's own activity factor at that time. -#}
+  {%- set rslot = [] -%}{%- set dslot = [] -%}
   {%- for k in range(144) -%}
     {%- set h = (k + 0.5) / 6 -%}
-    {%- set acc = namespace(v=0) -%}
-    {%- for ip in direct -%}
+    {%- set rs = [] -%}{%- set ds = [] -%}
+    {%- for ip in resolvers + direct -%}
       {%- set dw = day[ip] -%}
-      {%- set acc.v = acc.v + weight[ip] * (1.0 if ((h - dw[0]) % 24) < dw[1] else dw[2]) -%}
+      {%- set v = weight[ip] * (1.0 if ((h - dw[0]) % 24) < dw[1] else dw[2]) -%}
+      {%- do (rs if ip in resolvers else ds).append(v) -%}
     {%- endfor -%}
-    {%- do curve.append(acc.v) -%}
+    {%- do rslot.append(rs) -%}{%- do dslot.append(ds) -%}
   {%- endfor -%}
-  {%- set cmax = curve | max -%}
-  {%- set norm = [] -%}
-  {%- for v in curve -%}{%- do norm.append(v / cmax) -%}{%- endfor -%}
   {%- set zw = [] -%}
-  {%- for z in zones -%}{%- do zw.append(1.0 if loop.first else 0.35) -%}{%- endfor -%}
-  {%- set hosts = ['www', 'mail', 'vpn', 'api', 'app', 'portal', 'sso',
-      'status', 'cdn', 'git', 'docs', 'monitor', 'backup', 'ns1', 'ns2',
-      'smtp', 'intranet', 'wiki', 'crm', 'files', 'proxy', 'ldap', 'dc01',
-      'dc02', 'jira', 'grafana', 'owa', 'autodiscover'] -%}
-  {#- Labels no zone publishes: stale configs and typos in ordinary
-      traffic, dictionary candidates in an enumeration. -#}
-  {%- set strays = ['dev', 'test', 'staging', 'beta', 'old', 'admin',
-      'remote', 'webmail', 'ftp', 'db', 'sql', 'jenkins', 'gitlab',
-      'vault', 'citrix', 'exchange', 'mobile', 'shop', 'support', 'demo',
-      'uat', 'qa', 'secure', 'login', 'auth', 'mx2', 'vpn2', 'www2'] -%}
-  {%- set hw = [] -%}
-  {%- for h in hosts -%}{%- do hw.append(1.0 / (loop.index0 + 2)) -%}{%- endfor -%}
+  {%- for z in zones -%}{%- do zw.append(1.0 if loop.first else 0.5) -%}{%- endfor -%}
+  {#- Published host names (Zipf-like weights) and labels no zone
+      publishes: stale configs and typos in ordinary traffic,
+      dictionary candidates in an enumeration. -#}
+  {%- set hosts = [] -%}{%- set hw = [] -%}{%- set strays = [] -%}
+  {%- for i in range(samples.labels | length) -%}
+    {%- set row = samples.labels[i] -%}
+    {%- if row.published == 'true' -%}
+      {%- do hosts.append(row.label) -%}{%- do hw.append(row.weight | float) -%}
+    {%- else -%}{%- do strays.append(row.label) -%}
+    {%- endif -%}
+  {%- endfor -%}
   {%- do shared.update({'initialized': true, 'resolvers': resolvers,
-      'direct': direct, 'weight': weight, 'day': day, 'edns': edns,
-      'curve': norm, 'zw': zw, 'hosts': hosts, 'hw': hw, 'strays': strays,
-      'q': [], 'm': {}, 'cache': {}, 'start_at': none,
-      'last_client': none}) -%}
+      'direct': direct, 'edns': edns, 'rslot': rslot, 'dslot': dslot,
+      'zw': zw, 'hosts': hosts, 'hw': hw, 'strays': strays,
+      'labels': hosts + strays, 'q': [], 'seq': [0], 'hist': {},
+      'cache': {}, 'cq': module.collections.deque(), 'start_at': none,
+      'last_client': none, 'guard': [0, 0, 0]}) -%}
   {%- if params.anomaly_mode -%}
     {{- draw_start(now, now + ([interval, 24] | min * 3600) | int, false) -}}
   {%- endif -%}
@@ -119,26 +123,27 @@
 
 {%- set resolvers = shared.get('resolvers') -%}
 {%- set direct = shared.get('direct') -%}
-{%- set weight = shared.get('weight') -%}
-{%- set day = shared.get('day') -%}
 {%- set hosts = shared.get('hosts') -%}
 {%- set strays = shared.get('strays') -%}
-{%- set labels = hosts + strays -%}
+{%- set labels = shared.get('labels') -%}
 {%- set q = shared.get('q') -%}
-{%- set mstate = shared.get('m') -%}
-{%- set dt = timestamp.astimezone(utc) -%}
-{%- set hour = dt.hour + dt.minute / 60 -%}
+{%- set seq = shared.get('seq') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set slot = (now % 86400) // 600 -%}
+{%- set heapq = module.heapq -%}
 
 {%- macro gap(median, sigma) -%}
 {{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 0] | max -}}
 {%- endmacro -%}
 
-{%- macro enq(client, name, zone, qtype, at, ep=false) -%}
-  {%- do q.append({'due': at, 'client': client, 'name': name, 'zone': zone,
-      'qtype': qtype, 'ep': ep}) -%}
+{#- Queue item: [due, seq, row]; seq keeps equal due times in order. -#}
+{%- macro enq(client, name, zone, qtype, at, ep=none) -%}
+  {%- do seq.__setitem__(0, seq[0] + 1) -%}
+  {%- do heapq.heappush(q, [at, seq[0], {'client': client, 'name': name,
+      'zone': zone, 'qtype': qtype, 'ep': ep}]) -%}
 {%- endmacro -%}
 
-{%- set ns = namespace(zone=none) -%}
+{%- set ns = namespace(zone=none, held=none, n=0) -%}
 {%- macro pick_zone() -%}
   {%- set ns.zone = module.rand.weighted_choice(zones, shared.get('zw')) -%}
 {%- endmacro -%}
@@ -148,30 +153,65 @@
     else module.rand.weighted_choice(hosts, shared.get('hw')) -}}
 {%- endmacro -%}
 
-{%- macro activity(ip) -%}
-  {%- set dw = day[ip] -%}
-{{- 1.0 if ((hour - dw[0]) % 24) < dw[1] else dw[2] -}}
+{#- Chain state of client `c` in zone `z`, as an all-bindings detector
+    sees it: the earliest SOA of the zone inside the window that has a
+    later NS of the zone opens the widest partial; ns.held = distinct
+    A names of the zone after that NS (none if no such partial). -#}
+{%- macro chain_state(c, z) -%}
+  {%- set st = namespace(soa=false, ns=false) -%}
+  {%- set held = [] -%}
+  {%- for r in hist.get(c, []) -%}
+    {%- if r[2] == z -%}
+      {%- if not st.soa -%}
+        {%- if r[1] == 'SOA' -%}{%- set st.soa = true -%}{%- endif -%}
+      {%- elif not st.ns -%}
+        {%- if r[1] == 'NS' -%}{%- set st.ns = true -%}{%- endif -%}
+      {%- elif r[1] == 'A' and r[3] not in held -%}
+        {%- do held.append(r[3]) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set ns.held = held if st.ns else none -%}
 {%- endmacro -%}
 
-{#- 1a. Recursive resolvers: one independent question at a time, after
-    their own cache expired. They never ask for SOA here. -#}
-{%- set rw = [] -%}{%- for ip in resolvers -%}{%- do rw.append(weight[ip]) -%}{%- endfor -%}
-{%- set r = module.rand.weighted_choice(resolvers, rw) -%}
-{%- if module.rand.chance(0.12 * (activity(r) | float)) -%}
+{#- 1. Episode: a rotated direct client, picked like background, reads
+    the zone's SOA, then NS (MX and TXT sometimes in between), then asks
+    for distinct names of the zone until the tenth one. Next start:
+    window of w = min(interval / 4, 6 h) centred on due = this start +
+    interval, weighted by curve^2 + floor. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {%- set pool = [] -%}{%- set pw = [] -%}
+  {%- for ip in direct -%}
+    {%- if ip != shared.get('last_client') -%}
+      {%- do pool.append(ip) -%}{%- do pw.append(shared.get('dslot')[slot][loop.index0]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set c = module.rand.weighted_choice(pool, pw) -%}
   {{- pick_zone() -}}
-  {%- set qtype = module.rand.weighted_choice(['A', 'AAAA', 'MX', 'TXT', 'NS'], [60, 24, 6, 6, 4]) -%}
-  {%- if qtype in ['A', 'AAAA'] -%}
-    {{- enq(r, host_name() ~ '.' ~ ns.zone, ns.zone, qtype, now) -}}
-  {%- else -%}
-    {{- enq(r, ns.zone, ns.zone, qtype, now) -}}
-  {%- endif -%}
+  {%- set z = ns.zone -%}
+  {%- set at = namespace(t=now) -%}
+  {{- enq(c, z, z, 'SOA', at.t, 'lead') -}}
+  {%- set mid = ['NS'] -%}
+  {%- for t in ['MX', 'TXT'] -%}{%- if module.rand.chance(0.5) -%}{%- do mid.append(t) -%}{%- endif -%}{%- endfor -%}
+  {%- for t in module.rand.shuffle(mid) -%}
+    {%- set at.t = at.t + gap(3, 0.9) | int -%}
+    {{- enq(c, z, z, t, at.t, 'lead') -}}
+  {%- endfor -%}
+  {{- enq(c, none, z, 'A', at.t + gap(3, 0.8) | int, 'enum') -}}
+  {%- do shared.set('last_client', c) -%}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+  {{- draw_start(due - half, due + half, true) -}}
 {%- endif -%}
 
-{#- 1b. Direct clients (admin workstations, monitoring, mail relays,
-    scripts): short sessions with log-normal spacing. -#}
-{%- set dwts = [] -%}{%- for ip in direct -%}{%- do dwts.append(weight[ip]) -%}{%- endfor -%}
-{%- set c = module.rand.weighted_choice(direct, dwts) -%}
-{%- if module.rand.chance(0.011 * (activity(c) | float)) -%}
+{#- 2. The earliest due queued question takes this timestamp; otherwise
+    the timestamp's own stream produces a new question. -#}
+{%- if q and q[0][0] <= now -%}
+  {%- set e = heapq.heappop(q)[2] -%}
+{%- elif 'direct' in tags -%}
+  {#- Direct clients (admin workstations, monitoring, mail relays,
+      scripts): a short session with log-normal spacing. -#}
+  {%- set c = module.rand.weighted_choice(direct, shared.get('dslot')[slot]) -%}
   {{- pick_zone() -}}
   {%- set z = ns.zone -%}
   {%- set kind = module.rand.weighted_choice(['lookup', 'apex', 'sweep', 'mail', 'serial'], [50, 16, 14, 12, 8]) -%}
@@ -211,93 +251,74 @@
       {{- enq(c, z, z, 'TXT', at.t + gap(5, 0.8) | int) -}}
     {%- endif -%}
   {%- endif -%}
-{%- endif -%}
-
-{#- 2. Episode: a rotated direct client, picked like background, reads
-    the zone's SOA and NS (often MX and TXT), then asks for a dictionary
-    of distinct names. Next start: window of w = min(interval / 4, 6 h)
-    centred on due = this start + interval, weighted by curve^2 + floor. -#}
-{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
-  {%- set pool = direct | reject('equalto', shared.get('last_client')) | list -%}
-  {%- set pw = [] -%}
-  {%- for ip in pool -%}{%- do pw.append(weight[ip] * (activity(ip) | float)) -%}{%- endfor -%}
-  {%- set c = module.rand.weighted_choice(pool, pw) -%}
-  {{- pick_zone() -}}
-  {%- set z = ns.zone -%}
-  {%- set at = namespace(t=now) -%}
-  {%- set lead = ['SOA', 'NS'] -%}
-  {%- for t in ['MX', 'TXT'] -%}{%- if module.rand.chance(0.5) -%}{%- do lead.append(t) -%}{%- endif -%}{%- endfor -%}
-  {%- for t in lead -%}
-    {{- enq(c, z, z, t, at.t, true) -}}
-    {%- set at.t = at.t + gap(3, 0.9) | int -%}
-  {%- endfor -%}
-  {%- for h in module.rand.shuffle(labels)[:module.rand.number.integer(a_steps + 2, a_steps + 8)] -%}
-    {{- enq(c, h ~ '.' ~ z, z, 'A', at.t, true) -}}
-    {%- set at.t = at.t + gap(3, 0.8) | int -%}
-  {%- endfor -%}
-  {%- do shared.set('last_client', c) -%}
-  {%- set due = now + (interval * 3600) | int -%}
-  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
-  {{- draw_start(due - half, due + half, true) -}}
-{%- endif -%}
-
-{#- 3. Emit the earliest due question, otherwise nothing. -#}
-{%- set pick = namespace(i=-1, due=now + 1) -%}
-{%- for e in q -%}
-  {%- if e.due <= now and e.due < pick.due -%}
-    {%- set pick.i = loop.index0 -%}{%- set pick.due = e.due -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- if pick.i < 0 -%}{{ dispatch.drop() }}{%- endif -%}
-{%- set e = q.pop(pick.i) -%}
-
-{#- Guard on the final chain step. It replays the detector per client:
-    partials [step, SOA time, zone, names] start on SOA, advance on NS
-    of the zone and then on A for a name of the zone not seen in that
-    partial, expire more than `window` s after their SOA, the 8 newest
-    are kept, and a completion resets the client. A background A that
-    would complete a chain keeps its time and asks again for a name the
-    completing partials already hold; with none in common it is
-    dropped. Episode rows are never changed. -#}
-{%- macro step_ok(p, row) -%}
-  {%- if p[0] == 1 -%}{{- row.qtype == 'NS' and row.zone == p[2] -}}
-  {%- else -%}{{- row.qtype == 'A' and row.zone == p[2] and row.name not in p[3] -}}
-  {%- endif -%}
-{%- endmacro -%}
-{%- set parts = mstate.get(e.client, []) | selectattr('1', 'ge', now - window) | list -%}
-{%- if not e.ep and e.qtype == 'A' -%}
-  {%- set held = namespace(v=none) -%}
-  {%- for p in parts -%}
-    {%- if p[0] == n_steps - 1 and step_ok(p, e) == 'True' -%}
-      {%- set held.v = p[3] if held.v is none else held.v | select('in', p[3]) | list -%}
-    {%- endif -%}
-  {%- endfor -%}
-  {%- if held.v is not none -%}
-    {%- if not held.v -%}
-      {%- do mstate.update({e.client: parts}) -%}
-      {{- dispatch.drop() -}}
-    {%- endif -%}
-    {%- do e.update({'name': module.rand.choice(held.v)}) -%}
-  {%- endif -%}
-{%- endif -%}
-{%- set nxt = [] -%}
-{%- set fin = namespace(done=false) -%}
-{%- for p in parts -%}
-  {%- if not fin.done -%}
-    {%- if step_ok(p, e) == 'True' -%}
-      {%- if p[0] + 1 == n_steps -%}{%- set fin.done = true -%}
-      {%- else -%}{%- do nxt.append([p[0] + 1, p[1], p[2], p[3] + ([e.name] if e.qtype == 'A' else [])]) -%}
-      {%- endif -%}
-    {%- else -%}{%- do nxt.append(p) -%}
-    {%- endif -%}
-  {%- endif -%}
-{%- endfor -%}
-{%- if fin.done -%}
-  {%- do mstate.pop(e.client, none) -%}
+  {%- set e = heapq.heappop(q)[2] -%}
 {%- else -%}
-  {%- if e.qtype == 'SOA' -%}{%- do nxt.append([1, now, e.zone, []]) -%}{%- endif -%}
-  {%- if nxt -%}{%- do mstate.update({e.client: nxt[-8:]}) -%}
-  {%- else -%}{%- do mstate.pop(e.client, none) -%}{%- endif -%}
+  {#- Recursive resolvers: one independent question after their own
+      cache expired. They never ask for SOA here. -#}
+  {%- set r = module.rand.weighted_choice(resolvers, shared.get('rslot')[slot]) -%}
+  {{- pick_zone() -}}
+  {%- set qtype = module.rand.weighted_choice(['A', 'AAAA', 'MX', 'TXT', 'NS'], [60, 24, 6, 6, 4]) -%}
+  {%- set e = {'client': r, 'zone': ns.zone, 'qtype': qtype, 'ep': none,
+      'name': host_name() ~ '.' ~ ns.zone if qtype in ['A', 'AAAA'] else ns.zone} -%}
+{%- endif -%}
+
+{#- Chain history per client: SOA, NS and A rows inside the window,
+    starting at the oldest SOA still inside it (older rows cannot open
+    or extend a partial). -#}
+{%- set h = hist.get(e.client) -%}
+{%- if h -%}
+  {%- for i in range(h | length) -%}
+    {%- if h and (h[0][0] < now - window or h[0][1] != 'SOA') -%}{%- do h.pop(0) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if not h -%}{%- do hist.pop(e.client) -%}{%- endif -%}
+{%- endif -%}
+
+{%- if e.ep == 'enum' -%}
+  {#- Episode enumeration step: a name of the zone the client has not
+      asked for in the open partial; stop at the tenth distinct name. -#}
+  {{- chain_state(e.client, e.zone) -}}
+  {%- set held = ns.held or [] -%}
+  {%- set fresh = labels | reject('in', held | map('replace', '.' ~ e.zone, '') | list) | list -%}
+  {%- do e.update({'name': module.rand.choice(fresh) ~ '.' ~ e.zone}) -%}
+  {%- if ns.held is not none and held | length + 1 < a_steps -%}
+    {{- enq(e.client, none, e.zone, 'A', now + gap(3, 0.8) | int, 'enum') -}}
+  {%- endif -%}
+{%- elif e.qtype == 'A' and e.client in hist -%}
+  {#- Guard on the final step: a background A that would be the tenth
+      distinct name after SOA and NS of the zone keeps its time and
+      repeats a name the client already asked for. After a completed
+      chain (any further A of the zone completes one) it asks for the
+      same host in another zone; with none left it is dropped. -#}
+  {{- chain_state(e.client, e.zone) -}}
+  {%- if ns.held is not none and ns.held | length >= a_steps - 1
+      and (ns.held | length >= a_steps or e.name not in ns.held) -%}
+    {%- set g = shared.get('guard') -%}
+    {%- if ns.held | length < a_steps -%}
+      {%- do e.update({'name': module.rand.choice(ns.held)}) -%}
+      {%- do g.__setitem__(0, g[0] + 1) -%}
+    {%- else -%}
+      {%- set label = e.name[:-(e.zone | length + 1)] -%}
+      {%- set alt = namespace(z=none) -%}
+      {%- for z2 in module.rand.shuffle(zones | reject('equalto', e.zone) | list) -%}
+        {%- if alt.z is none -%}
+          {{- chain_state(e.client, z2) -}}
+          {%- if ns.held is none or ns.held | length < a_steps - 1
+              or (ns.held | length < a_steps and (label ~ '.' ~ z2) in ns.held) -%}
+            {%- set alt.z = z2 -%}
+          {%- endif -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if alt.z is none -%}
+        {%- do g.__setitem__(2, g[2] + 1) -%}
+        {{- dispatch.drop() -}}
+      {%- endif -%}
+      {%- do e.update({'name': label ~ '.' ~ alt.z, 'zone': alt.z}) -%}
+      {%- do g.__setitem__(1, g[1] + 1) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if e.qtype in ['SOA', 'NS', 'A'] and (e.qtype == 'SOA' or e.client in hist) -%}
+  {%- do hist.setdefault(e.client, []).append([now, e.qtype, e.zone, e.name]) -%}
 {%- endif -%}
 
 {#- EDNS: raw advertised size per client (-1 = no OPT record). The
@@ -311,13 +332,20 @@
 {%- set bufsize = maxlen ~ (' (' ~ raw ~ ')' if raw > 0 and raw != maxlen else '') -%}
 
 {#- Packet cache: identical question (name, type, DO, EDNS) within
-    cache-ttl seconds is a HIT; expired entries are pruned. -#}
+    cache-ttl seconds is a HIT; expired entries leave in expiry order. -#}
 {%- set cache = shared.get('cache') -%}
+{%- set cq = shared.get('cq') -%}
+{%- for i in range(cq | length) -%}
+  {%- if cq and cq[0][0] <= now -%}
+    {%- set old = cq.popleft() -%}
+    {%- if cache.get(old[1]) == old[0] -%}{%- do cache.pop(old[1]) -%}{%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
 {%- set ckey = e.name ~ '|' ~ e.qtype ~ '|' ~ dnssec ~ '|' ~ raw -%}
 {%- set hit = cache.get(ckey, 0) > now -%}
-{%- if not hit -%}{%- do cache.update({ckey: now + cache_ttl}) -%}{%- endif -%}
-{%- if cache | length > 256 -%}
-  {%- for k in cache | list -%}{%- if cache[k] <= now -%}{%- do cache.pop(k) -%}{%- endif -%}{%- endfor -%}
+{%- if not hit -%}
+  {%- do cache.update({ckey: now + cache_ttl}) -%}
+  {%- do cq.append([now + cache_ttl, ckey]) -%}
 {%- endif -%}
 {%- set pc = 'HIT' if hit else 'MISS' -%}
 
