@@ -1,14 +1,18 @@
 {#- FortiSOAR 7.x "Alert Deleted" audit records forwarded over syslog in
-    CEF, wrapped in ECS JSON. One input tick every 2 seconds.
-    Every analyst runs an independent session process (thinned Poisson
-    arrivals with a daytime peak and a per-day activity factor). A
-    session is a few bulk deletions from the grid (one record per alert,
-    milliseconds apart) separated by random gaps. Planned records sit in
-    a heap; each tick emits the earliest due one or drops.
+    CEF, wrapped in ECS JSON. Each input timestamp yields one record.
+    Work sessions of analysts plan their records (one per deleted alert,
+    milliseconds apart within one delete) into a heap. Each timestamp
+    emits the earliest planned record that is due. New sessions start
+    in the interval before a timestamp (with a probability that falls
+    as planned records pile up) or, when nothing is due, at the
+    timestamp itself. Records keep their planned times, so a record can
+    be written later than its time but never before it.
     Times are epoch seconds (UTC). -#}
 {%- set now = timestamp.timestamp() -%}
-{%- set window = 120 -%}
-{%- set burst = 9 -%}
+{%- set peak = 1.27 -%}
+{#- Relative deletion rate per UTC hour: the sum of the pattern bands. -#}
+{%- set curve = [0.35, 0.35, 0.35, 0.35, 0.35, 0.35, 0.50, 0.72, 0.97, 1.27, 1.27, 1.27,
+  1.27, 1.27, 1.27, 1.27, 0.97, 0.72, 0.50, 0.35, 0.35, 0.35, 0.35, 0.35] -%}
 {%- macro d(lo, med, sig, hi) -%}
   {#- Offset lognormal in seconds, upper tail redrawn. -#}
   {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
@@ -17,35 +21,17 @@
   {%- endfor -%}
   {{- [ns.v, hi] | min -}}
 {%- endmacro -%}
-{%- macro next_session(u, t) -%}
-  {#- Thinned Poisson session arrivals of one analyst, rate peaking at
-      12:30 UTC, scaled by the analyst's activity factor of that day. -#}
-  {%- set lam = shared.get('lam')[u] -%}
-  {%- set ns = namespace(t=t, go=true) -%}
-  {%- for _ in range(600) if ns.go -%}
-    {%- set ns.t = ns.t + module.rand.number.exponential(lam * 2.5) -%}
-    {%- set day = module.builtins.int(ns.t // 86400) -%}
-    {%- set fac = shared.get('fac') -%}
-    {%- if u not in fac or fac[u][0] != day -%}
-      {%- do fac.update({u: [day, [module.rand.number.lognormal(-0.125, 0.5), 2.5] | min]}) -%}
-    {%- endif -%}
-    {%- set h = (ns.t % 86400) / 3600.0 -%}
-    {%- set f = 0.35 + ([0, module.math.sin(module.math.pi * (h - 6) / 13)] | max) -%}
-    {%- if module.rand.number.floating(0, 1.35 * 2.5) < f * fac[u][1] -%}{%- set ns.go = false -%}{%- endif -%}
+{%- macro pick_time(lo, span, power, floor) -%}
+  {#- A time in [lo, lo + span) weighted by the hour curve raised to
+      power, plus a floor that keeps every hour possible. -#}
+  {%- set top = peak ** power + floor -%}
+  {%- set ns = namespace(x=lo, go=true) -%}
+  {%- for _ in range(400) if ns.go -%}
+    {%- set ns.x = lo + module.rand.number.floating(0, span) -%}
+    {%- set h = module.builtins.int(ns.x % 86400 // 3600) -%}
+    {%- set ns.go = module.rand.number.floating(0, top) >= curve[h] ** power + floor -%}
   {%- endfor -%}
-  {{- ns.t -}}
-{%- endmacro -%}
-{%- macro arm(due, span) -%}
-  {#- Arming time of the next episode: a random delay of up to span
-      seconds after due, weighted by the daytime shape of the sessions
-      with a small night floor, so every hour stays possible. -#}
-  {%- set ns = namespace(x=0.0, go=true) -%}
-  {%- for _ in range(200) if ns.go -%}
-    {%- set ns.x = module.rand.number.floating(0, span) -%}
-    {%- set h = ((due + ns.x) % 86400) / 3600.0 -%}
-    {%- set ns.go = module.rand.number.floating(0, 1.05) >= 0.05 + ([0, module.math.sin(module.math.pi * (h - 6) / 13)] | max) -%}
-  {%- endfor -%}
-  {{- due + ns.x -}}
+  {{- ns.x -}}
 {%- endmacro -%}
 {%- macro bulk_size() -%}
   {#- Alerts selected in one delete: usually one to three. -#}
@@ -55,7 +41,6 @@
   {%- set schema = {'type': 'typed-dict', 'fields': {
     'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
     'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
-    'sessions_per_day': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 2, 'le': 2000}},
     'alerts_per_day': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 50, 'le': 1000000}},
     'device_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._-]{1,63}$'}},
     'device_id': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9-]{1,32}$'}},
@@ -66,73 +51,132 @@
   {%- set users = [] -%}
   {%- set weights = [] -%}
   {%- set info = {} -%}
-  {%- set lam = {} -%}
   {%- for row in samples.analysts -%}
     {%- do users.append(row.user) -%}
     {%- do weights.append(row.weight) -%}
     {%- do info.update({row.user: [row.uuid, row.ip, row.alt_ip]}) -%}
   {%- endfor -%}
-  {%- set wsum = weights | sum -%}
-  {%- for row in samples.analysts -%}
-    {#- Peak-rate of the thinned process; the daytime shape averages
-        0.695 and peaks at 1.35. -#}
-    {%- do lam.update({row.user: params.sessions_per_day * row.weight / wsum / 86400.0 / 0.695 * 1.35}) -%}
+  {#- Chains from a remote-access address come only from analysts busy
+      enough to use that address every day (at least 2.4% of the
+      deletions). -#}
+  {%- set remote_ok = [] -%}
+  {%- for row in samples.analysts if row.weight / (weights | sum) >= 0.024 -%}
+    {%- do remote_ok.append(row.user) -%}
   {%- endfor -%}
   {%- set interval = params.anomaly_interval_hours * 3600 -%}
-  {%- do shared.update({'q': [], 'seq': 0, 'users': users, 'weights': weights, 'info': info, 'lam': lam, 'fac': {},
-    'sess': {}, 'recent': {}, 'pause': {}, 'deleted': [], 'dset': {}, 't0': now,
+  {%- do shared.update({'q': [], 'seq': 0, 'users': users, 'weights': weights, 'info': info,
+    'remote_ok': remote_ok, 'fac': {}, 'sess': {}, 'hist': {}, 'pause': {}, 'deleted': module.collections.deque(), 'dset': {},
+    't0': now, 'prev': now, 'drops': 0, 'debt': 0.0, 'gap': none,
     'id0': module.rand.number.integer(20000, 400000),
-    'ep_arm': arm(now + interval * module.rand.number.floating(0, 1.0), [interval / 4, 21600] | min) | float,
-    'ep_last': none}) -%}
-  {%- for u in users -%}
-    {%- do module.heapq.heappush(shared.get('q'), [next_session(u, now) | float, 0, 'sess', u, none, none]) -%}
-  {%- endfor -%}
-  {%- do shared.set('next_due', shared.get('q')[0][0]) -%}
+    'ep': {'id': 0, 'done': true, 'last': none,
+      'target': pick_time(now, [interval, 86400] | min, 1, 0) | float}}) -%}
 {%- endif -%}
-{%- if now < shared.get('next_due') -%}{{- dispatch.drop() -}}{%- endif -%}
 {%- set q = shared.get('q') -%}
 {%- set info = shared.get('info') -%}
 {%- set sess = shared.get('sess') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set pause = shared.get('pause') -%}
 {%- set dset = shared.get('dset') -%}
 {%- set deleted = shared.get('deleted') -%}
-{%- macro push(t, kind, u, ip, aid) -%}
+{%- set ep = shared.get('ep') -%}
+{%- macro push(t, kind, u, ip, aid, eid) -%}
   {%- do shared.set('seq', (shared.get('seq') + 1) % 1000000000) -%}
-  {%- do module.heapq.heappush(q, [t | float, shared.get('seq'), kind, u, ip, aid]) -%}
+  {%- do module.heapq.heappush(q, [t | float, shared.get('seq'), kind, u, ip, aid, eid]) -%}
 {%- endmacro -%}
-{%- macro plan_bulk(t, u, ip, kind, size=0) -%}
+{%- macro plan_bulk(t, u, ip, kind, size=0, eid=none) -%}
   {#- One bulk delete: alerts picked near each other in the grid (IDs
       descending with small skips), records milliseconds apart. Returns
       the time after the last record. -#}
   {%- set n = size if size else bulk_size() | int -%}
   {%- set top = shared.get('id0') + module.builtins.int((t - shared.get('t0')) * params.alerts_per_day / 86400.0) -%}
   {%- set ns = namespace(t=t, a=top - module.builtins.int(module.rand.number.lognormal(module.math.log(params.alerts_per_day / 3.0), 1.1)), k=0) -%}
-  {%- for _ in range(n * 4) if ns.k < n and ns.a > 1 -%}
+  {%- for _ in range(n * 8 + 20) if ns.k < n and ns.a > 1 -%}
     {%- if ns.a not in dset -%}
       {%- do dset.update({ns.a: 1}) -%}
       {%- do deleted.append(ns.a) -%}
-      {%- do push(ns.t, kind, u, ip, ns.a) -%}
+      {%- do push(ns.t, kind, u, ip, ns.a, eid) -%}
       {%- set ns.k = ns.k + 1 -%}
       {%- set ns.t = ns.t + (d(0.02, 0.18, 0.7, 2.5) | float) -%}
     {%- endif -%}
     {%- set ns.a = ns.a - (1 if module.rand.chance(0.8) else module.rand.number.integer(2, 6)) -%}
   {%- endfor -%}
-  {%- for _ in range(deleted | length - 30000) -%}{%- do dset.pop(deleted.pop(0), none) -%}{%- endfor -%}
+  {%- for _ in range(deleted | length - 300000) -%}{%- do dset.pop(deleted.popleft(), none) -%}{%- endfor -%}
   {{- ns.t -}}
 {%- endmacro -%}
-{%- set out = namespace(u=none, ip=none, aid=none, t=none) -%}
-{%- for _ in range(40) if out.u is none and q and q[0][0] <= now -%}
-  {%- set item = module.heapq.heappop(q) -%}
+{#- A new session starts in the interval since the previous timestamp
+    with a probability of 0.229 (about 0.9 of the records at about 3.9
+    records per session). Sessions started at timestamps with nothing
+    due supply the rest. The probability falls to zero as the oldest
+    due record ages from 30 to 150 seconds.
+    Episode records take timestamps that ordinary records would have
+    used. That debt (one per written episode record) is repaid at one
+    record per 30 minutes: while it lasts, the records it holds back do
+    not count towards the age above and sessions start 15% more often,
+    so the ordinary volume after an episode stays level instead of
+    dipping at once. -#}
+{%- set dt = now - shared.get('prev') -%}
+{%- if shared.get('gap') is none -%}
+  {%- do shared.set('gap', dt if dt > 0 else 1.0) -%}
+{%- else -%}
+  {%- do shared.set('gap', shared.get('gap') + 0.05 * (dt - shared.get('gap'))) -%}
+{%- endif -%}
+{%- do shared.set('debt', [0.0, shared.get('debt') - dt / 1800.0] | max) -%}
+{%- set age = (now - q[0][0]) if q and q[0][0] <= now else 0 -%}
+{%- set lag = [0, age - shared.get('debt') * shared.get('gap')] | max -%}
+{%- if params.anomaly_mode and now >= ep['target'] -%}
+  {#- The episode's session starts between its target time and this
+      timestamp in place of this interval's random session start. -#}
+  {%- do push(module.rand.number.floating([shared.get('prev'), ep['target']] | max, now), 'sess', none, none, none, 'ep') -%}
+  {%- do ep.update({'target': 1e18}) -%}
+{%- elif module.rand.chance(0.229 * (1.15 if shared.get('debt') > 0 else 1) * ([0, [1, 1.25 - lag / 120.0] | min] | max)) -%}
+  {%- do push(module.rand.number.floating(shared.get('prev'), now), 'sess', none, none, none, none) -%}
+{%- endif -%}
+{%- do shared.set('prev', now) -%}
+{%- set out = namespace(u=none, ip=none, aid=none, t=none, forced=0) -%}
+{%- for _ in range(100) if out.u is none and ((q and q[0][0] <= now) or out.forced < 3) -%}
+  {%- if q and q[0][0] <= now -%}
+    {%- set item = module.heapq.heappop(q) -%}
+  {%- else -%}
+    {#- Nothing due: a session starts at this timestamp. -#}
+    {%- set out.forced = out.forced + 1 -%}
+    {%- set item = [now, 0, 'sess', none, none, none, 'forced'] -%}
+  {%- endif -%}
   {%- set t = item[0] -%}
-  {%- set u = item[3] -%}
   {%- if item[2] == 'sess' -%}
-    {%- do module.heapq.heappush(q, [next_session(u, t) | float, 0, 'sess', u, none, none]) -%}
+    {#- The analyst is drawn by activity weight times a per-day factor
+        (bounded, so every analyst works every few days). -#}
+    {%- set day = module.builtins.int(t // 86400) -%}
+    {%- set fac = shared.get('fac') -%}
+    {%- set ws = [] -%}
+    {%- for name in shared.get('users') -%}
+      {%- if name not in fac or fac[name][0] != day -%}
+        {%- do fac.update({name: [day, [[module.rand.number.lognormal(-0.125, 0.5), 2.5] | min, 0.4] | max]}) -%}
+      {%- endif -%}
+      {%- do ws.append(shared.get('weights')[loop.index0] * fac[name][1]) -%}
+    {%- endfor -%}
     {#- An analyst still in a session keeps its address; a new session
-        comes from the office (85%) or the remote-access pool. -#}
-    {%- if u in sess and sess[u][1] > t -%}
-      {%- set ip = sess[u][0] -%}
-    {%- else -%}
-      {%- set ip = info[u][1] if module.rand.chance(0.85) else info[u][2] -%}
-    {%- endif -%}
+        comes from the office (85%) or the remote-access pool. The
+        episode's session is drawn the same way, repeated until it is
+        not the previous episode's analyst and the address is the
+        office or the analyst is a frequent remote user. A session
+        that has to write at this timestamp is redrawn while the
+        analyst has already made eight deletions from that address in
+        the last 120 seconds. -#}
+    {%- set pick = namespace(u=none, ip=none, go=true) -%}
+    {%- for _ in range(100) if pick.go -%}
+      {%- set pick.u = module.rand.weighted_choice(shared.get('users'), ws) -%}
+      {%- if pick.u in sess and sess[pick.u][1] > t -%}
+        {%- set pick.ip = sess[pick.u][0] -%}
+      {%- else -%}
+        {%- set pick.ip = info[pick.u][1] if module.rand.chance(0.85) else info[pick.u][2] -%}
+      {%- endif -%}
+      {%- set pick.go = (item[6] == 'ep' and (pick.u == ep['last']
+        or (pick.ip != info[pick.u][1] and pick.u not in shared.get('remote_ok'))))
+        or (item[6] == 'forced' and (hist.get(pick.u ~ '|' ~ pick.ip, [])
+          | select('ge', module.builtins.int(t * 1000) - 120000) | list | length) >= 8) -%}
+    {%- endfor -%}
+    {%- set u = pick.u -%}
+    {%- set ip = pick.ip -%}
     {%- set ns = namespace(t=t, go=true) -%}
     {%- for _ in range(30) if ns.go -%}
       {%- set ns.t = plan_bulk(ns.t, u, ip, 'del') | float -%}
@@ -140,62 +184,70 @@
       {%- if ns.go -%}{%- set ns.t = ns.t + (d(4, 110, 1.1, 1500) | float) -%}{%- endif -%}
     {%- endfor -%}
     {%- set end = ns.t -%}
-    {%- if params.anomaly_mode and t >= shared.get('ep_arm') and u != shared.get('ep_last') -%}
-      {#- Anomaly episode on the next session after due + delay by an
-          analyst other than the previous episode's: on top of the
-          ordinary session, the same analyst from the same address
-          deletes 10-15 more alerts in quick successive deletes, all
-          within about 100 seconds. -#}
-      {%- set total = module.rand.number.integer(10, 15) -%}
+    {%- if item[6] == 'ep' and not pick.go -%}
+      {#- Anomaly episode: on top of the ordinary session, the same
+          analyst from the same address deletes nine more alerts in
+          quick successive deletes within 95 seconds. It ends at the
+          record that makes nine deletions of that analyst and address
+          within 120 seconds. -#}
       {%- set t1 = t + (d(2, 25, 1.0, 120) | float) -%}
-      {#- Sizes and gaps are drawn until the deletes add up to the total
-          and fit in 95 seconds. -#}
       {%- set pl = namespace(ok=false, sizes=[], gaps=[]) -%}
       {%- for _ in range(40) if not pl.ok -%}
         {%- set pl.sizes = [] -%}{%- set pl.gaps = [] -%}
-        {%- for _ in range(total) if (pl.sizes | sum) < total -%}
-          {%- do pl.sizes.append([bulk_size() | int, total - (pl.sizes | sum)] | min) -%}
+        {%- for _ in range(9) if (pl.sizes | sum) < 9 -%}
+          {%- do pl.sizes.append([bulk_size() | int, 9 - (pl.sizes | sum)] | min) -%}
           {%- do pl.gaps.append(d(2, 9, 0.8, 40) | float) -%}
         {%- endfor -%}
-        {%- set pl.ok = (pl.gaps[:-1] | sum) + 0.4 * total <= 95 -%}
+        {%- set pl.ok = (pl.gaps[:-1] | sum) + 0.4 * 9 <= 95 -%}
       {%- endfor -%}
       {%- if not pl.ok -%}{%- set pl.gaps = [] -%}{%- for _ in pl.sizes -%}{%- do pl.gaps.append(4.0) -%}{%- endfor -%}{%- endif -%}
+      {%- set eid = ep['id'] + 1 -%}
       {%- set ns = namespace(t=t1) -%}
       {%- for n in pl.sizes -%}
-        {%- set ns.t = (plan_bulk(ns.t, u, ip, 'ep', n) | float) + pl.gaps[loop.index0] -%}
+        {%- set ns.t = (plan_bulk(ns.t, u, ip, 'ep', n, eid) | float) + pl.gaps[loop.index0] -%}
       {%- endfor -%}
       {%- set end = [end, ns.t] | max -%}
       {%- set interval = params.anomaly_interval_hours * 3600 -%}
-      {%- do shared.update({'ep_last': u, 'ep_arm': arm(t + interval, [interval / 4, 21600] | min) | float}) -%}
+      {%- set w = [interval / 4, 21600] | min -%}
+      {%- do ep.update({'id': eid, 'done': false, 'last': u,
+        'target': pick_time(t + interval - w / 2, w, 2, 0.05) | float}) -%}
+    {%- elif item[6] == 'ep' -%}
+      {#- No eligible analyst drawn: the next interval tries again. -#}
+      {%- do ep.update({'target': t}) -%}
     {%- endif -%}
     {%- do sess.update({u: [ip, [end + 300, (sess[u][1] if u in sess else 0)] | max]}) -%}
   {%- else -%}
-    {%- set out.u = u -%}{%- set out.ip = item[4] -%}{%- set out.aid = item[5] -%}{%- set out.t = t -%}
-    {%- if item[2] in ['del', 'dd'] -%}
-      {#- Pacing: an analyst who has made 8 ordinary deletions from one
-          address in the last 2 minutes pauses. The rest of that
-          delete and what follows it are postponed by an ordinary gap
-          between deletes; actor, address and alerts stay. Episode
-          records are not counted. -#}
-      {%- set recent = shared.get('recent') -%}
-      {%- set pause = shared.get('pause') -%}
-      {%- set key = u ~ '|' ~ out.ip -%}
+    {%- set u = item[3] -%}
+    {%- set ip = item[4] -%}
+    {%- set key = u ~ '|' ~ ip -%}
+    {%- set tms = module.builtins.int(t * 1000) -%}
+    {%- set h = hist.get(key, []) | select('ge', tms - 120000) | list -%}
+    {%- if item[2] == 'ep' -%}
+      {#- Episode records after the one that completed the nine are not
+          written. -#}
+      {%- if item[6] == ep['id'] and not ep['done'] -%}
+        {%- set out.u = u -%}{%- set out.ip = ip -%}{%- set out.aid = item[5] -%}{%- set out.t = t -%}
+        {%- do hist.update({key: h + [tms]}) -%}
+        {%- do shared.set('debt', shared.get('debt') + 1) -%}
+        {%- if (h | length) + 1 >= 9 -%}{%- do ep.update({'done': true}) -%}{%- endif -%}
+      {%- endif -%}
+    {%- else -%}
+      {#- Pacing: an analyst who has made eight deletions from one
+          address in the last 120 seconds pauses. The rest of that
+          delete (records within 3 seconds) and the record itself move
+          later by an ordinary gap between deletes; actor, address and
+          alerts stay. -#}
       {%- set p = pause.get(key) -%}
-      {%- set n = recent.get(key, []) | select('gt', t - window) | list | length -%}
       {%- if p and 0 <= t - p[0] <= 3 -%}
         {%- do pause.update({key: [t, p[1]]}) -%}
-        {%- do push(t + p[1], 'dd', u, out.ip, out.aid) -%}
-        {%- set out.u = none -%}
-      {%- elif n >= burst - 1 -%}
+        {%- do push(t + p[1], 'dd', u, ip, item[5], none) -%}
+      {%- elif h | length >= 8 -%}
         {%- set sh = d(4, 110, 1.1, 1500) | float -%}
         {%- do pause.update({key: [t, sh]}) -%}
-        {%- do push(t + sh, 'dd', u, out.ip, out.aid) -%}
-        {%- set out.u = none -%}
+        {%- do push(t + sh, 'dd', u, ip, item[5], none) -%}
       {%- else -%}
-        {%- do recent.update({key: (recent.get(key, []) | select('gt', t - window) | list) + [t]}) -%}
-      {%- endif -%}
-      {%- if recent | length > 40 -%}
-        {%- for k in recent.keys() | list if not (recent[k] | select('gt', t - window) | list) -%}{%- do recent.pop(k) -%}{%- endfor -%}
+        {%- set out.u = u -%}{%- set out.ip = ip -%}{%- set out.aid = item[5] -%}{%- set out.t = t -%}
+        {%- do hist.update({key: h + [tms]}) -%}
       {%- endif -%}
       {%- if pause | length > 40 -%}
         {%- for k in pause.keys() | list if t - pause[k][0] > 3 -%}{%- do pause.pop(k) -%}{%- endfor -%}
@@ -203,8 +255,10 @@
     {%- endif -%}
   {%- endif -%}
 {%- endfor -%}
-{%- do shared.set('next_due', q[0][0]) -%}
-{%- if out.u is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- if out.u is none -%}
+  {%- do shared.set('drops', shared.get('drops') + 1) -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
 {%- set end_ms = module.builtins.int(out.t * 1000) -%}
 {%- set moment = module.datetime.datetime.fromtimestamp(end_ms / 1000.0, module.datetime.timezone.utc) -%}
 {#- rsyslog stamps the line when it forwards it: a short skewed delay
