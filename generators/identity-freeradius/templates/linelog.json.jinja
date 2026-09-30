@@ -1,0 +1,299 @@
+{#- FreeRADIUS 3.2.10 file linelog lines of one server behind one
+    802.1X wireless controller. The input sets the rate and the
+    hour-of-day curve; every timestamp becomes exactly one line. Each
+    timestamp takes the earliest due step of an open attempt (rejects
+    of a mistyped password, the accept and its accounting Start first,
+    then retries of a stale saved password and accounting Stops) and,
+    when none is due, starts a new attempt of an idle device drawn by
+    its activity weight. The anomaly episode queues its own steps for
+    one idle device; its lines are emitted in turn with the due steps
+    of other devices, on top of background. -#}
+{%- set now = timestamp.timestamp() -%}
+{%- set sec = now | int -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 600 -%}
+{%- set min_rejects = 5 -%}
+{#- Mistyped-password bursts: 1-8 rejects, halving per extra reject.
+    Episodes draw from the same law's tail (k >= 5). A stale saved
+    password retries 2-14 times, decaying by 0.8 per retry. -#}
+{%- set burst = [1, 2, 3, 4, 5, 6, 7, 8] -%}
+{%- set burst_w = [128, 64, 32, 16, 8, 4, 2, 1] -%}
+{%- set stale = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14] -%}
+{%- set stale_w = [1000, 800, 640, 512, 410, 328, 262, 210, 168, 134, 107, 86, 69] -%}
+
+{#- Hour-of-day load, relative to the office-hours peak (UTC). It
+    repeats the rates of the patterns/*.yml input files and only places
+    episode starts; the input alone sets the line rate. -#}
+{%- set hcurve = [0.1, 0.1, 0.1, 0.1, 0.1, 0.13, 0.32, 0.65, 1.0, 1.0, 1.0, 1.0,
+    1.0, 1.0, 1.0, 1.0, 0.85, 0.65, 0.5, 0.4, 0.32, 0.25, 0.18, 0.13] -%}
+{%- macro hload(t) -%}
+  {{- hcurve[((t | int) // 3600) % 24] -}}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma, lo, hi) -%}
+  {{- [[module.random.lognormvariate(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 720) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- One fixed site: per-device activity and access-point preference
+      come from a fixed seed, so every run models the same network and
+      only behaviour is random. A device prefers one to three
+      neighbouring access points around its usual desk; activity
+      weights are bounded, so every device is active every day. -#}
+  {%- set rnd = module.random.Random(3210) -%}
+  {%- set aps = [] -%}
+  {%- for i in range(samples.access_points | length) -%}
+    {%- do aps.append(samples.access_points[i].mac ~ ':' ~ params.ssid) -%}
+  {%- endfor -%}
+  {%- set actors = [] -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- for i in range(samples.clients | length) -%}
+    {%- set row = samples.clients[i] -%}
+    {%- set home = rnd.randrange(aps | length) -%}
+    {%- set n_ap = rnd.choice([1, 2, 2, 3]) -%}
+    {%- set mine = [] -%}
+    {%- set mw = [] -%}
+    {%- for d in [0, 1, -1][:n_ap] -%}
+      {%- do mine.append(aps[(home + d) % (aps | length)]) -%}
+      {%- do mw.append(rnd.uniform(0.5, 1.5)) -%}
+    {%- endfor -%}
+    {%- set w = [[rnd.lognormvariate(0, 0.6), 0.5] | max, 2.0] | min -%}
+    {%- set acc.w = acc.w + w -%}
+    {%- do cum.append(acc.w) -%}
+    {%- do actors.append({'user': row.user, 'station': row.station,
+        'ip': row.framed_ip, 'w': w, 'aps': mine, 'apw': mw, 'busy': false}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'actors': actors, 'cum': cum,
+      'total': acc.w, 'hq': [], 'lq': [], 'seq': 0, 'row': 0, 'hist': {},
+      'start_at': none, 'scheduled': false, 'last_user': none}) -%}
+{%- endif -%}
+{%- set actors = shared.get('actors') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set row_n = shared.get('row') + 1 -%}
+{%- do shared.set('row', row_n) -%}
+
+{#- Two queues of due steps: tight steps (burst rejects, the accept,
+    the accounting Start and every episode step) go before flexible
+    ones (stale-password retries and accounting Stops). Delays are
+    minimum delays; each step takes the first free timestamp after its
+    due time. -#}
+{%- macro push(at, item, tight) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(shared.get('hq') if tight else shared.get('lq'), [at, n, item]) -%}
+{%- endmacro -%}
+
+{#- An attempt plan: k rejects, then an accept (or nothing, when the
+    user gives up), an accounting Start and a Stop after the session.
+    Burst gaps are seconds (a mistyped password); a stale device
+    retries every few tens of minutes until its password is updated. -#}
+{%- macro plan(a, k, final, is_stale, ep) -%}
+  {%- set actor = actors[a] -%}
+  {%- do actor.update({'busy': true}) -%}
+  {%- set s = namespace(gaps=[]) -%}
+  {%- for _ in range(20) -%}
+    {%- set s.gaps = [] -%}
+    {%- for i in range(k) -%}
+      {%- do s.gaps.append(gap(1200, 0.5, 60, 14400) | int if is_stale else gap(10, 0.7, 1, 75) | int) -%}
+    {%- endfor -%}
+    {#- An episode keeps its rejects within the first minutes. -#}
+    {%- if not ep or s.gaps | sum <= 360 -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('plan', {'a': a, 'k': k, 'i': 0, 'gaps': s.gaps,
+      'final': final, 'stale': is_stale, 'ep': ep,
+      'port': module.random.randint(1, 250),
+      'ap': module.rand.weighted_choice(actor.aps, actor.apw),
+      'cd': module.rand.weighted_choice([0, 1, 2, 3], [30, 45, 18, 7]),
+      'dur': gap(2100, 0.9, 20, 43200) | int, 'start': none}) -%}
+{%- endmacro -%}
+
+{#- Draw an idle device by activity weight: binary search over the
+    cumulative weights, busy devices redrawn. -#}
+{%- macro draw_idle(exclude_user) -%}
+  {%- set s = namespace(a=-1) -%}
+  {%- set cum = shared.get('cum') -%}
+  {%- for _ in range(64) -%}
+    {%- set i = module.bisect.bisect_right(cum, module.random.random() * shared.get('total')) -%}
+    {%- if i < actors | length and not actors[i].busy and actors[i].user != exclude_user -%}
+      {%- set s.a = i -%}{%- break -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- s.a -}}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first line, its hour drawn from the
+    background hour-of-day curve. Each later start is due one interval
+    after the actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor, so start hours never drift. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and not shared.get('scheduled') -%}
+  {%- do shared.update({'scheduled': true, 'start_at':
+      pick_start(sec, sec + ([interval, 24] | min * 3600) | int, false) | int}) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and sec >= shared.get('start_at') -%}
+  {#- Password guessing that succeeds from a device's usual station:
+      five to eight rejects seconds apart, an accept, the accounting
+      Start and an ordinary-length session. The device is drawn with
+      the background activity weights among idle devices; the previous
+      episode's user sits this one out. The attempt then holds that
+      device busy, exactly as a background attempt does. -#}
+  {%- set a = draw_idle(shared.get('last_user')) | int -%}
+  {%- if a >= 0 -%}
+    {{- plan(a, module.rand.weighted_choice(burst[4:], burst_w[4:]), 'accept', false, true) -}}
+    {{- push(now, {'k': 'reject', 'p': shared.get('plan')}, true) -}}
+    {%- set due = sec + (interval * 3600) | int -%}
+    {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
+    {%- do shared.update({'last_user': actors[a].user,
+        'start_at': pick_start(due - half, due + half, true) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Take the earliest due tight step, else (six times in ten, or
+    always once it is three minutes late) the earliest due flexible
+    step, else start an attempt of an idle device, so Stops mix with
+    new attempts as independent sessions would. The chain guard acts
+    on its final step only: outside episodes, an accounting Start that
+    would complete five rejects, an accept and the Start of one user
+    and station within the chain window is not sent, as for a client
+    that never completes the association after its accept; the device
+    goes idle and the timestamp goes to the next choice. -#}
+{%- set hq = shared.get('hq') -%}
+{%- set lq = shared.get('lq') -%}
+{%- set ns = namespace(item=none) -%}
+{%- for _ in range(16) -%}
+  {%- if hq and hq[0][0] <= now -%}
+    {%- set item = module.heapq.heappop(hq)[2] -%}
+  {%- elif lq and lq[0][0] <= now and (now - lq[0][0] > 180 or module.random.random() < 0.6) -%}
+    {%- set item = module.heapq.heappop(lq)[2] -%}
+  {%- else -%}{%- break -%}
+  {%- endif -%}
+  {%- set g = namespace(hit=false) -%}
+  {%- if item.k == 'connect' and not item.p.ep -%}
+    {%- set rs = [] -%}
+    {%- set acc_n = namespace(n=0) -%}
+    {%- for r in hist.get(item.p.a, []) if r[1] >= now - window - 1 -%}
+      {%- if r[2] == 'reject' -%}{%- do rs.append(r[0]) -%}{%- else -%}{%- set acc_n.n = r[0] -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set g.hit = rs | length >= min_rejects and acc_n.n > rs[min_rejects - 1] -%}
+  {%- endif -%}
+  {%- if g.hit -%}
+    {%- do actors[item.p.a].update({'busy': false}) -%}
+  {%- else -%}
+    {%- set ns.item = item -%}{%- break -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if ns.item is none -%}
+  {%- set d = namespace(a=draw_idle(none) | int) -%}
+  {%- if d.a < 0 -%}
+    {%- for i in range(actors | length) if not actors[i].busy -%}{%- set d.a = i -%}{%- break -%}{%- endfor -%}
+  {%- endif -%}
+  {%- if d.a < 0 -%}{%- do dispatch.drop() -%}{%- endif -%}
+  {%- set a = d.a -%}
+  {%- set r = module.random.random() -%}
+  {%- if r < 0.015 -%}
+    {{- plan(a, module.rand.weighted_choice(stale, stale_w), 'accept', true, false) -}}
+  {%- elif r < 0.065 -%}
+    {%- set k = module.rand.weighted_choice(burst, burst_w) -%}
+    {{- plan(a, k, 'accept' if module.rand.chance(0.85) else 'giveup', false, false) -}}
+  {%- else -%}
+    {{- plan(a, 0, 'accept', false, false) -}}
+  {%- endif -%}
+  {%- set p = shared.get('plan') -%}
+  {%- set ns.item = {'k': 'reject' if p.k > 0 else 'accept', 'p': p} -%}
+{%- endif -%}
+
+{%- set p = ns.item.p -%}
+{%- set actor = actors[p.a] -%}
+{%- set action = ns.item.k -%}
+
+{#- 3. Advance this attempt and queue its next step. -#}
+{%- if action == 'reject' -%}
+  {%- do p.update({'i': p.i + 1}) -%}
+  {%- if p.i < p.k -%}
+    {{- push(now + p.gaps[p.i - 1], {'k': 'reject', 'p': p}, not p.stale) -}}
+  {%- elif p.final == 'accept' -%}
+    {{- push(now + p.gaps[p.k - 1], {'k': 'accept', 'p': p}, not p.stale) -}}
+  {%- else -%}
+    {%- do actor.update({'busy': false}) -%}
+  {%- endif -%}
+{%- elif action == 'accept' -%}
+  {#- 1.5% of clients never complete the association after the accept:
+      no accounting follows. -#}
+  {%- if p.ep or module.random.random() >= 0.015 -%}
+    {{- push(now + p.cd, {'k': 'connect', 'p': p}, true) -}}
+  {%- else -%}
+    {%- do actor.update({'busy': false}) -%}
+  {%- endif -%}
+{%- elif action == 'connect' -%}
+  {%- do p.update({'start': sec}) -%}
+  {{- push(now + p.dur, {'k': 'disconnect', 'p': p}, false) -}}
+{%- else -%}
+  {%- set elapsed = sec - p.start -%}
+  {%- do actor.update({'busy': false}) -%}
+{%- endif -%}
+{%- if action in ['reject', 'accept'] -%}
+  {%- set keep = [] -%}
+  {%- for r in hist.get(p.a, []) if r[1] >= now - window - 1 -%}{%- do keep.append(r) -%}{%- endfor -%}
+  {%- do keep.append([row_n, now, action]) -%}
+  {%- do hist.update({p.a: keep[-24:]}) -%}
+{%- endif -%}
+
+{%- set principal = '[' ~ actor.user ~ ']' -%}
+{%- if action == 'reject' -%}
+  {%- set message = 'Rejected user: ' ~ principal ~ ' (cli ' ~ actor.station ~ ' port ' ~ p.port ~ ')' -%}
+  {%- set category = ['authentication'] -%}{%- set event_type = ['start'] -%}{%- set outcome = 'failure' -%}
+{%- elif action == 'accept' -%}
+  {%- set message = 'Accepted user: ' ~ principal ~ ' (cli ' ~ actor.station ~ ' port ' ~ p.port ~ ')' -%}
+  {%- set category = ['authentication'] -%}{%- set event_type = ['start'] -%}{%- set outcome = 'success' -%}
+{%- elif action == 'connect' -%}
+  {%- set message = 'Connect: ' ~ principal ~ ' (did ' ~ p.ap ~ ' cli ' ~ actor.station
+      ~ ' port ' ~ p.port ~ ' ip ' ~ actor.ip ~ ')' -%}
+  {%- set category = ['session'] -%}{%- set event_type = ['start'] -%}{%- set outcome = 'success' -%}
+{%- else -%}
+  {%- set message = 'Disconnect: ' ~ principal ~ ' (did ' ~ p.ap ~ ' cli ' ~ actor.station
+      ~ ' port ' ~ p.port ~ ' ip ' ~ actor.ip ~ ') ' ~ elapsed ~ ' seconds' -%}
+  {%- set category = ['session'] -%}{%- set event_type = ['end'] -%}{%- set outcome = 'success' -%}
+{%- endif -%}
+{%- set radius = {'client_shortname': params.nas_client, 'nas_port': p.port,
+    'calling_station_id': actor.station} -%}
+{%- set event = {'dataset': 'freeradius.linelog', 'module': 'freeradius', 'kind': 'event',
+    'category': category, 'type': event_type, 'action': action, 'outcome': outcome,
+    'original': message} -%}
+{%- set source = {'mac': actor.station} -%}
+{%- if action in ['connect', 'disconnect'] -%}
+  {%- do radius.update({'called_station_id': p.ap, 'framed_ip_address': actor.ip,
+      'acct_status_type': 'Start' if action == 'connect' else 'Stop'}) -%}
+  {%- do source.update({'ip': actor.ip}) -%}
+{%- endif -%}
+{%- if action == 'disconnect' -%}
+  {%- do radius.update({'acct_session_time': elapsed}) -%}
+  {%- do event.update({'duration': elapsed * 1000000000}) -%}
+{%- endif -%}
+{{ {'@timestamp': timestamp.isoformat(timespec='milliseconds'),
+    'ecs': {'version': '8.17.0'},
+    'event': event,
+    'message': message,
+    'host': {'name': params.radius_host},
+    'service': {'name': 'radiusd'},
+    'user': {'name': actor.user},
+    'source': source,
+    'radius': radius
+} | tojson }}
