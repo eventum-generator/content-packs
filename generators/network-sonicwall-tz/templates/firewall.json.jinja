@@ -1,0 +1,499 @@
+{#- One SonicWall TZ (SonicOS 6.5.4) sending default key-value Syslog
+    for LAN->WAN web traffic: m=97 (Syslog Website Accessed, HTTP
+    connection closed with URL data), m=537 (Connection Closed, no URL
+    data) and m=14 (CFS Web site access denied). The input sets the
+    rate and the hour curve; every timestamp emits one record: the
+    earliest due queued record (the next connection of a browsing
+    session, the next denial of a blocked-site attempt), otherwise the
+    first record of a new activity of a client present at this hour.
+    The anomaly episode only queues records of its own and never
+    touches the background activities or their clients. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set hq = module.heapq -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window_s = 1800 -%}
+{#- Office load by UTC hour, mean 1 over the day; the pattern files
+    give the record rate the same shape (about 12,500 a day). -#}
+{%- macro load_at(h) -%}
+{{- (1.6 if 8 <= h < 18 else (0.9 if h == 7 or 18 <= h < 21 else (0.5 if 21 <= h < 23 else 0.2))) / 0.925 -}}
+{%- endmacro -%}
+{%- macro period_at(h) -%}
+{{- 'day' if 8 <= h < 18 else ('eve' if h == 7 or 18 <= h < 21 else ('late' if 21 <= h < 23 else 'night')) -}}
+{%- endmacro -%}
+{#- A second in [a, b), density proportional to the load curve (sq
+    false) or to its square plus a small floor (sq true). -#}
+{%- macro pick_time(a, b, sq) -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- for hh in range(a // 3600, (b - 1) // 3600 + 1) -%}
+    {%- set lo = [hh * 3600, a] | max -%}
+    {%- set hi = [hh * 3600 + 3600, b] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = load_at(hh % 24) | float -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set sl = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.integer(sl[0], sl[1] - 1) -}}
+{%- endmacro -%}
+{%- set cats = ['search', 'it', 'business', 'unrated'] -%}
+{%- set cat_w = [25, 30, 20, 25] -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.client_count < 8 or params.client_first + params.client_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set sn = params.firewall_serial | lower -%}
+  {%- if sn | length != 12 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set checked = module.ipaddress.IPv4Address(params.firewall_wan_ip) -%}
+  {#- The office itself (site popularity, users' habits, MACs, the
+      internet servers) is fixed by the parameters, so every run with
+      the same parameters describes the same office. -#}
+  {%- set rng = module.random.Random('sonicwall-tz|' ~ params.client_prefix ~ params.client_first
+      ~ '|' ~ params.client_count ~ '|' ~ params.firewall_serial) -%}
+
+  {#- Web sites by CFS category (samples/sites.csv). Category codes are
+      the ones SonicOS publishes in its examples (11 Gambling, 64 Not
+      Rated, 29, 27, 15). Gambling is blocked by the CFS policy. -#}
+  {%- set sites = {'gambling': [], 'search': [], 'it': [], 'business': [], 'unrated': []} -%}
+  {%- for i in range(samples.sites | length) -%}
+    {%- set r = samples.sites[i] -%}
+    {%- if r.category not in sites -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+    {%- do sites[r.category].append([r.domain, r.ip]) -%}
+  {%- endfor -%}
+  {%- set site_w = {} -%}
+  {%- set site_i = {} -%}
+  {%- for k in sites -%}
+    {%- if not sites[k] -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+    {%- set w = [] -%}
+    {%- for s in sites[k] -%}{%- do w.append([[rng.lognormvariate(0, 0.9), 0.3] | max, 3.0] | min) -%}{%- endfor -%}
+    {%- do site_w.update({k: w}) -%}
+    {%- do site_i.update({k: range(sites[k] | length) | list}) -%}
+  {%- endfor -%}
+  {%- set n_gamble = sites.gambling | length -%}
+
+  {#- Clients: bounded random weights for browsing and for attempts on
+      blocked sites (a fifth of the users try gambling sites often, the
+      rest rarely), a per-client preference among gambling sites, and
+      a rank that decides who is still at work in the evening and whose
+      machine stays busy at night. -#}
+  {%- set order = range(params.client_count) | list -%}
+  {%- do rng.shuffle(order) -%}
+  {%- set heavy = order[:[(params.client_count * 0.2) | round | int, 3] | max] -%}
+  {%- set clients = [] -%}
+  {%- set cw = {} -%}
+  {%- set gwt = {} -%}
+  {%- set cinfo = {} -%}
+  {%- for n in range(params.client_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- set octets = [] -%}
+    {%- for b in range(5) -%}{%- do octets.append('%02x' % rng.randint(0, 255)) -%}{%- endfor -%}
+    {%- do clients.append(ip) -%}
+    {%- do cw.update({ip: [[rng.lognormvariate(0, 0.7), 0.4] | max, 2.5] | min}) -%}
+    {%- if n in heavy -%}
+      {%- do gwt.update({ip: [[rng.lognormvariate(module.math.log(6), 0.4), 3.0] | max, 12.0] | min}) -%}
+    {%- else -%}
+      {%- do gwt.update({ip: [[rng.lognormvariate(0, 0.7), 0.2] | max, 2.0] | min}) -%}
+    {%- endif -%}
+    {%- set raw = [] -%}
+    {%- for b in range(n_gamble) -%}{%- do raw.append([[rng.lognormvariate(0, 1.2), 0.15] | max, 6.0] | min) -%}{%- endfor -%}
+    {#- A frequent visitor has a favourite site (two thirds of its
+        attempts or more). -#}
+    {%- set fav = rng.randint(0, n_gamble - 1) if n in heavy else -1 -%}
+    {%- set gw = [] -%}
+    {%- for w in raw -%}{%- do gw.append((raw | sum + 1) * 2 if loop.index0 == fav else w) -%}{%- endfor -%}
+    {%- do cinfo.update({ip: {'mac': '02:' ~ octets | join(':'), 'gw': gw,
+        'port': module.rand.number.integer(49152, 65535)}}) -%}
+  {%- endfor -%}
+  {%- set ranked = clients[:] -%}
+  {%- do rng.shuffle(ranked) -%}
+  {%- set nc = clients | length -%}
+  {%- set pres = {'day': clients[:],
+      'eve': ranked[:(nc * 0.6) | round | int],
+      'late': ranked[:[(nc * 0.3) | round | int, 3] | max],
+      'night': ranked[:[(nc * 0.15) | round | int, 3] | max]} -%}
+
+  {#- Episode pairs: client/gambling-site pairs of the busy tier, whose
+      expected count of blocked-site attempts in 4 days is at least 10
+      (period shares of the daily volume: day 16, evening 3.6, late
+      1.0, night 1.6 of 22.2; 7.6 records per activity, 6.54% of
+      activities are attempts, 0.53 Not Rated visits per session).
+      Each client also gets the Not Rated hosts it visits at least 15
+      times in 4 days. -#}
+  {%- set share = {'day': 16 / 22.2, 'eve': 3.6 / 22.2, 'late': 1.0 / 22.2, 'night': 1.6 / 22.2} -%}
+  {%- set starts4 = 4 * 12500 / 7.6 -%}
+  {%- set ga = {} -%}
+  {%- set sa = {} -%}
+  {%- for c in clients -%}{%- do ga.update({c: 0}) -%}{%- do sa.update({c: 0}) -%}{%- endfor -%}
+  {%- for p in pres -%}
+    {%- set tot = namespace(g=0, c=0) -%}
+    {%- for c in pres[p] -%}{%- set tot.g = tot.g + gwt[c] -%}{%- set tot.c = tot.c + cw[c] -%}{%- endfor -%}
+    {%- set tg = tot.g -%}
+    {%- set tc = tot.c -%}
+    {%- for c in pres[p] -%}
+      {%- do ga.update({c: ga[c] + starts4 * 0.0654 * share[p] * gwt[c] / tg}) -%}
+      {%- do sa.update({c: sa[c] + starts4 * 0.9346 * share[p] * cw[c] / tc}) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set uw = site_w.unrated -%}
+  {%- set uw_sum = uw | sum -%}
+  {%- set eu = {} -%}
+  {%- set pairs = [] -%}
+  {%- for c in clients -%}
+    {%- set ok = [] -%}
+    {%- for u in site_i.unrated -%}
+      {%- if sa[c] * 0.53 * uw[u] / uw_sum >= 15 -%}{%- do ok.append(u) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- do eu.update({c: ok}) -%}
+    {%- set gw = cinfo[c].gw -%}
+    {%- set gsum = gw | sum -%}
+    {%- for si in range(n_gamble) -%}
+      {%- do pairs.append([c, si, ga[c] * gw[si] / gsum, ok | length > 0]) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set epairs = pairs | selectattr('3') | selectattr('2', 'ge', 10) | list -%}
+  {%- if epairs | map(attribute='0') | unique | list | length < 2 -%}
+    {%- set best = namespace(v=[]) -%}
+    {%- for c in clients -%}
+      {%- set top = pairs | selectattr('0', 'equalto', c) | selectattr('3') | sort(attribute='2', reverse=true) | list -%}
+      {%- if top -%}{%- set best.v = best.v + [top[0]] -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set epairs = (best.v | sort(attribute='2', reverse=true) | list)[:3] -%}
+  {%- endif -%}
+  {%- if not epairs -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- The machines of the two clients with the most frequent pairs are
+      in use at every hour, so every hour has two episode clients that
+      are present in background too (consecutive episodes differ). -#}
+  {%- set top = epairs | sort(attribute='2', reverse=true) | map(attribute='0') | unique | list -%}
+  {%- for c in top[:2] -%}
+    {%- for p in ['eve', 'late', 'night'] -%}
+      {%- if c not in pres[p] -%}{%- do pres[p].append(c) -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set pres_cw = {} -%}
+  {%- set pres_gw = {} -%}
+  {%- for p in pres -%}
+    {%- do pres_cw.update({p: []}) -%}
+    {%- do pres_gw.update({p: []}) -%}
+    {%- for c in pres[p] -%}{%- do pres_cw[p].append(cw[c]) -%}{%- do pres_gw[p].append(gwt[c]) -%}{%- endfor -%}
+  {%- endfor -%}
+
+  {%- set tls = [] -%}
+  {%- set tls_w = [] -%}
+  {%- for n in range(60) -%}
+    {%- do tls.append(rng.choice(['198.51.100.', '203.0.113.']) ~ rng.randint(100, 250)) -%}
+    {%- do tls_w.append(rng.lognormvariate(0, 1.2)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'cinfo': cinfo, 'sites': sites,
+      'site_w': site_w, 'site_i': site_i, 'pres': pres, 'pres_cw': pres_cw, 'pres_gw': pres_gw,
+      'epairs': epairs, 'eu': eu, 'tls': tls, 'tls_w': tls_w, 'q': [], 'ctr': [0], 'denials': {},
+      'seq': {'14': module.rand.number.integer(1, 40000), '97': module.rand.number.integer(1000, 3000000),
+        '537': module.rand.number.integer(1000, 9000000)},
+      'start_at': pick_time(now, now + ([interval, 24] | min * 3600) | int, false) | int,
+      'last_actor': none}) -%}
+{%- endif -%}
+
+{%- set q = shared.get('q') -%}
+{%- set ctr = shared.get('ctr') -%}
+{%- set sites = shared.get('sites') -%}
+{%- set site_w = shared.get('site_w') -%}
+{%- set site_i = shared.get('site_i') -%}
+{%- set denials = shared.get('denials') -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+{%- set gamble_paths = ['/', '/sports/live', '/casino/lobby', '/poker', '/promo/welcome', '/live-odds', '/login'] -%}
+{%- set gamble_path_w = [34, 13, 11, 9, 8, 7, 6] -%}
+{%- set paths = {
+    'search': ['/', '/search', '/images', '/news', '/favicon.ico'],
+    'it': ['/', '/ocsp', '/crl/root.crl', '/update/manifest.xml', '/download/agent.msi'],
+    'business': ['/', '/markets', '/login', '/orders', '/static/site.css'],
+    'unrated': ['/', '/index.html', '/login', '/download/setup.exe', '/static/app.js', '/api/status', '/images/logo.png']} -%}
+{%- set path_w = [30, 18, 14, 12, 10] -%}
+{%- set unrated_path_w = [30, 14, 10, 9, 14, 12, 11] -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{%- macro push(at, kind, s) -%}
+  {%- do ctr.append(ctr.pop() + 1) -%}
+  {%- do hq.heappush(q, [at, ctr[0], kind, s]) -%}
+{%- endmacro -%}
+
+{%- macro pick_path(kind) -%}
+  {%- if kind == 'unrated' -%}
+    {{- module.rand.weighted_choice(paths.unrated, unrated_path_w) -}}
+  {%- else -%}
+    {{- module.rand.weighted_choice(paths[kind], path_w) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Attempts to reach a blocked gambling site: one to six CFS denials
+    (reloads, retries, other pages of the site), then sometimes the
+    user tries a Not Rated host, occasionally with a path copied from
+    the blocked page, at most 20 minutes after the last denial. The
+    same law serves background and episode; the episode conditions it
+    on >= 3 denials and on the copied path of the first denial (one
+    that Not Rated browsing also requests), with a
+    client/site pair and a Not Rated host the client often visits in
+    background. -#}
+{%- macro attempt(c, si, episode, ui) -%}
+  {%- if episode -%}
+    {%- set k = module.rand.weighted_choice([3, 4, 5, 6], [18, 13, 10, 7]) -%}
+  {%- else -%}
+    {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [30, 22, 18, 13, 10, 7]) -%}
+  {%- endif -%}
+  {%- if episode -%}
+    {#- A first path that ordinary Not Rated browsing requests as well,
+        so every host/path pair of the chain's last step also occurs
+        in background; preferably not one of the client's recent or
+        queued background denials, whose attempt the episode's last
+        step would complete as well. -#}
+    {%- set busy = denials.get(c, []) | selectattr('t', 'ge', now - window_s) | map(attribute='path') | list -%}
+    {%- for e in q -%}
+      {%- if e[2] == 'deny' and e[3].src == c -%}{%- do busy.append(e[3].path) -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set ep = namespace(p=[], w=[], fp=[], fw=[]) -%}
+    {%- for p in gamble_paths -%}
+      {%- if p in paths.unrated -%}
+        {%- do ep.p.append(p) -%}{%- do ep.w.append(gamble_path_w[loop.index0]) -%}
+        {%- if p not in busy -%}{%- do ep.fp.append(p) -%}{%- do ep.fw.append(gamble_path_w[loop.index0]) -%}{%- endif -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set first = module.rand.weighted_choice(ep.fp, ep.fw) if ep.fp
+        else module.rand.weighted_choice(ep.p, ep.w) -%}
+  {%- else -%}
+    {%- set first = module.rand.weighted_choice(gamble_paths, gamble_path_w) -%}
+  {%- endif -%}
+  {%- set t = namespace(v=now, p=first, used=[]) -%}
+  {%- for n in range(k) -%}
+    {%- if not loop.first -%}
+      {%- set t.v = t.v + gap(12, 1.0) | int -%}
+      {%- if not module.rand.chance(0.6) -%}
+        {%- set t.p = module.rand.weighted_choice(gamble_paths, gamble_path_w) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- do t.used.append(t.p) -%}
+    {{- push(t.v, 'deny', {'src': c, 'site': si, 'path': t.p, 'episode': episode}) -}}
+  {%- endfor -%}
+  {%- if episode or module.rand.chance(0.3) -%}
+    {%- if episode -%}
+      {%- set up = t.used[0] -%}
+    {%- else -%}
+      {%- set ui = module.rand.weighted_choice(site_i.unrated, site_w.unrated) -%}
+      {%- set up = module.rand.choice(t.used) if module.rand.chance(0.5) else pick_path('unrated') -%}
+    {%- endif -%}
+    {{- push(t.v + [gap(90, 1.0) | int, 1200] | min, 'web',
+        {'src': c, 'cat': 'unrated', 'site': ui, 'path': up, 'episode': episode}) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Browsing session: log-normally many connections (median 6, at most
+    40), log-normal gaps (median 4 s); 70% HTTPS, 27% HTTP with URL
+    data, 3% HTTP closed without a request. -#}
+{%- macro session(c) -%}
+  {%- set cat = module.rand.weighted_choice(cats, cat_w) -%}
+  {%- set main = module.rand.weighted_choice(site_i[cat], site_w[cat]) -%}
+  {%- set tls_main = module.rand.weighted_choice(shared.get('tls'), shared.get('tls_w')) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for n in range([(module.rand.number.lognormal(module.math.log(5), 0.9)) | int + 1, 40] | min) -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(4, 1.2) | int -%}{%- endif -%}
+    {%- set r = module.rand.weighted_choice(['tls', 'web', 'bare'], [70, 27, 3]) -%}
+    {%- if r == 'tls' -%}
+      {{- push(t.v, 'tls', {'src': c, 'dst': tls_main if module.rand.chance(0.6)
+          else module.rand.weighted_choice(shared.get('tls'), shared.get('tls_w'))}) -}}
+    {%- else -%}
+      {%- set wc = cat if module.rand.chance(0.7) else module.rand.weighted_choice(cats, cat_w) -%}
+      {%- set wi = main if wc == cat else module.rand.weighted_choice(site_i[wc], site_w[wc]) -%}
+      {{- push(t.v, r, {'src': c, 'cat': wc, 'site': wi, 'path': pick_path(wc), 'episode': false}) -}}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{#- 1. Episode: the first starts within min(interval, 24 h), its time
+    drawn from the load curve; each later one in a window of
+    min(interval / 4, 6 h) centred on its due time (previous start
+    plus the interval), weighted by the squared load curve plus a
+    small floor. Client and site come from the busy-tier pairs of
+    clients present at this hour, not the previous episode's client
+    unless it is the only one present; the Not Rated host is one the
+    client often visits in background. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {%- set pres_now = shared.get('pres')[period_at(hour)] -%}
+  {%- set here = shared.get('epairs') | selectattr('0', 'in', pres_now) | list -%}
+  {%- set cand = (here | rejectattr('0', 'equalto', shared.get('last_actor')) | list) or here -%}
+  {%- set pair = module.rand.weighted_choice(cand, cand | map(attribute='2') | list) -%}
+  {%- set eu = shared.get('eu')[pair[0]] -%}
+  {%- set euw = [] -%}
+  {%- for u in eu -%}{%- do euw.append(site_w.unrated[u]) -%}{%- endfor -%}
+  {%- set ui = module.rand.weighted_choice(eu, euw) if eu
+      else module.rand.weighted_choice(site_i.unrated, site_w.unrated) -%}
+  {{- attempt(pair[0], pair[1], true, ui) -}}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+  {%- do shared.update({'last_actor': pair[0], 'start_at': pick_time(due - half, due + half, true) | int}) -%}
+{%- endif -%}
+
+{#- 2. No record due: a new activity of a client present at this hour,
+    a blocked-site attempt (6.54%) or a browsing session. The queue
+    holds at most a few hundred records; beyond that the earliest
+    record is emitted now instead of starting a new activity. -#}
+{%- if (not q or q[0][0] > now) and q | length < 500 -%}
+  {%- set per = period_at(hour) -%}
+  {%- if module.rand.chance(0.0654) -%}
+    {%- set c = module.rand.weighted_choice(shared.get('pres')[per], shared.get('pres_gw')[per]) -%}
+    {%- set si = module.rand.weighted_choice(site_i.gambling, shared.get('cinfo')[c].gw) -%}
+    {{- attempt(c, si, false, none) -}}
+  {%- else -%}
+    {{- session(module.rand.weighted_choice(shared.get('pres')[per], shared.get('pres_cw')[per])) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest queued record. -#}
+{%- set e = hq.heappop(q) -%}
+{%- set kind = e[2] -%}
+{%- set s = e[3] -%}
+
+{#- Per client: CFS denials within the chain window, pruned on every
+    access, so the state is bounded by clients x denials per 30
+    minutes. -#}
+{%- if kind == 'deny' or (kind == 'web' and s.cat == 'unrated') -%}
+  {%- set hist = denials.get(s.src, []) | selectattr('t', 'ge', now - window_s) | list -%}
+  {%- if kind == 'deny' -%}
+    {%- do hist.append({'t': now, 'site': s.site, 'path': s.path}) -%}
+  {%- elif not s.episode -%}
+    {#- Guard on the final chain step only: an ordinary Not Rated
+        visit keeps its time, client and host, but not a path that the
+        client requested on a blocked site that it was then denied at
+        least twice more within the chain window. -#}
+    {%- set blocked = [] -%}
+    {%- for d in hist -%}
+      {%- if hist[loop.index0 + 1:] | selectattr('site', 'equalto', d.site) | list | length >= 2 -%}
+        {%- do blocked.append(d.path) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if s.path in blocked -%}
+      {%- set free = namespace(p=[], w=[]) -%}
+      {%- for p in paths.unrated -%}
+        {%- if p not in blocked -%}{%- do free.p.append(p) -%}{%- do free.w.append(unrated_path_w[loop.index0]) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- do s.update({'path': module.rand.weighted_choice(free.p, free.w)}) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if hist -%}{%- do denials.update({s.src: hist}) -%}{%- else -%}{%- do denials.pop(s.src, none) -%}{%- endif -%}
+{%- endif -%}
+
+{#- Native default Syslog line. Field order follows the SonicOS 6.5.4
+    "Examples of Standard Syslog Messages". -#}
+{%- set ci = shared.get('cinfo')[s.src] -%}
+{%- do ci.update({'port': 49152 + (ci.port - 49152 + module.rand.weighted_choice([1, 2, 3], [70, 20, 10])) % 16384}) -%}
+{%- set sport = ci.port -%}
+{%- set sn = params.firewall_serial | lower -%}
+{%- set fw_mac = [sn[0:2], sn[2:4], sn[4:6], sn[6:8], sn[8:10], sn[10:12]] | join(':') -%}
+{%- set seq = shared.get('seq') -%}
+{%- set m = '14' if kind == 'deny' else ('97' if kind == 'web' else '537') -%}
+{#- n is the device's per-message-ID count; it also counts the same
+    message for traffic outside the modeled LAN (other zones, UDP,
+    inbound), so it advances by one or a little more. -#}
+{%- set extra = module.rand.weighted_choice([0, 1, 2, 3], {'14': [80, 15, 4, 1],
+    '97': [60, 25, 10, 5], '537': [30, 30, 20, 20]}[m]) -%}
+{%- do seq.update({m: (seq[m] + extra) % 99999999 + 1}) -%}
+{%- set n = seq[m] -%}
+{%- set stamp = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set heard = module.datetime.datetime.fromtimestamp(now + (1 if module.rand.chance(0.15) else 0), utc) -%}
+{%- set header = heard.strftime('%b ') ~ '%2d' % heard.day ~ heard.strftime(' %H:%M:%S') ~ ' '
+    ~ params.firewall_wan_ip ~ ' id=firewall sn=' ~ params.firewall_serial | upper
+    ~ ' time="' ~ stamp.strftime('%Y-%m-%d %H:%M:%S') ~ '" fw=' ~ params.firewall_wan_ip -%}
+{%- set sent = none -%}{%- set rcvd = none -%}{%- set spkt = none -%}{%- set rpkt = none -%}{%- set cdur = none -%}
+{%- set dmac = params.upstream_mac -%}
+{%- if kind == 'tls' -%}
+  {%- set dst = s.dst -%}{%- set dport = 443 -%}{%- set domain = none -%}
+  {%- set rcvd = (module.rand.number.lognormal(module.math.log(9000), 1.7)) | int + 400 -%}
+  {%- set sent = (module.rand.number.lognormal(module.math.log(1800), 0.8)) | int + 300 -%}
+  {%- set rpkt = (rcvd / module.rand.number.floating(900, 1400)) | round(0, 'ceil') | int + 3 -%}
+  {%- set spkt = [(sent / 500) | round(0, 'ceil') | int + 4, (rpkt / module.rand.number.floating(1.2, 2.0)) | int] | max -%}
+  {%- set cdur = (module.rand.number.lognormal(module.math.log(4000), 1.6)) | int + 30 -%}
+  {%- set raw = header ~ ' pri=6 c=1024 m=537 msg="Connection Closed" app=11 n=' ~ n
+      ~ ' src=' ~ s.src ~ ':' ~ sport ~ ':X0 dst=' ~ dst ~ ':443:X1 srcMac=' ~ ci.mac ~ ' dstMac=' ~ dmac
+      ~ ' proto=tcp/https sent=' ~ sent ~ ' rcvd=' ~ rcvd ~ ' spkt=' ~ spkt ~ ' rpkt=' ~ rpkt
+      ~ ' dpi=0 cdur=' ~ cdur ~ ' rule="9 (LAN->WAN)" fw_action="NA"' -%}
+{%- else -%}
+  {%- set site = sites['gambling' if kind == 'deny' else s.cat][s.site] -%}
+  {%- set domain = site[0] -%}{%- set dst = site[1] -%}{%- set dport = 80 -%}
+  {%- set flow = ' src=' ~ s.src ~ ':' ~ sport ~ ':X0 dst=' ~ dst ~ ':80:X1' -%}
+  {%- if kind == 'deny' -%}
+    {%- set dmac = fw_mac -%}
+    {%- set raw = header ~ ' pri=3 c=4 m=14 msg="Web site access denied" app=9 n=' ~ n ~ flow
+        ~ ' srcMac=' ~ ci.mac ~ ' dstMac=' ~ dmac ~ ' proto=tcp/http dstname=' ~ domain ~ ' arg=' ~ s.path
+        ~ ' code=11 Category="Gambling" rule="9 (LAN->WAN)" fw_action="drop"' -%}
+  {%- elif kind == 'bare' -%}
+    {#- HTTP connection closed without a request: no URL, so m=537. -#}
+    {%- set spkt = module.rand.weighted_choice([2, 3, 4], [30, 50, 20]) -%}
+    {%- set sent = 52 + 40 * (spkt - 1) + module.rand.number.integer(0, 60) -%}
+    {%- set cdur = (module.rand.number.lognormal(module.math.log(20000), 1.0)) | int + 50 -%}
+    {%- set domain = none -%}
+    {%- set raw = header ~ ' pri=6 c=1024 m=537 msg="Connection Closed" app=9 n=' ~ n ~ flow
+        ~ ' dstMac=' ~ dmac ~ ' proto=tcp/http sent=' ~ sent ~ ' spkt=' ~ spkt
+        ~ ' dpi=0 cdur=' ~ cdur ~ ' rule="9 (LAN->WAN)" fw_action="NA"' -%}
+  {%- else -%}
+    {%- set cfs = {'search': [29, 'Search Engines and Portals'], 'it': [27, 'Information Technology/Computers'],
+        'business': [15, 'Business and Economy'], 'unrated': [64, 'Not Rated']}[s.cat] -%}
+    {%- set rcvd = (module.rand.number.lognormal(module.math.log(6000), 1.8)) | int + 250 -%}
+    {%- set sent = (module.rand.number.lognormal(module.math.log(700), 0.7)) | int + 200 -%}
+    {%- set raw = header ~ ' pri=6 c=1024 m=97 app=48 n=' ~ n ~ flow
+        ~ ' srcMac=' ~ ci.mac ~ ' dstMac=' ~ dmac ~ ' proto=tcp/http op=1 sent=' ~ sent ~ ' rcvd=' ~ rcvd
+        ~ ' dpi=0 dstname=' ~ domain ~ ' arg=' ~ s.path ~ ' code=' ~ cfs[0] ~ ' Category="' ~ cfs[1] ~ '"'
+        ~ ' note="Policy: CFS Default Policy, Info: 6148 " rule="9 (LAN->WAN)" fw_action="NA"' -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- ECS document, following the Elastic sonicwall_firewall pipeline. -#}
+{%- set pri = 3 if kind == 'deny' else 6 -%}
+{%- set event = {'kind': 'event', 'dataset': 'sonicwall_firewall.log', 'code': m,
+    'sequence': n, 'severity': pri, 'original': raw} -%}
+{%- if kind == 'deny' -%}
+  {%- do event.update({'action': 'connection-denied', 'category': ['network'],
+      'type': ['connection', 'denied'], 'outcome': 'success'}) -%}
+{%- elif m == '537' -%}
+  {%- do event.update({'action': 'connection-end', 'category': ['network'],
+      'type': ['connection', 'end'], 'outcome': 'success', 'duration': cdur * 1000000}) -%}
+{%- endif -%}
+{%- set source = {'ip': s.src, 'port': sport} -%}
+{%- if kind != 'bare' -%}{%- do source.update({'mac': ci.mac | upper | replace(':', '-')}) -%}{%- endif -%}
+{%- set destination = {'ip': dst, 'port': dport, 'mac': dmac | upper | replace(':', '-')} -%}
+{%- set network = {'transport': 'tcp', 'protocol': 'https' if kind == 'tls' else 'http'} -%}
+{%- if sent is not none -%}
+  {%- do source.update({'bytes': sent}) -%}
+  {%- if spkt is not none -%}{%- do source.update({'packets': spkt}) -%}{%- endif -%}
+  {%- do network.update({'bytes': sent + (rcvd or 0)}) -%}
+{%- endif -%}
+{%- if rcvd is not none -%}{%- do destination.update({'bytes': rcvd}) -%}{%- endif -%}
+{%- if rpkt is not none -%}{%- do destination.update({'packets': rpkt}) -%}{%- endif -%}
+{%- set fwf = {'app': '11' if kind == 'tls' else ('48' if kind == 'web' else '9'),
+    'dpi': 'false'} if kind != 'deny' else {'app': '9'} -%}
+{%- if kind == 'deny' -%}{%- do fwf.update({'code': '11', 'Category': 'Gambling'}) -%}
+{%- elif kind == 'web' -%}{%- do fwf.update({'code': cfs[0] | string, 'Category': cfs[1]}) -%}{%- endif -%}
+{%- set record = {'@timestamp': stamp.isoformat(), 'ecs': {'version': '8.17.0'},
+    'event': event, 'log': {'level': 'error' if kind == 'deny' else 'info'},
+    'observer': {'ip': [params.firewall_wan_ip], 'name': 'firewall', 'serial_number': params.firewall_serial | upper,
+      'vendor': 'SonicWall', 'product': 'SonicOS', 'type': 'firewall',
+      'ingress': {'interface': {'name': 'X0'}}, 'egress': {'interface': {'name': 'X1'}}},
+    'source': source, 'destination': destination, 'network': network,
+    'rule': {'id': '9 (LAN->WAN)'}, 'related': {'ip': [s.src, dst, params.firewall_wan_ip]},
+    'sonicwall': {'firewall': fwf}} -%}
+{%- if kind == 'deny' -%}
+  {%- do record.update({'message': 'Web site access denied'}) -%}
+{%- elif kind == 'web' -%}
+  {%- do record.update({'message': 'Policy: CFS Default Policy, Info: 6148 ',
+      'http': {'request': {'method': 'GET'}}}) -%}
+{%- else -%}
+  {%- do record.update({'message': 'Connection Closed'}) -%}
+{%- endif -%}
+{%- if domain is not none -%}
+  {%- do record.update({'url': {'domain': domain, 'path': s.path, 'scheme': 'http',
+      'full': 'http://' ~ domain ~ s.path}}) -%}
+{%- endif -%}
+{{ record | tojson }}
