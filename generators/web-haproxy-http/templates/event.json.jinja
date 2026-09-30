@@ -1,0 +1,231 @@
+{%- set utc = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now_s = utc.timestamp() -%}
+{%- set interval_s = [params.anomaly_interval_hours|float, 0.5]|max * 3600 -%}
+{%- set export_path = module.urllib.parse.quote(params.anomaly_path, safe='/-._~') -%}
+{%- set chain_window_s = 300 -%}
+{%- set heapq = module.heapq -%}
+{%- set num = module.rand.number -%}
+{#- Background workload. A timestamp that no queued record claims
+    starts a login session with probability session_p, otherwise it
+    carries one request drawn from the ordinary pool. A session is
+    zero or more denied logins (fail_p of sessions, length law
+    fail_len), a 302 login (after failures with probability
+    fail_then_ok), the browser's GET of the redirect target (the
+    admin export with probability export_redirect_p, otherwise a
+    catalog page) and zero to three further requests. The failure
+    and export-redirect rates vary by day (lognormal factors). The
+    address in anomaly_ip is one more ordinary client, a remote-access
+    address whose users fail logins anomaly_fail_factor times as
+    often. -#}
+{%- set session_p = 0.12 -%}
+{%- set fail_p = 0.018 -%}
+{%- set fail_len = [[1, 2, 3, 4, 5, 6, 7], [39, 20, 18, 9, 6, 4.5, 3.5]] -%}
+{%- set fail_then_ok = 0.75 -%}
+{%- set export_redirect_p = 0.25 -%}
+{%- set anomaly_fail_factor = 5 -%}
+{%- set nclients = samples.clients | length -%}
+{%- set nreq = samples.requests | length -%}
+{%- set idx = shared.get('pool_index') -%}
+{%- if idx is none -%}
+  {%- set idx = {'export': [], 'catalog': [], 'other': []} -%}
+  {%- for i in range(nreq) -%}
+    {%- set r = samples.requests[i] -%}
+    {%- if r.path == '/admin/export' -%}{%- do idx.export.append(i) -%}{%- else -%}{%- do idx.other.append(i) -%}{%- endif -%}
+    {%- if r.path.startswith('/catalog/') -%}{%- do idx.catalog.append(i) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('pool_index', idx) -%}
+{%- endif -%}
+{%- set day = utc.strftime('%Y-%m-%d') -%}
+{%- set dayf = shared.get('day_factors') -%}
+{%- if dayf is none or dayf[0] != day -%}
+  {%- set dayf = [day, num.clamp(num.lognormal(0, 0.35), 0.45, 2.2), num.clamp(num.lognormal(0, 0.35), 0.45, 2.2)] -%}
+  {%- do shared.set('day_factors', dayf) -%}
+{%- endif -%}
+{%- set bgq = shared.get('bg_queue') -%}
+{%- if bgq is none -%}{%- set bgq = [] -%}{%- do shared.set('bg_queue', bgq) -%}{%- endif -%}
+{%- set epq = shared.get('ep_queue') -%}
+{%- if epq is none -%}{%- set epq = [] -%}{%- do shared.set('ep_queue', epq) -%}{%- endif -%}
+{%- set bg_due = bgq and bgq[0][0] <= now_s -%}
+{%- set ep_due = epq and epq[0][0] <= now_s -%}
+{%- set ns = namespace(row=none, plan=none) -%}
+{%- if not bg_due and not ep_due -%}
+  {#- A free timestamp. Recurrence: the first episode starts uniformly
+      within the first min(interval, 24 h) of the run; each next one is
+      due the interval after the actual start, drawn uniformly within
+      a window of width min(interval / 4, 6 h) centred on that time. An
+      episode starts on the first free timestamp at or after its due
+      time, so it never claims a timestamp of a queued record. -#}
+  {%- set due = shared.get('next_episode_at', none) if params.anomaly_mode else none -%}
+  {%- if params.anomaly_mode and due is none -%}
+    {%- do shared.set('next_episode_at', now_s + num.floating(0, [interval_s, 86400] | min)) -%}
+  {%- endif -%}
+  {%- if due is not none and now_s >= due -%}
+    {%- set half = ([interval_s / 4, 21600] | min) / 2 -%}
+    {%- do shared.set('next_episode_at', now_s + interval_s + num.floating(-half, half)) -%}
+    {%- set ns.plan = {'q': epq, 'ip': params.anomaly_ip, 'fails': 4, 'ok': true, 'target': module.rand.choice(idx.export), 'ep': true} -%}
+  {%- else -%}
+    {%- set src = params.anomaly_ip if num.integer(0, nclients) == 0 else samples.clients.pick().ip -%}
+    {%- if module.rand.chance(session_p) -%}
+      {%- set fails = module.rand.weighted_choice(fail_len[0], fail_len[1]) if module.rand.chance(fail_p * dayf[1] * (anomaly_fail_factor if src == params.anomaly_ip else 1)) else 0 -%}
+      {%- set target = module.rand.choice(idx.export) if module.rand.chance(export_redirect_p * dayf[2]) else module.rand.choice(idx.catalog) -%}
+      {%- set ns.plan = {'q': bgq, 'ip': src, 'fails': fails, 'ok': fails == 0 or module.rand.chance(fail_then_ok), 'target': target, 'ep': false} -%}
+    {%- else -%}
+      {%- set ns.row = {'ip': src, 'kind': 'pool', 'arg': num.integer(0, nreq - 1), 'ep': false} -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if ns.plan is not none -%}
+  {#- Queue the whole session; its first record takes this timestamp.
+      Retry pauses: 2 s plus a lognormal wait (median 5 s, at most
+      45 s); the redirect is followed on the next second; later
+      requests after 3 s plus a lognormal pause (median 15 s, at most
+      180 s). An episode is a session of the same law with four
+      denied logins, a 302 and the export as its redirect target; the
+      requests after its export are ordinary ones. -#}
+  {%- set pl = ns.plan -%}
+  {%- set st = namespace(t=now_s, seq=shared.get('seq', 0)) -%}
+  {%- for i in range(pl.fails) -%}
+    {%- if i > 0 -%}{%- set st.t = st.t + 2 + (num.clamp(num.lognormal(1.609, 0.6), 0, 43) | round | int) -%}{%- endif -%}
+    {%- do heapq.heappush(pl.q, [st.t, st.seq, {'ip': pl.ip, 'kind': 'fail', 'arg': none, 'ep': pl.ep}]) -%}
+    {%- set st.seq = st.seq + 1 -%}
+  {%- endfor -%}
+  {%- if pl.ok -%}
+    {%- if pl.fails > 0 -%}{%- set st.t = st.t + 2 + (num.clamp(num.lognormal(1.609, 0.6), 0, 43) | round | int) -%}{%- endif -%}
+    {%- do heapq.heappush(pl.q, [st.t, st.seq, {'ip': pl.ip, 'kind': 'ok', 'arg': none, 'ep': pl.ep}]) -%}
+    {%- do heapq.heappush(pl.q, [st.t + 1, st.seq + 1, {'ip': pl.ip, 'kind': 'pool', 'arg': pl.target, 'ep': pl.ep}]) -%}
+    {%- set st.t = st.t + 1 -%}
+    {%- set st.seq = st.seq + 2 -%}
+    {%- for j in range(num.integer(0, 3)) -%}
+      {%- set st.t = st.t + 3 + (num.clamp(num.lognormal(2.708, 0.8), 0, 177) | round | int) -%}
+      {%- do heapq.heappush(pl.q, [st.t, st.seq, {'ip': pl.ip, 'kind': 'pool', 'arg': num.integer(0, nreq - 1), 'ep': false}]) -%}
+      {%- set st.seq = st.seq + 1 -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- do shared.set('seq', st.seq) -%}
+  {%- set bg_due = bgq and bgq[0][0] <= now_s -%}
+{%- endif -%}
+{%- if ns.row is none -%}
+  {%- set ns.row = heapq.heappop(bgq)[2] if bg_due else heapq.heappop(epq)[2] -%}
+{%- endif -%}
+{%- set row = ns.row -%}
+{%- set src = row.ip -%}
+{%- if row.kind == 'fail' -%}
+  {%- set method, path, status, bytes, server = 'POST', '/login', 401, 310, 'app1' -%}
+{%- elif row.kind == 'ok' -%}
+  {%- set method, path, status, bytes, server = 'POST', '/login', 302, 196, 'app1' -%}
+{%- else -%}
+  {%- set req = samples.requests[row.arg] -%}
+  {%- set method, path, status, bytes, server = req.method, req.path, req.status, req.bytes, req.backend -%}
+  {%- if path == '/admin/export' -%}{%- set path = export_path -%}{%- endif -%}
+{%- endif -%}
+{%- set src_port = num.integer(40000, 62000) -%}
+{#- Guard: an ordinary export that would complete four 401 logins, a
+    302 login and the export from one client, the first 401 at most
+    chain_window_s before the export request, is replaced by another
+    request from the pool (any class but the export). The export's
+    timers are drawn first, only to place its request time; they are
+    kept when it is not replaced, and a replacement gets its own
+    timers, bytes and status below. The history is kept after an
+    episode, so a later ordinary export cannot complete a chain with
+    the episode's own logins either. -#}
+{%- set history = shared.get('login_history', {}) -%}
+{%- set pre = none -%}
+{%- if not row.ep and path == export_path and history.get(src, {}).get('armed') is not none -%}
+  {%- set pre = {'tr_request': num.integer(0, 2), 'tc_connect': num.integer(0, 4), 'tr_response': num.integer(80, 240), 'transfer': num.integer(300, 700)} -%}
+  {%- set pre_request_s = now_s - (pre.tr_request + pre.tc_connect + pre.tr_response + pre.transfer) / 1000 -%}
+  {%- if history[src].armed >= pre_request_s - chain_window_s -%}
+    {%- set req = samples.requests[module.rand.choice(idx.other)] -%}
+    {%- set method, path, status, bytes, server = req.method, req.path, req.status, req.bytes, req.backend -%}
+    {%- set pre = none -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set no_server = server == '<NOSRV>' -%}
+{%- if no_server -%}
+  {%- set tr_request = 0 -%}
+  {%- set tw_queue = -1 -%}
+  {%- set tc_connect = -1 -%}
+  {%- set tr_response = -1 -%}
+  {%- set ta_active = 0 -%}
+  {%- set termination = 'SC--' -%}
+  {%- set actconn = 1 -%}
+  {%- set feconn = 1 -%}
+  {%- set beconn = 0 -%}
+  {%- set srvconn = 0 -%}
+{%- else -%}
+  {%- set tr_request = module.rand.number.integer(0, 2) if pre is none else pre.tr_request -%}
+  {%- set tw_queue = 0 -%}
+  {%- set tc_connect = module.rand.number.integer(0, 4) if pre is none else pre.tc_connect -%}
+  {%- if path == export_path -%}
+    {%- set tr_response = module.rand.number.integer(80, 240) if pre is none else pre.tr_response -%}
+    {%- set transfer = module.rand.number.integer(300, 700) if pre is none else pre.transfer -%}
+  {%- elif status == 401 -%}
+    {%- set tr_response = module.rand.number.integer(8, 35) -%}
+    {%- set transfer = module.rand.number.integer(0, 10) -%}
+  {%- elif status == 302 -%}
+    {%- set tr_response = module.rand.number.integer(4, 25) -%}
+    {%- set transfer = module.rand.number.integer(0, 10) -%}
+  {%- elif status == 304 -%}
+    {%- set tr_response = module.rand.number.integer(1, 8) -%}
+    {%- set transfer = module.rand.number.integer(0, 3) -%}
+  {%- else -%}
+    {%- set tr_response = module.rand.number.integer(7, 75) -%}
+    {%- set transfer = module.rand.number.integer(0, 20) -%}
+  {%- endif -%}
+  {%- set ta_active = tr_request + tw_queue + tc_connect + tr_response + transfer -%}
+  {%- set termination = '----' -%}
+  {%- set feconn = module.rand.number.integer(1, 5) -%}
+  {%- set actconn = feconn + module.rand.number.integer(0, 2) -%}
+  {%- set beconn = module.rand.number.integer(0, feconn) -%}
+  {%- set srvconn = module.rand.number.integer(0, beconn) -%}
+{%- endif -%}
+{%- set request_s = now_s - ta_active / 1000 -%}
+{#- Guard history: per client, the 401 request times of the last
+    chain_window_s and the latest anchor that a 302 has armed. -#}
+{%- set h = history.get(src, {'fails': [], 'armed': none}) -%}
+{%- set fails = h.fails | select('ge', request_s - chain_window_s) | list -%}
+{%- set armed = h.armed if h.armed is not none and h.armed >= request_s - chain_window_s else none -%}
+{%- if path == '/login' and status == 401 -%}
+  {%- do fails.append(request_s) -%}
+{%- elif path == '/login' and status == 302 and fails | length >= 4 -%}
+  {%- set armed = [armed if armed is not none else fails[-4], fails[-4]] | max -%}
+{%- endif -%}
+{%- if not fails and armed is none -%}
+  {%- do history.pop(src, none) -%}
+{%- else -%}
+  {%- do history.update({src: {'fails': fails[-8:], 'armed': armed}}) -%}
+{%- endif -%}
+{%- do shared.set('login_history', history) -%}
+{%- set timers = tr_request ~ '/' ~ tw_queue ~ '/' ~ tc_connect ~ '/' ~ tr_response ~ '/' ~ ta_active -%}
+{%- set connections = actconn ~ '/' ~ feconn ~ '/' ~ beconn ~ '/' ~ srvconn ~ '/0' -%}
+{%- set reqline = method ~ ' ' ~ path ~ ' HTTP/1.1' -%}
+{%- set request_time = utc - module.datetime.timedelta(milliseconds=ta_active) -%}
+{%- set accept = request_time.strftime('%d/%b/%Y:%H:%M:%S.%f')[:-3] -%}
+{%- set body = src ~ ':' ~ src_port ~ ' [' ~ accept ~ '] ' ~ params.frontend_name ~ ' ' ~ params.backend_name ~ '/' ~ server ~ ' ' ~ timers ~ ' ' ~ status ~ ' ' ~ bytes ~ ' - - ' ~ termination ~ ' ' ~ connections ~ ' 0/0 "' ~ reqline ~ '"' -%}
+{%- set syslog_time = utc.strftime('%b ') ~ ('%2d' % utc.day) ~ utc.strftime(' %H:%M:%S') -%}
+{%- set original = syslog_time ~ ' ' ~ params.proxy_name ~ ' haproxy[2431]: ' ~ body -%}
+{%- set offset = shared.get('offset', 0) -%}
+{%- do shared.set('offset', offset + original.encode('utf-8')|length + 1) -%}
+{%- set url = {'original':path,'path':path} -%}
+{%- if path.endswith('.js') -%}{%- do url.update({'extension':'js'}) -%}{%- endif -%}
+{%- set out = {
+  '@timestamp': request_time.isoformat(),
+  'ecs': {'version':'8.17.0'},
+  'agent': {'ephemeral_id':'bb220000-2222-4444-8888-123456789abc','id':'aa110000-1111-4444-8888-123456789abc','name':params.proxy_name,'type':'filebeat','version':'8.17.0'},
+  'elastic_agent': {'id':'aa110000-1111-4444-8888-123456789abc','snapshot':false,'version':'8.17.0'},
+  'data_stream': {'dataset':'haproxy.log','namespace':'default','type':'logs'},
+  'event': {'agent_id_status':'verified','category':['web'],'dataset':'haproxy.log','duration':ta_active * 1000000,'ingested':utc.isoformat(),'kind':'event','original':original,'outcome':'failure' if status >= 400 else 'success','timezone':'+00:00'},
+  'haproxy': {
+    'backend_name':params.backend_name,'backend_queue':0,'bytes_read':bytes,'connection_wait_time_ms':tc_connect,
+    'connections':{'active':actconn,'backend':beconn,'frontend':feconn,'retries':0,'server':srvconn},
+    'frontend_name':params.frontend_name,
+    'http': {'request':{'captured_cookie':'-','raw_request_line':reqline,'time_wait_ms':tr_request,'time_wait_without_data_ms':tr_response},'response':{'captured_cookie':'-'}},
+    'server_name':server,'server_queue':0,'termination_state':termination,'total_waiting_time_ms':tw_queue
+  },
+  'host': {'name':params.proxy_name,'ip':[params.proxy_ip]},
+  'http': {'request':{'method':method},'response':{'bytes':bytes,'status_code':status},'version':'1.1'},
+  'input': {'type':'log'},'log': {'file':{'path':'/var/log/haproxy.log'},'offset':offset},
+  'message':body,'process':{'name':'haproxy','pid':2431},
+  'related':{'ip':[src]},'source':{'address':src,'ip':src,'port':src_port},
+  'tags':['preserve_original_event','haproxy-log'],'url':url
+} -%}
+{{- out | tojson -}}
