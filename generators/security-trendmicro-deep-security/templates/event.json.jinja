@@ -1,0 +1,304 @@
+{#- One Deep Security Agent firewall or intrusion prevention event per
+    input timestamp, relayed by Deep Security Manager in CEF (Deep
+    Security 20 "Syslog message formats"). A heap holds the scheduled
+    records of started activities (further connections of a session,
+    further denied attempts of a scan, its follow-up, further detections
+    of a burst, episode steps); the earliest due one takes the next
+    timestamp. A timestamp with nothing due starts a new background
+    activity - a logged connection session, a scan of blocked ports or
+    an intrusion prevention burst - drawn by its start rate at that hour,
+    so the input rate (floor plus working-day curve) is the event rate.
+    Times are epoch seconds. -#}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set now = module.builtins.int(timestamp.timestamp()) -%}
+{%- set hq = module.heapq -%}
+{%- set hour_s = 3600 -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour_s) -%}
+{#- Chain window: three distinct denied ports and the IPS event of one
+    source on one host within this many seconds. -#}
+{%- set window_s = 3600 -%}
+{#- Relative hourly activity of people (mean 1): the working-day share of
+    the input (patterns/workday.yml, beta 4.25/4.75) over a floor of one
+    third. Background start rates per hour: logged connection sessions
+    180 * c, scans 14.4 * (0.5 + 0.5 * c) (half automated tools, half
+    misconfigured clients following people), IPS bursts 1.0 flat. With
+    the mean records per start (1.67 / 3.66 / 1.73) they add up to the
+    input curve: 137.1 + 5231 * beta hourly mass records per hour. -#}
+{%- set curve = [0.335, 0.354, 0.419, 0.543, 0.725, 0.948, 1.191, 1.427, 1.632, 1.785, 1.87, 1.881,
+    1.818, 1.689, 1.509, 1.296, 1.072, 0.857, 0.67, 0.522, 0.421, 0.363, 0.339, 0.334] -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [module.builtins.int(module.rand.number.lognormal(module.math.log(median), sigma) + 0.5), 1] | max -}}
+{%- endmacro -%}
+{%- macro push(due, kind, s, episode=false) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do hq.heappush(shared.get('q'), [due, n, {'kind': kind, 'episode': episode, 's': s}]) -%}
+{%- endmacro -%}
+{%- macro draw(cum) -%}
+  {#- Index drawn by cumulative weights. -#}
+  {{- [module.bisect.bisect_right(cum, module.rand.number.floating(0, cum[-1])), cum | length - 1] | min -}}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its hour weighted by the scan curve
+      squared plus a small floor. -#}
+  {%- set dmax = 0.5 + 0.5 * (curve | max) -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- set d = (0.5 + 0.5 * curve[((c + shared.get('tzoff')) // hour_s) % 24]) / dmax -%}
+    {%- if module.rand.number.floating(0, 1.02) < d ** 2 + 0.02 -%}
+      {%- set r.v = c -%}{%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= params.anomaly_interval_hours <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.deny_rules | length < 5 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- Protected servers and source addresses with their activity
+      weights (samples/hosts.csv, samples/sources.csv). -#}
+  {%- set hosts = [] -%}
+  {%- set host_w = [] -%}
+  {%- for row in samples.hosts -%}
+    {%- do hosts.append({'name': row.name, 'ip': row.ip, 'id': row.id | int, 'mac': row.mac, 'web': row.role == 'web',
+        'ports': ([80, 443] if row.role == 'web' else []) + ([22] if row.os == 'linux' else [3389])}) -%}
+    {%- do host_w.append(row.weight | float) -%}
+  {%- endfor -%}
+  {%- set sources = [] -%}
+  {%- set src_w = [] -%}
+  {%- for row in samples.sources -%}
+    {%- do sources.append(row.ip) -%}{%- do src_w.append(row.weight | float) -%}
+  {%- endfor -%}
+  {#- Intrusion prevention rules with their detection weights
+      (samples/ips_rules.csv). -#}
+  {%- set ips_rules = [] -%}
+  {%- for row in samples.ips_rules -%}
+    {%- do ips_rules.append({'id': row.id | int, 'name': row.name, 'severity': row.severity | int,
+        'weight': row.weight | float, 'request': row.request}) -%}
+  {%- endfor -%}
+  {%- if not ips_rules -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set web_i = [] -%}{%- for h in hosts -%}{%- if h.web -%}{%- do web_i.append(loop.index0) -%}{%- endif -%}{%- endfor -%}
+  {%- if web_i | length < 2 -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set cum = namespace(h=[], s=[], w=[], a=0) -%}
+  {%- for w in host_w -%}{%- set cum.a = cum.a + w -%}{%- do cum.h.append(cum.a) -%}{%- endfor -%}
+  {%- set cum.a = 0 -%}
+  {%- for w in src_w -%}{%- set cum.a = cum.a + w -%}{%- do cum.s.append(cum.a) -%}{%- endfor -%}
+  {%- set cum.a = 0 -%}
+  {%- for i in web_i -%}{%- set cum.a = cum.a + host_w[i] -%}{%- do cum.w.append(cum.a) -%}{%- endfor -%}
+  {#- Episode pairs: a source and a web server that exchange at least
+      24 logged connections in four days on average (4320 sessions a day
+      of 1.67 connections), so each pair also meets in ordinary traffic;
+      the twelve busiest pairs if fewer qualify. -#}
+  {%- set pairs = [] -%}
+  {%- for si in range(sources | length) -%}
+    {%- for hi in web_i -%}
+      {%- set x = 4320 * 4 * 1.67 * (src_w[si] / cum.s[-1]) * (host_w[hi] / cum.h[-1]) -%}
+      {%- do pairs.append([x, si, hi]) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set pairs = pairs | sort(attribute='0', reverse=true) | list -%}
+  {%- set busy = pairs | selectattr('0', 'ge', 24) | list -%}
+  {%- if busy | length < 12 -%}{%- set busy = pairs[:12] -%}{%- endif -%}
+  {%- do shared.update({'initialized': true, 'hosts': hosts, 'sources': sources, 'web_i': web_i,
+      'ips_rules': ips_rules, 'ips_w': ips_rules | map(attribute='weight') | list, 'host_cum': cum.h, 'src_cum': cum.s, 'web_cum': cum.w, 'pairs': busy, 'q': [], 'seq': 0, 'hist': {},
+      'swept': now, 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()),
+      'last_source': none, 'last_host': none}) -%}
+  {%- do shared.set('next_due', pick_start(now, [interval, 24 * hour_s] | min) | int) -%}
+{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set sources = shared.get('sources') -%}
+{%- set web_i = shared.get('web_i') -%}
+
+{#- A burst of IPS detections of one source against a web service of
+    one host; an episode makes a single detection. -#}
+{%- macro ips_burst(src, hi, at, episode=false) -%}
+  {%- set port = module.rand.weighted_choice([80, 443], [60, 40]) -%}
+  {%- set t = namespace(v=at, rule=module.rand.weighted_choice(shared.get('ips_rules'), shared.get('ips_w'))) -%}
+  {%- for n in range(1 if episode else module.rand.weighted_choice([1, 2, 3, 4], [55, 25, 12, 8])) -%}
+    {%- if not loop.first -%}
+      {%- set t.v = t.v + gap(8, 1.2) | int -%}
+      {%- if module.rand.chance(0.25) -%}
+        {%- set t.rule = module.rand.weighted_choice(shared.get('ips_rules'), shared.get('ips_w')) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {{- push(t.v, 'ips', {'src': src, 'hi': hi, 'port': port, 'rule': t.rule}, episode) -}}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{%- macro log_conns(src, hi, port, at) -%}
+  {%- set t = namespace(v=at) -%}
+  {%- for n in range(module.rand.weighted_choice([1, 2, 3, 4], [58, 24, 11, 7])) -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(20, 1.4) | int -%}{%- endif -%}
+    {{- push(t.v, 'log', {'src': src, 'hi': hi, 'port': port}) -}}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{#- Denied attempts on several ports of one host, then optionally IPS
+    detections or an ordinary logged connection from the same source.
+    The same law serves background and the episode. The follow-up is
+    drawn independently of the port count; an IPS follow-up of a
+    background scan on three or more ports is not made (that is the
+    complete chain), every other outcome keeps its share. -#}
+{%- macro probe_burst(src, hi, k, follow, episode=false) -%}
+  {%- set ports = module.rand.shuffle(params.deny_rules | list)[:k] -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for rule in ports -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(20, 1.1) | int -%}{%- endif -%}
+    {%- for a in range(module.rand.weighted_choice([1, 2, 3], [55, 32, 13])) -%}
+      {%- if not loop.first -%}{%- set t.v = t.v + gap(3, 0.7) | int -%}{%- endif -%}
+      {{- push(t.v, 'deny', {'src': src, 'hi': hi, 'rule': rule}, episode) -}}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set at = t.v + gap(90, 1.0) | int -%}
+  {%- if follow == 'ips' and (episode or k < 3) -%}
+    {{- ips_burst(src, hi, at, episode) -}}
+  {%- elif follow == 'log' -%}
+    {{- log_conns(src, hi, module.rand.choice(hosts[hi].ports), at) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Episode: a scan of three to five blocked ports of a web server by
+    one source, then one IPS detection from it on that server. The first
+    start falls within min(interval, 24 h), each later one within
+    min(interval / 4, 6 h) centred one interval after the actual start,
+    both with the hour weighted by the scan curve squared plus a floor;
+    missed episodes are not replayed. The pair differs in source and
+    server from the previous episode's and is drawn from the busy pairs
+    by their traffic. -#}
+{%- if params.anomaly_mode and now >= shared.get('next_due') -%}
+  {%- set cand = namespace(p=[], w=[]) -%}
+  {%- for p in shared.get('pairs') -%}
+    {%- if sources[p[1]] != shared.get('last_source') and p[2] != shared.get('last_host') -%}
+      {%- do cand.p.append(p) -%}{%- do cand.w.append(p[0]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if not cand.p -%}{%- set cand.p = shared.get('pairs') -%}{%- set cand.w = cand.p | map(attribute='0') | list -%}{%- endif -%}
+  {%- set p = module.rand.weighted_choice(cand.p, cand.w) -%}
+  {{- probe_burst(sources[p[1]], p[2], module.rand.weighted_choice([3, 4, 5], [54, 31, 15]), 'ips', true) -}}
+  {%- set w = [interval // 4, 6 * hour_s] | min -%}
+  {%- do shared.update({'last_source': sources[p[1]], 'last_host': p[2],
+      'next_due': pick_start(now + interval - w // 2, w) | int}) -%}
+{%- endif -%}
+
+{#- 2. The earliest due scheduled record takes this timestamp; otherwise
+    a new background activity starts at this timestamp. -#}
+{%- if not (q and q[0][0] <= now) -%}
+  {%- set c = curve[((now + shared.get('tzoff')) // hour_s) % 24] -%}
+  {%- set wl = 180 * c -%}
+  {%- set wp = 14.4 * (0.5 + 0.5 * c) -%}
+  {%- set r = module.rand.number.floating(0, wl + wp + 1.0) -%}
+  {%- if r < wl -%}
+    {#- Ordinary connections matched by log-only rules. -#}
+    {%- set hi = draw(shared.get('host_cum')) | int -%}
+    {%- set h = hosts[hi] -%}
+    {%- set port = module.rand.weighted_choice(h.ports, [35, 55, 10] if h.web else [1]) -%}
+    {{- log_conns(sources[draw(shared.get('src_cum')) | int], hi, port, now) -}}
+  {%- elif r < wl + wp -%}
+    {#- Denied ports: scanners, inventory tools, misconfigured clients
+        and services. -#}
+    {%- set hi = draw(shared.get('host_cum')) | int -%}
+    {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5], [50, 24, 14, 8, 4]) -%}
+    {%- set u = module.rand.number.floating(0, 1) -%}
+    {%- set follow = ('ips' if u < 0.15 else ('log' if u < 0.45 else none)) if hosts[hi].web
+        else ('log' if u < 0.35 else none) -%}
+    {{- probe_burst(sources[draw(shared.get('src_cum')) | int], hi, k, follow) -}}
+  {%- else -%}
+    {#- False positives on ordinary web traffic and exploit checks of
+        vulnerability scans. -#}
+    {{- ips_burst(sources[draw(shared.get('src_cum')) | int], web_i[draw(shared.get('web_cum')) | int], now) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set e = hq.heappop(q)[2] -%}
+{%- set s = e.s -%}
+{%- set kind = e.kind -%}
+{%- set src = s.src -%}
+{%- set h = hosts[s.hi] -%}
+
+{#- Denied ports per source and host over the chain window. -#}
+{%- if now - shared.get('swept') >= hour_s -%}
+  {%- for key in hist | list -%}
+    {%- if hist[key][-1][0] < now - window_s -%}{%- do hist.pop(key) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('swept', now) -%}
+{%- endif -%}
+{%- set key = src ~ '>' ~ s.hi -%}
+{%- set recent = hist.get(key, []) | selectattr('0', 'ge', now - window_s) | list -%}
+{%- if kind == 'deny' -%}
+  {%- do hist.update({key: (recent + [[now, s.rule.port]])[-24:]}) -%}
+{%- elif kind == 'ips' and not e.episode and (recent | map(attribute='1') | unique | list | length) >= 3 -%}
+  {#- Guard on the final chain step only, window equal to the chain
+      window: an ordinary IPS detection whose source was denied on three
+      or more distinct ports of this host within the window becomes an
+      ordinary logged connection of the same source to the same web port
+      at the same time. -#}
+  {%- set kind = 'log' -%}
+{%- endif -%}
+
+{#- 4. The CEF message: extension order as in the Deep Security 20
+    firewall and intrusion prevention CEF samples, tenant fields as the
+    manager adds them when it relays agent events. -#}
+{%- set rt = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set header = rt.strftime('%b ') ~ ('%2d' % rt.day) ~ rt.strftime(' %H:%M:%S') ~ ' ' ~ params.manager_host -%}
+{%- set spt = module.rand.number.integer(49152, 65535) if module.rand.chance(0.7) else module.rand.number.integer(1024, 49151) -%}
+{%- set frag = 'DF' if module.rand.chance(0.93) else '' -%}
+{%- set base = 'cn1=' ~ h.id ~ ' cn1Label=Host ID dvchost=' ~ h.name ~ ' TrendMicroDsTenant=' ~ params.tenant
+    ~ ' TrendMicroDsTenantId=' ~ params.tenant_id -%}
+{%- if kind == 'ips' -%}
+  {%- set rule = s.rule -%}
+  {%- set sig = rule.id | string -%}{%- set name = rule.name -%}{%- set sev = rule.severity -%}
+  {%- set act = params.ips_action -%}{%- set dpt = s.port -%}
+  {%- set size = [[module.rand.number.lognormal(module.math.log(420), 0.6) | int, 120] | max, 1460] | min -%}
+  {%- set pos = module.rand.number.integer(0, [size - 60, 1] | max) -%}
+  {%- set stream = pos + (0 if module.rand.chance(0.6) else module.rand.number.integer(1, 2400)) -%}
+  {%- set has_data = dpt == 80 -%}
+  {%- set ext = base ~ ' dmac=' ~ h.mac ~ ' smac=' ~ params.gateway_mac ~ ' TrendMicroDsFrameType=IP src=' ~ src
+      ~ ' dst=' ~ h.ip ~ ' in=' ~ size ~ ' cs3=' ~ frag ~ ' cs3Label=Fragmentation Bits proto=TCP spt=' ~ spt
+      ~ ' dpt=' ~ dpt ~ ' cs2=0x18 ACK PSH cs2Label=TCP Flags cnt=1 act=' ~ act
+      ~ ' cn3=' ~ pos ~ ' cn3Label=Intrusion Prevention Packet Position cs5=' ~ stream
+      ~ ' cs5Label=Intrusion Prevention Stream Position cs6=' ~ (8 if has_data else 0)
+      ~ ' cs6Label=Intrusion Prevention Flags' -%}
+  {%- if has_data -%}
+    {%- set ext = ext ~ ' TrendMicroDsPacketData=' ~ module.base64.b64encode((rule.request ~ '\r\nHost: ' ~ h.name ~ '\r\n').encode()).decode() | replace('=', '\\=') -%}
+  {%- endif -%}
+  {%- set category = 'intrusion-prevention-event' -%}
+  {%- set ecs_category = ['intrusion_detection'] -%}
+{%- else -%}
+  {%- if kind == 'deny' -%}
+    {%- set sig = '21' -%}{%- set name = s.rule.name -%}{%- set sev = 5 -%}{%- set act = 'Deny' -%}{%- set dpt = s.rule.port -%}
+  {%- else -%}
+    {%- set lr = params.log_rules | selectattr('port', 'equalto', s.port) | first -%}
+    {%- set sig = '20' -%}{%- set name = lr.name -%}{%- set sev = 0 -%}{%- set act = 'Log' -%}{%- set dpt = s.port -%}
+  {%- endif -%}
+  {%- set size = module.rand.weighted_choice([60, 64, 66, 74], [30, 10, 25, 35]) -%}
+  {%- set ext = base ~ ' act=' ~ act ~ ' dmac=' ~ h.mac ~ ' smac=' ~ params.gateway_mac
+      ~ ' TrendMicroDsFrameType=IP src=' ~ src ~ ' dst=' ~ h.ip ~ ' in=' ~ size ~ ' cs3=' ~ frag
+      ~ ' cs3Label=Fragmentation Bits proto=TCP spt=' ~ spt ~ ' dpt=' ~ dpt
+      ~ ' cs2=0x02 SYN cs2Label=TCP Flags cnt=1' -%}
+  {%- set category = 'firewall-event' -%}
+  {%- set ecs_category = ['network'] -%}
+{%- endif -%}
+{%- set raw = header ~ ' CEF:0|Trend Micro|Deep Security Agent|' ~ params.product_version ~ '|' ~ sig ~ '|'
+    ~ name ~ '|' ~ sev ~ '|' ~ ext -%}
+
+{#- 5. ECS document, field names as the Elastic Trend Micro integration
+    maps them. -#}
+{%- set record = {'@timestamp': rt.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ecs_category, 'type': ['info'],
+    'action': act | lower | replace(' ', '-'), 'code': sig, 'severity': sev,
+    'dataset': 'trendmicro.deep_security', 'original': raw},
+  'observer': {'hostname': h.name, 'vendor': 'Trend Micro', 'product': 'Deep Security Agent',
+    'version': params.product_version},
+  'host': {'id': h.id | string, 'name': h.name, 'ip': [h.ip]},
+  'source': {'ip': src, 'port': spt, 'mac': params.gateway_mac | replace(':', '-')},
+  'destination': {'ip': h.ip, 'port': dpt, 'mac': h.mac | replace(':', '-')},
+  'network': {'transport': 'tcp', 'type': 'ipv4'},
+  'related': {'ip': [src, h.ip], 'hosts': [h.id | string, h.name]},
+  'trendmicro': {'deep_security': {'signature_id': sig | int, 'name': name, 'severity': sev | string,
+    'action': act, 'event_category': category, 'bytes_in': size,
+    'tenant_name': params.tenant, 'tenant_id': params.tenant_id | string}}} -%}
+{%- if kind == 'ips' -%}{%- do record.update({'rule': {'id': sig, 'name': name}}) -%}{%- else -%}{%- do record.update({'rule': {'name': name}}) -%}{%- endif -%}
+{{ record | tojson }}
