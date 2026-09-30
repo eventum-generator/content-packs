@@ -1,0 +1,277 @@
+{#- Kafka 3.9.0 StandardAuthorizer INFO topic denials. Every input
+    timestamp becomes one record at that time; all clock values are
+    integer milliseconds. Timestamps tagged `staff` start sessions of the
+    analyst and operations accounts, the others sessions of application
+    service accounts. A session is one client retrying one denied request
+    and possibly further operations on the same topic; its later
+    attempts take the first timestamp at or after their due time. -#}
+{#- Jinja has no raise statement: a missing-key lookup through the
+    standard library aborts the render with the message as the key. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span, curve, power, tzoff) -%}
+  {#- Time in [lo, lo + span) whose local hour is weighted by the
+      population curve to `power` plus a small floor. -#}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, 1.02) < curve[((c + tzoff) // 3600000) % 24] ** power + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- set tz = module.datetime.timezone.utc -%}
+{%- set now = (timestamp.timestamp() * 1000) | round | int -%}
+{%- set rand = module.rand -%}
+{%- set num = module.rand.number -%}
+{%- set ln = module.math.log -%}
+{%- set hour = 3600000 -%}
+{%- set window = 300000 -%}
+{%- set ops = ['READ', 'WRITE', 'ALTER_CONFIGS', 'DELETE'] -%}
+{%- set apis = {'READ': 'Fetch', 'WRITE': 'Produce', 'ALTER_CONFIGS': 'AlterConfigs', 'DELETE': 'DeleteTopics'} -%}
+{%- set ipv4 = '(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])(\\.(25[0-5]|2[0-4][0-9]|1[0-9][0-9]|[1-9]?[0-9])){3}' -%}
+{%- set interval = (params.anomaly_interval_hours * hour) | int if params.anomaly_interval_hours is number and module.math.isfinite(params.anomaly_interval_hours) else 0 -%}
+{%- if shared.get('clients') is none -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean -%}
+    {{- invalid('anomaly_interval_hours must be numeric') -}}
+  {%- endif -%}
+  {%- if not module.math.isfinite(params.anomaly_interval_hours) or not 1 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- invalid('anomaly_interval_hours must be finite in 1..8760') -}}
+  {%- endif -%}
+  {%- if params.broker_host is not string or not module.re.fullmatch('[A-Za-z0-9][A-Za-z0-9.-]{0,252}', params.broker_host) -%}
+    {{- invalid('broker_host must be an ASCII hostname') -}}
+  {%- endif -%}
+  {%- if not 2 <= samples.clients | length <= 64 -%}
+    {{- invalid('clients sample must hold 2..64 clients') -}}
+  {%- endif -%}
+  {%- set clients = [] -%}
+  {%- set index = {} -%}
+  {%- for row in samples.clients -%}
+    {%- if row.principal is not string or not module.re.fullmatch('User:[A-Za-z0-9._-]{1,64}', row.principal) or row.principal in index -%}
+      {{- invalid('client principals must be distinct User principals') -}}
+    {%- endif -%}
+    {%- if row.ip is not string or not module.re.fullmatch(ipv4, row.ip) -%}
+      {{- invalid('client ip must be a dotted-quad IPv4 string') -}}
+    {%- endif -%}
+    {%- if row.group not in ['service', 'staff'] -%}
+      {{- invalid('client group must be service or staff') -}}
+    {%- endif -%}
+    {%- if row.weight is not number or row.weight is boolean or not 1 <= row.weight <= 1000 -%}
+      {{- invalid('client weight must be a number in 1..1000') -}}
+    {%- endif -%}
+    {%- do index.update({row.principal: clients | length}) -%}
+    {%- do clients.append({'principal': row.principal, 'ip': row.ip, 'group': row.group, 'weight': row.weight, 'bag': [], 'pairs': {}, 'cursor': 0, 'item': none, 'left': 0, 'used': [], 'due': none, 'ep': false}) -%}
+  {%- endfor -%}
+  {%- for row in samples.denials -%}
+    {%- if row.principal not in index -%}
+      {{- invalid('denial principal is not a listed client') -}}
+    {%- endif -%}
+    {%- if row.topic is not string or not module.re.fullmatch('[A-Za-z0-9._-]{1,249}', row.topic) or row.topic in ['.', '..'] -%}
+      {{- invalid('denial topic must satisfy Kafka topic syntax') -}}
+    {%- endif -%}
+    {%- if row.operation not in ops -%}
+      {{- invalid('denial operation must be READ, WRITE, ALTER_CONFIGS or DELETE') -}}
+    {%- endif -%}
+    {%- if row.weight is not integer or row.weight is boolean or not 1 <= row.weight <= 50 -%}
+      {{- invalid('denial weight must be an integer in 1..50') -}}
+    {%- endif -%}
+    {%- set client = clients[index[row.principal]] -%}
+    {%- if row.operation in client.pairs.get(row.topic, []) -%}
+      {{- invalid('denial rows must be distinct per principal, topic and operation') -}}
+    {%- endif -%}
+    {%- do client.pairs.update({row.topic: client.pairs.get(row.topic, []) + [row.operation]}) -%}
+    {%- for _ in range(row.weight) -%}
+      {%- do client.bag.append([row.topic, row.operation]) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set pool = [] -%}
+  {%- for client in clients -%}
+    {%- if not client.bag -%}
+      {{- invalid('every client needs at least one denial row') -}}
+    {%- endif -%}
+    {%- do client.update({'bag': rand.shuffle(client.bag)}) -%}
+    {%- for topic, attempted in client.pairs | dictsort -%}
+      {%- if attempted | length == 4 -%}
+        {%- do pool.append([index[client.principal], topic]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- if params.anomaly_mode and pool | length < 2 -%}
+    {{- invalid('anomaly_mode needs two client/topic pairs with all four operations') -}}
+  {%- endif -%}
+  {#- Relative hourly volume of each population in local time, from the
+      time patterns (service: uniform floor plus beta(4, 4); staff:
+      08:00-18:00 band plus a uniform floor). -#}
+  {%- set curves = {'service': [0.48, 0.487, 0.507, 0.545, 0.599, 0.665, 0.738, 0.812, 0.88, 0.938, 0.979, 1.0, 1.0, 0.979, 0.938, 0.88, 0.812, 0.738, 0.665, 0.599, 0.545, 0.507, 0.487, 0.48], 'staff': [0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.04, 0.04, 0.04, 0.04, 0.04, 0.04]} -%}
+  {%- set tzoff = (timestamp.utcoffset().total_seconds() * 1000) | int -%}
+  {%- set pool = rand.shuffle(pool) -%}
+  {%- set ep_at = none -%}
+  {%- if params.anomaly_mode -%}
+    {%- set ep_at = pick_start(now, [interval, 24 * hour] | min, curves[clients[pool[0][0]].group], 1, tzoff) | int -%}
+  {%- endif -%}
+  {%- do shared.update({'clients': clients, 'pool': pool, 'pool_cursor': 0, 'curves': curves, 'tzoff': tzoff, 'hist': {}, 'guards': 0, 'ep': none, 'ep_at': ep_at}) -%}
+{%- endif -%}
+{%- set clients = shared.get('clients') -%}
+{%- set pool = shared.get('pool') -%}
+{%- set curves = shared.get('curves') -%}
+{%- set pop = 'staff' if 'staff' in tags else 'service' -%}
+{%- set out = namespace(client=none, topic=none, op=none, ep=false) -%}
+{#- Episode start: at the first timestamp at or after the drawn start
+    when the rotating pair's principal has no session of its own under
+    way (otherwise a few minutes later). The episode is one session of
+    that principal: one attempt of each operation on the topic. The first
+    start falls within min(interval, 24 h), its hour weighted by the
+    population curve; each next one within min(interval / 4, 6 h)
+    centred one interval after the actual start, weighted by the curve
+    squared. Missed episodes are not replayed. -#}
+{%- if params.anomaly_mode and shared.get('ep') is none and now >= shared.get('ep_at') -%}
+  {%- set cursor = shared.get('pool_cursor') -%}
+  {%- set pick = pool[cursor] -%}
+  {%- set actor = clients[pick[0]] -%}
+  {%- if actor.item is none -%}
+    {%- if cursor + 1 < pool | length -%}
+      {%- do shared.set('pool_cursor', cursor + 1) -%}
+    {%- else -%}
+      {%- set reshuffled = rand.shuffle(pool) -%}
+      {%- if reshuffled[0] == pick -%}
+        {%- set reshuffled = reshuffled[1:] + reshuffled[:1] -%}
+      {%- endif -%}
+      {%- do shared.update({'pool': reshuffled, 'pool_cursor': 0}) -%}
+    {%- endif -%}
+    {%- do actor.update({'ep': true}) -%}
+    {%- do shared.set('ep', {'actor': pick[0], 'topic': pick[1], 'step': 0, 't0': now, 'due': now}) -%}
+    {%- set following = shared.get('pool')[shared.get('pool_cursor')] -%}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {%- do shared.set('ep_at', pick_start(now + interval - w // 2, w, curves[clients[following[0]].group], 2, shared.get('tzoff')) | int) -%}
+  {%- else -%}
+    {%- do shared.set('ep_at', now + (num.exponential(1 / 300) * 1000) | int) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set ep = shared.get('ep') -%}
+{%- set bg = namespace(c=none, fresh=false) -%}
+{%- if ep is not none and ep.due <= now -%}
+  {#- Episode steps take the first timestamp at or after their due time,
+      ahead of ordinary retries. Gaps follow the ordinary retry gap and
+      shrink if needed so the four steps stay within 4 minutes. -#}
+  {%- set out.client = clients[ep.actor] -%}
+  {%- set out.topic = ep.topic -%}
+  {%- set out.op = ops[ep.step] -%}
+  {%- set out.ep = true -%}
+  {%- if ep.step == 3 -%}
+    {%- do shared.set('ep', none) -%}
+    {%- do out.client.update({'ep': false}) -%}
+  {%- else -%}
+    {%- set gap = (num.clamp(num.lognormal(ln(25), 0.6), 5, 60) * 1000) | int -%}
+    {%- set budget = [(240000 - (now - ep.t0)) // (3 - ep.step), 0] | max -%}
+    {%- do ep.update({'step': ep.step + 1, 'due': now + ([gap, budget] | min)}) -%}
+  {%- endif -%}
+{%- else -%}
+  {#- Ordinary: the attempt due earliest, else a new session of an idle
+      client of this timestamp's population, drawn by client weight. -#}
+  {%- for client in clients -%}
+    {%- if client.item is not none and client.due <= now and (bg.c is none or client.due < bg.c.due) -%}
+      {%- set bg.c = client -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if bg.c is none -%}
+    {%- set idle = [] -%}
+    {%- set weights = [] -%}
+    {%- for client in clients if client.item is none and not client.ep and client.group == pop -%}
+      {%- do idle.append(client) -%}
+      {%- do weights.append(client.weight) -%}
+    {%- endfor -%}
+    {%- if not idle -%}
+      {%- for client in clients if client.item is none and not client.ep -%}
+        {%- do idle.append(client) -%}
+        {%- do weights.append(client.weight) -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- if idle -%}
+      {%- set bg.c = rand.weighted_choice(idle, weights) -%}
+      {%- set bg.fresh = true -%}
+    {%- else -%}
+      {#- Every client is inside a session: the next attempt comes
+          early. -#}
+      {%- for client in clients -%}
+        {%- if client.item is not none and (bg.c is none or client.due < bg.c.due) -%}
+          {%- set bg.c = client -%}
+        {%- endif -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set client = bg.c -%}
+  {%- if bg.fresh -%}
+    {%- set item = client.bag[client.cursor] -%}
+    {%- if client.cursor + 1 < client.bag | length -%}
+      {%- do client.update({'cursor': client.cursor + 1}) -%}
+    {%- else -%}
+      {%- do client.update({'cursor': 0, 'bag': rand.shuffle(client.bag)}) -%}
+    {%- endif -%}
+    {%- set size = rand.weighted_choice([1, 2, 3], [70, 25, 5]) if item[1] in ['ALTER_CONFIGS', 'DELETE'] else rand.weighted_choice([1, 2, 3, 4, 5, 6, 7, 8], [30, 22, 16, 11, 8, 6, 4, 3]) -%}
+    {%- do client.update({'item': item, 'left': size, 'used': [item[1]]}) -%}
+  {%- endif -%}
+  {%- set out.client = client -%}
+  {%- set out.topic = client.item[0] -%}
+  {%- set out.op = client.item[1] -%}
+  {%- do client.update({'left': client.left - 1}) -%}
+  {%- if client.left > 0 -%}
+    {%- set gap = num.clamp(num.lognormal(ln(45), 0.6), 15, 300) if out.op in ['ALTER_CONFIGS', 'DELETE'] else num.clamp(num.lognormal(ln(25), 0.6), 5, 180) -%}
+    {%- do client.update({'due': now + (gap * 1000) | int}) -%}
+  {%- else -%}
+    {%- set others = client.pairs[out.topic] | reject('in', client.used) | list -%}
+    {%- if others and rand.chance(0.3) -%}
+      {%- set follow = rand.choice(others) -%}
+      {%- set size = rand.weighted_choice([1, 2, 3], [70, 25, 5]) if follow in ['ALTER_CONFIGS', 'DELETE'] else rand.weighted_choice([1, 2, 3, 4, 5, 6, 7, 8], [30, 22, 16, 11, 8, 6, 4, 3]) -%}
+      {%- do client.update({'item': [out.topic, follow], 'left': size, 'used': client.used + [follow], 'due': now + (num.clamp(num.lognormal(ln(90), 0.7), 20, 600) * 1000) | int}) -%}
+    {%- else -%}
+      {%- do client.update({'item': none, 'used': [], 'due': none}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set current = out.client -%}
+{#- Recent denials per principal and topic within the chain window. An
+    ordinary DELETE that would follow READ, WRITE and ALTER_CONFIGS of
+    the same principal on the same topic within 300 s is logged as a
+    repeated ALTER_CONFIGS attempt instead. -#}
+{%- set key = current.principal ~ '|' ~ out.topic -%}
+{%- set recent = [] -%}
+{%- for entry in shared.get('hist').get(key, []) if now - entry[1] <= window -%}
+  {%- do recent.append(entry) -%}
+{%- endfor -%}
+{%- if out.op == 'DELETE' and not out.ep -%}
+  {%- set seen = namespace(step=0) -%}
+  {%- for entry in recent if seen.step < 3 and entry[0] == ops[seen.step] -%}
+    {%- set seen.step = seen.step + 1 -%}
+  {%- endfor -%}
+  {%- if seen.step == 3 -%}
+    {%- set out.op = 'ALTER_CONFIGS' -%}
+    {%- do shared.set('guards', shared.get('guards') + 1) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- do recent.append([out.op, now]) -%}
+{%- do shared.get('hist').update({key: recent}) -%}
+{%- set when = module.datetime.datetime.fromtimestamp(now // 1000, tz) + module.datetime.timedelta(milliseconds=now % 1000) -%}
+{%- set created = when + module.datetime.timedelta(milliseconds=(num.clamp(num.lognormal(ln(400), 0.7), 20, 8000)) | int) -%}
+{%- set ingested = created + module.datetime.timedelta(milliseconds=(num.clamp(num.lognormal(ln(900), 0.6), 50, 20000)) | int) -%}
+{%- set message = 'Principal = ' ~ current.principal ~ ' is Denied operation = ' ~ out.op ~ ' from host = ' ~ current.ip ~ ' on resource = Topic:LITERAL:' ~ out.topic ~ ' for request = ' ~ apis[out.op] ~ ' with resourceRefCount = 1 based on rule DefaultDeny' -%}
+{%- set original = '[' ~ when.strftime('%Y-%m-%d %H:%M:%S,') ~ ('%03d' | format(now % 1000)) ~ '] INFO ' ~ message ~ ' (kafka.authorizer.logger)' -%}
+{%- set iso = '%Y-%m-%dT%H:%M:%S.' -%}
+{{- {
+  '@timestamp': when.strftime(iso) ~ ('%03d' | format(when.microsecond // 1000)) ~ 'Z',
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['api'], 'type': ['denied'], 'action': 'authorization-denied', 'outcome': 'failure', 'original': original, 'created': created.strftime(iso) ~ ('%03d' | format(created.microsecond // 1000)) ~ 'Z', 'ingested': ingested.strftime(iso) ~ ('%03d' | format(ingested.microsecond // 1000)) ~ 'Z', 'timezone': '+00:00'},
+  'host': {'name': params.broker_host},
+  'log': {'level': 'INFO', 'logger': 'kafka.authorizer.logger'},
+  'message': message,
+  'tags': ['preserve_original_event'],
+  'user': {'name': current.principal[5:]},
+  'source': {'ip': current.ip},
+  'related': {'ip': [current.ip], 'user': [current.principal[5:]]},
+  'kafka': {'principal': current.principal, 'operation': out.op, 'resource': {'type': 'Topic', 'pattern_type': 'LITERAL', 'name': out.topic}, 'request': apis[out.op], 'resource_ref_count': 1, 'rule': 'DefaultDeny', 'authorization_result': 'Denied', 'log': {'class': 'kafka.authorizer.logger', 'component': 'unknown'}}
+} | tojson -}}
