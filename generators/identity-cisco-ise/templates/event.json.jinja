@@ -1,0 +1,416 @@
+{#- Cisco ISE Administrative and Operational Audit over remote syslog.
+    The input sets the rate; every timestamp emits one record. Each
+    timestamp emits the earliest due step of an open session (failed
+    retries and logins first, then edits and logouts), otherwise it
+    starts a session of an idle account drawn by activity weight. -#}
+{%- set H = 3600000 -%}
+{%- set W = 1800000 -%}
+{%- set now = (timestamp.timestamp() * 1000) | round | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set epoch = module.datetime.datetime(1970, 1, 1, tzinfo=utc) -%}
+{#- Records per hour of the input patterns (UTC), for episode placement. -#}
+{%- set hload = [30, 30, 30, 30, 30, 30, 60, 120, 210, 210, 210, 210, 210, 210, 210, 210, 210, 120, 60, 60, 60, 30, 30, 30] -%}
+{%- set admins = params.admins -%}
+{%- set cats = ['Passed Authentications', 'Failed Attempts', 'RADIUS Accounting', 'System Statistics'] -%}
+{%- set chain_cats = cats[:3] -%}
+{%- set tgts = ['RemoteCollector', 'BackupCollector'] -%}
+{%- set interval = ([params.anomaly_interval_hours | float, 2.0] | max * H) | int -%}
+
+{#- Episode time in [a, b), weighted by load^2 + floor, plus start delay. -#}
+{%- macro ep_time(a, b) -%}
+  {%- set ns = namespace(t=a) -%}
+  {%- for k in range(5000) -%}
+    {%- set ns.t = module.rand.number.integer(a, b - 1) -%}
+    {%- set lv = hload[(ns.t // H) % 24] / 210 -%}
+    {%- if module.rand.number.floating(0, 1.02) < lv * lv + 0.02 -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {{- ns.t + (module.rand.number.exponential(1 / 180000) | int) -}}
+{%- endmacro -%}
+
+{#- Random routine edit of a logging category, from its current state.
+    Routine work never detaches a remote target; a disabled one is a
+    known gap in log forwarding, so routine edits often restore it. -#}
+{%- macro rand_edit(ed) -%}
+  {%- set dis_t = [] -%}{%- for n in tgts -%}{%- if not shared.get('tgt')[n] -%}{%- do dis_t.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- if dis_t and module.rand.chance(0.45) -%}
+    {%- do ed.update({'type': 'tgt', 'name': module.rand.choice(dis_t)}) -%}
+  {%- else -%}
+    {%- set dis = [] -%}{%- for n in cats -%}{%- if not shared.get('cat')[n][0] -%}{%- do dis.append(n) -%}{%- endif -%}{%- endfor -%}
+    {%- set name = module.rand.choice(dis) if dis and module.rand.chance(0.65) else module.rand.choice(cats) -%}
+    {%- set cur = shared.get('cat')[name] -%}
+    {%- if not cur[0] -%}
+      {%- do ed.update({'type': 'cat', 'name': name, 'on': true, 'sev': cur[1]}) -%}
+    {%- elif module.rand.chance(0.35) -%}
+      {%- do ed.update({'type': 'cat', 'name': name, 'on': false, 'sev': cur[1]}) -%}
+    {%- else -%}
+      {%- do ed.update({'type': 'cat', 'name': name, 'on': true, 'sev': module.rand.choice(['INFO', 'WARN', 'DEBUG', 'ERROR'] | reject('equalto', cur[1]) | list)}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- if not shared.get('init') -%}
+  {#- Accounts: the configured administrators (full access, the only
+      ones who edit logging settings) and read-only operators. The
+      administrators together start about 4.5% of sessions. -#}
+  {%- set names = [] -%}{%- set ips = [] -%}{%- set cum = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- set ops = samples.operators -%}
+  {%- set opw = [] -%}
+  {%- for i in range(ops | length) -%}{%- do opw.append(module.rand.number.floating(0.7, 1.3)) -%}{%- endfor -%}
+  {%- set adm_total = (opw | sum) * 0.045 / 0.955 -%}
+  {%- for a in admins -%}
+    {%- do names.append(a) -%}{%- do ips.append(params.admin_ips[loop.index0]) -%}
+    {%- set acc.w = acc.w + adm_total * params.admin_weights[loop.index0] / (params.admin_weights | sum) -%}
+    {%- do cum.append(acc.w) -%}
+  {%- endfor -%}
+  {%- for i in range(ops | length) -%}
+    {%- do names.append(ops[i].name) -%}{%- do ips.append(ops[i].ip) -%}
+    {%- set acc.w = acc.w + opw[i] -%}
+    {%- do cum.append(acc.w) -%}
+  {%- endfor -%}
+  {%- set seq0 = module.rand.number.integer(150000, 900000) -%}
+  {%- do shared.update({'init': true, 'names': names, 'ips': ips, 'cum': cum, 'total': acc.w,
+      'sess': {}, 'hq': [], 'lq': [], 'n': 0, 'cf': {}, 'mt': {},
+      'cat': {'Passed Authentications': [true, 'INFO'], 'Failed Attempts': [true, 'INFO'], 'RADIUS Accounting': [true, 'INFO'], 'System Statistics': [true, 'INFO']},
+      'tgt': {'RemoteCollector': true, 'BackupCollector': true},
+      'mid': seq0 - module.rand.number.integer(20, 90), 'seq': seq0, 'cv': module.rand.number.integer(900, 3000),
+      'last': now, 'ep_start': none, 'ep_prev': {}}) -%}
+  {%- if params.anomaly_mode -%}
+    {%- do shared.set('ep_start', ep_time(now, now + [interval, 24 * H] | min) | int) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- set S = shared.get('sess') -%}
+{%- set hq = shared.get('hq') -%}
+{%- set lq = shared.get('lq') -%}
+{%- set cf = shared.get('cf') -%}
+{%- set pick = namespace(a=none) -%}
+
+{#- Episode start: the actor rotates, weighted as background, among idle
+    administrators; the episode is that administrator's next session,
+    from the jump host as often as a logging-maintenance session. -#}
+{%- if shared.get('ep_start') is not none and now >= shared.get('ep_start') -%}
+  {%- set cand = namespace(names=[], w=[]) -%}
+  {%- for a in admins -%}
+    {%- if a != shared.get('ep_prev').get('actor') and a not in S and cf.get(a, 0) <= 1 -%}
+      {%- set cand.names = cand.names + [a] -%}{%- set cand.w = cand.w + [params.admin_weights[loop.index0]] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set cat_ok = shared.get('cat')['Passed Authentications'][0] or shared.get('cat')['Failed Attempts'][0] or shared.get('cat')['RADIUS Accounting'][0] -%}
+  {%- set tgt_ok = shared.get('tgt')['RemoteCollector'] or shared.get('tgt')['BackupCollector'] -%}
+  {%- if cand.names and cat_ok and tgt_ok -%}
+    {%- set actor = module.rand.weighted_choice(cand.names, cand.w) -%}
+    {%- set ip = params.jump_host_ip if module.rand.chance(0.8) else params.admin_ips[admins.index(actor)] -%}
+    {%- set rows = [] -%}
+    {%- set tt = namespace(t=now) -%}
+    {%- for k in range(3) -%}
+      {%- do rows.append([tt.t, 'fail']) -%}
+      {%- set tt.t = tt.t + (module.rand.number.lognormal(9.39, 0.8) | int) + 1 -%}
+    {%- endfor -%}
+    {%- do rows.append([tt.t, 'login']) -%}
+    {%- set tt.t = tt.t + ([module.rand.number.lognormal(11.92, 0.7), 780000] | min | int) -%}
+    {%- do rows.append([tt.t, 'xcat']) -%}
+    {%- set tt.t = tt.t + ([module.rand.number.lognormal(11.41, 0.7), 480000] | min | int) -%}
+    {%- do rows.append([tt.t, 'xtgt']) -%}
+    {#- Like a background maintenance session, the administrator restores
+        each disabled object before logging out with the same chance. -#}
+    {%- for k in range(2) -%}
+      {%- if module.rand.chance(0.6) -%}
+        {%- set tt.t = tt.t + (module.rand.number.lognormal(12.39, 0.8) | int) + 1 -%}
+        {%- do rows.append([tt.t, 'mre']) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set tt.t = tt.t + (module.rand.number.lognormal(12.39, 0.8) | int) + 1 -%}
+    {%- do rows.append([tt.t, 'logout']) -%}
+    {%- do S.update({actor: {'rows': rows, 'ip': ip, 'ep': true, 't0': now, 'dis': []}}) -%}
+    {%- do shared.get('ep_prev').update({'actor': actor}) -%}
+    {%- set due = now + interval -%}
+    {%- set half = ([interval // 4, 6 * H] | min) // 2 -%}
+    {%- do shared.set('ep_start', ep_time(due - half, due + half) | int) -%}
+    {%- set pick.a = actor -%}
+  {%- else -%}
+    {#- Nobody eligible is idle, or no chain category or target is
+        enabled: retry after a random 5-60 minutes. -#}
+    {%- do shared.set('ep_start', now + module.rand.number.integer(300000, 3600000)) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Earliest due step: retries and logins first, then edits and logouts. -#}
+{%- if pick.a is none and hq and hq[0][0] <= now -%}
+  {%- set pick.a = module.heapq.heappop(hq)[2] -%}
+{%- elif pick.a is none and lq and lq[0][0] <= now -%}
+  {%- set pick.a = module.heapq.heappop(lq)[2] -%}
+{%- endif -%}
+
+{#- An episode edit waits (up to the chain window) while every object it
+    could disable is already disabled; the timestamp goes to the next due
+    step or a new session instead. -#}
+{%- if pick.a is not none and S[pick.a].ep and S[pick.a].rows[0][1] in ['xcat', 'xtgt'] and now < S[pick.a].t0 + 1700000 -%}
+  {%- set hk = S[pick.a].rows[0][1] -%}
+  {%- set ok = namespace(v=false) -%}
+  {%- for n in (chain_cats if hk == 'xcat' else tgts) -%}
+    {%- if (shared.get('cat')[n][0] if hk == 'xcat' else shared.get('tgt')[n]) -%}{%- set ok.v = true -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if not ok.v -%}
+    {%- do shared.set('n', shared.get('n') + 1) -%}
+    {%- do module.heapq.heappush(hq, [now + 60000, shared.get('n'), pick.a]) -%}
+    {%- set pick.a = none -%}
+    {%- if hq and hq[0][0] <= now -%}
+      {%- set pick.a = module.heapq.heappop(hq)[2] -%}
+    {%- elif lq and lq[0][0] <= now -%}
+      {%- set pick.a = module.heapq.heappop(lq)[2] -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Otherwise a new session of an idle account drawn by weight. -#}
+{%- if pick.a is none -%}
+  {%- set names = shared.get('names') -%}
+  {%- set cum = shared.get('cum') -%}
+  {%- set d = namespace(i=0) -%}
+  {%- for k in range(200) -%}
+    {%- set d.i = [module.bisect.bisect_right(cum, module.random.random() * shared.get('total')), cum | length - 1] | min -%}
+    {%- if names[d.i] not in S -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set a = names[d.i] -%}
+  {%- set is_admin = d.i < admins | length -%}
+  {#- Logging-maintenance sessions (6% of administrator sessions) mostly
+      run from the jump host; other sessions from the account's own
+      workstation, sometimes via the jump host. -#}
+  {%- set maint = is_admin and module.rand.chance(0.06) -%}
+  {%- set jump = 0.8 if maint else (0.15 if is_admin else 0.10) -%}
+  {%- set via_jump = module.rand.chance(jump) -%}
+  {%- set ip = params.jump_host_ip if via_jump else shared.get('ips')[d.i] -%}
+  {%- set rows = [] -%}
+  {%- set tt = namespace(t=now) -%}
+  {#- Failure law: one mistyped password is more common than two, two
+      than three. Administrators type the local ISE password more often
+      wrong on the shared jump host than on their own workstation. -#}
+  {%- if is_admin and via_jump -%}
+    {%- set nf = module.rand.weighted_choice([0, 1, 2, 3, 4], [915, 42, 24, 12, 7]) -%}
+  {%- elif is_admin -%}
+    {%- set nf = module.rand.weighted_choice([0, 1, 2, 3, 4], [972, 16, 7, 3, 2]) -%}
+  {%- else -%}
+    {%- set nf = module.rand.weighted_choice([0, 1, 2, 3, 4], [9700, 200, 60, 28, 12]) -%}
+  {%- endif -%}
+  {%- set nf = [nf, 4 - cf.get(a, 0)] | min -%}
+  {%- for k in range(nf) -%}
+    {%- do rows.append([tt.t, 'fail']) -%}
+    {%- set tt.t = tt.t + (module.rand.number.lognormal(9.39, 0.8) | int) + 1 -%}
+  {%- endfor -%}
+  {%- if nf == 0 or not module.rand.chance(0.12) -%}
+    {%- do rows.append([tt.t, 'login']) -%}
+    {%- if is_admin -%}
+      {%- set end = tt.t + (module.rand.number.lognormal(13.64, 0.9) | int) + 2000 -%}
+      {#- Routine sessions make random category edits. A maintenance
+          session disables a category and sometimes detaches a remote
+          target after it, and often re-enables them before logging
+          out. -#}
+      {%- set intents = [] -%}
+      {%- if maint -%}
+        {%- if module.rand.chance(0.85) -%}{%- do intents.append('mcat') -%}{%- endif -%}
+        {%- if module.rand.chance(0.25) -%}{%- do intents.append('mtgt') -%}{%- endif -%}
+        {%- for j in range(module.rand.weighted_choice([0, 1, 2], [50, 35, 15])) -%}{%- do intents.append('edit') -%}{%- endfor -%}
+        {%- for j in range(intents | select('in', ['mcat', 'mtgt']) | list | length) -%}{%- if module.rand.chance(0.6) -%}{%- do intents.append('mre') -%}{%- endif -%}{%- endfor -%}
+        {%- if not intents -%}{%- do intents.append('edit') -%}{%- endif -%}
+      {%- else -%}
+        {%- for j in range(module.rand.weighted_choice([0, 1, 2, 3], [72, 20, 6, 2])) -%}{%- do intents.append('edit') -%}{%- endfor -%}
+      {%- endif -%}
+      {%- set times = [] -%}
+      {%- for j in intents -%}{%- do times.append(module.rand.number.integer(tt.t + 1000, end - 1000)) -%}{%- endfor -%}
+      {%- for x in times | sort -%}{%- do rows.append([x, intents[loop.index0]]) -%}{%- endfor -%}
+    {%- else -%}
+      {%- set end = tt.t + (module.rand.number.lognormal(12.8, 0.9) | int) + 2000 -%}
+    {%- endif -%}
+    {%- do rows.append([end, 'logout']) -%}
+  {%- endif -%}
+  {%- do S.update({a: {'rows': rows, 'ip': ip, 'ep': false, 'dis': []}}) -%}
+  {%- set pick.a = a -%}
+{%- endif -%}
+
+{#- Pop the step to emit at this timestamp; queue the session's next. -#}
+{%- set actor = pick.a -%}
+{%- set sess = S[actor] -%}
+{%- set ip = sess.ip -%}
+{%- set kind = sess.rows.pop(0)[1] -%}
+{%- set t = now -%}
+{%- if sess.rows -%}
+  {%- set nxt = sess.rows[0] -%}
+  {%- set tight = sess.ep or nxt[1] in ['fail', 'login'] -%}
+  {#- An episode keeps its steps inside the chain window. -#}
+  {%- set at = [nxt[0], sess.t0 + 1500000] | min if sess.ep and nxt[1] in ['fail', 'login', 'xcat', 'xtgt'] else nxt[0] -%}
+  {%- do shared.set('n', shared.get('n') + 1) -%}
+  {%- do module.heapq.heappush(hq if tight else lq, [at, shared.get('n'), actor]) -%}
+{%- else -%}
+  {%- do S.pop(actor) -%}
+{%- endif -%}
+
+{#- Decide configuration edits from the current object state. -#}
+{%- set ed = {} -%}
+{%- set bg_edit = kind in ['edit', 'mcat', 'mtgt', 'mre'] -%}
+{%- if bg_edit -%}
+  {%- set en_c = [] -%}{%- for n in cats -%}{%- if shared.get('cat')[n][0] -%}{%- do en_c.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set en_t = [] -%}{%- for n in tgts -%}{%- if shared.get('tgt')[n] -%}{%- do en_t.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set mine = sess.dis -%}
+  {%- if kind == 'mcat' and en_c -%}
+    {%- set name = module.rand.choice(en_c) -%}
+    {%- do ed.update({'type': 'cat', 'name': name, 'on': false, 'sev': shared.get('cat')[name][1]}) -%}
+  {%- elif kind == 'mtgt' and en_t -%}
+    {%- do ed.update({'type': 'tgt', 'name': module.rand.choice(en_t)}) -%}
+  {%- elif kind == 'mre' and mine -%}
+    {%- set m = mine.pop() -%}
+    {%- if m[0] == 'cat' and not shared.get('cat')[m[1]][0] -%}
+      {%- do ed.update({'type': 'cat', 'name': m[1], 'on': true, 'sev': shared.get('cat')[m[1]][1]}) -%}
+    {%- elif m[0] == 'tgt' and not shared.get('tgt')[m[1]] -%}
+      {%- do ed.update({'type': 'tgt', 'name': m[1]}) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if not ed -%}{%- do rand_edit(ed) -%}{%- endif -%}
+{%- elif kind == 'xcat' -%}
+  {%- set en = [] -%}{%- for n in chain_cats -%}{%- if shared.get('cat')[n][0] -%}{%- do en.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set pref = en | reject('equalto', shared.get('ep_prev').get('cat')) | list -%}
+  {%- set name = module.rand.choice(pref or en or chain_cats) -%}
+  {%- do ed.update({'type': 'cat', 'name': name, 'on': not en, 'sev': shared.get('cat')[name][1]}) -%}
+  {%- do shared.get('ep_prev').update({'cat': name}) -%}
+{%- elif kind == 'xtgt' -%}
+  {%- set en = [] -%}{%- for n in tgts -%}{%- if shared.get('tgt')[n] -%}{%- do en.append(n) -%}{%- endif -%}{%- endfor -%}
+  {%- set pref = en | reject('equalto', shared.get('ep_prev').get('tgt')) | list -%}
+  {%- set name = module.rand.choice(pref or en or tgts) -%}
+  {%- do ed.update({'type': 'tgt', 'name': name}) -%}
+  {%- do shared.get('ep_prev').update({'tgt': name}) -%}
+{%- endif -%}
+
+{#- Mirror of the chain matcher per administrator|IP (3 failures,
+    success, category disable, target disable within W of the first
+    step): best[k] is the latest first-step time of a partial that has
+    matched k steps. It includes episode rows and is not reset when a
+    chain completes. -#}
+{%- set mkey = actor ~ '|' ~ ip -%}
+{%- set best = shared.get('mt').get(mkey, [none, none, none, none, none, none]) if actor in admins else none -%}
+{%- set cat_disable = ed.get('type') == 'cat' and not ed.get('on') -%}
+{%- set tgt_disable = ed.get('type') == 'tgt' and shared.get('tgt')[ed.get('name')] -%}
+{%- if best is not none and tgt_disable and best[5] is not none and t - best[5] <= W and bg_edit -%}
+  {#- Guard on the final step only: a background target disable that
+      would complete the chain becomes another routine edit of the same
+      administrator at the same time. -#}
+  {%- for k in range(50) -%}
+    {%- do ed.clear() -%}
+    {%- do rand_edit(ed) -%}
+    {%- if not (ed.type == 'tgt' and shared.get('tgt')[ed.name]) -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set cat_disable = ed.get('type') == 'cat' and not ed.get('on') -%}
+  {%- set tgt_disable = ed.get('type') == 'tgt' and shared.get('tgt')[ed.get('name')] -%}
+{%- endif -%}
+{%- if best is not none -%}
+  {%- set nb = [] -%}
+  {%- for x in best -%}{%- do nb.append(x if x is not none and t - x <= W else none) -%}{%- endfor -%}
+  {%- set ob = nb[:] -%}
+  {%- if kind == 'fail' -%}
+    {%- do nb.__setitem__(1, t) -%}
+    {%- for s in [1, 2] -%}{%- if ob[s] is not none and (nb[s + 1] is none or ob[s] > nb[s + 1]) -%}{%- do nb.__setitem__(s + 1, ob[s]) -%}{%- endif -%}{%- endfor -%}
+  {%- elif kind == 'login' and ob[3] is not none and (nb[4] is none or ob[3] > nb[4]) -%}
+    {%- do nb.__setitem__(4, ob[3]) -%}
+  {%- elif cat_disable and ob[4] is not none and (nb[5] is none or ob[4] > nb[5]) -%}
+    {%- do nb.__setitem__(5, ob[4]) -%}
+  {%- endif -%}
+  {%- do shared.get('mt').update({mkey: nb}) -%}
+{%- endif -%}
+
+{#- Apply state. -#}
+{%- if kind == 'fail' -%}
+  {%- do cf.update({actor: cf.get(actor, 0) + 1}) -%}
+{%- elif kind == 'login' -%}
+  {%- do cf.update({actor: 0}) -%}
+{%- endif -%}
+{%- if (bg_edit or kind in ['xcat', 'xtgt']) and (cat_disable or tgt_disable) -%}
+  {%- do sess.dis.append([ed.type, ed.name]) -%}
+{%- endif -%}
+{%- if ed.get('type') == 'cat' -%}
+  {%- do shared.get('cat').update({ed.name: [ed.on, ed.sev]}) -%}
+{%- elif ed.get('type') == 'tgt' -%}
+  {%- set old_status = 'ENABLED' if shared.get('tgt')[ed.name] else 'DISABLED' -%}
+  {%- set new_status = 'DISABLED' if shared.get('tgt')[ed.name] else 'ENABLED' -%}
+  {%- do shared.get('tgt').update({ed.name: not shared.get('tgt')[ed.name]}) -%}
+{%- endif -%}
+
+{#- Native counters: message number and sequence advance together with
+    the node's other audit records; configuration version with every
+    deployment change. -#}
+{%- set gap_s = [(t - shared.get('last')) / 1000, 0] | max -%}
+{%- set inc = 1 + (module.numpy.random.poisson(gap_s / 45) | int) -%}
+{%- do shared.update({'mid': shared.get('mid') + inc, 'seq': shared.get('seq') + inc, 'last': t}) -%}
+{%- set cv = shared.get('cv') + (module.numpy.random.poisson(gap_s / 2400) | int) + (1 if ed else 0) -%}
+{%- do shared.set('cv', cv) -%}
+{%- set mid = '%010d' % shared.get('mid') -%}
+{%- set seq = shared.get('seq') -%}
+{%- set event_time = epoch + module.datetime.timedelta(milliseconds=t) -%}
+
+{%- set code = '51001' -%}
+{%- set desc = 'Administrator-Login: Administrator authentication succeeded' -%}
+{%- set action = 'administrator-login' -%}
+{%- set operation = 'Administrator authentication successful' -%}
+{%- set category = ['iam', 'authentication'] -%}
+{%- set event_type = ['admin', 'info'] -%}
+{%- set outcome = 'success' -%}
+{%- set detail = {} -%}
+{%- set config_fields = '' -%}
+{%- if kind == 'fail' -%}
+  {%- set code = '51000' -%}
+  {%- set desc = 'Administrator-Login: Administrator authentication failed' -%}
+  {%- set operation = 'Authentication failed due to invalid user or password\\, or account is disabled/locked' -%}
+  {%- set category = none -%}
+  {%- set event_type = none -%}
+  {%- set outcome = 'failure' -%}
+{%- elif kind == 'logout' -%}
+  {%- set code = '51002' -%}
+  {%- set desc = 'Administrator-Login: Administrator logged off' -%}
+  {%- set operation = 'User logged out' -%}
+{%- elif ed.get('type') == 'cat' -%}
+  {%- set code = '52001' -%}
+  {%- set desc = 'Configuration-Changes: Changed configuration' -%}
+  {%- set action = 'configuration-changes' -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_type = ['change', 'info'] -%}
+  {%- set outcome = none -%}
+  {%- set local = 'enable' if ed.on else 'disable' -%}
+  {%- set targets = ['LogCollector'] if ed.on else [] -%}
+  {%- set change = 'Object modified:\\, Log Severity Level = ' ~ ed.sev ~ '\\,Local Logging = ' ~ local ~ '\\,Assigned Targets = {' ~ (targets | join(',')) ~ '}' -%}
+  {%- set operation = 'LoggingCategories "' ~ ed.name ~ '" has been edited successfully.' -%}
+  {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSCategory, ObjectName=' ~ ed.name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSCategory', 'name': ed.name}, 'local_logging': local, 'assigned_targets': targets, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
+{%- elif ed.get('type') == 'tgt' -%}
+  {%- set code = '52001' -%}
+  {%- set desc = 'Configuration-Changes: Changed configuration' -%}
+  {%- set action = 'configuration-changes' -%}
+  {%- set category = ['iam', 'configuration'] -%}
+  {%- set event_type = ['change', 'info'] -%}
+  {%- set outcome = none -%}
+  {%- set target_ip = params.remote_collector_ip if ed.name == 'RemoteCollector' else params.backup_collector_ip -%}
+  {%- set target_description = 'Remote UDP Collector' if ed.name == 'RemoteCollector' else 'Backup UDP Collector' -%}
+  {%- set change = 'Object modified:\\,Port = 514\\,IP Address = ' ~ target_ip ~ '\\,Facility Code = LOCAL6\\,Length = 1024\\,Description = ' ~ target_description ~ '\\,Include Alarms = FALSE\\,Old status = ' ~ old_status ~ ' New status = ' ~ new_status ~ '\\,' -%}
+  {%- set operation = 'LoggingTargets "' ~ ed.name ~ '" has been edited successfully.' -%}
+  {%- set config_fields = 'FailureFlag=false, RequestResponseType=initial, ' -%}
+  {%- set config_tail = 'ConfigChangeData=' ~ change ~ ', ObjectType=UPSLogTarget, ObjectName=' ~ ed.name ~ ', OperationMessageText=' ~ operation ~ ',' -%}
+  {%- do detail.update({'config_change': {'data': change}, 'object': {'type': 'UPSLogTarget', 'name': ed.name}, 'failure': {'flag': false}, 'request_response': {'type': 'initial'}, 'operation_message': {'text': operation}}) -%}
+{%- endif -%}
+{%- set inner_time = event_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3] -%}
+{%- set payload = inner_time ~ ' +00:00 ' ~ ('%010d' % seq) ~ ' ' ~ code ~ ' NOTICE ' ~ desc ~ ', ConfigVersionId=' ~ cv ~ ', ' ~ config_fields ~ 'AdminInterface=GUI, AdminIPAddress=' ~ ip ~ ', ' -%}
+{%- if code in ['51001', '51002'] -%}{%- set payload = payload ~ 'AdminSession=AdminGUI_Session, ' -%}{%- endif -%}
+{%- set payload = payload ~ 'AdminName=' ~ actor ~ ', ' -%}
+{%- if code in ['51000', '51001', '51002'] -%}
+  {%- set payload = payload ~ 'OperationMessageText=' ~ operation ~ ',' -%}
+{%- else -%}
+  {%- set payload = payload ~ config_tail -%}
+{%- endif -%}
+{%- set original = '<181>' ~ event_time.strftime('%b %e %H:%M:%S') ~ ' ' ~ params.ise_name ~ ' CISE_Administrative_and_Operational_Audit ' ~ mid ~ ' 1 0 ' ~ payload -%}
+{%- set cise = {'admin': {'interface': 'GUI'}, 'category': {'name': 'CISE_Administrative_and_Operational_Audit'}, 'config_version': {'id': cv}, 'message': {'code': code, 'description': desc, 'id': mid}, 'segment': {'number': 0, 'total': 1}} -%}
+{%- if code in ['51001', '51002'] -%}{%- do cise.admin.update({'session': 'AdminGUI_Session'}) -%}{%- endif -%}
+{%- if code in ['51000', '51001', '51002'] -%}{%- do cise.update({'operation_message': {'text': operation}}) -%}{%- endif -%}
+{%- do cise.update(detail) -%}
+{%- set event = {'action': action, 'code': code, 'dataset': 'cisco_ise.log', 'kind': 'event', 'original': original, 'sequence': seq, 'timezone': '+00:00'} -%}
+{%- if category is not none -%}{%- do event.update({'category': category}) -%}{%- endif -%}
+{%- if event_type is not none -%}{%- do event.update({'type': event_type}) -%}{%- endif -%}
+{%- if outcome is not none -%}{%- do event.update({'outcome': outcome}) -%}{%- endif -%}
+{%- set out = {'@timestamp': event_time.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': event, 'cisco_ise': {'log': cise}, 'client': {'ip': ip, 'user': {'name': actor}}, 'host': {'hostname': params.ise_name}, 'observer': {'name': params.ise_name, 'product': 'Identity Services Engine', 'vendor': 'Cisco', 'version': '3.4'}, 'log': {'level': 'notice', 'syslog': {'priority': 181, 'severity': {'name': 'notice'}}}, 'message': payload, 'related': {'hosts': [params.ise_name], 'ip': [ip], 'user': [actor]}, 'user': {'name': actor}} -%}
+{{- out | tojson -}}
