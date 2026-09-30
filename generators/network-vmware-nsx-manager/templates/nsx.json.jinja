@@ -1,0 +1,405 @@
+{#- VMware NSX-T Data Center 3.2 Manager audit records from /var/log/syslog
+    wrapped in ECS JSON: ACCESS_CONTROL LOGIN/LOGOUT, policy API audit
+    (AAA GetCurrentUserInfo) and node API (NAPI) audit lines.
+    Every input timestamp becomes one record stamped with that timestamp.
+    A due follow-up (password retry, collector login, session end,
+    exporter restore, episode step) takes it first; otherwise a `ui`
+    timestamp goes to an administrator (the next request of an open
+    session, or a login of an account whose absence is over) and an `api`
+    timestamp to the monitoring script. Times are in milliseconds. -#}
+{%- set now = module.builtins.int(timestamp.timestamp() * 1000) -%}
+{%- set hour = 3600000 -%}
+{%- set r = namespace(kind=none, user=none, ip=none, ok=none, a=none, method=none, path=none, code=none, size=none, dur=none, action=none) -%}
+{#- Relative administrator activity per hour of the generator timezone,
+    matching patterns/ui-floor.yml + patterns/ui-office.yml. -#}
+{%- set curve = [0.005, 0.007, 0.019, 0.058, 0.139, 0.268, 0.436, 0.626, 0.802, 0.933, 1.0, 0.997, 0.919, 0.78, 0.614, 0.443, 0.288, 0.168, 0.085, 0.037, 0.015, 0.007, 0.005, 0.005] -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, truncated by redrawing; returns ms. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- module.builtins.int(([ns.v, hi] | min) * 1000) -}}
+{%- endmacro -%}
+{%- macro typo_gap() -%}{{- d(2, 8, 0.8, 240) -}}{%- endmacro -%}
+{%- macro op_gap() -%}{{- d(0.5, 25, 1.1, 1200) -}}{%- endmacro -%}
+{%- macro session_len() -%}{{- d(20, 1400, 1.0, 28800) -}}{%- endmacro -%}
+{%- macro absence() -%}{{- d(30, 5400, 1.1, 172800) -}}{%- endmacro -%}
+{%- macro retry_later() -%}{{- d(30, 900, 1.0, 21600) -}}{%- endmacro -%}
+{%- macro restore_delay() -%}{{- d(30, 1500, 1.1, 43200) -}}{%- endmacro -%}
+{%- macro sky_gap() -%}{{- d(60, 2700, 0.8, 21600) -}}{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its hour weighted by the activity
+      curve squared plus a small floor. -#}
+  {%- set top = 1.02 -%}
+  {%- set p = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not p.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, top) < curve[((c + shared.get('tzoff')) // hour) % 24] ** 2 + 0.02 -%}
+      {%- set p.v = c -%}
+      {%- set p.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- p.v -}}
+{%- endmacro -%}
+{#- Row helpers: each sets the row of this timestamp. -#}
+{%- macro login(i, ok) -%}
+  {%- set ac = samples.accounts[i] -%}
+  {%- set r.kind = 'login' -%}{%- set r.user = ac.user -%}{%- set r.ip = ac.ip -%}{%- set r.ok = ok -%}{%- set r.a = i -%}
+  {%- set r.action = 'login-success' if ok else 'login-failure' -%}
+  {%- set h = shared.get('hist').setdefault(ac.user, []) -%}
+  {%- do h.append([now, ac.ip, ok]) -%}
+  {%- for _ in range(h | length) if h and h[0][0] < now - 2400000 -%}{%- do h.pop(0) -%}{%- endfor -%}
+  {%- if h | length > 40 -%}{%- do h.pop(0) -%}{%- endif -%}
+{%- endmacro -%}
+{%- macro logout(i) -%}
+  {%- set r.kind = 'logout' -%}{%- set r.user = samples.accounts[i].user -%}{%- set r.a = i -%}{%- set r.action = 'logout' -%}
+{%- endmacro -%}
+{%- macro uinfo(i) -%}
+  {%- set r.kind = 'policy' -%}{%- set r.user = samples.accounts[i].user -%}{%- set r.a = i -%}{%- set r.action = 'user-info-read' -%}
+{%- endmacro -%}
+{%- macro list_body() -%}
+  {%- set items = [] -%}
+  {%- set cfg = shared.get('exp_cfg') -%}
+  {%- for n in shared.get('exporters') -%}
+    {%- do items.append('{"exporter_name":"' ~ n ~ '","level":"INFO","port":' ~ cfg[n].port ~ ',"protocol":"' ~ cfg[n].protocol ~ '","server":"' ~ cfg[n].server ~ '"}') -%}
+  {%- endfor -%}
+  {{- '{"_schema":"NodeSyslogExporterPropertiesListResult","_self":{"href":"/node/services/syslog/exporters","rel":"self"},"result_count":' ~ (items | length) ~ ',"results":[' ~ (items | join(',')) ~ ']}' -}}
+{%- endmacro -%}
+{%- macro napi(i, method, path, code, size, dur, action) -%}
+  {%- set r.kind = 'napi' -%}{%- set r.a = i -%}{%- set r.user = samples.accounts[i].user -%}
+  {%- set r.method = method -%}{%- set r.path = path -%}{%- set r.code = code -%}{%- set r.size = size -%}{%- set r.action = action -%}
+  {%- set r.dur = [module.builtins.round(dur * 1000000), 1] | max -%}
+{%- endmacro -%}
+{%- macro napi_read(i) -%}
+  {%- set k = module.rand.weighted_choice(['exporters', 'status', 'version', 'services'], [28, 36, 14, 22]) -%}
+  {%- if k == 'exporters' -%}
+    {{- napi(i, 'GET', '/api/v1/node/services/syslog/exporters', 200, list_body() | length, module.rand.number.lognormal(module.math.log(0.006), 0.5), 'syslog-exporter-list') -}}
+  {%- elif k == 'status' -%}
+    {{- napi(i, 'GET', '/api/v1/node/status', 200, module.builtins.int(1180 * module.rand.number.lognormal(0, 0.04)), module.rand.number.lognormal(module.math.log(0.04), 0.6), 'node-api-read') -}}
+  {%- elif k == 'version' -%}
+    {{- napi(i, 'GET', '/api/v1/node/version', 200, 111, module.rand.number.lognormal(module.math.log(0.003), 0.4), 'node-api-read') -}}
+  {%- else -%}
+    {{- napi(i, 'GET', '/api/v1/node/services', 200, module.builtins.int(3350 * module.rand.number.lognormal(0, 0.02)), module.rand.number.lognormal(module.math.log(0.02), 0.5), 'node-api-read') -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro delete(i, name) -%}
+  {%- do shared.get('exporters').remove(name) -%}
+  {%- do shared.get('pending').append(name) -%}
+  {{- napi(i, 'DELETE', '/api/v1/node/services/syslog/exporters/' ~ name, 200, 0, module.rand.number.lognormal(module.math.log(0.9), 0.5), 'syslog-exporter-delete') -}}
+  {{- push(now + (restore_delay() | int), {'k': 'restore', 'name': name}) -}}
+{%- endmacro -%}
+{%- macro create(i, name) -%}
+  {%- set c = shared.get('exp_cfg')[name] -%}
+  {%- do shared.get('exporters').append(name) -%}
+  {%- set body = '{"exporter_name":"' ~ name ~ '","level":"INFO","port":' ~ c.port ~ ',"protocol":"' ~ c.protocol ~ '","server":"' ~ c.server ~ '"}' -%}
+  {{- napi(i, 'POST', '/api/v1/node/services/syslog/exporters', 201, body | length, module.rand.number.lognormal(module.math.log(1.1), 0.5), 'syslog-exporter-create') -}}
+{%- endmacro -%}
+{%- macro completes_chain(user) -%}
+  {#- True when this account's login rows of the last 1800 s hold three
+      failures from one address followed by a success from it, so a
+      delete now would complete the chain. -#}
+  {%- set hl = shared.get('hist').get(user, []) -%}
+  {%- set st = namespace(ok=false) -%}
+  {%- for ip in hl | map(attribute=1) | unique | list -%}
+    {%- set c = namespace(n=0) -%}
+    {%- for x in hl if x[1] == ip and x[0] >= now - 1800000 -%}
+      {%- if not x[2] -%}{%- set c.n = c.n + 1 -%}{%- elif c.n >= 3 -%}{%- set st.ok = true -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {{- 'y' if st.ok else '' -}}
+{%- endmacro -%}
+{%- macro session_op(i) -%}
+  {#- One request of an open session: a node API call (read, rarely an
+      exporter change by a power account) or a UI user info read. -#}
+  {%- set ac = samples.accounts[i] -%}
+  {%- set ex = shared.get('exporters') -%}
+  {%- if module.rand.chance(ac.napi) -%}
+    {%- set x = module.rand.number.floating(0, 1) -%}
+    {%- if ac.power and x < 0.003 and ex | length >= 2 -%}
+      {%- if completes_chain(ac.user) -%}
+        {%- do shared.set('guard', shared.get('guard') + 1) -%}
+        {{- napi_read(i) -}}
+      {%- else -%}
+        {{- delete(i, module.rand.choice(ex)) -}}
+      {%- endif -%}
+    {%- elif ac.power and x < 0.004 and (ex | length) + (shared.get('pending') | length) < 4 -%}
+      {#- At most four exporters: those configured plus those deleted and
+          awaiting re-creation. -#}
+      {%- set free = [] -%}
+      {%- for n in shared.get('exp_cfg') if n not in ex and n not in shared.get('pending') -%}{%- do free.append(n) -%}{%- endfor -%}
+      {%- if free -%}{{- create(i, module.rand.choice(free)) -}}{%- else -%}{{- napi_read(i) -}}{%- endif -%}
+    {%- else -%}
+      {{- napi_read(i) -}}
+    {%- endif -%}
+  {%- else -%}
+    {{- uinfo(i) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro login_try(i) -%}
+  {#- Next login attempt of an administrator: a failure (then a retry
+      seconds later, or giving up for a while) or a success that opens
+      a session. An episode login also schedules its exporter delete. -#}
+  {%- set s = shared.get('st')[i] -%}
+  {%- if s.fails > 0 -%}
+    {{- login(i, false) -}}
+    {%- do s.update({'fails': s.fails - 1}) -%}
+    {%- if s.fails == 0 and s.give_up -%}
+      {%- do s.update({'state': 'idle', 'next_ok': now + (retry_later() | int)}) -%}
+    {%- else -%}
+      {{- push(now + (typo_gap() | int), {'k': 'try', 'a': i}) -}}
+    {%- endif -%}
+  {%- else -%}
+    {{- login(i, true) -}}
+    {%- do s.update({'state': 'in', 'sid': s.sid + 1}) -%}
+    {%- set end = namespace(v=now + (session_len() | int)) -%}
+    {%- if s.ep -%}
+      {#- First request gap plus zero to three ordinary request gaps,
+          redrawn so the delete stays within 1500 s of the first
+          failure. -#}
+      {%- set g = namespace(v=0, ok=false) -%}
+      {%- for _ in range(20) if not g.ok -%}
+        {%- set g.v = d(0.2, 2, 0.8, 30) | int -%}
+        {%- for _ in range(s.pre) -%}{%- set g.v = g.v + (op_gap() | int) -%}{%- endfor -%}
+        {%- set g.ok = now + g.v - shared.get('ep_t0') <= 1500000 -%}
+      {%- endfor -%}
+      {%- set due = [now + g.v, shared.get('ep_t0') + 1500000] | min -%}
+      {{- push(due, {'k': 'ep_del', 'a': i, 'sid': s.sid}) -}}
+      {%- set end.v = [end.v, due + 120000] | max -%}
+      {%- if s.keep -%}{%- set end.v = [end.v, s.next_ok - 60000] | min -%}{%- endif -%}
+      {%- do s.update({'ep': false}) -%}
+    {%- endif -%}
+    {{- push(end.v, {'k': 'end', 'a': i, 'sid': s.sid, 'keep': s.keep}) -}}
+    {%- do s.update({'keep': false}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro script_step() -%}
+  {#- Monitoring script: logs in (rarely failing and retrying on its next
+      poll), runs a batch of requests, then logs out or starts again. -#}
+  {%- set i = shared.get('script') -%}
+  {%- set s = shared.get('st')[i] -%}
+  {%- if s.state == 'in' and s.ops <= 0 -%}
+    {%- do s.update({'state': 'idle'}) -%}
+    {%- if module.rand.chance(samples.accounts[i].logout) -%}{{- logout(i) -}}{%- endif -%}
+  {%- endif -%}
+  {%- if r.action is none -%}
+    {%- if s.state == 'idle' -%}
+      {%- do s.update({'state': 'login', 'fails': module.rand.weighted_choice([0, 1, 2], [97, 2, 1])}) -%}
+    {%- endif -%}
+    {%- if s.state == 'login' and s.fails > 0 -%}
+      {{- login(i, false) -}}
+      {%- do s.update({'fails': s.fails - 1}) -%}
+    {%- elif s.state == 'login' -%}
+      {{- login(i, true) -}}
+      {%- do s.update({'state': 'in', 'ops': [module.builtins.int(4 + module.rand.number.lognormal(module.math.log(20), 0.5)), 90] | min}) -%}
+    {%- else -%}
+      {{- session_op(i) -}}
+      {%- do s.update({'ops': s.ops - 1}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro human_step() -%}
+  {#- An administrator by weight among those with an open session or an
+      absence that is over; if none, any open session, else the account
+      whose absence ends first logs in early. -#}
+  {%- set st = shared.get('st') -%}
+  {%- set p = namespace(i=none) -%}
+  {%- for _ in range(12) if p.i is none -%}
+    {%- set i = module.rand.weighted_choice(shared.get('hi'), shared.get('hw')) -%}
+    {%- if st[i].state == 'in' or (st[i].state == 'idle' and now >= st[i].next_ok) -%}{%- set p.i = i -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if p.i is none -%}
+    {%- set ins = [] -%}
+    {%- set f = namespace(i=none, at=none) -%}
+    {%- for i in shared.get('hi') -%}
+      {%- if st[i].state == 'in' -%}{%- do ins.append(i) -%}
+      {%- elif st[i].state == 'idle' and (f.at is none or st[i].next_ok < f.at) -%}{%- set f.i = i -%}{%- set f.at = st[i].next_ok -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set p.i = module.rand.choice(ins) if ins else f.i -%}
+  {%- endif -%}
+  {%- if p.i is none -%}
+    {{- script_step() -}}
+  {%- elif st[p.i].state == 'in' -%}
+    {{- session_op(p.i) -}}
+  {%- else -%}
+    {%- set n = module.rand.weighted_choice([0, 1, 2, 3, 4, 5], [920, 50, 15, 8, 4, 3]) -%}
+    {%- do st[p.i].update({'state': 'login', 'fails': n, 'give_up': n > 0 and module.rand.chance(0.2)}) -%}
+    {{- login_try(p.i) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro ep_start() -%}
+  {#- Episode: an idle episode-capable administrator (not the previous
+      episode's) whose next own login is more than 35 minutes away logs
+      in with three to five failures from the own address, then a
+      success; the session then runs like any other, deletes one node
+      syslog exporter (not the previous episode's) after the usual
+      request gaps and ends before the account's own next login, which
+      keeps its time. After 20 minutes without such an account, an idle
+      one whose absence is over is taken, and the episode session is its
+      next session. The next start falls within min(interval / 4, 6 h)
+      centred one interval after this one. -#}
+  {%- set st = shared.get('st') -%}
+  {%- set ca = [] -%}
+  {%- set cw = [] -%}
+  {%- set late = now - shared.get('ep_due') > 1200000 -%}
+  {%- for i in shared.get('hi') if samples.accounts[i].chain and st[i].state == 'idle' and i != shared.get('ep_last_actor') and (late or st[i].next_ok >= now + 2100000) -%}
+    {%- do ca.append(i) -%}{%- do cw.append(samples.accounts[i].weight) -%}
+  {%- endfor -%}
+  {%- if ca and shared.get('exporters') | length >= 2 -%}
+    {%- set ai = module.rand.weighted_choice(ca, cw) -%}
+    {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {%- do st[ai].update({'state': 'login', 'fails': module.rand.weighted_choice([3, 4, 5], [55, 28, 17]), 'give_up': false, 'ep': true, 'keep': st[ai].next_ok >= now + 2100000, 'pre': module.rand.weighted_choice([0, 1, 2, 3], [40, 30, 18, 12])}) -%}
+    {%- do shared.update({'ep_active': true, 'ep_last_actor': ai, 'ep_t0': now, 'ep_due': pick_start(now + interval - w // 2, w) | int}) -%}
+    {{- login_try(ai) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro serve(it) -%}
+  {%- set st = shared.get('st') -%}
+  {%- if it.k == 'try' -%}
+    {%- if st[it.a].state == 'login' -%}{{- login_try(it.a) -}}{%- endif -%}
+  {%- elif it.k == 'end' -%}
+    {%- set s = st[it.a] -%}
+    {%- if s.state == 'in' and s.sid == it.sid -%}
+      {%- do s.update({'state': 'idle'}) -%}
+      {%- if not it.keep -%}{%- do s.update({'next_ok': now + (absence() | int)}) -%}{%- endif -%}
+      {%- if module.rand.chance(samples.accounts[it.a].logout) -%}{{- logout(it.a) -}}{%- endif -%}
+    {%- endif -%}
+  {%- elif it.k == 'sky' -%}
+    {#- Skyline collector: its encoded credentials fail once, the retry
+        succeeds right after, then a few reads. -#}
+    {{- login(shared.get('collector'), false) -}}
+    {{- push(now + module.rand.number.integer(12, 90), {'k': 'sky_ok'}) -}}
+    {{- push(now + (sky_gap() | int), {'k': 'sky'}) -}}
+  {%- elif it.k == 'sky_ok' -%}
+    {{- login(shared.get('collector'), true) -}}
+    {%- set t = namespace(v=now) -%}
+    {%- for _ in range(module.rand.weighted_choice([0, 1, 2], [30, 50, 20])) -%}
+      {%- set t.v = t.v + (d(0.05, 0.6, 0.8, 20) | int) -%}
+      {{- push(t.v, {'k': 'sky_read'}) -}}
+    {%- endfor -%}
+  {%- elif it.k == 'sky_read' -%}
+    {{- uinfo(shared.get('collector')) -}}
+  {%- elif it.k == 'restore' -%}
+    {#- A deleted exporter is re-created by a power administrator with an
+        open session, or later when one has. -#}
+    {%- set online = [] -%}
+    {%- for i in shared.get('hi') if samples.accounts[i].power and st[i].state == 'in' -%}{%- do online.append(i) -%}{%- endfor -%}
+    {%- if online -%}
+      {%- do shared.get('pending').remove(it.name) -%}
+      {{- create(module.rand.choice(online), it.name) -}}
+    {%- else -%}
+      {{- push(now + (d(30, 300, 1.0, 3600) | int), it) -}}
+    {%- endif -%}
+  {%- elif it.k == 'ep_del' -%}
+    {%- set s = st[it.a] -%}
+    {%- set ex = shared.get('exporters') -%}
+    {%- set cand = (ex | reject('equalto', shared.get('ep_last_exp')) | list) if ex | length >= 2 else [] -%}
+    {%- if s.state == 'in' and s.sid == it.sid and cand -%}
+      {%- set name = module.rand.choice(cand) -%}
+      {{- delete(it.a, name) -}}
+      {%- do shared.update({'ep_last_exp': name, 'ep_active': false}) -%}
+    {%- elif s.state == 'in' and s.sid == it.sid and now + 60000 - shared.get('ep_t0') < 1750000 -%}
+      {{- push(now + 60000, it) -}}
+    {%- else -%}
+      {%- do shared.update({'ep_active': false, 'ep_abort': shared.get('ep_abort') + 1}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- if shared.get('st') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'manager_host': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set st = [] -%}
+  {%- set hi = [] -%}
+  {%- set hw = [] -%}
+  {%- set role = {} -%}
+  {%- for ac in samples.accounts -%}
+    {%- do st.append({'state': 'idle', 'fails': 0, 'give_up': false, 'sid': 0, 'ops': 0, 'ep': false, 'keep': false, 'pre': 0,
+      'next_ok': now + module.builtins.int(module.rand.number.floating(0, 1) * (absence() | int))}) -%}
+    {%- if ac.role == 'human' -%}{%- do hi.append(loop.index0) -%}{%- do hw.append(ac.weight) -%}{%- else -%}{%- do role.update({ac.role: loop.index0}) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set cfg = {} -%}
+  {%- set active = [] -%}
+  {%- for e in samples.exporters -%}
+    {%- do cfg.update({e.name: {'server': e.server, 'protocol': e.protocol, 'port': e.port}}) -%}
+    {%- if not e.standby -%}{%- do active.append(e.name) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'st': st, 'hi': hi, 'hw': hw, 'script': role.script, 'collector': role.collector,
+    'exp_cfg': cfg, 'exporters': module.random.sample(active, 3), 'pending': [], 'hist': {},
+    'queue': [], 'seq': 0, 'guard': 0, 'ep_abort': 0,
+    'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds() * 1000),
+    'pid': {'http': module.rand.number.integer(1200, 32000), 'policy': module.rand.number.integer(1200, 32000), 'napi': module.rand.number.integer(1200, 32000)},
+    'ep_active': false, 'ep_last_actor': none, 'ep_last_exp': none, 'ep_t0': 0}) -%}
+  {%- do shared.set('ep_due', pick_start(now, [interval, 24 * hour] | min) | int) -%}
+  {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (sky_gap() | int)), {'k': 'sky'}) -}}
+{%- endif -%}
+{#- A due episode takes an administrator timestamp, or after 20 minutes
+    of waiting any timestamp. -#}
+{%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_due') and ('ui' in tags or now - shared.get('ep_due') > 1200000) -%}
+  {{- ep_start() -}}
+{%- endif -%}
+{%- set q = shared.get('queue') -%}
+{%- for _ in range(16) if r.action is none -%}
+  {%- if q and q[0][0] <= now -%}
+    {{- serve(module.heapq.heappop(q)[2]) -}}
+  {%- elif 'api' in tags -%}
+    {{- script_step() -}}
+  {%- else -%}
+    {{- human_step() -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if r.action is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set t = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set iso = t.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d' | format(t.microsecond // 1000) ~ 'Z' -%}
+{%- set pid = shared.get('pid') -%}
+{%- set host = params.manager_host -%}
+{%- set ac = samples.accounts[r.a] -%}
+{%- set nsx = {'component': 'nsx-manager', 'audit': true} -%}
+{%- set event = {'@timestamp': iso, 'ecs': {'version': '8.17.0'}, 'host': {'name': host}, 'user': {'name': r.user}, 'related': {'user': [r.user]}, 'log': {'file': {'path': '/var/log/syslog'}, 'level': 'info', 'syslog': {'appname': 'NSX'}}} -%}
+{%- if r.kind in ['login', 'logout'] -%}
+  {%- if r.kind == 'login' -%}
+    {%- if ac.ldap and r.ok -%}
+      {%- set dn = 'CN=' ~ ac.cn ~ ',OU=Network Admins,DC=contoso,DC=local' -%}
+      {%- set uname = 'LdapUserDetailsImpl [Dn=' ~ dn ~ '; Username=' ~ r.user ~ '; Password=[PROTECTED]; Enabled=true; AccountNonExpired=true; CredentialsNonExpired=true; AccountNonLocked=true; Granted Authorities=[]]@' ~ r.ip -%}
+    {%- else -%}
+      {%- set uname = r.user ~ '@' ~ r.ip -%}
+    {%- endif -%}
+    {%- set op = 'LOGIN' -%}{%- set status = 'success' if r.ok else 'failure' -%}
+    {%- do event.update({'source': {'ip': r.ip}}) -%}
+    {%- do event.related.update({'ip': [r.ip]}) -%}
+  {%- else -%}
+    {%- set uname = r.user -%}{%- set op = 'LOGOUT' -%}{%- set status = 'success' -%}
+  {%- endif -%}
+  {%- set original = iso ~ ' ' ~ host ~ ' NSX ' ~ pid.http ~ ' SYSTEM [nsx@6876 audit="true" comp="nsx-manager" level="INFO" subcomp="http"] UserName="' ~ uname ~ '", ModuleName="ACCESS_CONTROL", Operation="' ~ op ~ '", Operation status="' ~ status ~ '"' -%}
+  {%- do event.log.syslog.update({'procid': pid.http | string, 'msgid': 'SYSTEM'}) -%}
+  {%- do nsx.update({'subcomponent': 'http', 'user_name': uname, 'module_name': 'ACCESS_CONTROL', 'operation': op, 'operation_status': status}) -%}
+  {%- do event.update({'event': {'kind': 'event', 'category': ['authentication'], 'type': (['start'] if r.ok else ['denied']) if op == 'LOGIN' else ['end'], 'action': r.action, 'outcome': status}}) -%}
+{%- elif r.kind == 'policy' -%}
+  {%- set req = module.rand.crypto.uuid4() -%}
+  {%- set original = iso ~ ' ' ~ host ~ ' NSX ' ~ pid.policy ~ ' - [nsx@6876 audit="true" comp="nsx-manager" level="INFO" reqId="' ~ req ~ '" subcomp="policy" username="' ~ r.user ~ '"] UserName="' ~ r.user ~ '", ModuleName="AAA", Operation="GetCurrentUserInfo", Operation status="success"' -%}
+  {%- do event.log.syslog.update({'procid': pid.policy | string, 'msgid': '-'}) -%}
+  {%- do nsx.update({'subcomponent': 'policy', 'request_id': req, 'user_name': r.user, 'module_name': 'AAA', 'operation': 'GetCurrentUserInfo', 'operation_status': 'success'}) -%}
+  {%- do event.update({'event': {'kind': 'event', 'category': ['iam'], 'type': ['info'], 'action': r.action, 'outcome': 'success'}}) -%}
+{%- else -%}
+  {%- set ua = ac.ua -%}
+  {%- set original = iso ~ ' ' ~ host ~ ' NSX ' ~ pid.napi ~ ' - [nsx@6876 comp="nsx-manager" subcomp="node-mgmt" username="' ~ r.user ~ '" level="INFO" audit="true"] ' ~ r.user ~ " '" ~ r.method ~ ' ' ~ r.path ~ "' " ~ r.code ~ ' ' ~ r.size ~ ' "" "' ~ ua ~ '" ' ~ '%d.%06d' | format(r.dur // 1000000, r.dur % 1000000) -%}
+  {%- do event.log.syslog.update({'procid': pid.napi | string, 'msgid': '-'}) -%}
+  {%- do nsx.update({'subcomponent': 'node-mgmt'}) -%}
+  {%- set etype = {'GET': ['access'], 'DELETE': ['deletion'], 'POST': ['creation']}[r.method] -%}
+  {%- do event.update({'event': {'kind': 'event', 'category': ['configuration'], 'type': etype, 'action': r.action, 'outcome': 'success', 'duration': r.dur * 1000},
+    'http': {'request': {'method': r.method}, 'response': {'status_code': r.code, 'body': {'bytes': r.size}}},
+    'url': {'path': r.path}, 'user_agent': {'original': ua}}) -%}
+{%- endif -%}
+{%- do event.event.update({'original': original}) -%}
+{%- do event.update({'vmware': {'nsx': nsx}}) -%}
+{{- event | tojson -}}
