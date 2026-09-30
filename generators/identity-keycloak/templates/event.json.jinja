@@ -1,0 +1,511 @@
+{#- Keycloak 26.7.4 jboss-logging event listener lines of one realm,
+    as Elastic Agent ships them from the Keycloak log file. The input
+    sets the rate and the hour-of-day curve; every timestamp becomes
+    exactly one line. Each timestamp takes the earliest due step of an
+    open attempt (wrong passwords, LOGIN and the code exchange first,
+    then admin operations and logouts) and, when none is due, starts a
+    new attempt of an idle account picked by its activity weight. The
+    anomaly episode queues its own steps for one idle administrator
+    and takes over ticks of that same stream. -#}
+{%- set now = timestamp.timestamp() -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 900 -%}
+{%- set min_fails = 5 -%}
+{%- set code_ttl = 55 -%}
+{%- set priv = params.privileged_role_name -%}
+{#- Wrong-password bursts: 1-8 failures, halving per extra failure. -#}
+{%- set burst = [1, 2, 3, 4, 5, 6, 7, 8] -%}
+{%- set burst_w = [128, 64, 32, 16, 8, 4, 2, 1] -%}
+{#- An administrator typing the previous (rotated) password by hand
+    over VPN retries it 3-8 times before fetching the new one from the
+    vault: stale_p of VPN admin console attempts, stale_rep after such
+    an attempt (the next one is often stale again). Episodes draw their
+    failure count from this law's tail (k >= 5). -#}
+{%- set stale_k = [3, 4, 5, 6, 7, 8] -%}
+{%- set stale_kw = [15, 25, 25, 17, 11, 7] -%}
+{%- set stale_p = 0.07 -%}
+{%- set stale_rep = 0.45 -%}
+{%- set nops = [0, 1, 2, 3, 4, 5, 6] -%}
+{%- set nops_w = [10, 30, 25, 15, 10, 6, 4] -%}
+{%- set base = params.sso_base_url -%}
+{%- set clients = {
+    'account-console': [base ~ '/realms/' ~ params.realm ~ '/account/', 'openid email profile'],
+    'portal': ['https://portal.corp.example/oauth2/callback', 'openid profile email'],
+    'hr-app': ['https://hr.corp.example/login/oauth2/code/keycloak', 'openid profile'],
+    'mail-ui': ['https://mail.corp.example/sso/callback', 'openid email profile'],
+    'security-admin-console': [base ~ '/admin/' ~ params.realm ~ '/console/', 'openid profile email']} -%}
+{%- set n_users = 1500 -%}
+{%- set admin_names = ['adm.kuznetsov', 'adm.sidorova', 'adm.frolov', 'adm.egorova', 'adm.volkova'] -%}
+{%- set role_names = ['portal-editor', 'hr-viewer', 'mail-archive', 'finance-reader', 'project-lead', priv] -%}
+{%- set role_w = [22, 18, 14, 16, 14, 16] -%}
+{%- set vpn_ips = params.vpn_nat_ips -%}
+
+{#- Hour-of-day load, relative to the office-hours peak. It repeats the
+    rates of the patterns/*.yml input files and only places episode
+    starts; the input alone sets the event rate. -#}
+{%- macro hload(t) -%}
+  {%- set h = ((t | int) // 3600) % 24 -%}
+  {{- 1.0 if 8 <= h < 18 else (0.5 if 7 <= h < 8 or 18 <= h < 20 else (0.25 if 20 <= h < 23 else 0.15)) -}}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma, lo, hi) -%}
+  {{- [[module.random.lognormvariate(module.math.log(median), sigma) | round | int, lo] | max, hi] | min -}}
+{%- endmacro -%}
+
+{#- Keycloak 26 session, code and token ids: 128 random bits. -#}
+{%- macro rid() -%}
+  {%- set h = '%032x' | format(module.random.getrandbits(128)) -%}
+  {{- h[:8] ~ '-' ~ h[8:12] ~ '-' ~ h[12:16] ~ '-' ~ h[16:20] ~ '-' ~ h[20:] -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (6 <= interval <= 720) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- One fixed organisation: identities, home addresses, preferred
+      applications and activity weights come from a fixed seed, so every
+      run models the same realm and only behaviour is random. -#}
+  {%- set rnd = module.random.Random(2674) -%}
+  {%- set male = ['alexey', 'andrey', 'artem', 'denis', 'dmitry', 'egor', 'igor', 'ivan', 'kirill',
+      'maxim', 'mikhail', 'nikolai', 'oleg', 'pavel', 'roman', 'sergey', 'vladimir', 'yuri',
+      'anton', 'boris', 'grigory', 'konstantin', 'leonid', 'stanislav'] -%}
+  {%- set female = ['alina', 'anastasia', 'anna', 'daria', 'ekaterina', 'elena', 'irina', 'ksenia',
+      'maria', 'natalia', 'olga', 'polina', 'svetlana', 'tatiana', 'victoria', 'yulia',
+      'alexandra', 'galina', 'larisa', 'marina', 'nadezhda', 'sofia', 'valeria', 'vera'] -%}
+  {%- set surnames = ['ivanov', 'smirnov', 'kuznetsov', 'popov', 'vasiliev', 'petrov', 'sokolov',
+      'mikhailov', 'novikov', 'fedorov', 'morozov', 'volkov', 'alekseev', 'lebedev', 'semenov',
+      'egorov', 'pavlov', 'kozlov', 'stepanov', 'nikolaev', 'orlov', 'andreev', 'makarov',
+      'nikitin', 'zakharov', 'zaitsev', 'solovyov', 'borisov', 'yakovlev', 'grigoriev',
+      'romanov', 'vorobyov', 'sergeev', 'frolov', 'gusev', 'titov', 'kuzmin', 'belov',
+      'komarov', 'kiselev'] -%}
+  {%- set combos = [] -%}
+  {%- for f in male -%}{%- for s in surnames -%}{%- do combos.append(f ~ '.' ~ s) -%}{%- endfor -%}{%- endfor -%}
+  {%- for f in female -%}{%- for s in surnames -%}{%- do combos.append(f ~ '.' ~ s ~ 'a') -%}{%- endfor -%}{%- endfor -%}
+  {%- set actors = [] -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- set app_names = ['account-console', 'portal', 'hr-app', 'mail-ui'] -%}
+  {%- for p in rnd.sample(combos, n_users) + admin_names -%}
+    {%- set adm = p in admin_names -%}
+    {%- if adm -%}
+      {%- set apps = ['security-admin-console', 'account-console'] -%}
+      {%- set aw = [0.85, 0.15] -%}
+    {%- else -%}
+      {%- set apps = rnd.sample(app_names, rnd.choice([1, 2, 2, 3])) -%}
+      {%- set aw = [] -%}
+      {%- for a in apps -%}{%- do aw.append(rnd.lognormvariate(0, 0.8)) -%}{%- endfor -%}
+    {%- endif -%}
+    {#- Activity weight: users vary widely; administrators each start
+        attempts at 1.4-1.8 times a median user's rate and work remotely
+        40-50% of the time, so every administrator + VPN address pair
+        recurs within days. -#}
+    {%- set w = rnd.uniform(1.4, 1.8) if adm else rnd.lognormvariate(0, 0.6) -%}
+    {%- set acc.w = acc.w + w -%}
+    {%- do cum.append(acc.w) -%}
+    {%- do actors.append({'name': p, 'id': module.uuid.UUID(int=rnd.getrandbits(128), version=4) | string, 'admin': adm,
+        'ip': ('10.20.5.' if adm else '10.20.' ~ rnd.randint(8, 15) ~ '.') ~ rnd.randint(10, 250),
+        'remote': rnd.uniform(0.4, 0.5) if adm else rnd.uniform(0.15, 0.45), 'apps': apps, 'aw': aw, 'w': w, 'busy': false, 'stale': false}) -%}
+  {%- endfor -%}
+  {%- set roles = {} -%}
+  {%- for r in role_names -%}
+    {%- do roles.update({r: params.privileged_role_id if r == priv else module.uuid.UUID(int=rnd.getrandbits(128), version=4) | string}) -%}
+  {%- endfor -%}
+  {#- Standing role assignments; the privileged role starts with two
+      holders whose grants are permanent. -#}
+  {%- set held = {} -%}
+  {%- for i in range(n_users) -%}
+    {%- do held.update({i: rnd.sample(role_names[:-1], rnd.choice([0, 1, 1, 2]))}) -%}
+  {%- endfor -%}
+  {%- for i in rnd.sample(range(n_users) | list, 2) -%}
+    {%- do held[i].append(priv) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'actors': actors, 'cum': cum, 'total': acc.w,
+      'hq': [], 'lq': [], 'seq': 0, 'roles': roles, 'held': held, 'revoke': [],
+      'recent': {}, 'offset': module.random.randint(200000, 9000000),
+      'start_at': none, 'scheduled': false, 'last_admin': none, 'last_target': none}) -%}
+{%- endif -%}
+{%- set actors = shared.get('actors') -%}
+{%- set held = shared.get('held') -%}
+{%- set recent = shared.get('recent') -%}
+
+{#- Two queues of due steps: tight steps (wrong passwords, LOGIN, the
+    code exchange and every episode step) go before flexible ones
+    (admin operations and logouts). -#}
+{%- macro push(at, item, tight) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(shared.get('hq') if tight else shared.get('lq'), [at, n, item]) -%}
+{%- endmacro -%}
+
+{#- One login attempt in one browser authentication session: k wrong
+    passwords, then LOGIN (or nothing, when the user gives up), the
+    authorization-code exchange, admin operations for the admin
+    console, and an optional logout. Gaps are minimum delays; each
+    step takes the first free tick after its due time. -#}
+{%- macro plan(a, k, final, ep, ip, client, work=false) -%}
+  {%- set actor = actors[a] -%}
+  {%- do actor.update({'busy': true}) -%}
+  {%- set fg = [] -%}
+  {%- for i in range(k) -%}{%- do fg.append(gap(8, 0.6, 2, 40) | int) -%}{%- endfor -%}
+  {%- set n_ops = 0 -%}
+  {%- if client == 'security-admin-console' -%}
+    {#- An episode, or an administrator who had to fetch the new
+        password, came to do console work: at least one operation. -#}
+    {%- set busy_s = ep or work -%}
+    {%- set n_ops = module.rand.weighted_choice(nops[1:] if busy_s else nops, nops_w[1:] if busy_s else nops_w) -%}
+  {%- endif -%}
+  {%- set og = [] -%}
+  {%- for i in range(n_ops) -%}
+    {%- do og.append(gap(45, 0.9, 3, 300) | int if i == 0 else gap(70, 1.0, 3, 900) | int) -%}
+  {%- endfor -%}
+  {%- set lo = module.rand.chance(0.5 if actor.admin else 0.3) -%}
+  {%- set tail = (gap(300, 1.0, 10, 7200) if actor.admin else gap(2700, 1.0, 30, 28800)) | int -%}
+  {%- do shared.set('plan', {'a': a, 'k': k, 'i': 0, 'fg': fg, 'final': final, 'ep': ep,
+      'ip': ip, 'client': client, 'asid': rid(), 'tab': module.secrets.token_urlsafe(8),
+      'ops': og, 'op_i': 0, 'logout': lo, 'tail': tail, 'login_t': none,
+      'cd': module.random.uniform(0.2, 1.5)}) -%}
+{%- endmacro -%}
+
+{%- macro pick_ip(actor) -%}
+  {{- module.rand.choice(vpn_ips) if module.rand.chance(actor.remote) else actor.ip -}}
+{%- endmacro -%}
+
+{#- Start a background attempt of an idle account drawn by activity
+    weight (binary search over cumulative weights, busy accounts
+    redrawn). -#}
+{%- macro start_attempt() -%}
+  {%- set s = namespace(a=none) -%}
+  {%- set cum = shared.get('cum') -%}
+  {%- for _ in range(32) -%}
+    {%- set i = module.bisect.bisect_right(cum, module.random.random() * shared.get('total')) -%}
+    {%- if i < actors | length and not actors[i].busy -%}{%- set s.a = i -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if s.a is none -%}{%- set s.a = module.random.randrange(n_users) -%}{%- endif -%}
+  {%- set actor = actors[s.a] -%}
+  {%- set client = module.rand.weighted_choice(actor.apps, actor.aw) -%}
+  {%- set ip = pick_ip(actor) -%}
+  {%- set stale = namespace(on=false) -%}
+  {%- if actor.admin and ip in vpn_ips and client == 'security-admin-console' -%}
+    {#- Over VPN the administrator types the admin console password by
+        hand and sometimes types the previous, rotated one. -#}
+    {%- set stale.on = module.rand.chance(stale_rep if actor.stale else stale_p) -%}
+    {%- do actor.update({'stale': stale.on}) -%}
+  {%- endif -%}
+  {%- if stale.on -%}
+    {%- set k = module.rand.weighted_choice(stale_k, stale_kw) -%}
+    {{- plan(s.a, k, 'accept' if module.rand.chance(0.9) else 'giveup', false, ip, client, true) -}}
+  {#- Ordinary typos: 12% of attempts start with wrong passwords. -#}
+  {%- elif module.rand.chance(0.12) -%}
+    {%- set k = module.rand.weighted_choice(burst, burst_w) -%}
+    {{- plan(s.a, k, 'accept' if module.rand.chance(0.85) else 'giveup', false, ip, client) -}}
+  {%- else -%}
+    {{- plan(s.a, 0, 'accept', false, ip, client) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first tick, its hour drawn from the
+    background hour-of-day curve. Each later start is due one interval
+    after the actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor, so start hours never drift. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and not shared.get('scheduled') -%}
+  {%- set t0 = now | int -%}
+  {%- do shared.update({'scheduled': true, 'start_at':
+      pick_start(t0, t0 + ([interval, 24] | min * 3600) | int, false) | int}) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {#- Password guessing against an administrator from a VPN egress
+      address, then LOGIN, the code exchange and a grant of the
+      privileged role. The administrator is drawn with the background
+      activity weights among administrators with no attempt of their
+      own in progress; the previous episode's administrator sits out.
+      The attempt then holds that administrator busy, exactly as a
+      background attempt does. -#}
+  {%- set ep = namespace(c=[], w=[]) -%}
+  {%- for i in range(n_users, actors | length) -%}
+    {%- set actor = actors[i] -%}
+    {%- if not actor.busy and actor.name != shared.get('last_admin') -%}
+      {%- set ep.c = ep.c + [i] -%}{%- set ep.w = ep.w + [actor.w] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ep.c -%}
+    {%- set a = module.rand.weighted_choice(ep.c, ep.w) -%}
+    {{- plan(a, module.rand.weighted_choice(stale_k[2:], stale_kw[2:]), 'accept', true,
+        module.rand.choice(vpn_ips), 'security-admin-console') -}}
+    {{- push(now, {'k': 'fail', 'p': shared.get('plan')}, true) -}}
+    {%- set t0 = now | int -%}
+    {%- set due = t0 + (interval * 3600) | int -%}
+    {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
+    {%- do shared.update({'last_admin': actors[a].name,
+        'start_at': pick_start(due - half, due + half, true) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Take the earliest due tight step, else the earliest due flexible
+    step, else start an attempt. A code not exchanged within the
+    one-minute Client Login Timeout (55 s margin) is abandoned: the
+    attempt ends after LOGIN and the tick goes to the next choice.
+    Episode attempts obey the same rule; an abandoned episode stays an
+    incomplete chain and the recurrence goes on from its start. -#}
+{%- set hq = shared.get('hq') -%}
+{%- set lq = shared.get('lq') -%}
+{%- set ns = namespace(item=none) -%}
+{%- for _ in range(16) -%}
+  {%- if hq and hq[0][0] <= now -%}
+    {%- set item = module.heapq.heappop(hq)[2] -%}
+  {%- elif lq and lq[0][0] <= now -%}
+    {%- set item = module.heapq.heappop(lq)[2] -%}
+  {%- else -%}{%- break -%}
+  {%- endif -%}
+  {%- if item.k == 'token' and now - item.p.login_t > code_ttl -%}
+    {%- do actors[item.p.a].update({'busy': false}) -%}
+  {%- else -%}
+    {%- set ns.item = item -%}{%- break -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if ns.item is none -%}
+  {{- start_attempt() -}}
+  {%- set p = shared.get('plan') -%}
+  {%- set ns.item = {'k': 'fail' if p.k > 0 else 'login', 'p': p} -%}
+{%- endif -%}
+
+{%- set p = ns.item.p -%}
+{%- set kind = ns.item.k -%}
+{%- set actor = actors[p.a] -%}
+{%- set key = actor.id ~ '|' ~ p.ip -%}
+{%- set hist = [] -%}
+{%- if actor.admin -%}
+  {%- for r in recent.get(key, []) if r[0] >= now - window -%}{%- do hist.append(r) -%}{%- endfor -%}
+{%- endif -%}
+{%- set op = none -%}
+
+{#- 3. Advance this attempt and queue its next step. -#}
+{%- if kind == 'fail' -%}
+  {%- do p.update({'i': p.i + 1}) -%}
+  {%- if p.i < p.k -%}
+    {{- push(now + p.fg[p.i - 1], {'k': 'fail', 'p': p}, true) -}}
+  {%- elif p.final == 'accept' -%}
+    {{- push(now + p.fg[p.k - 1], {'k': 'login', 'p': p}, true) -}}
+  {%- else -%}
+    {%- do actor.update({'busy': false}) -%}
+  {%- endif -%}
+{%- elif kind == 'login' -%}
+  {%- do p.update({'login_t': now}) -%}
+  {{- push(now + p.cd, {'k': 'token', 'p': p}, true) -}}
+{%- elif kind == 'token' or kind == 'op' -%}
+  {%- if kind == 'op' -%}
+    {%- set op = namespace(type='CREATE', target=none, role=none) -%}
+    {%- set revoke = shared.get('revoke') -%}
+    {%- if p.ep and p.op_i == 0 -%}
+      {#- The episode's grant: a user without the role, not the previous
+          episode's target. -#}
+      {%- set s = namespace(t=none) -%}
+      {%- for _ in range(200) -%}
+        {%- set i = module.random.randrange(n_users) -%}
+        {%- if priv not in held[i] and i != shared.get('last_target') -%}{%- set s.t = i -%}{%- break -%}{%- endif -%}
+      {%- endfor -%}
+      {%- set op.target = s.t -%}
+      {%- set op.role = priv -%}
+      {%- do shared.set('last_target', op.target) -%}
+    {%- else -%}
+      {%- set due = [] -%}
+      {%- for r in revoke if r[0] <= now and priv in held[r[1]] -%}{%- do due.append(r) -%}{%- endfor -%}
+      {%- if due and module.rand.chance(0.7) -%}
+        {#- Time-bound privileged access expires: an administrator
+            removes it in the next console session. -#}
+        {%- set op.type = 'DELETE' -%}{%- set op.target = due[0][1] -%}{%- set op.role = priv -%}
+      {%- elif module.rand.chance(0.6) -%}
+        {%- set op.role = module.rand.weighted_choice(role_names, role_w) -%}
+        {%- set s = namespace(t=none) -%}
+        {%- for _ in range(200) -%}
+          {%- set i = module.random.randrange(n_users) -%}
+          {%- if op.role not in held[i] -%}{%- set s.t = i -%}{%- break -%}{%- endif -%}
+        {%- endfor -%}
+        {%- set op.target = s.t -%}
+        {#- Guard on the chain's final step only: a background grant of
+            the privileged role that would complete five failures,
+            LOGIN and the code exchange by the same account and address
+            within the chain window grants another role instead. -#}
+        {%- set g = namespace(n=0, st=0) -%}
+        {%- for r in hist -%}
+          {%- if g.st == 0 and r[1] == 'fail' -%}
+            {%- set g.n = g.n + 1 -%}{%- if g.n >= min_fails -%}{%- set g.st = 1 -%}{%- endif -%}
+          {%- elif g.st == 1 and r[1] == 'login' -%}{%- set g.st = 2 -%}
+          {%- elif g.st == 2 and r[1] == 'token' -%}{%- set g.st = 3 -%}
+          {%- endif -%}
+        {%- endfor -%}
+        {%- if op.role == priv and g.st == 3 -%}
+          {%- set alt = [] -%}
+          {%- for r in role_names[:-1] if r not in held[op.target] -%}{%- do alt.append(r) -%}{%- endfor -%}
+          {%- set op.role = module.rand.choice(alt) if alt else role_names[0] -%}
+          {%- if op.role in held[op.target] -%}{%- set op.type = 'DELETE' -%}{%- endif -%}
+        {%- endif -%}
+      {%- else -%}
+        {%- set op.type = 'DELETE' -%}
+        {%- set s = namespace(t=none) -%}
+        {%- for _ in range(200) -%}
+          {%- set i = module.random.randrange(n_users) -%}
+          {%- set own = [] -%}
+          {%- for r in held[i] if r != priv -%}{%- do own.append(r) -%}{%- endfor -%}
+          {%- if own -%}{%- set s.t = [i, module.rand.choice(own)] -%}{%- break -%}{%- endif -%}
+        {%- endfor -%}
+        {%- set op.target = s.t[0] -%}{%- set op.role = s.t[1] -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if op.type == 'CREATE' -%}
+      {%- do held[op.target].append(op.role) -%}
+      {%- if op.role == priv -%}
+        {%- do revoke.append([now + gap(28800, 0.6, 3600, 172800) | int, op.target]) -%}
+      {%- endif -%}
+    {%- else -%}
+      {%- do held[op.target].remove(op.role) -%}
+      {%- set keep = [] -%}
+      {%- for r in revoke if r[1] != op.target or op.role != priv -%}{%- do keep.append(r) -%}{%- endfor -%}
+      {%- do shared.set('revoke', keep) -%}
+    {%- endif -%}
+    {%- do p.update({'op_i': p.op_i + 1}) -%}
+  {%- endif -%}
+  {%- if p.op_i < p.ops | length -%}
+    {{- push(now + p.ops[p.op_i], {'k': 'op', 'p': p}, p.ep) -}}
+  {%- elif p.logout -%}
+    {{- push(now + p.tail, {'k': 'logout', 'p': p}, p.ep) -}}
+  {%- else -%}
+    {%- do actor.update({'busy': false}) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- do actor.update({'busy': false}) -%}
+{%- endif -%}
+{%- if actor.admin -%}
+  {%- if kind in ['fail', 'login', 'token'] -%}{%- do hist.append([now, kind]) -%}{%- endif -%}
+  {%- if hist -%}{%- do recent.update({key: hist[-40:]}) -%}{%- else -%}{%- do recent.pop(key, none) -%}{%- endif -%}
+{%- endif -%}
+
+{#- 4. Render the listener line (quotes '"', sanitize on) and the
+    document Elastic's Keycloak integration makes of it. -#}
+{%- macro q(v) -%}{{ '"' ~ (v | string | replace('"', '\\"')) ~ '"' }}{%- endmacro -%}
+{%- set cl = clients[p.client] -%}
+{%- set event_time = timestamp -%}
+{%- set thread = 'executor-thread-' ~ gap(24, 0.7, 1, 200) -%}
+{%- set url = none -%}
+{%- if op is not none -%}
+  {%- set target_id = actors[op.target].id -%}
+  {%- set rtype = 'REALM_ROLE_MAPPING' -%}
+  {%- set rpath = 'users/' ~ target_id ~ '/role-mappings/realm' -%}
+  {%- set rep = '[{"id":"' ~ shared.get('roles')[op.role] ~ '","name":"' ~ op.role
+      ~ '","composite":false,"clientRole":false,"containerId":"' ~ params.realm_id ~ '"}]' -%}
+  {%- set message = 'operationType=' ~ q(op.type) ~ ', realmId=' ~ q(params.realm_id)
+      ~ ', realmName=' ~ q(params.realm) ~ ', clientId=' ~ q(params.admin_console_client_uuid)
+      ~ ', userId=' ~ q(actor.id) ~ ', ipAddress=' ~ q(p.ip) ~ ', resourceType=' ~ q(rtype)
+      ~ ', resourcePath=' ~ q(rpath) ~ ', representation=' ~ q(rep) -%}
+  {%- set level = 'INFO' -%}
+  {%- set etype = 'ADMIN' -%}
+{%- else -%}
+  {%- set etype = {'fail': 'LOGIN_ERROR', 'login': 'LOGIN', 'token': 'CODE_TO_TOKEN', 'logout': 'LOGOUT'}[kind] -%}
+  {%- set level = 'WARN' if kind == 'fail' else 'INFO' -%}
+  {%- set message = 'type=' ~ q(etype) ~ ', realmId=' ~ q(params.realm_id) ~ ', realmName=' ~ q(params.realm)
+      ~ ', clientId=' ~ q(p.client) ~ ', userId=' ~ q(actor.id) -%}
+  {%- if kind != 'fail' -%}{%- set message = message ~ ', sessionId=' ~ q(p.asid) -%}{%- endif -%}
+  {%- set message = message ~ ', ipAddress=' ~ q(p.ip) -%}
+  {%- if kind == 'fail' -%}
+    {%- set message = message ~ ', error=' ~ q('invalid_user_credentials') ~ ', auth_method=' ~ q('openid-connect')
+        ~ ', auth_type=' ~ q('code') ~ ', redirect_uri=' ~ q(cl[0]) ~ ', code_id=' ~ q(p.asid)
+        ~ ', username=' ~ q(actor.name) ~ ', authSessionParentId=' ~ q(p.asid) ~ ', authSessionTabId=' ~ q(p.tab) -%}
+    {%- set url = cl[0] -%}
+  {%- elif kind == 'login' -%}
+    {%- set message = message ~ ', auth_method=' ~ q('openid-connect') ~ ', response_type=' ~ q('code')
+        ~ ', redirect_uri=' ~ q(cl[0]) ~ ', remember_me=' ~ q('false') ~ ', consent=' ~ q('no_consent_required')
+        ~ ', code_id=' ~ q(p.asid) ~ ', response_mode=' ~ q('query') ~ ', username=' ~ q(actor.name)
+        ~ ', authSessionParentId=' ~ q(p.asid) ~ ', authSessionTabId=' ~ q(p.tab) -%}
+    {%- set url = cl[0] -%}
+  {%- elif kind == 'token' -%}
+    {%- set message = message ~ ', token_id=' ~ q(('onltac:' if p.client == 'security-admin-console' else 'onrtac:') ~ rid())
+        ~ ', grant_type=' ~ q('authorization_code') ~ ', refresh_token_type=' ~ q('Refresh')
+        ~ ', scope=' ~ q(cl[1]) ~ ', refresh_token_id=' ~ q(rid()) ~ ', code_id=' ~ q(p.asid)
+        ~ ', client_auth_method=' ~ q('client-secret') -%}
+  {%- else -%}
+    {%- set message = message ~ ', redirect_uri=' ~ q(cl[0]) -%}
+    {%- set url = cl[0] -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set line = event_time.strftime('%Y-%m-%d %H:%M:%S,%f')[:23] ~ ' ' ~ level ~ '  [org.keycloak.events] ('
+    ~ thread ~ ') ' ~ message -%}
+{%- set offset = shared.get('offset') -%}
+{%- do shared.set('offset', offset + (line | length) + 1) -%}
+{%- set ingest_time = event_time + module.datetime.timedelta(milliseconds=gap(1800, 0.5, 300, 20000) | int) -%}
+
+{%- set event = {'original': line, 'kind': 'event', 'timezone': '+00:00',
+    'dataset': 'keycloak.log', 'agent_id_status': 'verified',
+    'ingested': ingest_time.strftime('%Y-%m-%dT%H:%M:%SZ')} -%}
+{%- set kc = {'realm': {'id': params.realm_id}} -%}
+{%- if op is not none -%}
+  {%- set code = op.type ~ '-' ~ rtype -%}
+  {%- do event.update({'code': code, 'action': code, 'outcome': 'unknown', 'category': ['iam'],
+      'type': ['info', 'admin', 'creation' if op.type == 'CREATE' else 'deletion']}) -%}
+  {%- do kc.update({'client': {'id': params.admin_console_client_uuid}, 'event_type': 'admin',
+      'admin': {'operation': op.type, 'resource': {'type': rtype, 'path': rpath}}}) -%}
+{%- else -%}
+  {%- do event.update({'action': etype,
+      'outcome': 'failure' if kind == 'fail' else ('success' if kind == 'login' else 'unknown'),
+      'category': ['authentication'],
+      'type': ['info', 'start'] if kind == 'login' else (['info', 'end'] if kind == 'logout' else ['info'])}) -%}
+  {%- if kind == 'fail' -%}{%- do event.update({'code': 'invalid_user_credentials'}) -%}{%- endif -%}
+  {%- set login = {'type': etype} -%}
+  {%- if kind in ['fail', 'login', 'logout'] -%}{%- do login.update({'redirect_uri': cl[0]}) -%}{%- endif -%}
+  {%- if kind in ['fail', 'login'] -%}
+    {%- do login.update({'auth_method': 'openid-connect', 'code_id': p.asid,
+        'auth_session_parent_id': p.asid, 'auth_session_tab_id': p.tab}) -%}
+  {%- endif -%}
+  {%- if kind == 'fail' -%}{%- do login.update({'auth_type': 'code'}) -%}{%- endif -%}
+  {%- if kind == 'token' -%}{%- do login.update({'code_id': p.asid}) -%}{%- endif -%}
+  {%- do kc.update({'client': {'id': p.client}, 'event_type': 'login', 'login': login}) -%}
+  {%- if kind != 'fail' -%}{%- do kc.update({'session': {'id': p.asid}}) -%}{%- endif -%}
+{%- endif -%}
+{%- set user = {'id': actor.id} -%}
+{%- if kind in ['fail', 'login'] -%}{%- do user.update({'name': actor.name}) -%}{%- endif -%}
+{%- set related = {'ip': [p.ip], 'user': [actor.id]} -%}
+{%- if op is not none -%}
+  {%- do user.update({'target': {'id': target_id}}) -%}
+  {%- do related.user.append(target_id) -%}
+{%- endif -%}
+{%- set doc = {
+    '@timestamp': event_time.strftime('%Y-%m-%dT%H:%M:%S.%f')[:23] ~ 'Z',
+    'agent': {'ephemeral_id': params.collector_ephemeral_id, 'id': params.collector_id,
+              'name': params.hostname, 'type': 'filebeat', 'version': params.collector_version},
+    'data_stream': {'dataset': 'keycloak.log', 'namespace': 'default', 'type': 'logs'},
+    'ecs': {'version': '8.11.0'},
+    'elastic_agent': {'id': params.collector_id, 'snapshot': false, 'version': params.collector_version},
+    'event': event,
+    'host': {'architecture': 'x86_64', 'containerized': true, 'hostname': params.hostname,
+             'ip': [params.host_ip], 'name': params.hostname,
+             'os': {'codename': 'bookworm', 'family': 'debian', 'kernel': '6.1.0-28-amd64',
+                    'name': 'Debian GNU/Linux', 'platform': 'debian', 'type': 'linux', 'version': '12'}},
+    'input': {'type': 'filestream'},
+    'keycloak': kc,
+    'log': {'file': {'path': '/opt/keycloak/data/log/keycloak.log'}, 'level': level,
+            'logger': 'org.keycloak.events', 'offset': offset},
+    'process': {'thread': {'name': thread}},
+    'related': related,
+    'source': {'address': p.ip, 'ip': p.ip},
+    'tags': ['preserve_original_event', 'forwarded', 'keycloak-log'],
+    'user': user} -%}
+{%- if url is not none -%}
+  {%- set parts = url.split('/') -%}
+  {%- do doc.update({'url': {'original': url, 'scheme': parts[0][:-1], 'domain': parts[2],
+      'path': '/' ~ parts[3:] | join('/')}}) -%}
+  {%- do related.update({'hosts': [parts[2]]}) -%}
+{%- endif -%}
+{{- doc | tojson -}}
