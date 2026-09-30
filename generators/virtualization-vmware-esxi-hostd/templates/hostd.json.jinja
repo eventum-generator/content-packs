@@ -1,0 +1,135 @@
+{#- ESXi 8 hostd native messages with an explicit ECS wrapper.
+    One timestamp emits one row. Pending records are bounded by the admission limit plus 20 VM restores;
+    authentication history has three timestamps per fixed client. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = ts.timestamp() -%}
+{%- set interval = params.anomaly_interval_hours * 3600 -%}
+{%- macro schedule(lo, hi, squared=true) -%}
+  {%- set candidates = [] -%}{%- set weights = [] -%}
+  {%- for _ in range(96) -%}
+    {%- set t = module.rand.number.floating(lo, hi) -%}
+    {%- set h = module.datetime.datetime.fromtimestamp(t, module.datetime.timezone.utc).hour -%}
+    {%- set w = 1.0 if 8 <= h < 18 else 0.04 -%}
+    {%- do candidates.append(t) -%}{%- do weights.append(w * w + 0.001 if squared else w) -%}
+  {%- endfor -%}
+  {{- module.rand.weighted_choice(candidates, weights) -}}
+{%- endmacro -%}
+{%- if shared.get('clients') is none -%}
+  {%- do module.pydantic_core.SchemaValidator({'type':'typed-dict','fields':{
+    'anomaly_mode':{'type':'typed-dict-field','schema':{'type':'bool','strict':true}},
+    'anomaly_interval_hours':{'type':'typed-dict-field','schema':{'type':'float','ge':2,'le':8760}},
+    'host_name':{'type':'typed-dict-field','schema':{'type':'str','pattern':'^[A-Za-z0-9][A-Za-z0-9.-]{0,126}$'}}
+  }}).validate_python(params) -%}
+  {%- set clients = [] -%}
+  {%- for a in samples.clients -%}
+    {%- do clients.append({'user':a.user,'ip':a.ip,'auto':a.auto,'agent':a.agent,'failures':[],'prefix':0,'consecutive':0,'reserved':0,'weight':module.rand.number.floating(0.7,1.3)}) -%}
+  {%- endfor -%}
+  {%- set vms = {} -%}{%- for v in samples.vms -%}{%- do vms.update({v.id:true}) -%}{%- endfor -%}
+  {%- do shared.update({'clients':clients,'vms':vms,'queue':[],'last_actor':none,'last_vm':none,'episode':false,
+    'next_episode':schedule(now,now + [interval,86400]|min,false)|float,'evkey':module.rand.number.integer(1000,90000),'taskkey':module.rand.number.integer(1000000,5000000)}) -%}
+{%- endif -%}
+{%- set clients = shared.get('clients') -%}
+{%- set queue = shared.get('queue') -%}
+{%- set vms = shared.get('vms') -%}
+{%- macro session(ai, episode=false) -%}
+  {%- set a = clients[ai] -%}
+  {%- set sid = module.rand.crypto.uuid4() -%}
+  {%- set opid = 'esxui-' ~ module.rand.string.hex(4) ~ '-' ~ module.rand.string.hex(4) -%}
+  {%- set failures = 3 if episode else module.rand.weighted_choice([0,1,2,3],[980,17,2.7,0.3]) -%}
+  {%- set failures = [failures,4-a.consecutive-a.reserved]|min -%}
+  {%- do a.update({'reserved':a.reserved+failures}) -%}
+  {%- do queue.append({'due':now,'a':ai,'kind':'auth','left':failures,'episode':episode,'sid':sid,'opid':opid,'start':now}) -%}
+{%- endmacro -%}
+{#- Episodes own independent sessions. They never update or replace an
+    existing ordinary session; the same cap admits both kinds. -#}
+{%- if params.anomaly_mode and not shared.get('episode') and now >= shared.get('next_episode') and queue|length < 62 -%}
+  {%- set eligible = [] -%}{%- set weights = [] -%}
+  {%- for a in clients if not a.auto -%}
+    {%- set ai = clients.index(a) -%}
+    {%- if ai != shared.get('last_actor') and a.consecutive+a.reserved <= 1 -%}{%- do eligible.append(ai) -%}{%- do weights.append(a.weight) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if eligible -%}
+  {%- set ai = module.rand.weighted_choice(eligible,weights) -%}
+  {{- session(ai,true) -}}
+  {%- set window = [interval/4,21600]|min -%}
+  {%- do shared.update({'episode':true,'last_actor':ai,'next_episode':schedule(now+interval-window/2,now+interval+window/2)|float}) -%}
+{%- endif -%}
+{%- endif -%}
+{%- set due = queue|selectattr('due','le',now)|list -%}
+{%- if not due and queue|length < 64 -%}
+  {%- set eligible=[] -%}{%- set weights=[] -%}
+  {%- for ai in range(clients|length) if clients[ai].auto == ('automation' in tags) -%}
+    {%- do eligible.append(ai) -%}{%- do weights.append(clients[ai].weight) -%}
+  {%- endfor -%}
+  {{- session(module.rand.weighted_choice(eligible,weights)) -}}
+  {%- set due = queue|selectattr('due','le',now)|list -%}
+{%- endif -%}
+{#- At the cap, finish the oldest queued row rather than admit more work. -#}
+{%- set item = ((due if due else queue)|sort(attribute='due'))[0] -%}
+{%- do queue.remove(item) -%}
+{%- set a = clients[item.a] -%}
+{%- set r = namespace(action='',sub='Vimsvc.ha-eventmgr',body='',level='In(166)',tid=none,operation=none) -%}
+{%- set key = shared.get('evkey')+1 -%}{%- do shared.set('evkey',key) -%}
+{%- set ctx = 'opID=' ~ item.opid ~ ' sid=' ~ item.sid[:8] -%}
+{%- if item.kind == 'auth' -%}
+  {%- if item.left > 0 -%}
+    {%- set r.action='auth-failed' -%}{%- set r.sub='Vimsvc.HaSessionManager' -%}{%- set r.level='Wa(164)' -%}
+    {%- set r.body='Rejected password for user ' ~ a.user ~ ' from ' ~ a.ip ~ ' - session=' ~ item.sid -%}
+    {%- do a.update({'reserved':a.reserved-1,'consecutive':a.consecutive+1}) -%}
+    {%- do a.failures.append(now) -%}{%- if a.failures|length > 3 -%}{%- do a.failures.pop(0) -%}{%- endif -%}
+    {%- do queue.append(dict(item,due=now+module.rand.number.floating(3,12),left=item.left-1)) -%}
+  {%- else -%}
+    {%- do a.update({'consecutive':0}) -%}
+    {%- set r.action='login' -%}
+    {%- set r.body='Event ' ~ key ~ ' : User ' ~ a.user ~ '@' ~ a.ip ~ ' logged in as ' ~ a.agent -%}
+    {%- if a.failures|length == 3 and now-a.failures[0] <= 1800 -%}{%- do a.update({'prefix':a.failures[0]}) -%}{%- endif -%}
+    {%- set task = item.episode or (not a.auto and module.rand.chance(0.06)) -%}
+    {%- do queue.append(dict(item,due=now+module.rand.number.floating(10,40),kind='task' if task else 'logout',start=now)) -%}
+  {%- endif -%}
+{%- elif item.kind == 'task' -%}
+  {%- set op = 'powerOff' if item.episode else module.rand.weighted_choice(['powerOff','createSnapshot'],[15,85]) -%}
+  {%- if op == 'powerOff' and not item.episode and a.prefix and now-a.prefix <= 1800 -%}{%- set op='createSnapshot' -%}{%- endif -%}
+  {%- set available=[] -%}
+  {%- for vm,up in vms.items() if up and (not item.episode or vm != shared.get('last_vm')) -%}{%- do available.append(vm) -%}{%- endfor -%}
+  {%- if not available -%}{%- set op='createSnapshot' -%}{%- set available=vms|list -%}{%- endif -%}
+  {%- set vm=module.rand.choice(available) -%}
+  {%- set taskkey=shared.get('taskkey')+1 -%}{%- do shared.set('taskkey',taskkey) -%}
+  {%- set tid='haTask-' ~ vm ~ '-vim.VirtualMachine.' ~ op ~ '-' ~ taskkey -%}
+  {%- set r.action='vm-poweroff-request' if op=='powerOff' else 'vm-snapshot-request' -%}
+  {%- set r.sub='Vimsvc.TaskManager' -%}{%- set r.body='Task Created : ' ~ tid -%}{%- set r.tid=tid -%}{%- set r.operation=op -%}
+  {%- set ctx=ctx ~ ' user=' ~ a.user -%}
+  {%- do queue.append(dict(item,kind='done',due=now+module.rand.number.floating(2,10),tid=tid,operation=op,vm=vm)) -%}
+  {%- if op=='powerOff' -%}
+    {%- do vms.update({vm:false}) -%}
+    {%- do queue.append(dict(item,kind='restore',due=now+module.rand.number.floating(300,900),vm=vm,episode=false)) -%}
+    {%- if item.episode -%}{%- do shared.set('last_vm',vm) -%}{%- endif -%}
+  {%- endif -%}
+  {%- if item.episode -%}{%- do shared.set('episode',false) -%}{%- endif -%}
+{%- elif item.kind=='restore' -%}
+  {%- set taskkey=shared.get('taskkey')+1 -%}{%- do shared.set('taskkey',taskkey) -%}
+  {%- set tid='haTask-' ~ item.vm ~ '-vim.VirtualMachine.powerOn-' ~ taskkey -%}
+  {%- set r.action='vm-poweron-request' -%}{%- set r.sub='Vimsvc.TaskManager' -%}{%- set r.body='Task Created : ' ~ tid -%}{%- set r.tid=tid -%}{%- set r.operation='powerOn' -%}
+  {%- set ctx=ctx ~ ' user=' ~ a.user -%}
+  {%- do vms.update({item.vm:true}) -%}
+  {%- do queue.append(dict(item,kind='restored',due=now+module.rand.number.floating(2,10),tid=tid,operation='powerOn')) -%}
+{%- elif item.kind in ['done','restored'] -%}
+  {%- set r.action='task-completed' -%}{%- set r.sub='Vimsvc.TaskManager' -%}{%- set r.body='Task Completed : ' ~ item.tid ~ ' Status success' -%}{%- set r.tid=item.tid -%}{%- set r.operation=item.operation -%}
+  {%- set ctx=ctx ~ ' user=' ~ a.user -%}
+  {%- if item.kind=='restored' or item.operation != 'powerOff' -%}{%- do queue.append(dict(item,kind='logout',due=now+module.rand.number.floating(10,60))) -%}{%- endif -%}
+{%- else -%}
+  {%- set r.action='logout' -%}
+  {%- set login=module.datetime.datetime.fromtimestamp(item.start,module.datetime.timezone.utc) -%}
+  {%- set r.body='Event ' ~ key ~ ' : User ' ~ a.user ~ '@' ~ a.ip ~ ' logged out (login time: ' ~ login.strftime('%A, %d %B, %Y %I:%M:%S %p') ~ ', number of API invocations: ' ~ module.rand.number.integer(1,40) ~ ', user agent: ' ~ a.agent ~ ')' -%}
+{%- endif -%}
+{%- set stamp=ts.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d'|format(ts.microsecond//1000) ~ 'Z' -%}
+{%- set pid=module.rand.number.integer(2099000,2103999) -%}
+{%- set original=stamp ~ ' ' ~ r.level ~ ' Hostd[' ~ pid ~ ']: [Originator@6876 sub=' ~ r.sub ~ ' ' ~ ctx ~ '] ' ~ r.body -%}
+{%- set auth=r.action in ['login','logout','auth-failed'] -%}
+{%- set event={'@timestamp':stamp,'ecs':{'version':'8.17.0'},
+  'event':{'kind':'event','category':['authentication'] if auth else ['configuration'],'type':['end' if r.action in ['logout','task-completed'] else 'start' if auth else 'change'],'action':r.action,'outcome':'failure' if r.action=='auth-failed' else 'success','original':original},
+  'host':{'name':params.host_name},'log':{'file':{'path':'/var/run/log/hostd.log'},'level':'warning' if r.action=='auth-failed' else 'info'},
+  'process':{'name':'Hostd','pid':pid},'source':{'ip':a.ip},'user':{'name':a.user},'related':{'user':[a.user],'ip':[a.ip]},
+  'vmware':{'esxi':{'subsystem':r.sub,'message':r.body}}} -%}
+{%- if auth -%}{%- do event.vmware.esxi.update({'client_agent':a.agent}) -%}{%- endif -%}
+{%- if r.tid is not none -%}{%- do event.vmware.esxi.update({'task_id':r.tid,'operation':r.operation}) -%}{%- endif -%}
+{{- event|tojson -}}
