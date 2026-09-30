@@ -1,0 +1,411 @@
+{#- Microsoft DNS Server Audit and Analytical records as parsed ECS JSON.
+    Every input timestamp yields exactly one record at that time; the
+    input sets the rate and its hour-of-day curve. A small queue holds
+    scheduled records - answers, drops and further names of a lookup,
+    Windows DNS client retransmissions of dropped queries (1, 1, 2, 4 s),
+    policy creations and deletions of administrator sessions and episode
+    steps. The earliest due queued record takes the timestamp; otherwise
+    the timestamp starts a new client lookup. State changes (a policy
+    created or deleted, a query dropped or answered) take effect when
+    their record is emitted, and records are emitted in the order of
+    their scheduled times. Times are in microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- set hq = module.heapq -%}
+{%- set hour = 3600000000 -%}
+{#- Chain window, counted from the 577: a background deletion by the
+    creator within this window, after at least three dropped queries,
+    would complete the chain; it deletes another active policy instead
+    (see the 580 row). -#}
+{%- set window = 3600000000 -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its hour weighted by the
+      administrator activity curve squared plus a small floor. -#}
+  {%- set curve = shared.get('curve') -%}
+  {%- set top = (curve | max) ** 2 + 0.02 -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, top) < curve[((c + shared.get('tzoff')) // 3600000000) % 24] ** 2 + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro other_admin(ai) -%}
+  {%- set idx = range(samples.admins | length) | reject('equalto', ai) | list -%}
+  {%- set ws = [] -%}
+  {%- for i in idx -%}{%- do ws.append(1 / samples.admins[i].gap_h) -%}{%- endfor -%}
+  {{- module.rand.weighted_choice(idx, ws) -}}
+{%- endmacro -%}
+{%- macro received(it, d) -%}
+  {#- Effects of a received query (256) with scheduled time d: dropped
+      (259 right after it, and a retransmission while the client still
+      waits) if an active policy matches the name, otherwise answered
+      (257) after the answer time. -#}
+  {%- set qn = samples.queries[it.n].qname -%}
+  {%- set active = shared.get('active') -%}
+  {%- set hit = namespace(p=none) -%}
+  {%- for pname, pol in active.items() if hit.p is none and (qn.endswith(pol.m) if pol.wild else qn == pol.m) -%}{%- set hit.p = pname -%}{%- endfor -%}
+  {%- if hit.p is not none -%}
+    {{- push(d, {'k': 'row', 'code': 259, 'c': it.c, 'n': it.n, 'xid': it.xid, 'pol': hit.p}) -}}
+    {%- if it.a < 4 -%}
+      {{- push(d + [1, 1, 2, 4][it.a] * 1000000 + (ln(0.004, 0.8) | int), {'k': 'row', 'code': 256, 'c': it.c, 'n': it.n, 'a': it.a + 1, 'xid': it.xid, 'port': it.port}) -}}
+    {%- endif -%}
+  {%- else -%}
+    {%- set el = ln(0.0007, 0.7) | int -%}
+    {{- push(d + el, {'k': 'row', 'code': 257, 'c': it.c, 'n': it.n, 'xid': it.xid, 'port': it.port, 'guid': it.guid, 'el': el}) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 2, 'le': 8760}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python({'anomaly_mode': params.anomaly_mode, 'anomaly_interval_hours': params.anomaly_interval_hours}) -%}
+  {#- Relative administrator activity by hour of the generator timezone
+      (peak 1): admin sessions are thinned by it; episode starts are
+      weighted by its square. Client traffic follows the input. -#}
+  {%- do shared.update({'queue': [], 'seq': 0, 'active': {}, 'recent': [], 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()) * 1000000, 'record': module.rand.number.integer(2000, 60000), 'guarded': 0, 'suppressed': 0, 'curve': [0.08, 0.06, 0.05, 0.05, 0.06, 0.1, 0.25, 0.55, 0.85, 1.0, 1.0, 0.95, 0.85, 0.95, 1.0, 1.0, 0.9, 0.7, 0.45, 0.3, 0.2, 0.15, 0.12, 0.1]}) -%}
+  {%- set ccw = namespace(v=[], acc=0) -%}
+  {%- for _ in samples.clients -%}
+    {%- set ccw.acc = ccw.acc + module.rand.number.lognormal(0, 0.9) -%}
+    {%- do ccw.v.append(ccw.acc) -%}
+  {%- endfor -%}
+  {%- set qcw = namespace(v=[], acc=0) -%}
+  {%- for row in samples.queries -%}
+    {%- set qcw.acc = qcw.acc + row.weight -%}
+    {%- do qcw.v.append(qcw.acc) -%}
+  {%- endfor -%}
+  {%- do shared.update({'ccw': ccw.v, 'ci': range(samples.clients | length) | list, 'qcw': qcw.v, 'qi': range(samples.queries | length) | list}) -%}
+  {#- Episode admin weights: episodes go to the administrators who own
+      an area (a target they manage), in proportion to their activity
+      (1 / gap_h). An episode excludes the previous episode's admin, so
+      the weights are solved such that the long-run episode share per
+      admin equals that activity share. -#}
+  {%- set pa = [] -%}
+  {%- for row in samples.admins -%}{%- do pa.append(1 / row.gap_h if row.area else 0) -%}{%- endfor -%}
+  {%- set ew = namespace(v=pa) -%}
+  {%- for _ in range(200) -%}
+    {%- set tot = ew.v | sum -%}
+    {%- set nxt = [] -%}
+    {%- for i in range(pa | length) -%}{%- do nxt.append(pa[i] / (tot - ew.v[i])) -%}{%- endfor -%}
+    {%- set ns = nxt | sum -%}
+    {%- set ew.v = nxt | map('float') | list -%}
+    {%- set scaled = [] -%}
+    {%- for x in ew.v -%}{%- do scaled.append(x / ns) -%}{%- endfor -%}
+    {%- set ew.v = scaled -%}
+  {%- endfor -%}
+  {%- set threads = [] -%}
+  {%- for _ in range(module.rand.number.integer(6, 12)) -%}{%- do threads.append(4 * module.rand.number.integer(200, 2500)) -%}{%- endfor -%}
+  {%- set area = [] -%}
+  {%- for row in samples.admins -%}
+    {%- set m = namespace(v=none) -%}
+    {%- for tg in samples.targets -%}{%- if tg.label == row.area -%}{%- set m.v = loop.index0 -%}{%- endif -%}{%- endfor -%}
+    {%- do area.append(m.v) -%}
+  {%- endfor -%}
+  {%- do shared.update({'area': area, 'ep_w': ew.v, 'pid': 4 * module.rand.number.integer(300, 1500), 'threads': threads}) -%}
+  {%- for row in samples.admins -%}
+    {{- push(now + module.builtins.int(module.rand.number.floating(0, 1) * (ln(row.gap_h * 3600, 0.8) | int)), {'k': 'adm', 'a': loop.index0}) -}}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'ep_last_admin': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- set active = shared.get('active') -%}
+{%- set curve = shared.get('curve') -%}
+{%- set tzoff = shared.get('tzoff') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode: at the first timestamp at or after the drawn start, and
+    after a random delay, an admin other than the previous episode's
+    creates an Ignore policy for a target other than the previous
+    episode's. Client traffic is unchanged; the policy drops whatever
+    queries match it, and once three have been dropped the creator
+    deletes it again inside the chain window. The first start falls
+    within the first min(interval, 24 h); each later start within a
+    window of min(interval / 4, 6 h) centred one interval after the
+    actual start, weighted by the activity curve squared. Missed
+    episodes are not replayed. Episode records are queued like any
+    administrator record and take over the next timestamp once due. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {{- push(now + (ln(45, 0.8) | int), {'k': 'epc'}) -}}
+  {%- do shared.set('ep_due', now + 1000 * 24 * hour) -%}
+{%- endif -%}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(64) if out.row is none and queue and queue[0][0] <= now -%}
+  {%- set top = hq.heappop(queue) -%}
+  {%- set due = top[0] -%}
+  {%- set item = top[2] -%}
+  {%- if item.k == 'row' and item.code == 256 -%}
+    {%- do item.update({'guid': '{' ~ (module.rand.crypto.uuid4() | string | upper) ~ '}'}) -%}
+    {{- received(item, due) -}}
+    {%- set out.row = item -%}
+  {%- elif item.k == 'row' and item.code == 257 -%}
+    {%- set out.row = item -%}
+  {%- elif item.k == 'row' and item.code == 259 -%}
+    {%- set pol = active.get(item.pol) -%}
+    {%- if pol is none -%}{%- set pol = {'ep': false, 'drops': 0, 'planned': true} -%}{%- endif -%}
+    {%- do pol.update({'drops': pol.drops + 1}) -%}
+    {%- if pol.ep and not pol.planned and pol.drops >= 3 -%}
+      {%- do pol.update({'planned': true}) -%}
+      {{- push([due + (ln(180, 0.9) | int), pol.deadline] | min, {'k': 'row', 'code': 580, 'p': item.pol, 'by': pol.by, 'own': true}) -}}
+    {%- endif -%}
+    {%- set out.row = item -%}
+  {%- elif item.k == 'row' and item.code == 577 -%}
+    {#- Policy creation for a target without an active policy. An
+        administrator with an area mostly blocks its own target, or
+        another free target when its own is already blocked; an episode
+        always blocks its own. Nothing when no target is free. -#}
+    {%- set taken = [] -%}
+    {%- for pol in active.values() -%}{%- do taken.append(pol.ti) -%}{%- endfor -%}
+    {%- set area = shared.get('area')[item.a] -%}
+    {%- if item.ta is defined -%}
+      {%- set free = [item.ta] | reject('in', taken) | list -%}
+    {%- elif area is not none and (item.ep or module.rand.chance(0.9)) and area not in taken -%}
+      {%- set free = [area] -%}
+    {%- elif item.ep -%}
+      {%- set free = [] -%}
+    {%- else -%}
+      {%- set free = range(samples.targets | length) | reject('in', taken) | list -%}
+    {%- endif -%}
+    {%- if free -%}
+      {%- set ws = [] -%}
+      {%- for i in free -%}{%- do ws.append(samples.targets[i].weight) -%}{%- endfor -%}
+      {%- set ti = module.rand.weighted_choice(free, ws) -%}
+      {%- set tg = samples.targets[ti] -%}
+      {%- set n = namespace(v=params.policy_name ~ '-' ~ tg.label ~ '-' ~ module.rand.string.hex(4) | lower) -%}
+      {%- set recent = shared.get('recent') -%}
+      {%- for _ in range(8) if n.v in recent -%}{%- set n.v = params.policy_name ~ '-' ~ tg.label ~ '-' ~ module.rand.string.hex(4) | lower -%}{%- endfor -%}
+      {%- do recent.append(n.v) -%}
+      {%- if recent | length > 300 -%}{%- do recent.pop(0) -%}{%- endif -%}
+      {%- set crit = tg.criteria.split(',', 1)[1] -%}
+      {%- set wild = crit.startswith('*.') -%}
+      {%- set order = (active | length) + 1 -%}
+      {%- set pol = {'by': item.a, 't0': now, 'ti': ti, 'm': (crit[1:] if wild else crit) ~ '.', 'wild': wild, 'drops': 0, 'ep': item.ep, 'planned': false, 'deadline': due + module.builtins.int(window * module.rand.number.floating(0.4, 0.97))} -%}
+      {%- do active.update({n.v: pol}) -%}
+      {%- set out.row = {'code': 577, 'pol': n.v, 'by': item.a, 'crit': tg.criteria, 'order': order} -%}
+      {%- if item.ep -%}
+        {#- The creator deletes an episode policy after its third drop,
+            or at the deadline if fewer queries reached it. -#}
+        {{- push(pol.deadline, {'k': 'epd', 'p': n.v}) -}}
+        {%- set w = [interval // 4, 6 * hour] | min -%}
+        {%- do shared.update({'ep_last_admin': item.a, 'ep_due': pick_start(due + interval - w // 2, w) | int}) -%}
+      {%- else -%}
+        {#- Background lifetime: a mistake undone by its creator within
+            a minute or so; a block rolled back by a colleague after
+            users complain (about half an hour); a temporary block of
+            about two hours; or a block kept for several hours. -#}
+        {%- set r = module.rand.number.floating(0, 1) -%}
+        {%- if r < 0.2 -%}
+          {%- set life = ln(60, 0.8) | int -%}
+          {%- set same = module.rand.chance(0.95) -%}
+        {%- elif r < 0.6 -%}
+          {%- set life = ln(1500, 0.6) | int -%}
+          {%- set same = false -%}
+        {%- elif r < 0.87 -%}
+          {%- set life = ln(7200, 0.5) | int -%}
+          {%- set same = module.rand.chance(0.6) -%}
+        {%- else -%}
+          {%- set life = ln(18000, 0.5) | int -%}
+          {%- set same = module.rand.chance(0.5) -%}
+        {%- endif -%}
+        {{- push(due + life, {'k': 'row', 'code': 580, 'p': n.v, 'by': item.a if same else other_admin(item.a) | int, 'own': false}) -}}
+        {%- if r < 0.2 and same and module.rand.chance(0.5) -%}
+          {#- The mistake is corrected: the creator adds the policy for
+              the same target again shortly after removing it. -#}
+          {{- push(due + life + (ln(40, 0.6) | int), {'k': 'row', 'code': 577, 'a': item.a, 'ep': false, 'ta': ti}) -}}
+        {%- endif -%}
+      {%- endif -%}
+    {%- elif item.ep -%}
+      {{- push(due + (ln(300, 0.8) | int), {'k': 'epc'}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'row' and item.code == 580 -%}
+    {#- Policy deletion. A background deletion that would complete the
+        chain (by the creator, within the window after the 577, after
+        three drops) keeps its time and account but deletes another
+        active policy whose deletion completes nothing and that is not
+        an episode's; if there is none, it is not performed. The
+        guarded policy stays until an ordinary later deletion. -#}
+    {%- if item.p in active -%}
+      {%- set pol = active[item.p] -%}
+      {%- if item.own or not (item.by == pol.by and now - pol.t0 <= window and pol.drops >= 3) -%}
+        {%- do active.pop(item.p) -%}
+        {%- set out.row = {'code': 580, 'pol': item.p, 'by': item.by} -%}
+      {%- else -%}
+        {%- set cand = [] -%}
+        {%- for qn, q in active.items() if qn != item.p and not q.ep and not (item.by == q.by and now - q.t0 <= window and q.drops >= 3) -%}{%- do cand.append(qn) -%}{%- endfor -%}
+        {%- if cand -%}
+          {%- set qn = module.rand.choice(cand) -%}
+          {%- do active.pop(qn) -%}
+          {%- do shared.set('guarded', shared.get('guarded') + 1) -%}
+          {%- set out.row = {'code': 580, 'pol': qn, 'by': item.by} -%}
+        {%- else -%}
+          {%- do shared.set('suppressed', shared.get('suppressed') + 1) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'adm' -%}
+    {#- Admin session arrival, thinned by the curve of its hour; a
+        session performs one policy operation, sometimes two a minute or
+        so apart. -#}
+    {%- set adm = samples.admins[item.a] -%}
+    {{- push(due + (ln(adm.gap_h * 3600, 0.7) | int), item) -}}
+    {%- if module.rand.chance(curve[((due + tzoff) // hour) % 24]) -%}
+      {%- set n = namespace(v=1, go=true) -%}
+      {%- for _ in range(1) if n.go -%}
+        {%- if module.rand.chance(0.2) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
+      {%- endfor -%}
+      {{- push(due, {'k': 'op', 'a': item.a, 'left': n.v}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'op' -%}
+    {#- Delete an active policy picked at random (cleanup), or create a
+        policy. An episode's policy is left to its creator. -#}
+    {%- set names = [] -%}
+    {%- for pn, pol in active.items() if not pol.ep -%}{%- do names.append(pn) -%}{%- endfor -%}
+    {%- if names and module.rand.chance(0.12) -%}
+      {{- push(due, {'k': 'row', 'code': 580, 'p': module.rand.choice(names), 'by': item.a, 'own': false}) -}}
+    {%- else -%}
+      {{- push(due, {'k': 'row', 'code': 577, 'a': item.a, 'ep': false}) -}}
+    {%- endif -%}
+    {%- if item.left > 1 -%}
+      {{- push(due + (ln(70, 0.9) | int), {'k': 'op', 'a': item.a, 'left': item.left - 1}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'epc' -%}
+    {#- Episode admin: an account other than the previous episode's
+        whose own name has no active policy; if there is none, try
+        again later. -#}
+    {%- set taken = [] -%}
+    {%- for pol in active.values() -%}{%- do taken.append(pol.ti) -%}{%- endfor -%}
+    {%- set idx = [] -%}
+    {%- for i in range(samples.admins | length) if samples.admins[i].area and i != shared.get('ep_last_admin') and shared.get('area')[i] not in taken -%}{%- do idx.append(i) -%}{%- endfor -%}
+    {%- if idx -%}
+      {%- set ws = [] -%}
+      {%- for i in idx -%}{%- do ws.append(shared.get('ep_w')[i]) -%}{%- endfor -%}
+      {{- push(due, {'k': 'row', 'code': 577, 'a': module.rand.weighted_choice(idx, ws), 'ep': true}) -}}
+    {%- else -%}
+      {{- push(due + (ln(1800, 0.5) | int), {'k': 'epc'}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'epd' -%}
+    {#- Episode deadline: the creator deletes the policy even if fewer
+        than three queries were dropped. -#}
+    {%- if item.p in active and not active[item.p].planned -%}
+      {%- set pol = active[item.p] -%}
+      {%- do pol.update({'planned': true}) -%}
+      {{- push(due, {'k': 'row', 'code': 580, 'p': item.p, 'by': pol.by, 'own': true}) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.row is none -%}
+  {#- A new client lookup: one name, or several distinct names resolved
+      in parallel within a millisecond or so (application start, logon);
+      the further names are queued right behind the first. -#}
+  {%- set ci = module.random.choices(shared.get('ci'), cum_weights=shared.get('ccw'))[0] -%}
+  {%- set b = namespace(n=1, go=module.rand.chance(0.45), t=now, names=[]) -%}
+  {%- for _ in range(5) if b.go -%}
+    {%- set b.n = b.n + 1 -%}
+    {%- set b.go = module.rand.chance(0.5) -%}
+  {%- endfor -%}
+  {%- for _ in range(b.n) -%}
+    {%- set qi = module.random.choices(shared.get('qi'), cum_weights=shared.get('qcw'))[0] -%}
+    {%- if qi not in b.names -%}
+      {%- do b.names.append(qi) -%}
+      {%- set it = {'k': 'row', 'code': 256, 'c': ci, 'n': qi, 'a': 0, 'xid': module.rand.number.integer(1, 65535), 'port': module.rand.number.integer(49152, 65535)} -%}
+      {%- if out.row is none -%}
+        {%- do it.update({'guid': '{' ~ (module.rand.crypto.uuid4() | string | upper) ~ '}'}) -%}
+        {{- received(it, now) -}}
+        {%- set out.row = it -%}
+      {%- else -%}
+        {{- push(b.t, it) -}}
+      {%- endif -%}
+      {%- set b.t = b.t + (ln(0.0008, 1.2) | int) -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- set row = out.row -%}
+{%- set moment = ts -%}
+{#- Records in the Elastic microsoft_dnsserver parsed shape: the native
+    event data renamed under microsoft_dnsserver.*, ECS fields added by
+    the ingest pipeline, duplicates kept (preserve_duplicate_custom_fields). -#}
+{%- set code = row.code -%}
+{%- set eid = code | string -%}
+{%- set is_audit = code in [577, 580] -%}
+{%- set is_query = code == 256 -%}
+{%- set is_ignored = code == 259 -%}
+{%- set dataset = 'microsoft_dnsserver.audit' if is_audit else 'microsoft_dnsserver.analytical' -%}
+{%- set out = {'@timestamp': moment.isoformat(timespec='milliseconds').replace('+00:00', 'Z'), 'ecs': {'version': '8.17.0'}, 'event': {'code': eid, 'provider': 'Microsoft-Windows-DNSServer', 'kind': 'event', 'dataset': dataset}, 'data_stream': {'type': 'logs', 'dataset': dataset, 'namespace': 'default'}, 'host': {'name': params.server_name}, 'input': {'type': 'winlog' if is_audit else 'etw'}, 'log': {'level': 'error' if is_ignored else 'information'}, 'process': {'pid': shared.get('pid'), 'thread': {'id': module.rand.choice(shared.get('threads'))}}, 'tags': ['preserve_duplicate_custom_fields']} -%}
+{%- if is_audit -%}
+  {#- Other Audit channel events (zone and record operations, not
+      modeled) take record numbers in between. -#}
+  {%- set record = shared.get('record') + 1 + (module.rand.number.integer(1, 6) if module.rand.chance(0.3) else 0) -%}
+  {%- do shared.set('record', record) -%}
+  {%- set admin = samples.admins[row.by] -%}
+  {%- set policy = row.pol -%}
+  {%- do out.update({'winlog': {'api': 'wineventlog', 'channel': 'Microsoft-Windows-DNSServer/Audit', 'computer_name': params.server_name, 'event_id': eid, 'keywords': ['AUDIT_POLICY'], 'opcode': 'Info', 'provider_guid': '{eb79061a-a566-4698-9119-3ed2807060e7}', 'provider_name': 'Microsoft-Windows-DNSServer', 'record_id': record | string, 'task': 'POLICY_OP', 'user': {'domain': params.domain, 'identifier': params.domain_sid ~ '-' ~ admin.rid, 'name': admin.name, 'type': 'User'}}, 'related': {'user': [admin.name]}}) -%}
+  {%- do out.event.update({'action': 'POLICY_OP'}) -%}
+  {%- if code == 577 -%}
+    {%- set criteria = row.crit -%}
+    {%- do out.update({'message': 'A server level policy ' ~ policy ~ ' for Query processing  has been created on server ' ~ params.server_name ~ ' with following properties: Processing order:' ~ row.order ~ '; Criteria:' ~ criteria ~ '; Action:Ignore; Condition:And; IsEnabled:True.', 'microsoft_dnsserver': {'audit': {'action': 'Ignore', 'condition': 'And', 'criteria': criteria, 'is_enabled': 'True', 'name_server': params.server_name, 'policy': policy, 'processing_order': row.order | string, 'type': 'Query processing'}}}) -%}
+  {%- else -%}
+    {%- do out.update({'message': 'The server level policy ' ~ policy ~ ' has been deleted from server ' ~ params.server_name ~ '.', 'microsoft_dnsserver': {'audit': {'name_server': params.server_name, 'policy': policy}}}) -%}
+  {%- endif -%}
+{%- else -%}
+  {%- set qrow = samples.queries[row.n] -%}
+  {%- set qname = qrow.qname -%}
+  {%- set client = samples.clients[row.c].ip -%}
+  {#- Ignored queries carry an empty InterfaceIP, as in the published
+      259 record; the pipeline then sets no interface_ip. -#}
+  {%- set iface = '' if is_ignored else params.server_ip -%}
+  {%- set name = namespace(wire='') -%}
+  {%- set labels = qname.rstrip('.').split('.') -%}
+  {%- for label in labels -%}
+    {%- set name.wire = name.wire ~ ('%02X' % (label | length)) ~ label.encode('ascii').hex().upper() -%}
+  {%- endfor -%}
+  {%- set question = name.wire ~ '00' ~ '0001' ~ '0001' -%}
+  {%- set xid_hex = '%04X' % row.xid -%}
+  {%- set xid = row.xid | string -%}
+  {%- set kw = 'QUERY_RECEIVED' if is_query else ('IGNORED_QUERY' if is_ignored else 'RESPONSE_SUCCESS') -%}
+  {%- do out.update({'winlog': {'channel': 'Microsoft-Windows-DNS-Server/Analytical', 'flags': ['64_BIT_HEADER', 'EXTENDED_INFO', 'PROCESSOR_INDEX'], 'flags_raw': '0x241', 'keywords': [kw], 'keywords_raw': '0x8000000000000001' if is_query else ('0x8000000000000008' if is_ignored else '0x8000000000000002'), 'level': 'Error' if is_ignored else 'Information', 'level_raw': 2 if is_ignored else 4, 'opcode_raw': 0, 'provider_guid': '{EB79061A-A566-4698-9119-3ED2807060E7}', 'provider_message': 'Microsoft-Windows-DNS-Server', 'session': 'Microsoft-Windows-DNSServer-Analytical.etl', 'task': 'LOOK_UP', 'task_raw': 1, 'version': 0}, 'user': {'id': 'NT AUTHORITY\\SYSTEM'}}) -%}
+  {%- do out.event.update({'action': 'LOOK_UP', 'category': ['network'], 'type': ['protocol'], 'severity': 2 if is_ignored else 4}) -%}
+  {%- do out.log.update({'file': {'path': 'Microsoft-Windows-DNSServer-Analytical.etl'}}) -%}
+  {#- registered_domain processor (public suffix list): the zone sits
+      under the public suffix "com". -#}
+  {%- set dq = {'name': labels | join('.'), 'registered_domain': labels[-2:] | join('.'), 'top_level_domain': labels[-1], 'type': 'A'} -%}
+  {%- if labels | length > 2 -%}{%- do dq.update({'subdomain': labels[:-2] | join('.')}) -%}{%- endif -%}
+  {%- set ana = {'additional_info': '.', 'question_name': qname, 'question_type': 'A', 'xid': xid} -%}
+  {%- if iface -%}{%- do ana.update({'interface_ip': iface}) -%}{%- endif -%}
+  {%- set rel = [client] -%}
+  {%- if iface and iface != client -%}{%- do rel.append(iface) -%}{%- endif -%}
+  {%- do out.update({'dns': {'id': xid, 'question': dq}, 'related': {'ip': rel}, 'microsoft_dnsserver': {'analytical': ana}}) -%}
+  {%- if is_query -%}
+    {%- set packet = '0x' ~ xid_hex ~ '01000001000000000000' ~ question -%}
+    {%- set size = (packet | length - 2) // 2 -%}
+    {%- do ana.update({'bytes_sent': size, 'description': 'Query received', 'guid': row.guid, 'packet_data': packet, 'source': {'ip': client, 'port': row.port}}) -%}
+    {%- do out.update({'source': {'ip': client, 'port': row.port}, 'network': {'bytes': size, 'direction': 'ingress', 'protocol': 'dns', 'transport': 'udp'}, 'message': 'QUERY_RECEIVED: TCP=0; InterfaceIP=' ~ iface ~ '; Source=' ~ client ~ '; RD=1; QNAME=' ~ qname ~ '; QTYPE=1; XID=' ~ xid ~ '; Port=' ~ row.port ~ '; Flags=256; PacketData=' ~ packet ~ '; AdditionalInfo = VirtualizationInstanceOptionValue: .; GUID=' ~ row.guid}) -%}
+    {%- do out.dns.update({'header_flags': ['RD']}) -%}
+  {%- elif is_ignored -%}
+    {%- do ana.update({'description': 'Ignored query', 'policy_name': row.pol, 'reason': 'Policy', 'source': {'ip': client}, 'zone': params.zone}) -%}
+    {%- do out.event.update({'reason': 'Policy'}) -%}
+    {%- do out.update({'source': {'ip': client}, 'network': {'direction': 'ingress', 'protocol': 'dns', 'transport': 'udp'}, 'message': 'IGNORED_QUERY: TCP=0; InterfaceIP=' ~ iface ~ '; Source=' ~ client ~ '; Reason=Policy; QNAME=' ~ qname ~ '; QTYPE=1; XID=' ~ xid ~ '; Zone=' ~ params.zone ~ '; PolicyName=' ~ row.pol ~ '; AdditionalInfo = VirtualizationInstance: .'}) -%}
+  {%- else -%}
+    {%- set ip = namespace(wire='') -%}
+    {%- for octet in qrow.answer_ip.split('.') -%}{%- set ip.wire = ip.wire ~ ('%02X' % (octet | int)) -%}{%- endfor -%}
+    {%- set packet = '0x' ~ xid_hex ~ '85000001000100000000' ~ question ~ 'C00C000100010000012C0004' ~ ip.wire -%}
+    {%- set size = (packet | length - 2) // 2 -%}
+    {%- set elapsed = (row.el // 1000) | string -%}
+    {%- do ana.update({'additional_info': 'VirtualizationInstance:.', 'bytes_sent': size, 'description': 'Response success', 'destination': {'ip': client, 'port': row.port}, 'dnssec': '0', 'elapsed_time': elapsed, 'guid': row.guid, 'packet_data': packet, 'response_code': 'NoError', 'scope': 'Default', 'zone': params.zone}) -%}
+    {%- do out.event.update({'outcome': 'success'}) -%}
+    {%- do out.update({'destination': {'ip': client, 'port': row.port}, 'network': {'bytes': size, 'direction': 'egress', 'protocol': 'dns', 'transport': 'udp'}, 'message': 'RESPONSE_SUCCESS: TCP=0; InterfaceIP=' ~ iface ~ '; Destination=' ~ client ~ '; AA=1; AD=0; QNAME=' ~ qname ~ '; QTYPE=1; XID=' ~ xid ~ '; DNSSEC=0; RCODE=0; Port=' ~ row.port ~ '; Flags=34048; Scope=Default; Zone=' ~ params.zone ~ '; PolicyName=NULL; PacketData=' ~ packet ~ '; AdditionalInfo= VirtualizationInstance:.; ElapsedTime=' ~ elapsed ~ '; GUID=' ~ row.guid ~ ' '}) -%}
+    {%- do out.dns.update({'response_code': 'NoError', 'header_flags': ['AA']}) -%}
+  {%- endif -%}
+{%- endif -%}
+{{- out | tojson -}}
