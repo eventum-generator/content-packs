@@ -1,0 +1,276 @@
+{#- Falco0.45.0 / stable rules5.2.0 syscall alerts. The input sets the
+    rate and the hour-of-day curve; every timestamp becomes exactly one
+    alert, stamped with the timestamp itself.
+    Each timestamp takes the earliest due step of an anomaly episode,
+    else the earliest due child of an open exec session, else starts a
+    new background action: an interactive exec session of a pod drawn
+    by its activity weight (3 of 7), which raises "Terminal shell in
+    container" and queues its bash children (shadow reads and API
+    contacts at lognormal gaps until the session ends), or an API
+    contact of a random pod's application entrypoint (4 of 7,
+    non-interactive, tty 0).
+    API contacts query `/version` or API discovery `/api`.
+    Guard: a session child's API contact that follows a shadow-read child
+    of the same shell at most `guard` seconds after that shell queries
+    `/version`; from `guard` seconds on it queries `/api` at the ordinary
+    12%. Time, pod and lineage stay; only the target of that final step
+    changes, so the complete shell -> read -> `/api` lineage within
+    `guard` stays episode-only. -#}
+{%- from 'templates/_base.json.jinja' import render with context -%}
+{%- set us = 1000000 -%}
+{%- set now = module.builtins.int(timestamp.timestamp()) * us + timestamp.microsecond -%}
+{%- set hq = module.heapq -%}
+{%- set rnd = module.random -%}
+{%- set log = module.math.log -%}
+{%- set hour = 3600 -%}
+{%- set guard = 300 -%}
+{#- Weekday hour-of-day load (UTC) relative to the office-hours unit
+    rate; on Saturday and Sunday the part above the 0.12 floor drops to
+    `weekend`. It repeats the rates of the patterns/ input files and
+    only places episode starts; the input alone sets the alert rate. -#}
+{%- set hload = [0.12, 0.12, 0.12, 0.12, 0.12, 0.12, 0.30, 0.55, 0.95, 0.95, 0.95, 0.95,
+    0.95, 0.95, 0.95, 0.95, 0.95, 0.95, 0.55, 0.30, 0.30, 0.12, 0.12, 0.12] -%}
+{%- set weekend = 0.35 -%}
+{#- Terminal of a new exec session: the lowest pts index not held by
+    another open session of the pod (devpts numbering), as a Linux
+    device number (136 << 8 | index). -#}
+{%- macro pty(i) -%}
+  {%- set held = shared.get('ptys')[i] -%}
+  {%- set k = namespace(v=0) -%}
+  {%- for _ in range(64) if k.v in held -%}{%- set k.v = k.v + 1 -%}{%- endfor -%}
+  {{- 34816 + k.v -}}
+{%- endmacro -%}
+{%- macro push(heap, due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do hq.heappush(heap, [due, s, item]) -%}
+{%- endmacro -%}
+{#- Episode start placement, in seconds: a point of [lo, hi) drawn by
+    hour slot, weighted by the hour load, or by its square plus a small
+    floor. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % hour -%}
+  {%- for k in range((hi - top) // hour + 1) -%}
+    {%- set a = [top + k * hour, lo] | max -%}
+    {%- set b = [top + (k + 1) * hour, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload[(a // hour) % 24] -%}
+      {%- if (a // 86400 + 3) % 7 >= 5 -%}{%- set h = 0.12 + (h - 0.12) * weekend -%}{%- endif -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- rnd.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if shared.get('q') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 1, 'le': 8760}},
+    'api_server_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[0-9]{1,3}(\\.[0-9]{1,3}){3}$'}},
+    'agent_version': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'ecs_version': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'data_stream_namespace': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'log_path': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- do shared.update({'q': [], 'eq': [], 'seq': 0, 'sessions': {}, 'pids': {}, 'live': {}, 'offsets': {},
+      'ep_last': none, 'seen': {}, 'ptys': {}, 'last_ns': 0, 'last_t': none, 'gap': 10.0}) -%}
+  {%- set inventory = [] -%}
+  {#- One fixed cluster: pod activity weights come from a fixed seed, so
+      every run models the same busy and quiet pods and only behaviour
+      is random. -#}
+  {%- set org = module.random.Random(5021) -%}
+  {%- set cum = namespace(v=0.0, list=[]) -%}
+  {%- for row in samples.pods -%}
+    {%- set i = loop.index0 -%}
+    {%- set shim_start = (now // us - rnd.randint(2 * 86400, 30 * 86400)) * 1000000000 + rnd.randint(0, 999999999) -%}
+    {%- set w = org.lognormvariate(0, 0.8) -%}
+    {%- do inventory.append({'container_id': row.container_id, 'container_name': row.container_name,
+        'pod_name': row.pod_name, 'namespace': row.namespace, 'pod_ip': row.pod_ip,
+        'image_repository': row.image.rsplit(':', 1)[0], 'image_tag': row.image.rsplit(':', 1)[1],
+        'node': row.node, 'node_id': row.node_id, 'node_ip': row.node_ip, 'node_mac': row.node_mac, 'uid': row.uid,
+        'w': w,
+        'shim': {'pid': 50000 + i, 'start': shim_start, 'name': 'containerd-shim'},
+        'app': {'pid': 60000 + i * 40 + rnd.randint(1, 39),
+          'start': shim_start + rnd.randint(200, 4000) * 1000000 + rnd.randint(0, 999999), 'name': 'sh'}}) -%}
+    {%- set cum.v = cum.v + w -%}
+    {%- do cum.list.append(cum.v) -%}
+    {%- do shared.get('seen').update({i: {'tty': {}, 'shell': {}, 'read': {}, 'api': {}}}) -%}
+    {%- do shared.get('ptys').update({i: []}) -%}
+    {%- if row.node not in shared.get('pids') -%}
+      {%- do shared.get('pids').update({row.node: 100000 + rnd.randint(0, 400000)}) -%}
+      {%- do shared.get('live').update({row.node: []}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.update({'inventory': inventory, 'cum': cum.list, 'total_w': cum.v}) -%}
+  {%- if params.anomaly_mode -%}
+    {#- First start: a point of the first min(interval, 24 h) drawn from
+        the background hour-of-day curve. -#}
+    {%- set t0 = now // us -%}
+    {%- do shared.set('start_at', (pick_start(t0, t0 + [module.builtins.int(params.anomaly_interval_hours * hour), 24 * hour] | min, false) | int) * us + rnd.randint(0, us - 1)) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set inventory = shared.get('inventory') -%}
+{%- set sessions = shared.get('sessions') -%}
+{%- set q = shared.get('q') -%}
+{%- set eq = shared.get('eq') -%}
+{#- Recent spacing of timestamps (exponential moving average, seconds):
+    the episode keeps its whole chain clear of the detection window by
+    a margin of six average gaps. -#}
+{%- if shared.get('last_t') is not none -%}
+  {%- do shared.set('gap', 0.97 * shared.get('gap') + 0.03 * (now - shared.get('last_t')) / us) -%}
+{%- endif -%}
+{%- do shared.set('last_t', now) -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {#- Episode: one exec session of a pod picked by the background session
+      weights, never the previous episode's pod, among busy pods (weight
+      at least 1.8: 109 of the 500 pods, 47% of all sessions, so
+      each chain value recurs in the pod's background of any run) whose
+      own session background already showed, at least twice each, the
+      terminal the new session gets, a shell command, a read command and
+      an `/api` query by a session child; the episode reuses those
+      values, drawn by their background counts. Its shell takes this timestamp; a
+      shadow read and an `/api` query of the same shell follow at the
+      background child gaps, conditioned on the whole chain ending six
+      average gaps before the detection window closes. Next due from
+      this actual start. -#}
+  {%- set cum = shared.get('cum') -%}
+  {%- set pick = namespace(i=none) -%}
+  {%- for _ in range(400) if pick.i is none -%}
+    {%- set c = [module.bisect.bisect_right(cum, rnd.random() * shared.get('total_w')), cum | length - 1] | min -%}
+    {%- set sn = shared.get('seen')[c] -%}
+    {%- if c != shared.get('ep_last') and inventory[c].w >= 1.8 and sn.api.get('curl -ks https://kubernetes.default.svc.cluster.local/api', 0) >= 2
+        and sn.tty.get(pty(c) | int, 0) >= 2 and (sn.shell.values() | list + [0]) | max >= 2
+        and (sn.read.values() | list + [0]) | max >= 2 -%}{%- set pick.i = c -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if pick.i is none -%}
+    {%- do shared.set('start_at', now + rnd.randint(60, 1800) * us) -%}
+  {%- else -%}
+    {%- set limit = [60, guard - 20 - 6 * shared.get('gap')] | max -%}
+    {%- set g = namespace(a=0, b=0, go=true) -%}
+    {%- for _ in range(400) if g.go -%}
+      {%- set g.a = rnd.lognormvariate(log(90), 1.1) -%}
+      {%- set g.b = rnd.lognormvariate(log(100), 1.2) -%}
+      {%- if g.a + g.b < limit -%}{%- set g.go = false -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if g.go -%}{%- set g.a = rnd.uniform(1, limit / 2) -%}{%- set g.b = rnd.uniform(1, limit / 2) -%}{%- endif -%}
+    {%- set seen = shared.get('seen')[pick.i] -%}
+    {%- set sh = seen.shell.items() | selectattr(1, 'ge', 2) | list -%}
+    {%- set rd = seen.read.items() | selectattr(1, 'ge', 2) | list -%}
+    {%- set tty = pty(pick.i) | int -%}
+    {%- do shared.get('ptys')[pick.i].append(tty - 34816) -%}
+    {%- set sid = shared.get('seq') + 1 -%}
+    {%- do shared.set('seq', sid) -%}
+    {%- do sessions.update({sid: {'pod': pick.i, 'pid': none, 'start': none, 'ns': none,
+        'tty': tty, 'read': false, 'left': 3, 'ep': true,
+        'cmds': {'shell': module.rand.weighted_choice(sh | map(attribute=0) | list, sh | map(attribute=1) | list),
+          'read': module.rand.weighted_choice(rd | map(attribute=0) | list, rd | map(attribute=1) | list),
+          'api': 'curl -ks https://kubernetes.default.svc.cluster.local/api'}}}) -%}
+    {{- push(eq, now, {'kind': 'shell', 'pod': pick.i, 'sid': sid}) -}}
+    {{- push(eq, now + module.builtins.int(g.a * us), {'kind': 'read', 'pod': pick.i, 'sid': sid}) -}}
+    {{- push(eq, now + module.builtins.int((g.a + g.b) * us), {'kind': 'api', 'pod': pick.i, 'sid': sid}) -}}
+    {%- do shared.set('ep_last', pick.i) -%}
+    {%- set t0 = now // us -%}
+    {%- set due = t0 + module.builtins.int(params.anomaly_interval_hours * hour) -%}
+    {%- set half = [module.builtins.int(params.anomaly_interval_hours * hour) // 4, 6 * hour] | min // 2 -%}
+    {%- do shared.set('start_at', (pick_start(due - half, due + half, true) | int) * us + rnd.randint(0, us - 1)) -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Take the earliest due episode step, else the earliest due session
+    child, else start a background action. -#}
+{%- if eq and eq[0][0] <= now -%}
+  {%- set it = hq.heappop(eq)[2] -%}
+{%- elif q and q[0][0] <= now -%}
+  {%- set it = hq.heappop(q)[2] -%}
+{%- elif rnd.random() < 3 / 7 -%}
+  {#- Exec session: queue its bash children, shadow reads (55%) and API
+      contacts (45%) at lognormal gaps until the session ends (lognormal
+      duration, median 10 min, at most 4 h and 12 children). -#}
+  {%- set cum = shared.get('cum') -%}
+  {%- set i = [module.bisect.bisect_right(cum, rnd.random() * shared.get('total_w')), cum | length - 1] | min -%}
+  {%- set sid = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', sid) -%}
+  {%- set end = now + module.builtins.int([rnd.lognormvariate(log(600), 1.0), 4 * hour] | min * us) -%}
+  {%- set t = namespace(v=now + module.builtins.int(rnd.lognormvariate(log(90), 1.1) * us), n=0) -%}
+  {%- for _ in range(12) if t.v < end -%}
+    {{- push(q, t.v, {'kind': 'read' if rnd.random() < 0.55 else 'api', 'pod': i, 'sid': sid}) -}}
+    {%- set t.n = t.n + 1 -%}
+    {%- set t.v = t.v + module.builtins.int(rnd.lognormvariate(log(100), 1.2) * us) -%}
+  {%- endfor -%}
+  {%- set tty = pty(i) | int -%}
+  {%- do shared.get('ptys')[i].append(tty - 34816) -%}
+  {%- do sessions.update({sid: {'pod': i, 'pid': none, 'start': none, 'ns': none,
+      'tty': tty, 'read': false, 'left': t.n + 1, 'ep': false, 'cmds': none}}) -%}
+  {%- set it = {'kind': 'shell', 'pod': i, 'sid': sid} -%}
+{%- else -%}
+  {%- set it = {'kind': 'api', 'pod': rnd.randrange(inventory | length), 'sid': none} -%}
+{%- endif -%}
+{%- set pod = inventory[it.pod] -%}
+{%- set ns = [now * 1000 + rnd.randint(0, 999), shared.get('last_ns') + 1] | max -%}
+{%- do shared.set('last_ns', ns) -%}
+{%- set source = module.datetime.datetime.fromtimestamp(ns // 1000000000, module.datetime.timezone.utc) + module.datetime.timedelta(microseconds=(ns % 1000000000) // 1000) -%}
+{#- Host PIDs: every node's counter advances by a random number of
+    unlogged processes; at the wrap, live session shells are skipped. -#}
+{%- set pids = shared.get('pids') -%}
+{%- set live = shared.get('live')[pod.node] -%}
+{%- set alloc = namespace(pid=pids[pod.node] + 1 + (rnd.lognormvariate(log(14), 1.0) | int)) -%}
+{%- if alloc.pid > 4194303 -%}{%- set alloc.pid = 300 + rnd.randint(0, 999) -%}{%- endif -%}
+{%- for _ in range(64) if alloc.pid in live -%}{%- set alloc.pid = alloc.pid + 1 -%}{%- endfor -%}
+{%- do pids.update({pod.node: alloc.pid}) -%}
+{%- set s = sessions.get(it.sid) if it.sid is not none else none -%}
+{%- set cmd = none -%}
+{%- if it.kind == 'shell' -%}
+  {%- set start = ns - module.builtins.int(rnd.lognormvariate(log(4000000), 0.8)) -%}
+  {%- do s.update({'pid': alloc.pid, 'start': start, 'ns': ns}) -%}
+  {%- do live.append(alloc.pid) -%}
+  {%- set parent = pod.shim -%}
+  {%- set tty = s.tty -%}
+  {%- set cmd = rnd.choice(['bash', 'bash -l']) -%}
+{%- else -%}
+  {%- if it.kind == 'read' -%}
+    {%- set start = ns - module.builtins.int(rnd.lognormvariate(log(60000000), 0.6)) -%}
+    {%- set cmd = rnd.choice(['python3 /opt/maintenance/check_users.py', 'python3 /opt/maintenance/check_shadow.py']) -%}
+  {%- else -%}
+    {%- set start = ns - module.builtins.int(rnd.lognormvariate(log(25000000), 0.7)) -%}
+    {%- if s is none -%}
+      {%- set p_api = 0.4 -%}
+    {%- elif s.read -%}
+      {#- The guard, on the same millisecond clock as `@timestamp`. -#}
+      {%- set p_api = 0 if ns // 1000000 - s.ns // 1000000 <= guard * 1000 else 0.12 -%}
+    {%- else -%}
+      {%- set p_api = 0.12 -%}
+    {%- endif -%}
+    {%- set cmd = 'curl -ks https://kubernetes.default.svc.cluster.local/' ~ ('api' if rnd.random() < p_api else 'version') -%}
+  {%- endif -%}
+  {%- if s is none -%}
+    {%- set parent = pod.app -%}
+    {%- set tty = 0 -%}
+  {%- else -%}
+    {%- set parent = {'pid': s.pid, 'start': s.start, 'name': 'bash'} -%}
+    {%- set tty = s.tty -%}
+    {%- set start = [start, s.start + 1000000 + rnd.randint(0, 999999)] | max -%}
+    {%- if it.kind == 'read' -%}{%- do s.update({'read': true}) -%}{%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if s is not none and s.ep -%}
+  {%- set cmd = s.cmds[it.kind] -%}
+{%- else -%}
+  {%- set sn = shared.get('seen')[it.pod] -%}
+  {%- if it.kind == 'shell' -%}
+    {%- do sn.tty.update({tty: sn.tty.get(tty, 0) + 1}) -%}
+    {%- do sn.shell.update({cmd: sn.shell.get(cmd, 0) + 1}) -%}
+  {%- elif s is not none -%}
+    {%- do sn[it.kind].update({cmd: sn[it.kind].get(cmd, 0) + 1}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if s is not none -%}
+  {%- do s.update({'left': s.left - 1}) -%}
+  {%- if s.left <= 0 -%}
+    {%- do sessions.pop(it.sid) -%}
+    {%- do live.remove(s.pid) -%}
+    {%- do shared.get('ptys')[it.pod].remove(s.tty - 34816) -%}
+  {%- endif -%}
+{%- endif -%}
+{{- render(pod, it.kind, source, ns, alloc.pid, start, parent, tty, cmd) -}}
