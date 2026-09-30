@@ -1,0 +1,323 @@
+{#- One Unbound 1.26.1 recursive resolver writing tagged query and
+    reply lines to its own logfile. Every input timestamp is one line:
+    a reply whose time has come (logged at its own time, the query
+    time plus the resolution time), else the next queued lookup of a
+    client (a follow-up, a burst or an episode step), else the first
+    lookup of a new client session. Times are integer microseconds. -#}
+{%- set now = timestamp.replace(microsecond=0).timestamp() | int -%}
+{%- set now_us = now * 1000000 + timestamp.microsecond -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set heapq = module.heapq -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set zones = params.tunnel_domains -%}
+{#- Chain window of the detector (zone A lookup to eighth TXT). -#}
+{%- set chain_us = 600 * 1000000 -%}
+{#- Relative hour-of-day load of the input patterns (UTC). -#}
+{%- macro load_at(h) -%}
+{{- 1.6 if 7 <= h < 17 else (0.9 if 17 <= h < 21 else 0.33) -}}
+{%- endmacro -%}
+{#- A second in [a, b), density proportional to the load curve (sq
+    false) or to its square plus a small floor (sq true). -#}
+{%- macro pick_time(a, b, sq) -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- for hh in range(a // 3600, (b - 1) // 3600 + 1) -%}
+    {%- set lo = [hh * 3600, a] | max -%}
+    {%- set hi = [hh * 3600 + 3600, b] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = load_at(hh % 24) | float -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set sl = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.integer(sl[0], sl[1] - 1) -}}
+{%- endmacro -%}
+{#- Log-normal delay in microseconds. -#}
+{%- macro gap_us(median, sigma, cap) -%}
+{{- ([module.rand.number.lognormal(module.math.log(median), sigma), cap] | min * 1000000) | int -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set clients = [] -%}
+  {%- set weights = [] -%}
+  {%- for i in range(params.client_count) -%}
+    {%- do clients.append(params.client_prefix ~ (params.client_first + i)) -%}
+    {%- do weights.append([[module.rand.number.lognormal(0, 0.8), 0.4] | max, 3.0] | min) -%}
+  {%- endfor -%}
+  {%- set pools = {} -%}
+  {%- for z in zones -%}{%- do pools.update({z: []}) -%}{%- endfor -%}
+  {%- do shared.update({'initialized': true, 'clients': clients, 'weights': weights,
+      'replies': [], 'rides': [], 'seq': 0, 'cache': {}, 'hist': {}, 'pools': pools,
+      'start_at': pick_time(now, now + ([interval, 24] | min * 3600) | int, false) | int,
+      'last_client': none, 'last_zone': none, 'used': {}}) -%}
+{%- endif -%}
+{%- set replies = shared.get('replies') -%}
+{%- set rides = shared.get('rides') -%}
+{%- set pools = shared.get('pools') -%}
+{%- set hist = shared.get('hist') -%}
+
+{%- macro push(heap, due, rec) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do heapq.heappush(heap, [due, shared.get('seq'), rec]) -%}
+{%- endmacro -%}
+
+{#- Detector history of client c under zone z: apex A lookup times and
+    hex TXT lookup times of the last chain window. Prints 1 when a hex
+    TXT lookup at t would be the eighth after an A lookup within the
+    window (any earlier A lookup, completed chains included). -#}
+{%- macro completes(c, z, t) -%}
+  {%- set h = hist.get(c ~ '|' ~ z) -%}
+  {%- if h -%}
+    {%- set a = h[0] | select('ge', t - chain_us) | list -%}
+    {%- if a and (h[1] | select('gt', a[0]) | list | length) >= 7 -%}1{%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro remember(c, z, t, is_a) -%}
+  {%- set h = hist.setdefault(c ~ '|' ~ z, [[], []]) -%}
+  {%- set lo = t - chain_us -%}
+  {%- set kept = [h[0] | select('ge', lo) | list, h[1] | select('ge', lo) | list] -%}
+  {%- do kept[0 if is_a else 1].append(t) -%}
+  {%- do hist.update({c ~ '|' ~ z: kept}) -%}
+{%- endmacro -%}
+
+{#- Question of a TXT lookup of a 32-hex label under zone z. Most
+    labels are new; some repeat a recent label of the same zone. The
+    zone's answer to a label (data or NXDOMAIN) is fixed when the
+    label first appears. -#}
+{%- macro hex_question(q, z) -%}
+  {%- set pool = pools[z] -%}
+  {%- if pool and module.rand.chance(0.15) -%}
+    {%- set lab = module.rand.choice(pool) -%}
+  {%- else -%}
+    {%- set lab = [module.rand.string.hex(32),
+        'NOERROR' if module.rand.chance(0.6) else 'NXDOMAIN',
+        module.rand.number.integer(16, 200)] -%}
+    {%- do pool.append(lab) -%}
+    {%- if pool | length > 60 -%}{%- do pool.pop(0) -%}{%- endif -%}
+  {%- endif -%}
+  {%- set qname = lab[0] ~ '.' ~ z ~ '.' -%}
+  {%- do q.update({'name': qname, 'type': 'TXT', 'zone': z, 'hex': true, 'rcode': lab[1],
+      'size': (40 + qname | length + lab[2]) if lab[1] == 'NOERROR' else (91 + qname | length),
+      'ttl': 10 if lab[1] == 'NOERROR' else 60, 'ext': true}) -%}
+{%- endmacro -%}
+
+{%- macro apex_question(q, z) -%}
+  {%- set qname = z ~ '.' -%}
+  {%- do q.update({'name': qname, 'type': 'A', 'zone': z, 'hex': false, 'rcode': 'NOERROR',
+      'size': 44 + qname | length, 'ttl': 60, 'ext': true}) -%}
+{%- endmacro -%}
+
+{%- macro plain_question(q) -%}
+  {%- if module.rand.chance(0.8) -%}
+    {%- set s = samples.questions.weighted_pick('weight') -%}
+    {%- do q.update({'name': s.name, 'type': s.type, 'zone': none, 'hex': false, 'rcode': s.rcode,
+        'size': s.size, 'ttl': 45 if s.rcode == 'NXDOMAIN' else (180 if s.type in ['TXT', 'MX'] else 60),
+        'ext': false}) -%}
+  {%- else -%}
+    {%- set qname = 'host-%03d.corp.example.' | format(module.rand.number.integer(1, 100)) -%}
+    {%- do q.update({'name': qname, 'type': 'A', 'zone': none, 'hex': false, 'rcode': 'NOERROR',
+        'size': 44 + qname | length, 'ttl': 60, 'ext': false}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- Burst size of hex TXT lookups: mostly one to three; 3% are scans
+    of a batch of hashes (median 8). The first burst after a zone A
+    lookup is never a scan. -#}
+{%- macro burst_size(scan_ok) -%}
+  {%- if scan_ok and module.rand.chance(0.03) -%}
+    {%- set x = module.rand.number.lognormal(module.math.log(8), 0.4) -%}
+  {%- else -%}
+    {%- set x = module.rand.number.lognormal(module.math.log(1.6), 0.5) -%}
+  {%- endif -%}
+  {{- [[x | round | int, 1] | max, 40] | min -}}
+{%- endmacro -%}
+{%- macro run_bursts() -%}
+{{- module.rand.weighted_choice([1, 2, 3, 4, 5, 6, 8, 10], [40, 22, 13, 9, 6, 4, 3, 3]) -}}
+{%- endmacro -%}
+
+{#- 1. Episode due: queue its first step. The first episode starts
+    within min(interval, 24 h), its time drawn from the load curve;
+    each later one in a window of min(interval / 4, 6 h) centred on
+    its due time (previous start plus the interval), weighted by the
+    squared load curve. The client is drawn by background weight
+    among clients that already use a telemetry zone, and uses one of
+    its own zones that it has not touched within the chain window;
+    client and zone differ from the last episode. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {%- set cs = [] -%}
+  {%- set cw = [] -%}
+  {%- set cz = [] -%}
+  {%- for c in shared.get('clients') -%}
+    {%- if c != shared.get('last_client') -%}
+      {%- set own = [] -%}
+      {%- for z in shared.get('used').get(c, []) -%}
+        {%- set h = hist.get(c ~ '|' ~ z, [[], []]) -%}
+        {%- if z != shared.get('last_zone')
+            and not (h[0] | select('ge', now_us - chain_us) | list)
+            and not (h[1] | select('ge', now_us - chain_us) | list) -%}
+          {%- do own.append(z) -%}
+        {%- endif -%}
+      {%- endfor -%}
+      {%- if own -%}
+        {%- do cs.append(c) -%}
+        {%- do cw.append(shared.get('weights')[loop.index0]) -%}
+        {%- do cz.append(own) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if cs -%}
+    {%- set i = module.rand.weighted_choice(range(cs | length) | list, cw) -%}
+    {%- set ez = module.rand.choice(cz[i]) -%}
+    {{- push(rides, now_us, {'k': 'ep', 'c': cs[i], 'z': ez, 'n': 0}) -}}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+    {%- do shared.update({'last_client': cs[i], 'last_zone': ez,
+        'start_at': pick_time(due - half, due + half, true) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Pick this line: a due reply, else a due queued lookup, else a
+    new session of a client drawn by activity weight. -#}
+{%- set pick = namespace(t=now_us, r=none) -%}
+{%- if replies and replies[0][0] <= now_us -%}
+  {%- set e = heapq.heappop(replies) -%}
+  {%- set pick.t = e[0] -%}
+  {%- set pick.r = e[2] -%}
+{%- elif rides and rides[0][0] <= now_us -%}
+  {%- set pick.r = heapq.heappop(rides)[2] -%}
+{%- else -%}
+  {%- set c = module.rand.weighted_choice(shared.get('clients'), shared.get('weights')) -%}
+  {%- set kind = module.rand.weighted_choice(['plain', 'zone', 'run'], [96, 2, 2]) -%}
+  {%- if kind == 'plain' -%}
+    {%- set pick.r = {'k': 'plain', 'c': c, 'more': module.rand.chance(0.3)} -%}
+  {%- else -%}
+    {%- set z = module.rand.choice(zones) -%}
+    {%- if kind == 'zone' -%}
+      {%- set pick.r = {'k': 'zone', 'c': c, 'z': z, 'run': module.rand.chance(0.6)} -%}
+    {%- else -%}
+      {%- set pick.r = {'k': 'run', 'c': c, 'z': z, 'bursts': run_bursts() | int - 1,
+          'left': burst_size(true) | int} -%}
+    {%- endif -%}
+    {%- set u = shared.get('used').setdefault(c, []) -%}
+    {%- if z not in u -%}{%- do u.append(z) -%}{%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set r = pick.r -%}
+{%- set t = pick.t -%}
+{%- set is_reply = r.k == 'reply' -%}
+
+{%- if not is_reply -%}
+  {#- 3. The lookup this record stands for, and its follow-up. -#}
+  {%- set q = {'c': r.c, 'ep': r.k == 'ep'} -%}
+  {%- if r.k == 'plain' -%}
+    {{- plain_question(q) -}}
+    {%- if r.more -%}
+      {{- push(rides, t + gap_us(0.4, 1.2, 20) | int, {'k': 'plain', 'c': r.c, 'more': false}) -}}
+    {%- endif -%}
+  {%- elif r.k == 'zone' or (r.k == 'ep' and r.n == 0) -%}
+    {{- apex_question(q, r.z) -}}
+    {%- if r.k == 'ep' -%}
+      {#- Episode: a first burst like the first burst of a background
+          run, then a second burst of the same client and zone that
+          starts 60-360 s after the A lookup and lasts until the
+          eighth lookup, as when a second run of the client overlaps
+          the first. -#}
+      {{- push(rides, t + gap_us(2.5, 0.9, 120) | int, dict(r, n=1, a0=t,
+          left=[burst_size(false) | int, 7] | min,
+          s2=t + module.rand.number.integer(60000000, 360000000))) -}}
+    {%- elif r.run -%}
+      {{- push(rides, t + gap_us(2.5, 0.9, 120) | int, {'k': 'run', 'c': r.c, 'z': r.z,
+          'bursts': run_bursts() | int - 1, 'left': burst_size(false) | int}) -}}
+    {%- endif -%}
+  {%- else -%}
+    {#- Hex TXT lookup of a background run or an episode. A background
+        lookup that would complete a chain goes to another telemetry
+        zone of the same client instead (same time and label law). -#}
+    {%- set z = namespace(v=r.z) -%}
+    {%- set done = completes(r.c, r.z, t) == '1' -%}
+    {%- if done and r.k != 'ep' -%}
+      {%- set alt = [] -%}
+      {%- for z2 in zones -%}
+        {%- if z2 != r.z and completes(r.c, z2, t) != '1' -%}{%- do alt.append(z2) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- do shared.set('guard_n', shared.get('guard_n', 0) + 1) -%}
+      {%- if not alt -%}
+        {%- do shared.set('guard_drop_n', shared.get('guard_drop_n', 0) + 1) -%}
+        {{- dispatch.drop() -}}
+      {%- endif -%}
+      {%- set z.v = module.rand.choice(alt) -%}
+    {%- endif -%}
+    {{- hex_question(q, z.v) -}}
+    {%- if r.k == 'ep' -%}
+      {%- if done -%}
+        {#- The run goes on like a background run: its remaining
+            bursts after the usual pauses. -#}
+        {%- set more = run_bursts() | int - 2 -%}
+        {%- if more > 0 -%}
+          {{- push(rides, t + gap_us(2400, 0.6, 14400) | int, {'k': 'run', 'c': r.c, 'z': r.z,
+              'bursts': more - 1, 'left': burst_size(true) | int}) -}}
+        {%- endif -%}
+      {%- elif r.n < 30 and t < r.a0 + chain_us -%}
+        {%- set nxt = t + gap_us(1.5, 0.9, 60) | int -%}
+        {%- if r.left > 1 -%}
+          {{- push(rides, nxt, dict(r, n=r.n + 1, left=r.left - 1)) -}}
+        {%- else -%}
+          {{- push(rides, [nxt, r.s2] | max, dict(r, n=r.n + 1, left=99, s2=0)) -}}
+        {%- endif -%}
+      {%- endif -%}
+    {%- elif r.left > 1 -%}
+      {{- push(rides, t + gap_us(1.5, 0.9, 60) | int, dict(r, left=r.left - 1)) -}}
+    {%- elif r.bursts > 0 -%}
+      {{- push(rides, t + gap_us(2400, 0.6, 14400) | int, dict(r, bursts=r.bursts - 1,
+          left=burst_size(true) | int)) -}}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if q.zone -%}{{- remember(q.c, q.zone, t, not q.hex) -}}{%- endif -%}
+
+  {#- 4. Cache: an answer is served from cache between its arrival and
+      its expiry; the cache holds at most 256 entries. -#}
+  {%- set cache = shared.get('cache') -%}
+  {%- set key = q.name ~ '|' ~ q.type -%}
+  {%- set hit = cache.get(key) -%}
+  {%- if hit and hit[0] <= t < hit[1] -%}
+    {%- set from_cache = 1 -%}
+    {%- set latency = 0 -%}
+  {%- else -%}
+    {%- set from_cache = 0 -%}
+    {%- set latency = [module.rand.number.lognormal(module.math.log(45000 if q.ext else 12000), 0.8) | int, 300] | max -%}
+    {%- if key not in cache and cache | length >= 256 -%}{%- do cache.pop(cache | first) -%}{%- endif -%}
+    {%- do cache.update({key: [t + latency, t + latency + q.ttl * 1000000]}) -%}
+  {%- endif -%}
+  {%- set worker = module.rand.number.integer(0, params.worker_count - 1) -%}
+  {{- push(replies, t + latency + module.rand.number.integer(40, 900),
+      dict(q, k='reply', worker=worker, from_cache=from_cache, latency=latency)) -}}
+  {%- set r = dict(q, worker=worker) -%}
+{%- endif -%}
+
+{%- set et = module.datetime.datetime.fromtimestamp(t // 1000000, utc).replace(microsecond=t % 1000000) -%}
+{%- set log_clock = et.strftime('%Y-%m-%dT%H:%M:%S.') ~ ('%03d' | format(et.microsecond // 1000)) ~ '+00:00' -%}
+{%- set message = ('reply: ' if is_reply else 'query: ') ~ r.c ~ ' ' ~ r.name ~ ' ' ~ r.type ~ ' IN' ~ (
+    ' ' ~ r.rcode ~ ' ' ~ ('%d.%06d' | format(r.latency // 1000000, r.latency % 1000000)) ~ ' ' ~ r.from_cache ~ ' ' ~ r.size
+    if is_reply else '') -%}
+{%- set labels = r.name.rstrip('.').split('.') -%}
+{%- set event = {
+  '@timestamp': et.strftime('%Y-%m-%dT%H:%M:%S.%f+00:00'),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['network'], 'type': ['end'] if is_reply else ['start'],
+            'action': 'dns-reply' if is_reply else 'dns-query',
+            'original': log_clock ~ ' unbound[' ~ params.process_id ~ ':' ~ r.worker ~ '] ' ~ message},
+  'host': {'name': params.host_name},
+  'process': {'name': 'unbound', 'pid': params.process_id},
+  'source': {'ip': r.c},
+  'related': {'ip': [r.c]},
+  'dns': {'type': 'answer' if is_reply else 'query',
+          'question': {'name': r.name, 'type': r.type, 'class': 'IN',
+                       'registered_domain': labels[-2:] | join('.')},
+          'response_code': r.rcode if is_reply else none},
+  'unbound': {'worker_id': r.worker,
+              'reply': {'time_to_resolve': r.latency / 1000000, 'from_cache': r.from_cache,
+                        'response_size': r.size} if is_reply else none}
+} -%}
+{{- event | tojson -}}
