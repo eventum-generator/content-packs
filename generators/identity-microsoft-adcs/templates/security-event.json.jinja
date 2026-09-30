@@ -1,0 +1,126 @@
+{# One pending request, one episode, fixed administrative histories. #}
+{%- set event_time = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = event_time.timestamp() -%}
+{%- set interval = [params.anomaly_interval_hours | float,6] | max * 3600 -%}
+{%- set half = [interval / 4,21600] | min / 2 -%}
+{%- set curve = [0.5,0.5,0.5,0.5,0.5,0.5,0.5,0.5,1,1,1,1,1,1,1,1,1,1,0.5,0.5,0.5,0.5,0.5,0.5] -%}
+{%- if shared.get('maintenance_phase') is none -%}
+  {%- set phase = now + module.rand.number.floating(0,43200) -%}
+  {%- do shared.set('maintenance_phase',phase) -%}
+  {%- do shared.set('next_maintenance',phase) -%}
+{%- endif -%}
+{%- macro schedule(first=false) -%}
+  {%- set lo = now + 180 if first else now + interval - half + 180 -%}
+  {%- set hi = now + [interval,86400] | min - 180 if first else now + interval + half - 180 -%}
+  {%- set candidates = [] -%}{%- set weights = [] -%}
+  {%- for i in range(((hi-lo)/60) | int + 1) -%}
+    {%- set candidate = lo + i*60 -%}
+    {%- set maintenance_distance = (candidate-shared.get('maintenance_phase')) % 43200 -%}
+    {# Do not move or cancel the independent twice-daily maintenance. #}
+    {%- if 2160 < maintenance_distance < 41040 -%}
+      {%- do candidates.append(candidate) -%}
+      {%- set weight = curve[(candidate // 3600) | int % 24] -%}
+      {%- do weights.append(weight if first else weight*weight+0.01) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('episode_due',module.rand.weighted_choice(candidates,weights)) -%}
+{%- endmacro -%}
+{%- if shared.get('episode_due') is none -%}{%- do schedule(true) -%}{%- endif -%}
+{%- set process_id = shared.get('process_id',652) -%}
+{%- if shared.get('restart_due') is not none and now >= shared.get('restart_due') -%}
+  {%- set process_id = process_id + 48 -%}
+  {%- do shared.set('process_id',process_id) -%}
+  {%- do shared.pop('restart_due') -%}
+{%- endif -%}
+{%- set pending = shared.get('pending',{}) -%}
+{%- set episode = shared.get('episode',{}) -%}
+{%- set audit_filter = shared.get('audit_filter',127) -%}
+{%- set code = 4886 -%}
+{%- set ai = 50 -%}
+{%- set thread_id = module.rand.choice([368,412,588,724]) -%}
+{%- set req_id = shared.get('request_id',3000) -%}
+{%- set attributes = 'CertificateTemplate:' ~ params.routine_template -%}
+{%- set reductions = shared.get('reductions',{}) -%}
+{%- if pending -%}
+  {%- set ai = pending.ai -%}{%- set user = pending.user -%}
+  {%- set attributes = pending.attributes -%}{%- set thread_id = pending.thread -%}
+  {%- set code = 4887 if pending.episode else module.rand.weighted_choice([4887,4888],[98,2]) -%}
+  {# Exact final-step guard, including prefixes emitted by earlier episodes. #}
+  {%- if not pending.episode and code == 4887 and 'SAN:upn=' in attributes and now-reductions.get(ai,-1000000)<=180 -%}
+    {%- set code = 4888 -%}
+  {%- endif -%}
+  {%- do shared.set('pending',{}) -%}
+{%- elif audit_filter == 119 and now >= shared.get('restore_due') -%}
+  {%- set code = 4885 -%}{%- set audit_filter = 127 -%}
+  {%- set ai = module.rand.choice([50,51]) -%}
+{%- elif episode -%}
+  {%- set ai = episode.ai -%}
+  {%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template ~ '\nSAN:upn=' ~ params.privileged_upn -%}
+  {%- do shared.set('episode',{}) -%}
+{%- elif audit_filter == 127 and params.anomaly_mode and now >= shared.get('episode_due') -%}
+  {%- set code = 4885 -%}{%- set audit_filter = 119 -%}
+  {%- set ai = module.rand.choice([50,51] | reject('equalto',shared.get('previous_actor')) | list) -%}
+  {%- do shared.set('previous_actor',ai) -%}
+  {%- do shared.set('episode',{'ai':ai}) -%}
+  {%- do schedule() -%}
+{%- elif audit_filter == 127 and now >= shared.get('next_maintenance') -%}
+  {%- set code = 4885 -%}{%- set audit_filter = 119 -%}
+  {%- set ai = module.rand.choice([50,51]) -%}
+  {%- do shared.set('next_maintenance',shared.get('next_maintenance')+43200) -%}
+{%- else -%}
+  {%- set admin_request = module.rand.chance(0.025) -%}
+  {%- if admin_request -%}
+    {%- set ai = module.rand.choice([50,51]) -%}
+    {%- if module.rand.chance(0.2) -%}
+      {%- set attributes = 'CertificateTemplate:' ~ params.enrollment_template ~ '\nSAN:upn=' ~ params.privileged_upn -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set ai = module.rand.number.integer(0,19) if module.rand.chance(0.3 if 8<=event_time.hour<18 else 0.03) else module.rand.number.integer(20,49) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set user = params.suspicious_requester if ai == 50 else samples.accounts[ai].name -%}
+{%- if code == 4885 -%}
+  {%- set thread_id = module.rand.choice([1024,1172]) -%}
+  {%- do shared.set('audit_filter',audit_filter) -%}
+  {%- do shared.set('restart_due',now+15) -%}
+  {%- if audit_filter == 119 -%}
+    {%- do reductions.update({ai:now}) -%}
+    {%- do shared.set('reductions',reductions) -%}
+    {%- do shared.set('restore_due',now+module.rand.number.floating(900,1800)) -%}
+  {%- endif -%}
+{%- elif code == 4886 -%}
+  {%- set req_id = req_id+1 -%}{%- do shared.set('request_id',req_id) -%}
+  {%- do shared.set('pending',{'ai':ai,'user':user,'attributes':attributes,'thread':thread_id,'episode':episode | length > 0}) -%}
+{%- endif -%}
+{%- set seq = shared.get('record_id',310000)+module.rand.number.integer(4,40) -%}{%- do shared.set('record_id',seq) -%}
+{%- if code == 4885 -%}
+  {%- set data = {'AuditFilter': audit_filter|string, 'SubjectUserSid': 'S-1-5-21-1000000000-2000000000-3000000000-' ~ samples.accounts[ai].sid, 'SubjectUserName': user, 'SubjectDomainName': params.domain, 'SubjectLogonId': '0x' ~ module.rand.string.hex(6)} -%}
+{%- else -%}
+  {%- set data = {'RequestId': req_id|string, 'Requester': params.domain ~ '\\' ~ user, 'Attributes': attributes} -%}
+  {%- if code == 4887 or code == 4888 -%}
+    {%- set ski = [] -%}{%- for index in range(20) -%}{%- do ski.append(module.rand.string.hex(2)) -%}{%- endfor -%}
+    {%- do data.update({'Disposition': '3' if code == 4887 else '-2146875375', 'SubjectKeyIdentifier': ski|join(' '), 'Subject': 'CN=' ~ user if code == 4887 else ''}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set created = event_time.isoformat(timespec='microseconds').replace('+00:00', 'Z') -%}
+{%- set ns = namespace(xml='<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-Security-Auditing" Guid="{54849625-5478-4994-A5BA-3E3B0328C30D}"/><EventID>' ~ code ~ '</EventID><Version>0</Version><Level>0</Level><Task>12805</Task><Opcode>0</Opcode><Keywords>0x8020000000000000</Keywords><TimeCreated SystemTime="' ~ created ~ '"/><EventRecordID>' ~ seq ~ '</EventRecordID><Correlation/><Execution ProcessID="' ~ process_id ~ '" ThreadID="' ~ thread_id ~ '"/><Channel>Security</Channel><Computer>' ~ (params.ca_host|e) ~ '</Computer><Security/></System><EventData>') -%}
+{%- for key, value in data.items() -%}{%- set ns.xml = ns.xml ~ '<Data Name="' ~ key ~ '">' ~ (value|e) ~ '</Data>' -%}{%- endfor -%}
+{%- set ns.xml = ns.xml ~ '</EventData></Event>' -%}
+{%- set names = {4885: 'ca-audit-filter-changed', 4886: 'certificate-requested', 4887: 'certificate-issued', 4888: 'certificate-denied'} -%}
+{%- set event = {
+  '@timestamp': event_time.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'code': code|string, 'kind': 'event', 'category': ['configuration'] if code == 4885 else ['iam'], 'type': ['change'] if code == 4885 else (['denied'] if code == 4888 else (['creation'] if code == 4887 else ['info'])), 'outcome': 'failure' if code == 4888 else 'success', 'action': names[code], 'provider': 'Microsoft-Windows-Security-Auditing', 'original': ns.xml},
+  'host': {'name': params.ca_host},
+  'observer': {'name': params.ca_name, 'type': 'certificate-authority'},
+  'user': {'name': user, 'domain': params.domain},
+  'related': {'user': [user]},
+  'winlog': {'channel': 'Security', 'provider_name': 'Microsoft-Windows-Security-Auditing', 'provider_guid': '{54849625-5478-4994-A5BA-3E3B0328C30D}', 'event_id': code|string, 'record_id': seq|string, 'computer_name': params.ca_host, 'task': 'Certification Services', 'level': 'information', 'opcode': 'Info', 'keywords': ['Audit Success'], 'process': {'pid': process_id, 'thread': {'id': thread_id}}, 'time_created': created, 'event_data': data}
+} -%}
+{%- if code == 4886 -%}{%- do event['event'].pop('outcome') -%}{%- endif -%}
+{%- if code == 4887 or code == 4888 -%}
+  {%- do shared.pop('requester', none) -%}
+  {%- do shared.pop('attributes', none) -%}
+  {%- do shared.pop('request_is_privileged', none) -%}
+{%- endif -%}
+{{- event | tojson -}}
