@@ -1,0 +1,307 @@
+{#- Proxmox VE 7.x native access/pveam records with ECS enrichment.
+    Human and automation inputs admit new independent sessions; earliest
+    due replies are served first. Every input timestamp emits one row.
+    Fixed nine clients, twelve VMs and bounded per-client histories. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, truncated by redrawing; returns ms. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- module.builtins.int(([ns.v, hi] | min) * 1000) -}}
+{%- endmacro -%}
+{%- macro typo_gap() -%}{{- d(3, 7, 0.7, 180) -}}{%- endmacro -%}
+{%- macro op_gap() -%}{{- d(1, 18, 1.1, 900) -}}{%- endmacro -%}
+{%- macro session_len() -%}{{- d(20, 1500, 1.0, 28800) -}}{%- endmacro -%}
+{%- macro renew_gap() -%}{{- d(30, 700, 0.6, 5400) -}}{%- endmacro -%}
+{%- macro restore_delay() -%}{{- d(30, 1200, 1.2, 43200) -}}{%- endmacro -%}
+{%- macro dl_time() -%}{{- d(0.02, 0.35, 0.8, 20) -}}{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'node_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9-]{0,62}$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {#- API clients: workstation or automation address, Proxmox user id,
+      whether it issues VM power requests, whether it authenticates with
+      an API token (no ticket requests), and a per-user ticket response
+      size (gzip body of username, ticket, CSRF token and capabilities). -#}
+  {%- set actors = [] -%}
+  {%- for a in samples.actors -%}{%- do actors.append({'ip':a.ip,'user':a.user,'power':a.power,'token':a.token,'tsize':a.tsize}) -%}{%- endfor -%}
+  {%- set queue = [] -%}
+  {%- for a in actors -%}
+    {%- do a.update({'state': 'idle', 'fails': 0, 'give_up': false, 'sess_end': 0, 'failures': [], 'prefix': -1e20}) -%}
+  {%- endfor -%}
+  {%- set vms = {} -%}
+  {%- for v in samples.vms -%}{%- do vms.update({v.id: true}) -%}{%- endfor -%}
+  {%- set day0 = now - now % 86400000 -%}
+  {%- set pv = day0 + 3600000 + module.rand.number.integer(0, 18000000) -%}
+  {%- if pv <= now -%}{%- set pv = day0 + 86400000 + 3600000 + module.rand.number.integer(0, 18000000) -%}{%- endif -%}
+  {%- do queue.append({'due': pv, 'k': 'pveam'}) -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+  {%- do shared.update({'queue': queue, 'actors': actors, 'vms': vms, 'last_ms': now - 1,
+    'sig': {'proxmox': now - module.rand.number.integer(86400000, 1728000000), 'turnkey': now - module.rand.number.integer(864000000, 15552000000)},
+    'ep_active': false, 'ep_last_actor': none, 'ep_last_vm': none,
+    'ep_start': now + module.rand.number.integer(0, [interval,86400000]|min)}) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- set actors = shared.get('actors') -%}
+{%- set vms = shared.get('vms') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * 3600000) -%}
+{#- Independent automation-client episode. Normal sessions retain their
+    queued records. First start is within min(interval,24h); later starts
+    use the symmetric recurrence window for this flat-hour population. -#}
+{%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_start') and queue|length < 120 -%}
+  {%- set ca = [] -%}
+  {%- for a in actors -%}
+    {%- set i = loop.index0 -%}
+    {%- if i in [4,5] and i != shared.get('ep_last_actor') -%}{%- do ca.append(i) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set cv = [] -%}
+  {%- for v, up in vms | dictsort if up and v != shared.get('ep_last_vm') -%}{%- do cv.append(v) -%}{%- endfor -%}
+  {%- if ca and cv -%}
+    {%- set ai = module.rand.choice(ca) -%}
+    {%- set start = now -%}
+    {%- do queue.append({'due': start, 'k': 'ep', 'a': ai, 'fails': 3, 'vm': module.rand.choice(cv)}) -%}
+    {%- do shared.update({'ep_active': true, 'ep_last_actor': ai, 'ep_start': start + interval + module.builtins.int(module.rand.number.floating(-1,1) * ([21600000,interval/4]|min)/2)}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set ready = [] -%}
+{%- for item in queue if item.due <= now -%}
+  {%- if item.k in ['pveam','pvline','restore'] or (item.a in [4,5,8]) == ('automation' in tags) -%}{%- do ready.append(item) -%}{%- endif -%}
+{%- endfor -%}
+{%- if not ready and queue|length < 128 -%}
+  {%- set available = [] -%}
+  {%- for i in range(actors|length) if actors[i].state == 'idle' and not actors[i].token -%}
+    {%- if ('human' in tags and i not in [4,5]) or ('automation' in tags and i in [4,5] and module.rand.chance(0.2)) -%}
+      {%- do available.append(i) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if available -%}
+    {%- do queue.append({'due':now,'k':'login','a':module.rand.choice(available)}) -%}
+  {%- else -%}
+    {%- do queue.append({'due':now,'k':'poll','a':8}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(24) if out.row is none -%}
+  {%- set pick = namespace(item=none) -%}
+  {%- for item in queue if item.due <= now and (pick.item is none or item.due < pick.item.due) -%}
+    {%- if item.k in ['pveam','pvline','restore','poll'] or (item.a in [4,5,8]) == ('automation' in tags) -%}{%- set pick.item = item -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if pick.item is none -%}{%- break -%}{%- endif -%}
+  {%- set item = pick.item -%}
+  {%- do queue.remove(item) -%}
+  {%- set rec = now -%}
+  {%- set new = [] -%}
+  {%- set r = namespace(a=none, method=none, path=none, code=none, size=none, action=none, logged=none, msg=none, pact=none) -%}
+  {#- Row helpers. -#}
+  {%- macro ticket(a, ok) -%}
+    {%- set r.a = a -%}{%- set r.method = 'POST' -%}{%- set r.path = '/api2/json/access/ticket' -%}{%- set r.logged = '-' -%}
+    {%- set r.code = 200 if ok else 401 -%}
+    {%- set r.size = actors[a].tsize + module.rand.number.integer(-5, 5) if ok else 13 -%}
+    {%- set r.action = 'ticket-issued' if ok else 'ticket-denied' -%}
+    {%- if ok -%}
+      {%- if actors[a].failures|length == 3 and rec-actors[a].failures[0] <= 1800000 -%}{%- do actors[a].update({'prefix':actors[a].failures[0]}) -%}{%- endif -%}
+    {%- else -%}
+      {%- do actors[a].failures.append(rec) -%}
+      {%- if actors[a].failures|length > 3 -%}{%- do actors[a].failures.pop(0) -%}{%- endif -%}
+    {%- endif -%}
+  {%- endmacro -%}
+  {%- macro power(a, vm, op) -%}
+    {%- set typ = {'start': 'qmstart', 'stop': 'qmstop', 'shutdown': 'qmshutdown', 'reboot': 'qmreboot'}[op] -%}
+    {%- set upid = 'UPID:' ~ params.node_name ~ ':' ~ '%08X' | format(module.rand.number.integer(4096, 4194303)) ~ ':' ~ '%08X' | format(module.rand.number.integer(1000000, 900000000)) ~ ':' ~ '%08X' | format(rec // 1000) ~ ':' ~ typ ~ ':' ~ vm ~ ':' ~ actors[a].user ~ ':' -%}
+    {%- set r.a = a -%}{%- set r.method = 'POST' -%}{%- set r.logged = actors[a].user -%}{%- set r.code = 200 -%}
+    {%- set r.path = '/api2/json/nodes/' ~ params.node_name ~ '/qemu/' ~ vm ~ '/status/' ~ op -%}
+    {%- set r.size = ('{"data":"' ~ upid ~ '"}') | length -%}
+    {%- set r.action = 'vm-' ~ op ~ '-request' -%}
+    {%- if op in ['stop', 'shutdown'] -%}
+      {%- do vms.update({vm: false}) -%}
+      {%- do new.append({'due': rec + (restore_delay() | int), 'k': 'restore', 'vm': vm}) -%}
+    {%- elif op == 'start' -%}{%- do vms.update({vm: true}) -%}{%- endif -%}
+  {%- endmacro -%}
+  {%- macro read(a) -%}
+    {%- set vm = module.rand.choice(vms | list) -%}
+    {%- set k = module.rand.weighted_choice(['resources', 'tasks', 'nstatus', 'current', 'config', 'qlist', 'cstatus', 'version'], [30, 14, 12, 22, 9, 7, 4, 2]) -%}
+    {%- set base = '/api2/json/nodes/' ~ params.node_name -%}
+    {%- set spec = {'resources': ['/api2/json/cluster/resources', 1480, 0.25], 'tasks': ['/api2/json/cluster/tasks', 930, 0.3], 'nstatus': [base ~ '/status', 760, 0.08], 'current': [base ~ '/qemu/' ~ vm ~ '/status/current', 610 if vms[vm] else 280, 0.1], 'config': [base ~ '/qemu/' ~ vm ~ '/config', 470, 0.2], 'qlist': [base ~ '/qemu', 1210, 0.2], 'cstatus': ['/api2/json/cluster/status', 190, 0.1], 'version': ['/api2/json/version', 84, 0.02]}[k] -%}
+    {%- set r.a = a -%}{%- set r.method = 'GET' -%}{%- set r.logged = actors[a].user -%}{%- set r.code = 200 -%}
+    {%- set r.path = spec[0] -%}
+    {%- set r.size = module.builtins.int(spec[1] * module.rand.number.lognormal(0, spec[2])) -%}
+    {%- set r.action = 'api-read' -%}
+  {%- endmacro -%}
+  {%- macro completes_chain(a) -%}
+    {#- True when this client's recent ticket rows hold three denials
+        followed by an issue inside the detection window, so a stop now
+        would complete the chain. -#}
+    {{- 'y' if rec-actors[a].prefix <= 1800000 else '' -}}
+  {%- endmacro -%}
+  {%- if item.k in ['login', 'try'] -%}
+    {%- set a = actors[item.a] -%}
+    {%- if item.k == 'login' -%}
+      {%- set n = module.rand.weighted_choice([0, 1, 2, 3], [980, 17, 2.7, 0.3]) -%}
+      {%- do a.update({'state': 'login', 'fails': n, 'give_up': n > 0 and module.rand.chance(0.2)}) -%}
+    {%- endif -%}
+    {%- if a.fails > 0 -%}
+      {{- ticket(item.a, false) -}}
+      {%- do a.update({'fails': a.fails - 1}) -%}
+      {%- if a.fails == 0 and a.give_up -%}
+        {%- do a.update({'state': 'idle'}) -%}
+      {%- else -%}
+        {%- do new.append({'due': rec + (typo_gap() | int), 'k': 'try', 'a': item.a}) -%}
+      {%- endif -%}
+    {%- else -%}
+      {{- ticket(item.a, true) -}}
+      {%- do a.update({'state': 'in', 'sid': a.get('sid', 0) + 1, 'sess_end': rec + (session_len() | int)}) -%}
+      {%- do new.append({'due': rec + (op_gap() | int), 'k': 'req', 'a': item.a, 'sid': a.sid}) -%}
+      {%- do new.append({'due': rec + (renew_gap() | int), 'k': 'renew', 'a': item.a, 'sid': a.sid}) -%}
+    {%- endif -%}
+  {%- elif item.k == 'req' -%}
+    {%- set a = actors[item.a] -%}
+    {%- if a.state != 'in' or item.sid != a.sid -%}
+    {%- elif rec >= a.sess_end -%}
+      {%- do a.update({'state': 'idle'}) -%}
+    {%- else -%}
+      {%- if a.power and module.rand.chance(0.0025) -%}
+        {%- set vm = module.rand.choice(vms | list) -%}
+        {%- if not vms[vm] -%}
+          {{- power(item.a, vm, 'start') -}}
+        {%- else -%}
+          {%- set op = module.rand.weighted_choice(['stop', 'shutdown', 'reboot'], [35, 45, 20]) -%}
+          {%- if op == 'stop' and completes_chain(item.a) -%}{{- read(item.a) -}}{%- else -%}{{- power(item.a, vm, op) -}}{%- endif -%}
+        {%- endif -%}
+      {%- else -%}
+        {{- read(item.a) -}}
+      {%- endif -%}
+      {%- do new.append({'due': rec + (op_gap() | int), 'k': 'req', 'a': item.a, 'sid': a.sid}) -%}
+    {%- endif -%}
+  {%- elif item.k == 'renew' -%}
+    {%- set a = actors[item.a] -%}
+    {%- if a.state == 'in' and item.sid == a.sid and rec < a.sess_end -%}
+      {%- if module.rand.chance(0.03) -%}
+        {#- Renewing an expired ticket fails like a wrong password; the
+            client logs in again. -#}
+        {{- ticket(item.a, false) -}}
+        {%- do a.update({'state': 'idle'}) -%}
+      {%- else -%}
+        {{- ticket(item.a, true) -}}
+        {%- do new.append({'due': rec + (renew_gap() | int), 'k': 'renew', 'a': item.a, 'sid': a.sid}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'poll' -%}
+    {{- read(item.a) -}}
+  {%- elif item.k == 'restore' -%}
+    {%- if not vms[item.vm] -%}
+      {%- set online = [] -%}
+      {%- for i in [4,5] if actors[i].power and actors[i].state == 'in' and rec < actors[i].sess_end -%}{%- do online.append(i) -%}{%- endfor -%}
+      {%- if online -%}
+        {{- power(module.rand.choice(online), item.vm, 'start') -}}
+      {%- else -%}
+        {%- do new.append({'due': rec + (d(30, 300, 1.0, 3600) | int), 'k': 'restore', 'vm': item.vm}) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'ep' -%}
+    {#- Episode: three denied ticket requests from one client address, an
+        issued ticket, zero to four reads, a stop request as that client's
+        user, then an ordinary session: reads and ticket renewals until the
+        session ends (before the client's own next login) or a renewal
+        fails. Gaps and lengths come from the ordinary session model. The
+        read and renewal items share one session record. -#}
+    {%- if item.fails > 0 -%}
+      {{- ticket(item.a, false) -}}
+      {%- do new.append(dict(item, due=rec + (typo_gap() | int), fails=item.fails - 1)) -%}
+    {%- elif item.fails == 0 -%}
+      {{- ticket(item.a, true) -}}
+      {%- set own = queue | selectattr('k', 'equalto', 'login') | selectattr('a', 'equalto', item.a) | map(attribute='due') | list -%}
+      {%- set end = [rec + (session_len() | int)] + ([(own | min) - 60000] if own else []) -%}
+      {%- set ses = {'end': end | min, 'alive': true, 'stopped': false} -%}
+      {%- do new.append(dict(item, due=rec + (op_gap() | int), fails=-1, pre=module.rand.weighted_choice([0, 1, 2, 3, 4], [45, 25, 15, 9, 6]), ses=ses)) -%}
+      {%- do new.append({'due': rec + (renew_gap() | int), 'k': 'eprenew', 'a': item.a, 'ses': ses}) -%}
+    {%- elif item.fails == -1 and item.pre > 0 -%}
+      {{- read(item.a) -}}
+      {%- do new.append(dict(item, due=rec + (op_gap() | int), pre=item.pre - 1)) -%}
+    {%- elif item.fails == -1 -%}
+      {%- set vm = item.vm -%}
+      {%- if not vms[vm] -%}
+        {%- set cv = [] -%}
+        {%- for v, up in vms | dictsort if up and v != shared.get('ep_last_vm') -%}{%- do cv.append(v) -%}{%- endfor -%}
+        {%- set vm = module.rand.choice(cv) if cv else none -%}
+      {%- endif -%}
+      {%- if vm is not none -%}
+        {{- power(item.a, vm, 'stop') -}}
+        {%- do shared.update({'ep_last_vm': vm}) -%}
+      {%- endif -%}
+      {%- do item.ses.update({'stopped': true}) -%}
+      {%- do shared.update({'ep_active': false}) -%}
+      {%- do new.append(dict(item, due=rec + (op_gap() | int), fails=-2)) -%}
+    {%- elif item.ses.alive and rec < item.ses.end -%}
+      {{- read(item.a) -}}
+      {%- do new.append(dict(item, due=rec + (op_gap() | int))) -%}
+    {%- endif -%}
+  {%- elif item.k == 'eprenew' -%}
+    {%- set ses = item.ses -%}
+    {%- if ses.alive and rec < ses.end -%}
+      {%- if ses.stopped and module.rand.chance(0.03) -%}
+        {{- ticket(item.a, false) -}}
+        {%- do ses.update({'alive': false}) -%}
+      {%- else -%}
+        {{- ticket(item.a, true) -}}
+        {%- do new.append(dict(item, due=rec + (renew_gap() | int))) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'pveam' -%}
+    {#- Daily appliance index update (pve-daily-update.timer, 01:00 plus
+        up to 5 h random delay): both index sources in order. -#}
+    {%- set sig = shared.get('sig') -%}
+    {%- if module.rand.chance(0.12) -%}{%- do sig.update({'proxmox': rec - module.rand.number.integer(600000, 80000000)}) -%}{%- endif -%}
+    {%- if module.rand.chance(0.01) -%}{%- do sig.update({'turnkey': rec - module.rand.number.integer(600000, 80000000)}) -%}{%- endif -%}
+    {%- set t = namespace(v=rec) -%}
+    {%- set lines = [] -%}
+    {%- for src in samples.index_sources -%}
+      {%- set sd = module.datetime.datetime.fromtimestamp(sig[src.name] // 1000, module.datetime.timezone.utc) -%}
+      {%- set made = sd.strftime('%a %b ') ~ (sd.day | string).rjust(2) ~ sd.strftime(' %H:%M:%S %Y') ~ ' UTC' -%}
+      {%- set t.v = t.v + module.rand.number.integer(1, 40) -%}{%- do lines.append([t.v, 'start download ' ~ src.url ~ '.asc', 'pveam-download-start']) -%}
+      {%- set t.v = t.v + (dl_time() | int) -%}{%- do lines.append([t.v, 'download finished: 200 OK', 'pveam-download-finished']) -%}
+      {%- set t.v = t.v + module.rand.number.integer(1, 40) -%}{%- do lines.append([t.v, 'start download ' ~ src.url ~ '.gz', 'pveam-download-start']) -%}
+      {%- set t.v = t.v + (dl_time() | int) -%}{%- do lines.append([t.v, 'download finished: 200 OK', 'pveam-download-finished']) -%}
+      {%- set t.v = t.v + module.rand.number.integer(20, 120) -%}{%- do lines.append([t.v, 'signature verification: gpgv: Signature made ' ~ made, 'pveam-signature-verification']) -%}
+      {%- set t.v = t.v + module.rand.number.integer(0, 3) -%}{%- do lines.append([t.v, 'signature verification: gpgv:                using RSA key ' ~ src.key, 'pveam-signature-verification']) -%}
+      {%- set t.v = t.v + module.rand.number.integer(0, 3) -%}{%- do lines.append([t.v, 'signature verification: gpgv: Good signature from "' ~ src.uid ~ '"', 'pveam-signature-verification']) -%}
+      {%- set t.v = t.v + module.rand.number.integer(5, 60) -%}{%- do lines.append([t.v, 'update successful', 'pveam-update-successful']) -%}
+    {%- endfor -%}
+    {%- set r.msg = 'starting update' -%}{%- set r.pact = 'pveam-update-start' -%}
+    {%- for l in lines -%}{%- do new.append({'due': l[0], 'k': 'pvline', 'msg': l[1], 'act': l[2]}) -%}{%- endfor -%}
+    {%- set day0 = rec - rec % 86400000 -%}
+    {%- do new.append({'due': day0 + 86400000 + 3600000 + module.rand.number.integer(0, 18000000), 'k': 'pveam'}) -%}
+  {%- elif item.k == 'pvline' -%}
+    {%- set r.msg = item.msg -%}{%- set r.pact = item.act -%}
+  {%- endif -%}
+  {%- do queue.extend(new) -%}
+  {%- if r.action is not none or r.msg is not none -%}
+    {%- do shared.update({'last_ms': rec}) -%}
+    {%- set out.row = {'rec': rec, 'a': r.a, 'method': r.method, 'path': r.path, 'code': r.code, 'size': r.size, 'action': r.action, 'logged': r.logged, 'msg': r.msg, 'pact': r.pact} -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.row is none -%}
+  {%- set out.row = {'rec':now,'a':8,'method':'GET','path':'/api2/json/cluster/resources','code':200,'size':module.rand.number.integer(1300,1800),'action':'api-read','logged':actors[8].user,'msg':none,'pact':none} -%}
+{%- endif -%}
+{%- set row = out.row -%}
+{%- set t = module.datetime.datetime.fromtimestamp(row.rec // 1000, module.datetime.timezone.utc) -%}
+{%- if row.msg is not none -%}
+  {%- set original = t.strftime('%Y-%m-%d %H:%M:%S') ~ ' ' ~ row.msg -%}
+  {%- set etype = {'pveam-update-start': 'start', 'pveam-download-start': 'start', 'pveam-download-finished': 'info', 'pveam-signature-verification': 'info', 'pveam-update-successful': 'end'}[row.pact] -%}
+  {%- set event = {'@timestamp': t.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['package'], 'type': [etype], 'action': row.pact, 'original': original}, 'host': {'name': params.node_name}, 'log': {'file': {'path': '/var/log/pveam.log'}}, 'proxmox': {'pveam': {'message': row.msg}}} -%}
+{%- else -%}
+  {%- set ip = actors[row.a].ip -%}
+  {%- set requestline = row.method ~ ' ' ~ row.path ~ ' HTTP/1.1' -%}
+  {%- set original = '::ffff:' ~ ip ~ ' - ' ~ row.logged ~ ' [' ~ t.strftime('%d/%m/%Y:%H:%M:%S %z') ~ '] "' ~ requestline ~ '" ' ~ row.code ~ ' ' ~ row.size -%}
+  {%- set is_ticket = row.path.endswith('/access/ticket') -%}
+  {%- set is_power = row.action.startswith('vm-') -%}
+  {%- set event_meta = {'kind': 'event', 'category': ['authentication'] if is_ticket else ['host'] if is_power else ['web'], 'type': ['denied'] if row.code == 401 else ['start'] if is_ticket else ['change'] if is_power else ['access'], 'action': row.action, 'outcome': 'failure' if row.code == 401 else 'success', 'original': original} -%}
+  {%- set event = {'@timestamp': t.isoformat(), 'ecs': {'version': '8.17.0'}, 'event': event_meta, 'host': {'name': params.node_name}, 'source': {'ip': ip}, 'related': {'ip': [ip]}, 'http': {'version': '1.1', 'request': {'method': row.method}, 'response': {'status_code': row.code, 'body': {'bytes': row.size}}}, 'url': {'path': row.path}, 'log': {'file': {'path': '/var/log/pveproxy/access.log'}}, 'proxmox': {'access': {'username': row.logged}}} -%}
+  {%- if row.logged != '-' -%}{%- do event.update({'user': {'name': row.logged}}) -%}{%- do event.related.update({'user': [row.logged]}) -%}{%- endif -%}
+{%- endif -%}
+{{- event | tojson -}}
