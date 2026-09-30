@@ -1,0 +1,240 @@
+{#- One Kerio Control firewall writing URL content-rule matches (rules
+    with "Log the traffic") to the Filter log. The input sets the rate:
+    `office` timestamps carry the users' browsing on a working-day
+    curve, `auto` timestamps the computers' automatic updates. Every
+    timestamp yields one record: the earliest due queued request,
+    otherwise the first request of a new action of that population
+    (its follow-up requests are queued). Episode requests join the same
+    queue and never replace or delay a user's own activity. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set heapq = module.heapq -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 3600 -%}
+{#- Office records per second by UTC hour, as in patterns/office-*.yml. -#}
+{%- set curve = [0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.003, 0.033,
+    0.093, 0.093, 0.093, 0.093, 0.093, 0.093, 0.093, 0.093, 0.093,
+    0.033, 0.033, 0.033, 0.003, 0.003, 0.003, 0.003] -%}
+
+{#- Pick an episode start in [lo, hi) in 10-minute slots weighted by
+    curve^power (+ floor). -#}
+{%- macro schedule(lo, hi, power, floor) -%}
+  {%- set n = [((hi - lo) / 600) | round(0, 'ceil') | int, 1] | max -%}
+  {%- set ws = [] -%}
+  {%- for i in range(n) -%}
+    {%- do ws.append(curve[((lo + i * 600 + 300) // 3600) % 24] ** power + floor) -%}
+  {%- endfor -%}
+  {%- set i = module.rand.weighted_choice(range(n) | list, ws) -%}
+  {%- do shared.set('start_at', [lo + i * 600 + module.rand.number.integer(0, 599), hi - 1] | min) -%}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if not (4 <= params.user_count <= samples.users | length)
+      or params.client_first + params.user_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- if params.anonymizer_hosts | length < 3 or params.tunnel_hosts | length < 2 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set users = [] -%}
+  {%- set draws = [] -%}
+  {%- for n in range(params.user_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do users.append([samples.users[n].name, ip]) -%}
+    {#- Bounded per-user propensity: some users hit blocked sites far
+        more often than others, none stays silent. -#}
+    {%- do draws.append(module.rand.number.clamp(module.rand.number.lognormal(0, 0.6), 0.45, 2.2)) -%}
+  {%- endfor -%}
+  {#- The first quarter of the users (at least two) are the busiest and
+      take remote-access and tunnel clients regularly, the others
+      seldom. -#}
+  {%- set k = [params.user_count // 4, 2] | max -%}
+  {%- set ranked = draws | sort(reverse=true) -%}
+  {%- set weights = module.rand.shuffle(ranked[:k]) + module.rand.shuffle(ranked[k:]) -%}
+  {%- set tier = [] -%}
+  {%- for n in range(params.user_count) -%}{%- do tier.append(n < k) -%}{%- endfor -%}
+  {%- set hosts = {'update': [], 'software': [], 'social': [], 'sharing': []} -%}
+  {%- for i in range(samples.hosts | length) -%}
+    {%- do hosts[samples.hosts[i].category].append(samples.hosts[i].host) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'users': users,
+      'weights': weights, 'tier': tier, 'hosts': hosts, 'q': [], 'seq': 0, 'anon': {},
+      'start_at': none, 'last_user': none, 'last_anon': none,
+      'last_tunnel': none}) -%}
+  {%- if params.anomaly_mode -%}
+    {{- schedule(now, now + ([interval, 24] | min * 3600) | int, 1, 0) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set users = shared.get('users') -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set q = shared.get('q') -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{#- Queue one request due at `at`. -#}
+{%- macro req(user, kind, host, at, method='GET', episode=false) -%}
+  {%- set seq = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', seq) -%}
+  {%- do heapq.heappush(q, [at, seq, user, kind, host, method, episode]) -%}
+{%- endmacro -%}
+
+{#- A burst of `n` requests of one kind, spaced by random gaps. -#}
+{%- macro burst(user, kind, hosts, n, median, sigma, stay, post=0) -%}
+  {%- set t = namespace(at=now, host=module.rand.choice(hosts)) -%}
+  {%- for i in range(n) -%}
+    {%- if i > 0 -%}
+      {%- set t.at = t.at + gap(median, sigma) | int -%}
+      {%- if not module.rand.chance(stay) -%}{%- set t.host = module.rand.choice(hosts) -%}{%- endif -%}
+    {%- endif -%}
+    {{- req(user, kind, t.host, t.at, 'POST' if module.rand.chance(post) else 'GET') -}}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{%- macro exe_host(tunnel_share) -%}
+{{- module.rand.choice(params.tunnel_hosts) if module.rand.chance(tunnel_share) else module.rand.choice(hosts['software']) -}}
+{%- endmacro -%}
+
+{#- 1. Episode: first start within min(interval, 24 h) on the office
+    curve; later starts within +-w/2 of the due time, weighted by
+    curve^2; next due from the actual start, never catching up. The
+    user comes from the first quarter, who take tunnel clients regularly. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {%- set pool = [] -%}
+  {%- set pw = [] -%}
+  {%- for u in users -%}
+    {%- if shared.get('tier')[loop.index0] and u != shared.get('last_user') -%}
+      {%- do pool.append(u) -%}{%- do pw.append(shared.get('weights')[loop.index0]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set u = module.rand.weighted_choice(pool, pw) -%}
+  {%- set a1 = module.rand.choice(params.anonymizer_hosts | reject('equalto', shared.get('last_anon')) | list) -%}
+  {%- set a2 = module.rand.choice(params.anonymizer_hosts | reject('equalto', a1) | list) -%}
+  {%- set th = module.rand.choice(params.tunnel_hosts | reject('equalto', shared.get('last_tunnel')) | list) -%}
+  {%- set t = namespace(at=now) -%}
+  {{- req(u, 'anon', a1, t.at, episode=true) -}}
+  {%- set t.at = t.at + [gap(45, 1.3) | int, 480] | min -%}
+  {{- req(u, 'anon', a2, t.at, episode=true) -}}
+  {%- if module.rand.chance(0.4) -%}
+    {%- set t.at = t.at + [gap(45, 1.3) | int, 480] | min -%}
+    {{- req(u, 'anon', module.rand.choice(params.anonymizer_hosts), t.at, episode=true) -}}
+  {%- endif -%}
+  {%- set t.at = t.at + [gap(420, 0.6) | int, 1800] | min -%}
+  {{- req(u, 'exe', th, t.at, episode=true) -}}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set w = ([interval / 4, 6] | min * 3600) | int -%}
+  {%- do shared.update({'last_user': u, 'last_anon': a1, 'last_tunnel': th}) -%}
+  {{- schedule(due - w // 2, due + w // 2, 2, 0.0001) -}}
+{%- endif -%}
+
+{#- 2. Nothing due: start a new action of this timestamp's population. -#}
+{%- if not q or q[0][0] > now -%}
+  {%- if 'auto' in tags -%}
+    {#- Computers fetch updates whoever uses them. -#}
+    {%- set h = module.rand.choice(hosts['update']) -%}
+    {{- burst(module.rand.choice(users), 'update', [h],
+        module.rand.weighted_choice([1, 2, 3, 4], [50, 25, 15, 10]), 3, 0.9, 1) -}}
+  {%- else -%}
+    {%- set i = module.rand.weighted_choice(range(users | length) | list, shared.get('weights')) -%}
+    {%- set u = users[i] -%}
+    {%- set tunnel = 0.45 if shared.get('tier')[i] else 0.05 -%}
+    {%- set kind = module.rand.weighted_choice(['exe', 'social', 'sharing', 'anon'],
+        [12, 31, 13, 16]) -%}
+    {%- if kind == 'exe' -%}
+      {{- burst(u, 'exe', [exe_host(tunnel)], module.rand.weighted_choice([1, 2], [82, 18]), 25, 1.2, 1) -}}
+    {%- elif kind == 'social' -%}
+      {{- burst(u, 'social', hosts['social'], module.rand.weighted_choice([1, 2, 3, 4, 5, 6],
+          [42, 24, 14, 9, 6, 5]), 25, 1.3, 0.7) -}}
+    {%- elif kind == 'sharing' -%}
+      {{- burst(u, 'sharing', hosts['sharing'], module.rand.weighted_choice([1, 2, 3], [58, 28, 14]),
+          40, 1.2, 0.6, 0.25) -}}
+    {%- else -%}
+      {%- set n = module.rand.weighted_choice([1, 2, 3, 4], [55, 29, 12, 4]) -%}
+      {{- burst(u, 'anon', params.anonymizer_hosts, n, 45, 1.3, 0.35) -}}
+      {#- Some users look for software after a blocked proxy page. -#}
+      {%- if module.rand.chance(0.22) -%}
+        {{- req(u, 'exe', exe_host(tunnel + 0.2), now + gap(300, 1.0) | int + gap(40, 1.0) | int * (n - 1)) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due request. -#}
+{%- set e = heapq.heappop(q) -%}
+{%- set user_name = e[2][0] -%}
+{%- set client_ip = e[2][1] -%}
+{%- set kind = e[3] -%}
+{%- set host = e[4] -%}
+{%- set method = e[5] -%}
+
+{#- Last blocked-anonymizer time per user and host. -#}
+{%- set seen = shared.get('anon').setdefault(user_name, {}) -%}
+{%- if kind == 'anon' -%}
+  {%- do seen.update({host: now}) -%}
+{%- endif -%}
+{#- Guard on the final chain step only: an ordinary tunnel-client
+    download after blocks on two different anonymizers within the chain
+    window comes from an ordinary software host instead. -#}
+{%- if kind == 'exe' and not e[6] and host in params.tunnel_hosts
+    and (seen.values() | select('ge', now - window) | list | length) >= 2 -%}
+  {%- set host = module.rand.choice(hosts['software']) -%}
+{%- endif -%}
+
+{%- if kind == 'update' -%}
+  {%- set action = 'ALLOW' -%}
+  {%- set rule = 'Allow automatic updates and MS Windows activation' -%}
+  {%- if host.startswith('update.') -%}
+    {%- set path = '/antivirus/datfiles/4.x/dat-' ~ module.rand.number.integer(4100, 9800) ~ '.zip' -%}
+  {%- elif host.startswith('activation.') -%}
+    {%- set path = module.rand.choice(['/licensing/activate', '/licensing/validate', '/genuine/check']) -%}
+  {%- else -%}
+    {%- set path = '/updates/kb' ~ module.rand.number.integer(4000000, 5099999) ~ '/'
+        ~ module.rand.string.hex(16) | lower ~ '.cab' -%}
+  {%- endif -%}
+{%- elif kind == 'exe' -%}
+  {%- set action = 'ALLOW' -%}
+  {%- set rule = 'Log executable downloads' -%}
+  {%- set product = host.split('.')[1] -%}
+  {%- set path = '/' ~ product ~ '/' ~ module.rand.number.integer(1, 24) ~ '.'
+      ~ module.rand.number.integer(0, 9) ~ '/' ~ product
+      ~ module.rand.choice(['-setup.exe', '-x64.msi', '_installer.exe', '-win64.exe']) -%}
+{%- elif kind == 'social' -%}
+  {%- set action = 'DENY' -%}
+  {%- set rule = 'Deny social networks' -%}
+  {%- set path = module.rand.weighted_choice(['/', '/feed', '/messages',
+      '/watch?v=' ~ module.rand.string.letters(11)], [45, 20, 15, 20]) -%}
+{%- elif kind == 'sharing' -%}
+  {%- set action = 'DENY' -%}
+  {%- set rule = 'Deny file sharing' -%}
+  {%- set path = '/upload' if method == 'POST' else module.rand.weighted_choice(['/',
+      '/s/' ~ module.rand.string.hex(12) | lower], [55, 45]) -%}
+{%- else -%}
+  {%- set action = 'DENY' -%}
+  {%- set rule = 'Deny anonymizers' -%}
+  {%- set path = module.rand.weighted_choice(['/', '/index.php',
+      '/browse.php?u=http%3A%2F%2F' ~ module.rand.choice(hosts['social'])], [50, 20, 30]) -%}
+{%- endif -%}
+
+{%- set url = 'http://' ~ host ~ path -%}
+{%- set iso = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set raw = '[' ~ iso.strftime('%d/%b/%Y %H:%M:%S') ~ '] ' ~ action ~ " URL '"
+  ~ rule ~ "' " ~ client_ip ~ ' ' ~ user_name ~ ' HTTP ' ~ method ~ ' ' ~ url -%}
+{%- set record = {'@timestamp': iso.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'kerio_control.filter',
+    'category': ['web', 'network'],
+    'type': ['access', 'allowed' if action == 'ALLOW' else 'denied'],
+    'action': action, 'original': raw},
+  'observer': {'hostname': params.firewall_host, 'vendor': 'GFI',
+    'product': 'Kerio Control', 'type': 'firewall'},
+  'rule': {'name': rule},
+  'source': {'ip': client_ip},
+  'user': {'name': user_name},
+  'http': {'request': {'method': method}},
+  'url': {'full': url, 'scheme': 'http', 'domain': host,
+    'path': path.split('?')[0]},
+  'related': {'ip': [client_ip], 'user': [user_name], 'hosts': [host]},
+  'kerio_control': {'filter': {'rule_type': 'URL', 'action': action}}} -%}
+{{ record | tojson }}
