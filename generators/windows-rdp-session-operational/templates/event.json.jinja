@@ -1,0 +1,163 @@
+{# Selected native LSM session lifecycle, bounded by 100 live sessions.
+   New sessions have ordinary shell/disconnect/reconnect/logoff schedules.
+   The only drop is the exact fifth-distinct-user logon guard. #}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = ts.timestamp() -%}
+{%- set interval = params.anomaly_interval_hours * 3600 -%}
+{%- set curve = [0.67] * 8 + [1.0] * 10 + [0.67] * 6 -%}
+{%- macro pick_start(lo, span, first=false) -%}
+  {%- set r = namespace(v=lo, ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.floating(0, span) -%}
+    {%- set weight = curve[(c // 3600) | int % 24] -%}
+    {%- if module.rand.number.floating(0, 1.02) < (weight if first else weight ** 2 + 0.02) -%}
+      {%- set r.v = c -%}{%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro push(due, sid, code) -%}
+  {%- set serial = shared.get('serial', 0) + 1 -%}
+  {%- do shared.set('serial', serial) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, serial, sid, code]) -%}
+{%- endmacro -%}
+{%- if shared.get('sessions') is none -%}
+  {%- do module.pydantic_core.SchemaValidator({'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}}
+  }}).validate_python(params) -%}
+  {%- set day = [] -%}{%- set night = [] -%}
+  {%- for account in samples.sessions -%}
+    {%- do day.append(3.0 if account.role == 'busy' else 1.0) -%}
+    {%- do night.append(0.6 if account.role == 'busy' else (1.0 if account.role == 'shift' else 0.02)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'sessions': {}, 'active': {}, 'queue': [], 'history': {}, 'episode': {},
+    'last_group': -1, 'record': 40000, 'session_counter': 100,
+    'pid': 4 * module.rand.number.integer(200, 1200), 'day_weights': day, 'night_weights': night}) -%}
+  {%- do shared.set('episode_due', pick_start(now, [interval, 86400] | min, true) | float) -%}
+{%- endif -%}
+{%- set sessions = shared.get('sessions') -%}
+{%- set active = shared.get('active') -%}
+{%- set queue = shared.get('queue') -%}
+{%- set history = shared.get('history') -%}
+{%- set episode = shared.get('episode') -%}
+{%- if params.anomaly_mode and not episode and now >= shared.get('episode_due') and sessions | length < 95 -%}
+  {%- set groups = [] -%}
+  {%- for group in range(4) if group != shared.get('last_group') -%}
+    {%- set eligible = [] -%}
+    {%- for ai in range(180 + group * 5, 185 + group * 5) if active.get(ai, 0) < 2 -%}{%- do eligible.append(ai) -%}{%- endfor -%}
+    {%- if eligible | length == 5 -%}{%- do groups.append(group) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if groups -%}
+    {%- set group = module.rand.choice(groups) -%}
+    {%- set episode = {'group': group, 'left': module.rand.shuffle(range(180 + group * 5, 185 + group * 5) | list), 'next': now, 'started': false} -%}
+    {%- do shared.set('episode', episode) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set code = 21 -%}
+{%- set episode_row = false -%}
+{%- set ai = none -%}
+{%- if episode and now >= episode.next and sessions | length < 100 -%}
+  {%- set eligible = episode.left | select('in', range(samples.sessions | length)) | list -%}
+  {%- set pick = namespace(v=none) -%}
+  {%- for candidate in eligible if pick.v is none and active.get(candidate, 0) < 2 -%}{%- set pick.v = candidate -%}{%- endfor -%}
+  {%- if pick.v is not none -%}
+    {%- set ai = pick.v -%}{%- set episode_row = true -%}
+    {%- do episode.left.remove(ai) -%}
+    {%- do episode.update({'next': now + module.rand.number.floating(30, 90)}) -%}
+    {%- if not episode.started -%}
+      {%- do episode.update({'started': true}) -%}
+      {%- set w = [interval / 4, 21600] | min -%}
+      {%- do shared.update({'last_group': episode.group, 'episode_due': pick_start(now + interval - w / 2, w) | float}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- if ai is none and queue and (queue[0][0] <= now or sessions | length >= 100) -%}
+  {# Shell startup precedes routine close processing at sparse input ticks. #}
+  {%- set shell = namespace(index=none, due=now) -%}
+  {%- for index in range(queue | length) if queue[index][3] == 22 and queue[index][0] <= shell.due -%}
+    {%- set shell.index = index -%}{%- set shell.due = queue[index][0] -%}
+  {%- endfor -%}
+  {%- if shell.index is none -%}
+    {%- set item = module.heapq.heappop(queue) -%}
+  {%- else -%}
+    {%- set item = queue.pop(shell.index) -%}{%- do module.heapq.heapify(queue) -%}
+  {%- endif -%}
+  {%- set sid = item[2] -%}{%- set code = item[3] -%}
+  {%- set session = sessions[sid] -%}{%- set ai = session.ai -%}
+{%- elif ai is none -%}
+  {%- set weights = shared.get('day_weights') if 8 <= ts.hour < 18 else shared.get('night_weights') -%}
+  {%- set eligible = [] -%}{%- set chosen_weights = [] -%}
+  {%- for candidate in range(samples.sessions | length) if active.get(candidate, 0) < 2 -%}
+    {%- do eligible.append(candidate) -%}{%- do chosen_weights.append(weights[candidate]) -%}
+  {%- endfor -%}
+  {%- set ai = module.rand.weighted_choice(eligible, chosen_weights) -%}
+{%- endif -%}
+{%- set account = samples.sessions[ai] -%}
+{%- if code == 21 -%}
+  {%- set recent = history.get(account.ip, {}) -%}
+  {%- set other = [] -%}
+  {%- for user, at in recent.items() if user != account.user and now - at <= 3600 -%}{%- do other.append(user) -%}{%- endfor -%}
+  {%- set completes = other | length >= 4 -%}
+  {%- if completes and not episode_row -%}
+    {# An unsuccessful new-session attempt produces no successful 21 in
+       this channel. No existing session is cancelled or reattributed. #}
+    {{- dispatch.drop() -}}
+  {%- endif -%}
+  {%- do recent.update({account.user: now}) -%}{%- do history.update({account.ip: recent}) -%}
+  {%- if completes and episode_row -%}
+    {%- do shared.set('episode', {}) -%}
+  {%- elif episode_row and not episode.left -%}
+    {# At the shipped density five episode logons finish within an hour.
+       A sparse custom input can retry remaining distinct users. #}
+    {%- do episode.update({'left': module.rand.shuffle(range(180 + episode.group * 5, 185 + episode.group * 5) | list)}) -%}
+  {%- endif -%}
+  {%- set sid = shared.get('session_counter') % 65535 + 1 -%}
+  {%- do shared.set('session_counter', sid) -%}
+  {%- set session = {'ai': ai, 'activity': '{' ~ module.rand.crypto.uuid4() ~ '}', 'status': 'connected'} -%}
+  {%- do sessions.update({sid: session}) -%}
+  {%- do active.update({ai: active.get(ai, 0) + 1}) -%}
+  {{- push(now + module.rand.number.floating(1, 8), sid, 22) -}}
+  {%- set stop = now + module.rand.number.floating(1200, 3600) -%}
+  {%- if module.rand.chance(0.3) -%}
+    {{- push(stop, sid, 24) -}}
+    {%- if module.rand.chance(0.7) -%}
+      {%- set reconnect = stop + module.rand.number.floating(60, 900) -%}
+      {{- push(reconnect, sid, 25) -}}
+      {{- push(reconnect + module.rand.number.floating(600, 1800), sid, 23) -}}
+    {%- else -%}
+      {{- push(stop + 1800, sid, 23) -}}
+    {%- endif -%}
+  {%- else -%}
+    {{- push(stop, sid, 23) -}}
+  {%- endif -%}
+{%- elif code == 24 -%}
+  {%- do session.update({'status': 'disconnected'}) -%}
+{%- elif code == 25 -%}
+  {%- do session.update({'status': 'connected'}) -%}
+{%- elif code == 23 -%}
+  {%- do sessions.pop(sid) -%}{%- do active.update({ai: active[ai] - 1}) -%}
+{%- endif -%}
+{%- set record = shared.get('record') + 1 -%}{%- do shared.set('record', record) -%}
+{%- set actor = account.user -%}{%- set source = account.ip -%}
+{%- set activity = session.activity if code != 25 else none -%}
+{%- set created = ts.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ module.rand.number.integer(0, 9) ~ 'Z' -%}
+{%- set pid = shared.get('pid') -%}{%- set thread = module.rand.choice([404, 408, 416, 432]) -%}
+{%- set provider = 'Microsoft-Windows-TerminalServices-LocalSessionManager' -%}
+{%- set channel = provider ~ '/Operational' -%}
+{%- set guid = '{5d896912-022d-40aa-a3a8-4fa5515c76d7}' -%}
+{%- set data = {'xml_name': 'EventXML', 'User': actor, 'SessionID': sid | string} -%}
+{%- if code != 23 -%}{%- do data.update({'Address': source}) -%}{%- endif -%}
+{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="' ~ provider ~ '" Guid="' ~ guid ~ '"/><EventID>' ~ code ~ '</EventID><Version>0</Version><Level>4</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x1000000000000000</Keywords><TimeCreated SystemTime="' ~ created ~ '"/><EventRecordID>' ~ record ~ '</EventRecordID>' ~ ('<Correlation ActivityID="' ~ activity ~ '"/>' if activity else '<Correlation/>') ~ '<Execution ProcessID="' ~ pid ~ '" ThreadID="' ~ thread ~ '"/><Channel>' ~ channel ~ '</Channel><Computer>' ~ (params.host_name | e) ~ '</Computer><Security UserID="S-1-5-18"/></System><UserData><EventXML xmlns="Event_NS"><User>' ~ (actor | e) ~ '</User><SessionID>' ~ sid ~ '</SessionID>' ~ ('<Address>' ~ source ~ '</Address>' if code != 23 else '') ~ '</EventXML></UserData></Event>' -%}
+{%- set actions = {21: 'session-logon', 22: 'shell-started', 23: 'session-logoff', 24: 'session-disconnected', 25: 'session-reconnected'} -%}
+{%- set parts = actor.split('\\', 1) -%}
+{%- set event = {'@timestamp': ts.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'code': code | string, 'provider': provider, 'action': actions[code], 'category': ['authentication', 'session'] if code == 21 else ['session'], 'type': ['start'] if code in [21, 22, 25] else ['end'], 'original': xml},
+  'host': {'name': params.host_name, 'ip': [params.host_ip]}, 'log': {'level': 'information'},
+  'user': {'name': parts[1], 'domain': parts[0]}, 'related': {'user': [actor]},
+  'winlog': {'channel': channel, 'computer_name': params.host_name, 'provider_name': provider, 'provider_guid': guid,
+    'event_id': code | string, 'record_id': record, 'version': 0, 'user_data': data,
+    'process': {'pid': pid, 'thread': {'id': thread}}, 'user': {'identifier': 'S-1-5-18'}}} -%}
+{%- if activity -%}{%- do event.winlog.update({'activity_id': activity}) -%}{%- endif -%}
+{%- if code != 23 -%}{%- do event.update({'source': {'ip': source}}) -%}{%- do event.related.update({'ip': [source]}) -%}{%- endif -%}
+{{- event | tojson -}}
