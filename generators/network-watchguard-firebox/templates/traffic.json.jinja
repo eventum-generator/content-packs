@@ -1,0 +1,433 @@
+{#- One WatchGuard Firebox logging traffic messages as they appear in
+    Traffic Monitor (and on a Syslog server). Every input timestamp
+    yields exactly one record at that time. Four tagged inputs carry
+    the populations: `office` (LAN clients during the working day),
+    `auto` (always-on LAN hosts), `vpn` (remote users reaching the SSL
+    VPN portal) and `wan` (unsolicited packets from the internet).
+    A small heap holds records that are due later (further echo
+    requests, SYN retries and further ports of a probe, follow-up
+    portal connections, episode steps); the earliest due one takes the
+    next timestamp of any input. Each population keeps a balance of
+    records emitted minus timestamps received, and a free timestamp
+    starts new activity of the population that is owed most, so every
+    population keeps its own volume and daily curve. Times are epoch
+    seconds. -#}
+{%- set now = module.builtins.int(timestamp.timestamp()) -%}
+{%- set hq = module.heapq -%}
+{%- set rnd = module.random -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set hour = 3600 -%}
+{%- set window_s = 3600 -%}
+{%- set fbx = params.firebox_external_ip -%}
+{%- set scan_ports = [22, 23, 25, 80, 445, 1433, 3306, 3389, 8080, 9007] -%}
+{%- set scan_weights = [20, 10, 6, 9, 10, 5, 4, 14, 8, 6] -%}
+{%- set services = {22: 'ssh', 23: 'telnet', 25: 'smtp', 80: 'http', 443: 'https',
+    445: 'microsoft-ds', 1433: 'ms-sql-s', 3306: 'mysql', 3389: 'ms-wbt-server',
+    8080: 'webcache'} -%}
+{#- Ports per unsolicited burst, by address class. One- and two-port
+    bursts keep the same 65:35 ratio in every class. -#}
+{%- set port_law = {'user': [[1, 2], [65, 35]],
+    'shared': [[1, 2, 3, 4, 5], [52, 28, 12, 5, 3]],
+    'scan': [[1, 2, 3, 4, 5], [39, 21, 20, 12, 8]]} -%}
+{#- Initial TTL, SYN window sizes and TCP header offset per OS. -#}
+{%- set stacks = {'windows': [128, [64240, 65535, 8192], 8],
+    'linux': [64, [64240, 29200], 10], 'macos': [64, [65535], 11],
+    'scanner': [255, [1024, 65535], 5]} -%}
+
+{%- macro ln(median, sigma) -%}
+  {#- Log-normal whole seconds with the given median, at least 1. -#}
+  {{- [module.builtins.int(module.rand.number.lognormal(module.math.log(median), sigma) + 0.5), 1] | max -}}
+{%- endmacro -%}
+
+{%- macro push(due, st, item) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do hq.heappush(shared.get('q'), [due, n, st, item]) -%}
+{%- endmacro -%}
+
+{%- macro spread(n, sigma) -%}
+  {#- Log-normal quantiles in random order: which host is busy changes
+      from run to run, the spread of activity across hosts does not. -#}
+  {%- set nd = module.statistics.NormalDist(0, sigma) -%}
+  {%- set out = [] -%}
+  {%- for i in range(n) -%}
+    {%- do out.append(module.math.exp(nd.inv_cdf((i + 0.5) / n)) | string) -%}
+  {%- endfor -%}
+  {{- module.rand.shuffle(out) | join(',') -}}
+{%- endmacro -%}
+
+{%- macro cumulative(weights) -%}
+  {%- set acc = namespace(v=0.0, out=[]) -%}
+  {%- for w in weights -%}
+    {%- set acc.v = acc.v + w -%}
+    {%- do acc.out.append(acc.v | string) -%}
+  {%- endfor -%}
+  {{- acc.out | join(',') -}}
+{%- endmacro -%}
+
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its hour weighted by the squared
+      portal activity curve plus a small floor. -#}
+  {%- set curve = shared.get('curve') -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, 1.02) < curve[((c + shared.get('tzoff')) // hour) % 24] ** 2 + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+
+{%- macro pick_ports(k) -%}
+  {%- set ports = scan_ports | list -%}
+  {%- set weights = scan_weights | list -%}
+  {%- set out = [] -%}
+  {%- for n in range(k) -%}
+    {%- set p = module.rand.weighted_choice(ports, weights) -%}
+    {%- set i = ports.index(p) -%}
+    {%- do ports.pop(i) -%}{%- do weights.pop(i) -%}
+    {%- do out.append(p | string) -%}
+  {%- endfor -%}
+  {{- out | join(',') -}}
+{%- endmacro -%}
+
+{%- macro probe_times(k) -%}
+  {#- Send times (offsets from the first packet) of 1-3 SYNs on each of
+      k ports, one list per port. -#}
+  {%- set t = namespace(v=0, out=[]) -%}
+  {%- for n in range(k) -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + ln(15, 1.2) | int -%}{%- endif -%}
+    {%- set row = [] -%}
+    {%- for a in range(module.rand.weighted_choice([1, 2, 3], [65, 25, 10])) -%}
+      {%- if not loop.first -%}{%- set t.v = t.v + ln(3, 0.5) | int -%}{%- endif -%}
+      {%- do row.append(t.v | string) -%}
+    {%- endfor -%}
+    {%- do t.out.append(row | join(' ')) -%}
+  {%- endfor -%}
+  {{- t.out | join(',') -}}
+{%- endmacro -%}
+
+{%- macro probe(src, ports, times, st, episode) -%}
+  {#- Unsolicited SYNs from one external address to ports of the
+      Firebox external address, sent by a stateless scanner or by an
+      ordinary TCP stack. The same law serves background and episode. -#}
+  {%- set tool = module.rand.chance(0.6) -%}
+  {%- for port in ports -%}
+    {%- for off in times[loop.index0].split(' ') -%}
+      {{- push(now + off | int, st, {'kind': 'ext_deny', 'src': src, 'port': port,
+          'tool': tool, 'episode': episode}) -}}
+    {%- endfor -%}
+  {%- endfor -%}
+{%- endmacro -%}
+
+{%- if shared.get('q') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 2, 'le': 8760}},
+    'device_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'firebox_external_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^\\d+\\.\\d+\\.\\d+\\.\\d+$'}},
+    'firebox_trusted_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^\\d+\\.\\d+\\.\\d+\\.\\d+$'}},
+    'external_interface': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'trusted_interface': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'client_prefix': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^\\d+\\.\\d+\\.\\d+\\.$'}},
+    'client_first': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 1, 'le': 247}},
+    'client_count': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 8, 'le': 254}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- if params.client_first + params.client_count > 255 -%}
+    {%- do module.pydantic_core.SchemaValidator({'type': 'int', 'le': 255}).validate_python(params.client_first + params.client_count) -%}
+  {%- endif -%}
+  {%- set checked = module.ipaddress.IPv4Address(fbx) -%}
+  {%- set hosts = {} -%}
+  {%- set clients = [] -%}
+  {%- for n in range(params.client_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do clients.append(ip) -%}
+    {%- do hosts.update({ip: {'os': module.rand.weighted_choice(['windows', 'linux', 'macos'], [78, 8, 14]),
+        'hops': module.rand.weighted_choice([0, 1], [70, 30])}}) -%}
+  {%- endfor -%}
+  {%- set client_w = spread(params.client_count, 1.2).split(',') | map('float') | list -%}
+  {#- About a quarter of the clients stay on around the clock (servers,
+      printers, machines left running); only they are active at night. -#}
+  {%- set on_idx = module.rand.shuffle(range(params.client_count) | list)[:[(params.client_count / 4) | round | int, 2] | max] | sort -%}
+  {%- set on_clients = [] -%}
+  {%- set on_w = [] -%}
+  {%- for i in on_idx -%}
+    {%- do on_clients.append(clients[i]) -%}{%- do on_w.append(client_w[i]) -%}
+  {%- endfor -%}
+  {#- External addresses from samples/remote_addresses.csv. `user`:
+      remote users behind home routers (portal logins; stray packets
+      from other devices behind the same address to one or two ports).
+      `shared`: shared egress addresses such as carrier-grade NAT or
+      cloud NAT gateways (several remote users log in through each;
+      infected devices behind them probe one to five ports). `scan`:
+      hosting and scanning ranges (most multi-port probes; portal logins
+      at a tenth of a user's rate, a VPS or jump host of a user). Each
+      row carries its probe and portal activity weights. -#}
+  {%- set remotes = [] -%}
+  {%- set classes = [] -%}
+  {%- set scan_w = [] -%}
+  {%- set vpn_w = [] -%}
+  {%- set pool = [] -%}
+  {%- set pool_w = [] -%}
+  {%- for row in samples.remote_addresses -%}
+    {%- set checked = module.ipaddress.IPv4Address(row.ip) -%}
+    {%- do remotes.append(row.ip) -%}
+    {%- do classes.append(row.role) -%}
+    {%- do scan_w.append(row.probe_weight | float) -%}
+    {%- do vpn_w.append(row.portal_weight | float) -%}
+    {%- do hosts.update({row.ip: {'os': row.os, 'hops': row.hops | int}}) -%}
+    {%- if row.role == 'shared' -%}
+      {%- do pool.append(row.ip) -%}{%- do pool_w.append(row.probe_weight | float) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do module.pydantic_core.SchemaValidator({'type': 'int', 'ge': 2}).validate_python(pool | length) -%}
+  {%- set web = [] -%}
+  {%- for n in range(40) -%}
+    {%- do web.append('203.0.113.' ~ module.rand.number.integer(1, 199)) -%}
+  {%- endfor -%}
+  {#- Portal logins by hour of the day, relative to the peak hour (the
+      hourly rate of patterns/vpn-*.yml). Episode starts are weighted by
+      its square. -#}
+  {%- set curve = [0.043, 0.043, 0.043, 0.045, 0.052, 0.076, 0.132, 0.233, 0.385, 0.574, 0.768,
+      0.924, 1.0, 0.974, 0.85, 0.662, 0.457, 0.278, 0.152, 0.082, 0.053, 0.045, 0.043, 0.043] -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'q': [], 'seq': 0, 'hosts': hosts, 'clients': clients,
+      'client_cum': cumulative(client_w).split(',') | map('float') | list,
+      'on_clients': on_clients, 'on_cum': cumulative(on_w).split(',') | map('float') | list,
+      'remotes': remotes, 'classes': classes,
+      'scan_cum': cumulative(scan_w).split(',') | map('float') | list,
+      'vpn_cum': cumulative(vpn_w).split(',') | map('float') | list,
+      'pool': pool, 'pool_w': pool_w, 'web': web, 'hist': {}, 'curve': curve,
+      'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()),
+      'bal': {'office': 0, 'auto': 0, 'vpn': 0, 'wan': 0}, 'ep_last': none}) -%}
+  {%- do shared.set('ep_due', pick_start(now, [interval, 24 * hour] | min) | int) -%}
+{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set bal = shared.get('bal') -%}
+{%- set tag = tags[0] -%}
+{%- do bal.update({tag: bal[tag] - 1}) -%}
+
+{#- Episode: at the first timestamp at or after its drawn start, a
+    shared egress address other than the previous episode's (weighted by
+    its probe rate) probes three to five ports of the Firebox with the
+    background law, then one portal connection follows a few minutes
+    later, all within the hour. Its records take over timestamps like
+    background records due later. The first start falls within the first
+    min(interval, 24 h); each later start within a window of
+    min(interval / 4, 6 h) centred one interval after the actual start,
+    both weighted by the portal curve squared. Missed episodes are not
+    replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- set cand = namespace(r=[], w=[]) -%}
+  {%- for ip in shared.get('pool') -%}
+    {%- if ip != shared.get('ep_last') -%}
+      {%- do cand.r.append(ip) -%}{%- do cand.w.append(shared.get('pool_w')[loop.index0]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set src = module.rand.weighted_choice(cand.r, cand.w) -%}
+  {%- set k = module.rand.weighted_choice([3, 4, 5], [12, 5, 3]) -%}
+  {%- set plan = namespace(times=[], login=0, ok=false) -%}
+  {%- for _ in range(50) if not plan.ok -%}
+    {%- set plan.times = probe_times(k).split(',') -%}
+    {%- set plan.login = plan.times[-1].split(' ')[-1] | int + ln(180, 0.8) | int -%}
+    {%- set plan.ok = plan.login <= 3000 -%}
+  {%- endfor -%}
+  {{- probe(src, pick_ports(k).split(',') | map('int') | list, plan.times, 'wan', true) -}}
+  {{- push(now + plan.login, 'vpn', {'kind': 'vpn_allow', 'src': src, 'burst': 0, 'episode': true}) -}}
+  {%- set w = [interval // 4, 6 * hour] | min -%}
+  {%- do shared.update({'ep_last': src, 'ep_due': pick_start(now + interval - w // 2, w) | int}) -%}
+{%- endif -%}
+
+{#- The earliest due record takes this timestamp. Otherwise new
+    activity starts for the population owed most (this timestamp's own
+    on ties). -#}
+{%- if not (q and q[0][0] <= now) -%}
+  {%- set pick = namespace(st=tag) -%}
+  {%- for st in ['office', 'auto', 'vpn', 'wan'] -%}
+    {%- if bal[st] < bal[pick.st] -%}{%- set pick.st = st -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set st = pick.st -%}
+  {%- if st == 'office' or st == 'auto' -%}
+    {#- A LAN client: HTTPS to the internet with source NAT, HTTP
+        through the proxy (logged when the connection ends), or echo
+        requests to the Firebox. Office traffic comes from any client,
+        night-time traffic only from always-on hosts. -#}
+    {%- if st == 'office' -%}
+      {%- set cl = shared.get('clients') -%}{%- set cum = shared.get('client_cum') -%}
+    {%- else -%}
+      {%- set cl = shared.get('on_clients') -%}{%- set cum = shared.get('on_cum') -%}
+    {%- endif -%}
+    {%- set c = cl[module.bisect.bisect(cum, rnd.random() * cum[-1])] -%}
+    {%- set dst = module.rand.choice(shared.get('web')[:[(module.rand.number.exponential(0.1)) | int + 1, 40] | min]) -%}
+    {%- set r = rnd.random() -%}
+    {%- if r < 0.029 -%}
+      {%- set t = namespace(v=now) -%}
+      {%- for n in range(module.rand.weighted_choice([1, 2, 4], [50, 20, 30])) -%}
+        {%- if not loop.first -%}{%- set t.v = t.v + ln(1, 0.4) | int -%}{%- endif -%}
+        {{- push(t.v, st, {'kind': 'ping_deny', 'src': c}) -}}
+      {%- endfor -%}
+    {%- elif r < 0.175 -%}
+      {{- push(now, st, {'kind': 'proxy_end', 'src': c, 'dst': dst, 'start': now - ln(4, 1.3) | int}) -}}
+    {%- else -%}
+      {{- push(now, st, {'kind': 'out_allow', 'src': c, 'dst': dst}) -}}
+    {%- endif -%}
+  {%- elif st == 'vpn' -%}
+    {#- A remote user opens the SSL VPN portal or tunnel. -#}
+    {%- set cum = shared.get('vpn_cum') -%}
+    {%- set r = shared.get('remotes')[module.bisect.bisect(cum, rnd.random() * cum[-1])] -%}
+    {{- push(now, st, {'kind': 'vpn_allow', 'src': r, 'episode': false,
+        'burst': module.rand.weighted_choice([0, 1, 2], [60, 28, 12])}) -}}
+  {%- else -%}
+    {#- Internet background radiation: scanners, worms, stale clients. -#}
+    {%- set cum = shared.get('scan_cum') -%}
+    {%- set i = module.bisect.bisect(cum, rnd.random() * cum[-1]) -%}
+    {%- set law = port_law[shared.get('classes')[i]] -%}
+    {%- set k = module.rand.weighted_choice(law[0], law[1]) -%}
+    {{- probe(shared.get('remotes')[i], pick_ports(k).split(',') | map('int') | list,
+        probe_times(k).split(','), st, false) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set top = hq.heappop(q) -%}
+{%- set st = top[2] -%}
+{%- set s = top[3] -%}
+{%- set kind = s.kind -%}
+{%- do bal.update({st: bal[st] + 1}) -%}
+
+{%- if kind == 'vpn_allow' and not s.episode -%}
+  {%- set seen = hist.get(s.src, {}).values() | select('ge', now - window_s) | list | length -%}
+  {%- if seen >= 3 -%}
+    {#- Guard on the final chain step only. An ordinary portal login of
+        an address with denied packets on three or more ports of the
+        Firebox within the last hour keeps its time and address and
+        becomes what such addresses otherwise send: a SYN to the former
+        portal port, denied. Its follow-up connections are not made. -#}
+    {%- set kind = 'ext_deny' -%}
+    {%- set s = {'kind': kind, 'src': s.src, 'port': 9007, 'episode': false, 'tool': false} -%}
+  {%- elif s.burst > 0 -%}
+    {{- push(now + ln(25, 1.0) | int, st, {'kind': 'vpn_allow', 'src': s.src, 'episode': false,
+        'burst': s.burst - 1}) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- if kind == 'ext_deny' -%}
+  {#- Last denied time per port of each external address: bounded by
+      addresses x ports. -#}
+  {%- do hist.setdefault(s.src, {}).update({s.port: now}) -%}
+{%- endif -%}
+
+{#- Traffic Monitor line. Field order follows the vendor examples. -#}
+{%- set stamp = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set host = hosts[s.src] -%}
+{%- set stack = stacks['scanner' if s.get('tool') else host.os] -%}
+{%- set ttl = stack[0] - host.hops -%}
+{%- set sport = module.rand.number.integer(1024, 65535) if s.get('tool')
+    else module.rand.number.integer(49152, 65535) -%}
+{%- set nat = none -%}
+{%- set flags = none -%}
+{%- set duration = none -%}
+{%- set counters = none -%}
+{%- if kind == 'out_allow' -%}
+  {%- set dst = s.dst -%}{%- set dport = 443 -%}{%- set proto = 'tcp' -%}
+  {%- set in_if = params.trusted_interface -%}{%- set out_if = params.external_interface -%}
+  {%- set action = 'Allow' -%}{%- set policy = 'Outgoing-00' -%}
+  {%- set rc = '100' -%}{%- set code = '3000-0148' -%}{%- set nat = fbx -%}
+  {%- set offset = stack[2] -%}
+  {%- set tcp_info = 'offset ' ~ offset ~ ' S ' ~ module.rand.number.integer(1, 4294967295)
+      ~ ' win ' ~ module.rand.choice(stack[1]) -%}
+  {%- set head = 'Allow ' ~ s.src ~ ' ' ~ dst ~ ' https/tcp ' ~ sport ~ ' 443 ' ~ in_if ~ ' ' ~ out_if
+      ~ ' Allowed ' ~ (20 + 4 * offset) ~ ' ' ~ ttl ~ ' (' ~ policy ~ ')' -%}
+  {%- set tail = ' proc_id="firewall" rc="100" src_ip_nat="' ~ nat ~ '" tcp_info="' ~ tcp_info
+      ~ '" msg_id="3000-0148"' -%}
+{%- elif kind == 'proxy_end' -%}
+  {%- set dst = s.dst -%}{%- set dport = 80 -%}{%- set proto = 'tcp' -%}
+  {%- set in_if = params.trusted_interface -%}{%- set out_if = params.external_interface -%}
+  {%- set action = 'Allow' -%}{%- set policy = 'HTTP-proxy-00' -%}
+  {%- set rc = '406' -%}{%- set code = '3000-0176' -%}{%- set nat = fbx -%}
+  {%- set duration = now - s.start -%}
+  {%- set rcvd_b = (module.rand.number.lognormal(module.math.log(6000), 1.6)) | int + 300 -%}
+  {%- set sent_b = (module.rand.number.lognormal(module.math.log(700), 0.7)) | int + 200 -%}
+  {%- set rcvd_p = (rcvd_b / module.rand.number.floating(1100, 1460)) | round(0, 'ceil') | int + 2 -%}
+  {%- set sent_p = [(sent_b / 536) | round(0, 'ceil') | int + 3, (rcvd_p / module.rand.number.floating(1.6, 2.2)) | int] | max -%}
+  {%- set sent_b = [sent_b, sent_p * 40] | max -%}
+  {%- set flags = module.rand.weighted_choice(['SDdF', 'SD'], [92, 8]) -%}
+  {%- set counters = [sent_p, rcvd_p, sent_b, rcvd_b] -%}
+  {%- set head = 'Allow ' ~ s.src ~ ' ' ~ dst ~ ' http/tcp ' ~ sport ~ ' 80 ' ~ in_if ~ ' ' ~ out_if
+      ~ ' Allowed (' ~ policy ~ ')' -%}
+  {%- set tail = ' proc_id="firewall" rc="406" msg_id="3000-0176" src_ip_nat="' ~ nat
+      ~ '" flags="' ~ flags ~ '" duration="' ~ duration ~ '" sent_pkts="' ~ sent_p
+      ~ '" rcvd_pkts="' ~ rcvd_p ~ '" sent_bytes="' ~ sent_b ~ '" rcvd_bytes="' ~ rcvd_b ~ '"' -%}
+{%- elif kind == 'ping_deny' -%}
+  {%- set dst = params.firebox_trusted_ip -%}{%- set dport = none -%}{%- set sport = none -%}
+  {%- set proto = 'icmp' -%}
+  {%- set in_if = params.trusted_interface -%}{%- set out_if = 'Firebox' -%}
+  {%- set action = 'Deny' -%}{%- set policy = 'Ping-00' -%}
+  {%- set rc = '101' -%}{%- set code = '3000-0148' -%}
+  {%- set plen = 60 if host.os == 'windows' else 84 -%}
+  {%- set duration = 0 -%}
+  {%- set counters = [1, 0, plen, 0] -%}
+  {%- set head = 'Deny ' ~ s.src ~ ' ' ~ dst ~ ' echo-request/icmp ' ~ in_if ~ ' Firebox Denied '
+      ~ plen ~ ' ' ~ ttl ~ ' (' ~ policy ~ ')' -%}
+  {%- set tail = ' proc_id="firewall" rc="101" msg_id="3000-0148" type="8" duration="0"'
+      ~ ' sent_pkts="1" rcvd_pkts="0" sent_bytes="' ~ plen ~ '" rcvd_bytes="0"' -%}
+{%- else -%}
+  {%- set dst = fbx -%}{%- set proto = 'tcp' -%}
+  {%- set in_if = params.external_interface -%}{%- set out_if = 'Firebox' -%}
+  {%- set offset = stack[2] -%}
+  {%- set tcp_info = 'offset ' ~ offset ~ ' S ' ~ module.rand.number.integer(1, 4294967295)
+      ~ ' win ' ~ module.rand.choice(stack[1]) -%}
+  {%- if kind == 'vpn_allow' -%}
+    {%- set dport = 443 -%}{%- set action = 'Allow' -%}{%- set policy = 'WatchGuard SSLVPN-00' -%}
+    {%- set rc = '100' -%}{%- set code = '3000-0148' -%}
+    {%- set head = 'Allow ' ~ s.src ~ ' ' ~ dst ~ ' https/tcp ' ~ sport ~ ' 443 ' ~ in_if ~ ' Firebox'
+        ~ ' Allowed ' ~ (20 + 4 * offset) ~ ' ' ~ ttl ~ ' (' ~ policy ~ ')' -%}
+    {%- set tail = ' proc_id="firewall" rc="100" tcp_info="' ~ tcp_info ~ '" msg_id="3000-0148"' -%}
+  {%- else -%}
+    {%- set dport = s.port -%}{%- set action = 'Deny' -%}{%- set policy = 'Unhandled External Packet-00' -%}
+    {%- set rc = '101' -%}{%- set code = '3000-0148' -%}
+    {%- set head = 'Deny ' ~ s.src ~ ' ' ~ dst ~ ' ' ~ services.get(dport, dport | string) ~ '/tcp '
+        ~ sport ~ ' ' ~ dport ~ ' ' ~ in_if ~ ' Firebox Denied ' ~ (20 + 4 * offset) ~ ' ' ~ ttl
+        ~ ' (' ~ policy ~ ')' -%}
+    {%- set tail = ' proc_id="firewall" rc="101" msg_id="3000-0148" tcp_info="' ~ tcp_info ~ '"' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set raw = stamp.strftime('%Y-%m-%d %H:%M:%S') ~ ' ' ~ head ~ tail -%}
+
+{#- ECS document. -#}
+{%- set event = {'kind': 'event', 'dataset': 'watchguard.firebox.traffic',
+  'category': ['network'], 'type': ['connection', 'allowed' if action == 'Allow' else 'denied']
+  if kind != 'proxy_end' else ['connection', 'end', 'allowed'],
+  'action': 'traffic_' ~ action | lower, 'code': code, 'original': raw} -%}
+{%- if duration is not none -%}{%- do event.update({'duration': duration * 1000000000}) -%}{%- endif -%}
+{%- set source = {'ip': s.src} -%}
+{%- set destination = {'ip': dst} -%}
+{%- if sport is not none -%}{%- do source.update({'port': sport}) -%}{%- endif -%}
+{%- if dport is not none -%}{%- do destination.update({'port': dport}) -%}{%- endif -%}
+{%- set related = [s.src, dst] -%}
+{%- if nat -%}
+  {%- do source.update({'nat': {'ip': nat}}) -%}
+  {%- do related.append(nat) -%}
+{%- endif -%}
+{%- set network = {'transport': proto} -%}
+{%- if counters -%}
+  {%- do source.update({'packets': counters[0], 'bytes': counters[2]}) -%}
+  {%- do destination.update({'packets': counters[1], 'bytes': counters[3]}) -%}
+  {%- do network.update({'packets': counters[0] + counters[1], 'bytes': counters[2] + counters[3]}) -%}
+{%- endif -%}
+{%- set wg = {'disposition': action, 'process': 'firewall', 'return_code': rc,
+  'src_interface': in_if, 'dst_interface': out_if} -%}
+{%- if flags -%}{%- do wg.update({'flags': flags}) -%}{%- endif -%}
+{%- set record = {'@timestamp': stamp.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': event,
+  'observer': {'name': params.device_name, 'vendor': 'WatchGuard', 'product': 'Firebox',
+    'type': 'firewall', 'ingress': {'interface': {'name': in_if}},
+    'egress': {'interface': {'name': out_if}}},
+  'source': source, 'destination': destination, 'network': network,
+  'rule': {'name': policy}, 'related': {'ip': related | unique | list},
+  'watchguard': {'firebox': wg}} -%}
+{{ record | tojson }}
