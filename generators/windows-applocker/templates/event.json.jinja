@@ -1,0 +1,420 @@
+{#- Microsoft-Windows-AppLocker records (EXE and DLL: 8002-8004; MSI and
+    Script: 8005-8007) as Winlogbeat-style ECS JSON with the raw event
+    XML. The input sets the rate and the hour-of-day curve; every
+    timestamp is one record, stamped with the timestamp itself. Each
+    timestamp takes the earliest due record of an operation already in
+    progress, else the next due operation of an administrator's visit,
+    else starts a new operation of a user drawn by activity weight.
+    Users work in long logon sessions on their own workstations (admins
+    visit random hosts); an operation starts an application, runs
+    scripts or installers, or tries a file from a user-writable folder
+    that the policy blocks. Times are in microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- set hq = module.heapq -%}
+{%- set sec = 1000000 -%}
+{%- set hour = 3600 * sec -%}
+{#- Chain window: a background launch of a proxy binary (rundll32,
+    regsvr32, mshta, certutil, MSBuild) whose session has a blocked
+    executable followed by a blocked script within this window becomes
+    the launch of another application. -#}
+{%- set window = 1901 * sec -%}
+{#- Relative record rate per UTC hour; mirrors the input patterns. -#}
+{%- set hload = [0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.05, 0.339, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0.339, 0.339, 0.05, 0.05, 0.05, 0.05, 0.05] -%}
+{%- set rules = {
+  'EXE:win': ['{A61C8B2C-A319-4CD0-9690-D2177CAD7B51}', '(Default Rule) All files located in the Windows folder', 'D:(XA;;FX;;;S-1-1-0;(APPID://PATH Contains "%WINDIR%\\*"))'],
+  'EXE:pf': ['{921CC481-6E17-4653-8F75-050B80ACCA20}', '(Default Rule) All files located in the Program Files folder', 'D:(XA;;FX;;;S-1-1-0;(APPID://PATH Contains "%PROGRAMFILES%\\*"))'],
+  'EXE:corp': ['{2B96EA72-3F7C-4B1C-A17D-79230F9D3B52}', 'Contoso line-of-business applications (CorpApps)', 'D:(XA;;FX;;;S-1-1-0;(APPID://PATH Contains "%OSDRIVE%\\CORPAPPS\\*"))'],
+  'EXE:adm': ['{FD686D83-A829-4351-8FF4-27C7DE5755D2}', '(Default Rule) All files', 'D:(XA;;FX;;;S-1-5-32-544;(APPID://PATH Contains "*"))'],
+  'SCRIPT:win': ['{73995B86-3A74-457F-864C-6F851516F1F8}', '(Default Rule) All scripts located in the Windows folder', 'D:(XA;;FX;;;S-1-1-0;(APPID://PATH Contains "%WINDIR%\\*"))'],
+  'SCRIPT:pf': ['{E67A01CA-2F1B-4D6B-85CD-8850943ED704}', '(Default Rule) All scripts located in the Program Files folder', 'D:(XA;;FX;;;S-1-1-0;(APPID://PATH Contains "%PROGRAMFILES%\\*"))'],
+  'SCRIPT:adm': ['{641D7CA0-C5A1-45C2-A8C2-E2322EFD44F3}', '(Default Rule) All scripts', 'D:(XA;;FX;;;S-1-5-32-544;(APPID://PATH Contains "*"))'],
+  'MSI:win': ['{3185BE65-0620-4F74-95D7-C7EFA445AEE9}', '(Default Rule) All Windows Installer files in %systemdrive%\\Windows\\Installer', 'D:(XA;;FX;;;S-1-1-0;(APPID://PATH Contains "%WINDIR%\\INSTALLER\\*"))'],
+  'MSI:ccm': ['{90DD4BE0-236C-41B8-83A8-87C9816D1C2F}', 'Configuration Manager client cache', 'D:(XA;;FX;;;S-1-1-0;(APPID://PATH Contains "%WINDIR%\\CCMCACHE\\*"))'],
+  'MSI:adm': ['{FD8C1788-B026-4E32-828F-FAE29BBC8EBB}', '(Default Rule) All Windows Installer files', 'D:(XA;;FX;;;S-1-5-32-544;(APPID://PATH Contains "*.*"))']
+} -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {#- Queue one record (k 'row') or one visit operation (k 'op'). -#}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- if item.k == 'row' -%}
+    {%- do item.sess.update({'pending': item.sess.pending + 1}) -%}
+    {%- do module.heapq.heappush(shared.get('rq'), [due, s, item]) -%}
+  {%- else -%}
+    {%- do module.heapq.heappush(shared.get('oq'), [due, s, item]) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro newpid() -%}{{- 4 * module.rand.number.integer(250, 11000) -}}{%- endmacro -%}
+{%- macro fill(path, user) -%}
+  {#- Expand the user and random-folder placeholders of a sample path. -#}
+  {{- path.replace('{U}', user).replace('{R}', module.rand.string.hex(8) | upper if module.rand.chance(0.5) else module.rand.crypto.uuid4() | upper) -}}
+{%- endmacro -%}
+{%- macro exe_rule(full) -%}
+  {%- set low = full | lower -%}
+  {{- 'EXE:win' if low.startswith('c:\\windows\\') else ('EXE:pf' if low.startswith('c:\\program files\\') else 'EXE:corp') -}}
+{%- endmacro -%}
+{%- macro row(sess, due, ch, code, full, fqbn, hash, pol, rule, pid, ppid, extra) -%}
+  {#- Queue one record. ch: 'exe' or 'msi' (channel). -#}
+  {%- set item = {'k': 'row', 'sess': sess, 'ch': ch, 'code': code, 'full': full, 'fqbn': fqbn, 'hash': hash, 'pol': pol, 'rule': rule, 'pid': pid, 'ppid': ppid} -%}
+  {%- do item.update(extra) -%}
+  {{- push(due, item) -}}
+{%- endmacro -%}
+{%- macro retries(t0, p_more) -%}
+  {#- Times of one attempt and its repeats (a user retrying a blocked
+      file), comma separated. -#}
+  {%- set t = namespace(v=t0, out=[t0 | string], go=true) -%}
+  {%- for _ in range(4) if t.go -%}
+    {%- if module.rand.chance(p_more) -%}
+      {%- set t.v = t.v + (ln(14, 1.0) | int) -%}
+      {%- do t.out.append(t.v | string) -%}
+    {%- else -%}{%- set t.go = false -%}{%- endif -%}
+  {%- endfor -%}
+  {{- t.out | join(',') -}}
+{%- endmacro -%}
+{%- macro run_app(sess, due, ai, extra) -%}
+  {#- Allowed executable launch (8002). -#}
+  {%- set a = shared.get('apps')[ai] -%}
+  {%- set pid = newpid() | int -%}
+  {%- set parent = (sess.explorer or newpid() | int) if module.rand.chance(0.75) or not sess.recent else module.rand.choice(sess.recent) -%}
+  {%- set x = {'lol': a.lol} -%}
+  {%- do x.update(extra) -%}
+  {{- row(sess, due, 'exe', 8002, a.full, a.fqbn, a.hash, 'EXE', exe_rule(a.full), pid, parent, x) -}}
+  {%- do sess.recent.append(pid) -%}
+  {%- if sess.recent | length > 12 -%}{%- do sess.recent.pop(0) -%}{%- endif -%}
+  {{- pid -}}
+{%- endmacro -%}
+{%- macro try_user_file(sess, due, extra) -%}
+  {#- A file from a user-writable folder: blocked for standard users
+      (8004, with repeats), allowed by the admin rule for admins.
+      Returns the time of the last attempt. -#}
+  {%- set u = shared.get('users')[sess.u] -%}
+  {%- set f = shared.get('user_files')[module.rand.weighted_choice(shared.get('uf_idx'), shared.get('uf_w'))] -%}
+  {%- set full = fill('C:\\Users\\{U}\\' ~ f.rel, u.name) -%}
+  {%- set times = (retries(due, 0.0 if u.admin else 0.45) | string).split(',') -%}
+  {%- for t in times -%}
+    {%- if u.admin -%}
+      {{- row(sess, t | int, 'exe', 8002, full, f.fqbn, f.hash, 'EXE', 'EXE:adm', newpid() | int, sess.explorer, extra) -}}
+    {%- else -%}
+      {{- row(sess, t | int, 'exe', 8004, full, f.fqbn, f.hash, 'EXE', none, newpid() | int, sess.explorer, extra) -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- times[-1] -}}
+{%- endmacro -%}
+{%- macro script_burst(sess, due, user_script, extra) -%}
+  {#- Script host or msiexec start (8002), then scripts or packages it
+      loads (8005). With user_script, one file from a user-writable
+      folder is tried as well: blocked (8007, with repeats) on enforced
+      hosts, audited (8006) on the pilot hosts, allowed for admins.
+      Returns the time of the last record. -#}
+  {%- set u = shared.get('users')[sess.u] -%}
+  {%- set host = shared.get('hosts')[sess.h] -%}
+  {%- set hi = module.rand.choice(shared.get('shost_idx')) -%}
+  {%- set pol = shared.get('apps')[hi].shost -%}
+  {%- set pid = run_app(sess, due, hi, extra) | int -%}
+  {%- set t = namespace(v=due) -%}
+  {%- set n = namespace(v=0, go=true) -%}
+  {%- for _ in range(6) if n.go -%}
+    {%- if module.rand.chance(0.7 if pol == 'SCRIPT' else 0.4) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set pool = shared.get('scripts_by')[pol] -%}
+  {%- for _ in range(n.v) -%}
+    {%- set t.v = t.v + (ln(0.6, 1.2) | int) -%}
+    {%- set s = module.rand.choice(pool) -%}
+    {%- set low = s.full | lower -%}
+    {%- set rk = pol ~ (':win' if low.startswith('c:\\windows\\installer\\') or (pol == 'SCRIPT' and low.startswith('c:\\windows\\')) else (':ccm' if pol == 'MSI' else ':pf')) -%}
+    {{- row(sess, t.v, 'msi', 8005, fill(s.full, u.name), s.fqbn, s.hash, pol, rk, pid, pid, extra) -}}
+  {%- endfor -%}
+  {%- if user_script -%}
+    {%- set s = module.rand.choice(shared.get('user_scripts_by')[pol]) -%}
+    {%- set full = fill('C:\\Users\\{U}\\' ~ s.rel, u.name) -%}
+    {%- set times = (retries(t.v + (ln(4, 1.0) | int), 0.0 if u.admin else 0.35) | string).split(',') -%}
+    {%- for tt in times -%}
+      {%- set code = 8005 if u.admin else (8006 if host.script_audit else 8007) -%}
+      {{- row(sess, tt | int, 'msi', code, full, s.fqbn, s.hash, pol, pol ~ ':adm' if u.admin else none, pid, pid, extra) -}}
+    {%- endfor -%}
+    {%- set t.v = times[-1] | int -%}
+  {%- endif -%}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro pick_app(u, lol_only) -%}
+  {%- set idx = shared.get('lol_idx') if lol_only else (shared.get('app_idx_dev') if u.dev else shared.get('app_idx')) -%}
+  {%- set w = shared.get('lol_w') if lol_only else (shared.get('app_w_dev') if u.dev else shared.get('app_w')) -%}
+  {{- module.rand.weighted_choice(idx, w) -}}
+{%- endmacro -%}
+{%- macro operation(sess, due) -%}
+  {#- One user operation inside a logon session. -#}
+  {%- set u = shared.get('users')[sess.u] -%}
+  {%- set r = module.rand.number.floating(0, 1) -%}
+  {%- if r < 0.835 -%}
+    {%- set _ = run_app(sess, due, pick_app(u, false) | int, {}) -%}
+  {%- elif r < 0.985 -%}
+    {%- set _ = script_burst(sess, due, module.rand.chance(0.04), {}) -%}
+  {%- else -%}
+    {#- A file from a user-writable folder; sometimes followed by a
+        script attempt or a proxy-binary launch (partial chains). -#}
+    {%- set t = try_user_file(sess, due, {}) | int -%}
+    {%- set r2 = module.rand.number.floating(0, 1) -%}
+    {%- if r2 < 0.3 -%}
+      {%- set t = script_burst(sess, t + (ln(120, 0.9) | int), true, {}) | int -%}
+      {%- if module.rand.chance(0.3) -%}{%- set _ = run_app(sess, t + (ln(150, 0.9) | int), pick_app(u, true) | int, {}) -%}{%- endif -%}
+    {%- elif r2 < 0.45 -%}
+      {%- set _ = run_app(sess, t + (ln(150, 0.9) | int), pick_app(u, true) | int, {}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro open_session(ui, h, due, dur) -%}
+  {#- Interactive logon: new logon ID and shell (explorer.exe, 8002). -#}
+  {%- set sess = {'u': ui, 'h': h, 'logon': '0x' ~ '%x' | format(module.rand.number.integer(131072, 67108863)), 'explorer': 0, 'recent': [], 't4': [], 't7': [], 'end': due + dur, 'pending': 0} -%}
+  {%- do sess.update({'explorer': run_app(sess, due, shared.get('explorer_idx'), {}) | int}) -%}
+  {%- do shared.get('users')[ui].update({'sess': sess}) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, hi, squared) -%}
+  {#- A time in [lo, hi) (seconds) weighted per UTC hour by the record
+      rate, or by its square plus a small floor. -#}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload[(a // 3600) % 24] -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.rand.number.integer(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if shared.get('rq') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set apps = [] -%}
+  {%- for r in samples.apps -%}{%- do apps.append({'full': r.full, 'fqbn': r.fqbn, 'hash': r.hash, 'w': r.w, 'lol': r.lol, 'shost': r.shost, 'dev': r.dev}) -%}{%- endfor -%}
+  {%- set lists = {'app_idx': [], 'app_w': [], 'app_idx_dev': [], 'app_w_dev': [], 'lol_idx': [], 'lol_w': [], 'shost_idx': [], 'uf_idx': [], 'uf_w': [], 'explorer_idx': 0} -%}
+  {%- for a in apps -%}
+    {%- if not a.dev -%}{%- do lists.app_idx.append(loop.index0) -%}{%- do lists.app_w.append(a.w) -%}{%- endif -%}
+    {%- do lists.app_idx_dev.append(loop.index0) -%}{%- do lists.app_w_dev.append(a.w) -%}
+    {%- if a.lol -%}{%- do lists.lol_idx.append(loop.index0) -%}{%- do lists.lol_w.append(a.w) -%}{%- endif -%}
+    {%- if a.shost -%}{%- do lists.shost_idx.append(loop.index0) -%}{%- endif -%}
+    {%- if a.full.endswith('explorer.exe') -%}{%- do lists.update({'explorer_idx': loop.index0}) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set ufs = [] -%}
+  {%- for r in samples.user_files -%}{%- do ufs.append({'rel': r.rel, 'fqbn': r.fqbn, 'hash': r.hash}) -%}{%- do lists.uf_idx.append(loop.index0) -%}{%- do lists.uf_w.append(r.w) -%}{%- endfor -%}
+  {%- set scs = {'SCRIPT': [], 'MSI': []} -%}
+  {%- for r in samples.scripts -%}{%- do scs[r.pol].append({'full': r.full, 'fqbn': r.fqbn, 'hash': r.hash}) -%}{%- endfor -%}
+  {%- set uscs = {'SCRIPT': [], 'MSI': []} -%}
+  {%- for r in samples.user_scripts -%}{%- do uscs[r.pol].append({'rel': r.rel, 'fqbn': r.fqbn, 'hash': r.hash}) -%}{%- endfor -%}
+  {%- set hosts = [] -%}
+  {%- for r in samples.hosts -%}
+    {%- do hosts.append({'name': r.name, 'script_audit': r.script_audit, 'rec': {'exe': module.rand.number.integer(20000, 2000000), 'msi': module.rand.number.integer(500, 90000)}}) -%}
+  {%- endfor -%}
+  {#- Activity weights: a standard user's operations follow their own
+      pace (bounded, so every user stays active); an administrator's
+      weight is that of starting a visit (about three a day). -#}
+  {%- set users = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- set cum = [] -%}
+  {%- for r in samples.users -%}
+    {%- set pace = [[module.rand.number.lognormal(0, 0.35), 0.6] | max, 1.7] | min -%}
+    {%- set w = 0.008 if r.admin else 1.0 / pace -%}
+    {%- do users.append({'name': r.name, 'sid': r.sid, 'host': r.host, 'dev': r.dev, 'admin': r.admin, 'pace': pace, 'w': w, 'sess': none, 'busy': false}) -%}
+    {%- set acc.w = acc.w + w -%}
+    {%- do cum.append(acc.w) -%}
+  {%- endfor -%}
+  {%- do shared.update(lists) -%}
+  {%- do shared.update({'rq': [], 'oq': [], 'seq': 0, 'apps': apps, 'user_files': ufs, 'scripts_by': scs, 'user_scripts_by': uscs, 'hosts': hosts, 'users': users, 'cum': cum, 'total': acc.w, 'ep_last_user': none, 'ep_last_host': none, 'ep_at': none, 'ep_retry': 0}) -%}
+  {%- if params.anomaly_mode -%}
+    {#- First episode within min(interval, 24 h), its hour drawn from the
+        record-rate curve. -#}
+    {%- set t0 = now // sec -%}
+    {%- do shared.set('ep_at', (pick_start(t0, t0 + module.builtins.int([params.anomaly_interval_hours, 24] | min * 3600), false) | int) * sec) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set rq = shared.get('rq') -%}
+{%- set oq = shared.get('oq') -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set users = shared.get('users') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode: a standard user logged on to their own enforced workstation
+    in an ordinary session (drawn by activity weight, other than the
+    previous episode's user and host) tries a file from a user-writable
+    folder (blocked, 8004), then a script from one (blocked, 8007), then
+    starts a proxy binary that the Windows-folder rule allows (8002),
+    all within 25 minutes. The session's own operations go on around
+    it; every file, delay and repeat count comes from the background
+    generators. The next start is due one interval after this start and
+    falls within w = min(interval / 4, 6 h) around that time, weighted
+    by the squared record-rate curve; missed episodes are not replayed.
+    With no eligible session open, the start waits for one (checked
+    once a minute). -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_at') and now >= shared.get('ep_retry') -%}
+  {%- set cand = namespace(i=[], w=[]) -%}
+  {%- for u in users -%}
+    {%- set s = u.sess -%}
+    {%- if s and not u.admin and u.host == s.h and not hosts[s.h].script_audit and loop.index0 != shared.get('ep_last_user') and s.h != shared.get('ep_last_host') and s.end > now + hour -%}
+      {%- set cand.i = cand.i + [loop.index0] -%}{%- set cand.w = cand.w + [u.w] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if cand.i -%}
+    {%- set ui = module.rand.weighted_choice(cand.i, cand.w) -%}
+    {%- set s = users[ui].sess -%}
+    {%- set ep = {'ep': true} -%}
+    {%- set t1 = try_user_file(s, now, ep) | int -%}
+    {%- set d = namespace(a=ln(120, 0.9) | int, b=ln(150, 0.9) | int) -%}
+    {%- for _ in range(40) if d.a + d.b > 900 * sec -%}{%- set d.a = ln(120, 0.9) | int -%}{%- set d.b = ln(150, 0.9) | int -%}{%- endfor -%}
+    {%- set t2 = script_burst(s, t1 + d.a, true, ep) | int -%}
+    {%- set _ = run_app(s, t2 + d.b, pick_app(users[ui], true) | int, ep) -%}
+    {%- set due = (now + interval) // sec -%}
+    {%- set half = module.builtins.int([params.anomaly_interval_hours / 4, 6] | min * 1800) -%}
+    {%- do shared.update({'ep_last_user': ui, 'ep_last_host': s.h, 'ep_at': (pick_start(due - half, due + half, true) | int) * sec}) -%}
+  {%- else -%}
+    {%- do shared.set('ep_retry', now + 60 * sec) -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Dispatcher: the earliest due record, else the next due visit
+    operation, else a new operation of a user drawn by activity weight
+    (binary search over cumulative weights; an administrator already on
+    a visit is redrawn). -#}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(24) if out.row is none -%}
+  {%- if rq and rq[0][0] <= now -%}
+    {%- set out.row = hq.heappop(rq)[2] -%}
+  {%- elif oq and oq[0][0] <= now -%}
+    {%- set top = hq.heappop(oq) -%}
+    {%- set item = top[2] -%}
+    {%- set u = users[item.u] -%}
+    {%- set s = u.sess -%}
+    {{- operation(s, top[0]) -}}
+    {%- set nxt = top[0] + module.builtins.int((ln(75, 1.25) | int) * u.pace) -%}
+    {%- if nxt < s.end -%}{{- push(nxt, item) -}}{%- else -%}{%- do u.update({'busy': false}) -%}{%- endif -%}
+  {%- else -%}
+    {%- set pick = namespace(i=none) -%}
+    {%- for _ in range(8) if pick.i is none -%}
+      {%- set i = module.bisect.bisect_right(shared.get('cum'), module.random.random() * shared.get('total')) -%}
+      {%- if i < users | length and not users[i].busy -%}{%- set pick.i = i -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if pick.i is none -%}{%- set pick.i = 0 -%}{%- endif -%}
+    {%- set u = users[pick.i] -%}
+    {%- if u.admin -%}
+      {#- An administrator's visit: a short interactive session on any
+          workstation with operations at the user's own pace. -#}
+      {{- open_session(pick.i, module.rand.number.integer(0, (hosts | length) - 1), now, ln(2400, 0.9) | int) -}}
+      {%- do u.update({'busy': true}) -%}
+      {{- push(now + (ln(40, 1.0) | int), {'k': 'op', 'u': pick.i}) -}}
+    {%- else -%}
+      {#- A user's own session lasts most of a day (screen locked
+          overnight); after it ends, the next operation logs on anew. -#}
+      {%- if u.sess is none or (now >= u.sess.end and u.sess.pending == 0) -%}
+        {{- open_session(pick.i, u.host, now, ln(20 * 3600, 0.5) | int) -}}
+      {%- endif -%}
+      {{- operation(u.sess, now) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set row = out.row -%}
+{%- set sess = row.sess -%}
+{%- do sess.update({'pending': sess.pending - 1}) -%}
+{%- for lst in [sess.t4, sess.t7] -%}
+  {%- for _ in range(16) if lst and now - lst[0] > window -%}{%- do lst.pop(0) -%}{%- endfor -%}
+{%- endfor -%}
+{%- if row.get('lol') and not row.get('ep') and sess.t4 and sess.t7 and sess.t7[-1] >= sess.t4[0] -%}
+  {#- Chain guard: in a session with a blocked executable and then a
+      blocked script within the window, a background proxy-binary launch
+      becomes the launch of another application (same law as ordinary
+      launches). -#}
+  {%- set sub = namespace(i=none) -%}
+  {%- for _ in range(16) if sub.i is none -%}
+    {%- set ai = pick_app(users[sess.u], false) | int -%}
+    {%- if not shared.get('apps')[ai].lol -%}{%- set sub.i = ai -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set a = shared.get('apps')[sub.i if sub.i is not none else shared.get('explorer_idx')] -%}
+  {%- do row.update({'full': a.full, 'fqbn': a.fqbn, 'hash': a.hash, 'rule': exe_rule(a.full), 'lol': false}) -%}
+{%- endif -%}
+{%- if row.code in [8004, 8007] -%}
+  {%- set lst = sess.t4 if row.code == 8004 else sess.t7 -%}
+  {%- do lst.append(now) -%}
+  {%- if lst | length > 16 -%}{%- do lst.pop(0) -%}{%- endif -%}
+{%- endif -%}
+{%- set u = users[sess.u] -%}
+{%- set host = hosts[sess.h] -%}
+{%- set ch = row.ch -%}
+{#- Other records of the same channel (not modeled) take record numbers
+    in between. -#}
+{%- set record_id = host.rec[ch] + 1 + (module.rand.number.integer(1, 3) if module.rand.chance(0.03) else 0) -%}
+{%- do host.rec.update({ch: record_id}) -%}
+{%- set moment = ts -%}
+{%- set system_time = moment.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ module.rand.number.integer(0, 9) ~ 'Z' -%}
+{%- set full = row.full -%}
+{%- set low = full | lower -%}
+{%- if low.startswith('c:\\windows\\system32\\') -%}{%- set fp = '%SYSTEM32%\\' ~ full[20:] | upper -%}
+{%- elif low.startswith('c:\\windows\\') -%}{%- set fp = '%WINDIR%\\' ~ full[11:] | upper -%}
+{%- elif low.startswith('c:\\program files\\') -%}{%- set fp = '%PROGRAMFILES%\\' ~ full[17:] | upper -%}
+{%- else -%}{%- set fp = '%OSDRIVE%\\' ~ full[3:] | upper -%}{%- endif -%}
+{%- set code = row.code -%}
+{%- set rule = rules[row.rule] if row.rule else ['{00000000-0000-0000-0000-000000000000}', '-', '-'] -%}
+{%- set level = {8002: [4, 'information'], 8005: [4, 'information'], 8003: [3, 'warning'], 8006: [3, 'warning'], 8004: [2, 'error'], 8007: [2, 'error']}[code] -%}
+{%- set channel = 'Microsoft-Windows-AppLocker/EXE and DLL' if ch == 'exe' else 'Microsoft-Windows-AppLocker/MSI and Script' -%}
+{%- if code in [8002, 8005] -%}{%- set message = fp ~ ' was allowed to run.' -%}
+{%- elif code in [8003, 8006] -%}{%- set message = fp ~ ' was allowed to run but would have been prevented from running if the AppLocker policy were enforced.' -%}
+{%- else -%}{%- set message = fp ~ ' was prevented from running.' -%}{%- endif -%}
+{%- set data = [
+  ['PolicyNameLength', row.pol | length], ['PolicyName', row.pol],
+  ['RuleId', rule[0]], ['RuleNameLength', rule[1] | length], ['RuleName', rule[1]],
+  ['RuleSddlLength', rule[2] | length], ['RuleSddl', rule[2]],
+  ['TargetUser', u.sid], ['TargetProcessId', row.pid],
+  ['FilePathLength', fp | length], ['FilePath', fp],
+  ['FileHashLength', 32], ['FileHash', row.hash],
+  ['FqbnLength', row.fqbn | length], ['Fqbn', row.fqbn],
+  ['TargetLogonId', sess.logon],
+  ['FullFilePathLength', full | length], ['FullFilePath', full]
+] -%}
+{%- set thread = 4 * module.rand.number.integer(200, 9000) -%}
+{%- set xml = namespace(v='<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-AppLocker" Guid="{cbda4dbf-8d5d-4f69-9578-be14aa540d22}"/><EventID>' ~ code ~ '</EventID><Version>0</Version><Level>' ~ level[0] ~ '</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8000000000000000</Keywords><TimeCreated SystemTime="' ~ system_time ~ '"/><EventRecordID>' ~ record_id ~ '</EventRecordID><Correlation/><Execution ProcessID="' ~ row.ppid ~ '" ThreadID="' ~ thread ~ '"/><Channel>' ~ channel ~ '</Channel><Computer>' ~ host.name ~ '</Computer><Security UserID="' ~ u.sid ~ '"/></System><UserData><RuleAndFileData xmlns="http://schemas.microsoft.com/schemas/event/Microsoft.Windows/1.0.0.0">') -%}
+{%- set user_data = {} -%}
+{%- for key, value in data -%}
+  {%- set xml.v = xml.v ~ '<' ~ key ~ '>' ~ (value | string).replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;') ~ '</' ~ key ~ '>' -%}
+  {%- do user_data.update({key: value}) -%}
+{%- endfor -%}
+{%- set xml.v = xml.v ~ '</RuleAndFileData></UserData></Event>' -%}
+{%- do user_data.update({'xml_name': 'RuleAndFileData'}) -%}
+{%- set file = {'hash': {'sha256': row.hash}, 'name': full.split('\\')[-1]} -%}
+{%- set m = module.re.match('^(?:CN=(?P<cn>[^,\\\\]*)(?:, )?)?(?:O=(?P<o>.*?)(?:, L=(?P<l>.*?))?(?:, S=(?P<s>.*?))?, C=(?P<c>[^\\\\]*))?\\\\(?P<prod>[^\\\\]*)\\\\(?P<orig>[^\\\\]*)\\\\(?P<ver>.*)$', row.fqbn) if row.fqbn != '-' else none -%}
+{%- if m -%}
+  {%- set pe = {} -%}
+  {%- for k, v in [['product', m.group('prod')], ['original_file_name', m.group('orig')], ['file_version', m.group('ver')]] if v -%}{%- do pe.update({k: v}) -%}{%- endfor -%}
+  {%- set subject = {} -%}
+  {%- if m.group('o') -%}{%- do subject.update({'organization': [m.group('o')]}) -%}{%- endif -%}
+  {%- if m.group('l') -%}{%- do subject.update({'locality': m.group('l')}) -%}{%- endif -%}
+  {%- if m.group('s') -%}{%- do subject.update({'state_or_province': [m.group('s')]}) -%}{%- endif -%}
+  {%- if m.group('c') -%}{%- do subject.update({'country': [m.group('c')]}) -%}{%- endif -%}
+  {%- if pe -%}{%- do file.update({'pe': pe}) -%}{%- endif -%}
+  {%- do file.update({'x509': {'subject': subject}}) -%}
+{%- endif -%}
+{%- set dataset = 'windows.applocker_exe_and_dll' if ch == 'exe' else 'windows.applocker_msi_and_script' -%}
+{%- set event = {
+  '@timestamp': moment.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+  'ecs': {'version': '8.17.0'},
+  'event': {'action': 'None', 'category': ['process'], 'code': code | string, 'dataset': dataset, 'kind': 'event', 'original': xml.v, 'provider': 'Microsoft-Windows-AppLocker', 'type': ['start']},
+  'file': file,
+  'host': {'name': host.name},
+  'log': {'level': level[1]},
+  'message': message,
+  'process': {'pid': row.ppid},
+  'tags': ['preserve_original_event'],
+  'user': {'id': u.sid},
+  'winlog': {
+    'channel': channel, 'computer_name': host.name, 'event_id': code | string, 'level': level[1], 'opcode': 'Info',
+    'process': {'pid': row.ppid, 'thread': {'id': thread}},
+    'provider_guid': '{cbda4dbf-8d5d-4f69-9578-be14aa540d22}', 'provider_name': 'Microsoft-Windows-AppLocker',
+    'record_id': record_id | string, 'task': 'None', 'time_created': moment.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+    'user': {'identifier': u.sid}, 'user_data': user_data, 'version': 0
+  }
+} -%}
+{{- event | tojson -}}
