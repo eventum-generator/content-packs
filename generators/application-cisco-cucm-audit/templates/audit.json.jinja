@@ -1,0 +1,350 @@
+{#- Cisco Unified CM 14 application audit file rows (|LogMessage form of
+    the Cisco DevNet Audit00000001.log example) wrapped in ECS JSON.
+    Every input timestamp becomes one row stamped with that timestamp.
+    It goes to the earliest due step of an open Administration session
+    (the next configuration change, or the logout), otherwise to a new
+    session of an administrator drawn by activity weight among those
+    whose pause after the last session is over. Times are in
+    milliseconds. -#}
+{%- set moment = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set moment = moment.replace(microsecond=moment.microsecond // 1000 * 1000) -%}
+{%- set now = module.builtins.int(moment.timestamp() * 1000) -%}
+{%- set hour = 3600000 -%}
+{%- set chain_ms = 7200000 -%}
+{%- set stale = 1200000 -%}
+{%- set r = namespace(kind=none, i=none, key=none) -%}
+{#- Relative row rate per UTC hour, matching patterns/floor.yml +
+    patterns/office.yml. -#}
+{%- set curve = [0.02, 0.02, 0.04, 0.10, 0.19, 0.32, 0.47, 0.64, 0.79, 0.91, 0.98, 1.0, 0.96, 0.87, 0.74, 0.59, 0.44, 0.30, 0.18, 0.10, 0.05, 0.03, 0.02, 0.02] -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, upper tail redrawn; returns ms. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- module.builtins.int(([ns.v, hi] | min) * 1000) -}}
+{%- endmacro -%}
+{%- macro op_gap() -%}{{- d(2, 35, 1.0, 1800) -}}{%- endmacro -%}
+{%- macro quick_gap() -%}{{- d(1.5, 8, 0.7, 300) -}}{%- endmacro -%}
+{%- macro look_time() -%}{{- d(10, 90, 1.0, 1800) -}}{%- endmacro -%}
+{%- macro pause() -%}{{- d(120, 900, 1.0, 21600) -}}{%- endmacro -%}
+{%- macro push(due, i) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('heap'), [due, s, i]) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its hour weighted by the activity
+      curve squared plus a small floor, in hours with at least 0.4 of
+      the peak rate. -#}
+  {%- set p = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(2000) if not p.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- set k = curve[((c + shared.get('tzoff')) // hour) % 24] -%}
+    {%- if k >= 0.4 and module.rand.number.floating(0, 1.02) < k ** 2 + 0.02 -%}
+      {%- set p.v = c -%}
+      {%- set p.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- p.v -}}
+{%- endmacro -%}
+{%- macro live(a, key) -%}
+  {#- Trims the administrator's adds of the record to the last chain_ms
+      and returns 'u' when one of them was updated since, 'a' when there
+      are only adds, '' when there are none. -#}
+  {%- set kept = [] -%}
+  {%- set ns = namespace(v='') -%}
+  {%- for e in a.hist.get(key, []) if now - e.t <= chain_ms -%}
+    {%- do kept.append(e) -%}
+    {%- set ns.v = 'u' if e.u or ns.v == 'u' else 'a' -%}
+  {%- endfor -%}
+  {%- if kept -%}{%- do a.hist.update({key: kept}) -%}{%- else -%}{%- do a.hist.pop(key, none) -%}{%- endif -%}
+  {{- ns.v -}}
+{%- endmacro -%}
+{%- macro emit(i, kind, key) -%}
+  {#- Row of administrator i; adds and updates also update the
+      administrator's per-record history of the last two hours (kept
+      after a delete). -#}
+  {%- set a = shared.get('admins')[i] -%}
+  {%- if kind == 'add' -%}
+    {%- do live(a, key) -%}
+    {%- do a.hist.setdefault(key, []).append({'t': now, 'u': false}) -%}
+  {%- elif kind == 'upd' and live(a, key) -%}
+    {%- for e in a.hist[key] -%}{%- do e.update({'u': true}) -%}{%- endfor -%}
+  {%- endif -%}
+  {%- if key is not none -%}{%- do a.update({'last_key': key}) -%}{%- endif -%}
+  {%- set r.kind = kind -%}{%- set r.i = i -%}{%- set r.key = key -%}
+{%- endmacro -%}
+{%- macro end_session(i) -%}
+  {#- The session is over; the pause before the account's next session
+      starts. -#}
+  {%- set a = shared.get('admins')[i] -%}
+  {%- do a.update({'stage': 'idle', 'ops': [], 'next_ok': now + (pause() | int)}) -%}
+  {%- if a.episode -%}
+    {%- do a.update({'episode': false}) -%}
+    {%- do shared.update({'ep_active': false, 'reserved': none}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro next_step(i, look) -%}
+  {#- Schedules the next change of the session, or its end: an explicit
+      logout, or (a quarter of sessions) the browser is closed and no
+      row is written. -#}
+  {%- set a = shared.get('admins')[i] -%}
+  {%- if a.ops -%}
+    {%- do push(now + ((quick_gap() if a.ops[0][2] else op_gap()) | int), i) -%}
+  {%- elif module.rand.chance(0.75) -%}
+    {%- do push(now + ((look_time() if look else op_gap()) | int), i) -%}
+  {%- else -%}
+    {%- do end_session(i) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro do_op(i, op) -%}
+  {%- set a = shared.get('admins')[i] -%}
+  {%- set nodes = shared.get('nodes') -%}
+  {%- set reserved = shared.get('reserved') -%}
+  {%- set kind = op[0] -%}
+  {%- if kind == 'add' -%}
+    {%- set cand = [] -%}
+    {%- for name in shared.get('names') if not nodes[name] and name != reserved -%}{%- do cand.append(name) -%}{%- endfor -%}
+    {%- set key = op[1] if op[1] is not none else (module.rand.choice(cand) if cand else none) -%}
+    {%- if key is not none and not nodes[key] -%}
+      {%- do nodes.update({key: true}) -%}
+      {%- do emit(i, 'add', key) -%}
+      {%- if not a.episode -%}
+        {%- if module.rand.chance(0.5) -%}
+          {%- do a.ops.insert(0, ['upd', key, true]) -%}
+        {%- elif module.rand.chance(0.6) -%}
+          {#- Added by mistake or for a test, removed in the session. -#}
+          {%- do a.ops.insert(module.rand.number.integer(0, a.ops | length), ['del', key, false]) -%}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif kind == 'upd' -%}
+    {%- set cand = [] -%}
+    {%- for name in shared.get('names') if nodes[name] and (name != reserved or a.episode) -%}{%- do cand.append(name) -%}{%- endfor -%}
+    {%- if op[1] is not none -%}
+      {%- set key = op[1] -%}
+    {%- elif a.last_key in cand and module.rand.chance(0.4) -%}
+      {%- set key = a.last_key -%}
+    {%- else -%}
+      {%- set key = module.rand.choice(cand) if cand else none -%}
+    {%- endif -%}
+    {%- if key is not none and nodes[key] -%}
+      {%- do emit(i, 'upd', key) -%}
+      {%- if module.rand.chance(0.25) -%}
+        {#- Saved again seconds later (a second field fixed). -#}
+        {%- do a.ops.insert(0, ['upd', key, true]) -%}
+      {%- elif not a.episode and op[1] is none and module.rand.chance(0.08) -%}
+        {%- do a.ops.insert(module.rand.number.integer(0, a.ops | length), ['del', key, false]) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set cand = [] -%}
+    {%- for name in shared.get('names') if nodes[name] and name != reserved -%}{%- do cand.append(name) -%}{%- endfor -%}
+    {%- set k = namespace(v=op[1] if op[1] is not none else (module.rand.choice(cand) if cand | length > 2 else none)) -%}
+    {%- if k.v is not none and nodes[k.v] and not a.episode and live(a, k.v) == 'u' -%}
+      {#- Guard: a delete that would complete the chain (this account
+          added the record at most two hours ago and updated it since)
+          goes to another present record, drawn like any delete, or is
+          not made when no such record is left. -#}
+      {%- set alts = [] -%}
+      {%- for q in cand if q != k.v and live(a, q) != 'u' -%}{%- do alts.append(q) -%}{%- endfor -%}
+      {%- if alts and cand | length > 2 -%}
+        {%- set k.v = module.rand.choice(alts) -%}
+        {%- do shared.set('guard_swap', shared.get('guard_swap') + 1) -%}
+      {%- else -%}
+        {%- set k.v = none -%}
+        {%- do shared.set('guard_omit', shared.get('guard_omit') + 1) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if k.v is not none and nodes[k.v] -%}
+      {%- do nodes.update({k.v: false}) -%}
+      {%- do emit(i, 'del', k.v) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro serve(i, due) -%}
+  {%- set a = shared.get('admins')[i] -%}
+  {%- if now - due > stale -%}
+    {#- Nothing happened for 20 minutes: the session has expired. -#}
+    {%- if a.episode -%}{%- do shared.set('ep_abort', shared.get('ep_abort') + 1) -%}{%- endif -%}
+    {%- do end_session(i) -%}
+  {%- elif a.ops -%}
+    {%- do do_op(i, a.ops.pop(0)) -%}
+    {%- do next_step(i, false) -%}
+  {%- else -%}
+    {%- do emit(i, 'logout', none) -%}
+    {%- do end_session(i) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro open_session(i, ops, sip) -%}
+  {%- do shared.get('admins')[i].update({'stage': 'sess', 'ops': ops, 'last_key': none, 'sip': sip}) -%}
+  {%- do emit(i, 'login', none) -%}
+  {%- do next_step(i, not ops) -%}
+{%- endmacro -%}
+{%- macro start_any() -%}
+  {#- A new session: the due episode when a busy account (not the
+      previous episode's) is out of session with its pause over and a
+      record (not the previous episode's) is absent with no add of it
+      by that account in the last two hours; otherwise an account drawn
+      by weight among those with the pause over, else the one whose
+      pause ends first; with every account in session the earliest
+      queued step comes forward. -#}
+  {%- set admins = shared.get('admins') -%}
+  {%- set nodes = shared.get('nodes') -%}
+  {%- set p = namespace(i=none) -%}
+  {%- if params.anomaly_mode and not shared.get('ep_active') and now >= shared.get('ep_due') -%}
+    {%- set ca = [] -%}
+    {%- set cw = [] -%}
+    {%- for i in shared.get('tier') if admins[i].stage == 'idle' and admins[i].next_ok <= now and i != shared.get('ep_last_admin') -%}
+      {%- do ca.append(i) -%}{%- do cw.append(admins[i].w) -%}
+    {%- endfor -%}
+    {%- if ca -%}
+      {%- set i = module.rand.weighted_choice(ca, cw) -%}
+      {%- set ck = [] -%}
+      {%- for name in shared.get('names') if not nodes[name] and name != shared.get('ep_last_key') and not live(admins[i], name) -%}{%- do ck.append(name) -%}{%- endfor -%}
+      {%- if ck -%}
+        {#- Episode: an ordinary session of the account from its usual
+            workstation: the record is added, updated seconds later,
+            possibly with other updates in between, and deleted again.
+            It leaves the account as any session does. -#}
+        {%- set key = module.rand.choice(ck) -%}
+        {%- set ops = [['add', key, false], ['upd', key, true]] -%}
+        {%- set more = namespace(go=module.rand.chance(0.45)) -%}
+        {%- for _ in range(6) if more.go -%}
+          {%- do ops.append(['upd', none, false]) -%}
+          {%- set more.go = module.rand.chance(0.45) -%}
+        {%- endfor -%}
+        {%- do ops.append(['del', key, false]) -%}
+        {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+        {%- set w = [interval // 4, 6 * hour] | min -%}
+        {%- do admins[i].update({'episode': true}) -%}
+        {%- do shared.update({'ep_active': true, 'reserved': key, 'ep_last_admin': i, 'ep_last_key': key, 'ep_count': shared.get('ep_count') + 1, 'ep_due': pick_start(now + interval - w // 2, w) | int}) -%}
+        {%- do open_session(i, ops, admins[i].ip) -%}
+        {%- set p.i = i -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if p.i is none -%}
+    {%- for _ in range(16) if p.i is none -%}
+      {%- set i = module.rand.weighted_choice(shared.get('idx'), shared.get('wts')) -%}
+      {%- if admins[i].stage == 'idle' and admins[i].next_ok <= now -%}{%- set p.i = i -%}{%- endif -%}
+    {%- endfor -%}
+    {%- if p.i is none -%}
+      {%- set f = namespace(i=none, at=none) -%}
+      {%- for i in shared.get('idx') if admins[i].stage == 'idle' and (f.at is none or admins[i].next_ok < f.at) -%}
+        {%- set f.i = i -%}{%- set f.at = admins[i].next_ok -%}
+      {%- endfor -%}
+      {%- set p.i = f.i -%}
+      {%- if p.i is not none -%}{%- do shared.set('pause_cut', shared.get('pause_cut') + 1) -%}{%- endif -%}
+    {%- endif -%}
+    {%- if p.i is not none -%}
+      {#- About 40% of sessions only look around; outside working hours
+          (below 0.3 of the peak rate) every session does. The rest
+          carry one to about a dozen changes. -#}
+      {%- set work = curve[((now + shared.get('tzoff')) // hour) % 24] >= 0.3 -%}
+      {%- set ops = [] -%}
+      {%- if work and module.rand.chance(0.6) -%}
+        {%- set cnt = namespace(n=1, go=true) -%}
+        {%- for _ in range(11) if cnt.go -%}
+          {%- if module.rand.chance(0.55) -%}{%- set cnt.n = cnt.n + 1 -%}{%- else -%}{%- set cnt.go = false -%}{%- endif -%}
+        {%- endfor -%}
+        {#- Adds are drawn more often when many servers are missing from
+            the table and deletes when many are present, so the table
+            stays near its usual size. -#}
+        {%- set present = shared.get('nodes').values() | select | list | length -%}
+        {%- set absent = (shared.get('names') | length) - present -%}
+        {%- for _ in range(cnt.n) -%}
+          {%- do ops.append([module.rand.weighted_choice(['upd', 'add', 'del'], [50, 2.1 * absent + 0.1, 1.2 * present + 0.1]), none, false]) -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- set a = admins[p.i] -%}
+      {%- do open_session(p.i, ops, a.ip if module.rand.chance(0.85) else a.alt_ip) -%}
+    {%- elif shared.get('heap') -%}
+      {%- do shared.set('pulled', shared.get('pulled') + 1) -%}
+      {%- set it = module.heapq.heappop(shared.get('heap')) -%}
+      {%- do serve(it[2], it[0]) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- if shared.get('admins') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 24, 'le': 8760, 'multiple_of': 24}},
+    'cucm_node': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,62}$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set admins = [] -%}
+  {%- set idx = [] -%}
+  {%- set wts = [] -%}
+  {%- set tier = [] -%}
+  {%- for row in samples.admins -%}
+    {%- do admins.append({'user': row.user, 'ip': row.ip, 'alt_ip': row.alt_ip, 'w': row.weight, 'stage': 'idle', 'ops': [], 'sip': row.ip,
+      'episode': false, 'last_key': none, 'hist': {}, 'next_ok': now + module.builtins.int(module.rand.number.floating(0, 1) * (pause() | int))}) -%}
+    {%- do idx.append(loop.index0) -%}
+    {%- do wts.append(row.weight) -%}
+    {%- if row.weight >= 4 -%}{%- do tier.append(loop.index0) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set nodes = {} -%}
+  {%- set names = [] -%}
+  {%- for row in samples.processnodes -%}{%- do nodes.update({row.name: row.present}) -%}{%- do names.append(row.name) -%}{%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'admins': admins, 'idx': idx, 'wts': wts, 'tier': tier, 'nodes': nodes, 'names': names | sort,
+    'heap': [], 'seq': 0, 'reserved': none, 'guard_swap': 0, 'guard_omit': 0, 'ep_abort': 0, 'ep_count': 0, 'pause_cut': 0, 'pulled': 0,
+    'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds() * 1000),
+    'ep_active': false, 'ep_last_admin': none, 'ep_last_key': none}) -%}
+  {%- do shared.set('ep_due', pick_start(now, [interval, 24 * hour] | min) | int) -%}
+{%- endif -%}
+{%- set heap = shared.get('heap') -%}
+{%- for _ in range(64) if r.kind is none -%}
+  {%- if heap and heap[0][0] <= now -%}
+    {%- set it = module.heapq.heappop(heap) -%}
+    {%- do serve(it[2], it[0]) -%}
+  {%- else -%}
+    {%- do start_any() -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set a = shared.get('admins')[r.i] -%}
+{%- set user_name = a.user -%}
+{%- set client_ip = a.sip -%}
+{%- set record = none -%}
+{%- if r.kind == 'login' -%}
+  {%- set severity = 6 -%}
+  {%- set event_type = 'UserLogging' -%}
+  {%- set resource_accessed = 'Cisco CallManager Administration' -%}
+  {%- set audit_category = 'AdministrativeEvent' -%}
+  {%- set component_id = 'Cisco CallManager Administration' -%}
+  {%- set details_raw = 'Successfully Logged into Cisco Unified CM Admin Webpages' -%}
+  {%- set action = 'user_login' -%}
+  {%- set ecs_category = ['authentication', 'session'] -%}
+  {%- set ecs_type = ['start'] -%}
+{%- elif r.kind == 'logout' -%}
+  {%- set severity = 6 -%}
+  {%- set event_type = 'UserLogging' -%}
+  {%- set resource_accessed = 'CUCMAdmin' -%}
+  {%- set audit_category = 'CriticalEvent' -%}
+  {%- set component_id = 'Cisco CUCM Administration' -%}
+  {%- set details_raw = 'Successfully Logged out Cisco Unified Administration Web Pages' -%}
+  {%- set action = 'user_logout' -%}
+  {%- set ecs_category = ['authentication', 'session'] -%}
+  {%- set ecs_type = ['end'] -%}
+{%- else -%}
+  {%- set operation = {'add': 'added', 'upd': 'updated', 'del': 'deleted'}[r.kind] -%}
+  {%- set severity = 5 -%}
+  {%- set event_type = 'GeneralConfigurationUpdate' -%}
+  {%- set resource_accessed = 'CUCMAdmin' -%}
+  {%- set audit_category = 'AdministrativeEvent' -%}
+  {%- set component_id = 'Cisco CUCM Administration' -%}
+  {%- set details_raw = ' record in table processnode with key field name = ' ~ r.key ~ ' ' ~ operation ~ ' ' -%}
+  {%- set record = {'table': 'processnode', 'key_field': 'name', 'key_value': r.key, 'operation': operation} -%}
+  {%- set action = 'processnode_' ~ operation -%}
+  {%- set ecs_category = ['configuration'] -%}
+  {%- set ecs_type = [{'add': 'creation', 'upd': 'change', 'del': 'deletion'}[r.kind]] -%}
+{%- endif -%}
+{%- set native_time = moment.strftime('%H:%M:%S.%f')[:-3] -%}
+{%- set original = native_time ~ ' |LogMessage   UserID : ' ~ user_name ~ '  ClientAddress : ' ~ client_ip ~ '  Severity : ' ~ severity ~ '  EventType : ' ~ event_type ~ '  ResourceAccessed: ' ~ resource_accessed ~ '  EventStatus : Success  CompulsoryEvent : No  AuditCategory : ' ~ audit_category ~ '  ComponentID : ' ~ component_id ~ '  CorrelationID :   AuditDetails : ' ~ details_raw ~ ' App ID: Cisco Tomcat Cluster ID:  Node ID: ' ~ params.cucm_node -%}
+{%- set details = details_raw | trim -%}
+{%- set audit = {'timestamp_local': native_time, 'user_id': user_name, 'client_address': client_ip, 'severity': severity, 'event_type': event_type, 'resource_accessed': resource_accessed, 'event_status': 'Success', 'compulsory_event': 'No', 'audit_category': audit_category, 'component_id': component_id, 'correlation_id': '', 'audit_details': details, 'app_id': 'Cisco Tomcat', 'cluster_id': '', 'node_id': params.cucm_node} -%}
+{%- if record is not none -%}{%- do audit.update({'record': record}) -%}{%- endif -%}
+{%- set payload = {'@timestamp': moment.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ecs_category, 'type': ecs_type, 'outcome': 'success', 'dataset': 'cucm.audit', 'module': 'cucm', 'action': action, 'code': event_type, 'original': original}, 'host': {'name': params.cucm_node}, 'service': {'name': 'Cisco Unified Communications Manager', 'version': '14.0.1.10000-20'}, 'user': {'name': user_name}, 'source': {'ip': client_ip}, 'related': {'user': [user_name], 'ip': [client_ip], 'hosts': [params.cucm_node]}, 'message': details, 'cucm': {'audit': audit}} -%}
+{{- payload | tojson -}}
