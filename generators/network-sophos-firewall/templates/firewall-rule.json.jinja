@@ -1,0 +1,523 @@
+{#- One Sophos Firewall (SFOS 20) logging Firewall Rule records in the
+    Central Reporting Format. The input sets the rate and the hour
+    curve; every timestamp emits one record: the earliest due queued
+    record (a connection stop, a burst follow-up, a later denied
+    packet), otherwise the first record of a new client activity.
+    The anomaly episode only queues records of its own and never
+    touches the background queue or the background clients. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set hq = module.heapq -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{#- Chain window of the detector (first denial to allowed start),
+    shared by the background guard. -#}
+{%- set guard_s = 3600 -%}
+{#- Background load factor by UTC hour, mean 1 over the day; the
+    pattern files give the record rate the same shape. -#}
+{%- macro load_at(h) -%}
+{{- (1.5 if 6 <= h < 16 else (0.8 if 16 <= h < 20 else 0.3)) / 0.883 -}}
+{%- endmacro -%}
+{#- Which clients are present: all in office hours, those still at
+    work in the evening, those left running overnight at night. -#}
+{%- macro period_at(h) -%}
+{{- 'day' if 6 <= h < 16 else ('eve' if 16 <= h < 20 else 'night') -}}
+{%- endmacro -%}
+{#- A second in [a, b), density proportional to the load curve (sq
+    false) or to its square plus a small floor (sq true). -#}
+{%- macro pick_time(a, b, sq) -%}
+  {%- set slots = [] -%}
+  {%- set ws = [] -%}
+  {%- for hh in range(a // 3600, (b - 1) // 3600 + 1) -%}
+    {%- set lo = [hh * 3600, a] | max -%}
+    {%- set hi = [hh * 3600 + 3600, b] | min -%}
+    {%- if hi > lo -%}
+      {%- set c = load_at(hh % 24) | float -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do ws.append(((c * c + 0.05) if sq else c) * (hi - lo)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set sl = module.rand.weighted_choice(slots, ws) -%}
+  {{- module.rand.number.integer(sl[0], sl[1] - 1) -}}
+{%- endmacro -%}
+{%- set probe_ports = [22, 135, 445, 1433, 3389, 5985, 8080] -%}
+{%- set open_ports = {'file': [445], 'intranet': [443], 'terminal': [3389],
+    'linux': [443]} -%}
+{%- set admin_ports = {'file': [445, 3389, 5985], 'intranet': [443, 22, 3389, 5985],
+    'terminal': [3389, 5985], 'linux': [443, 22]} -%}
+{%- set rules = {
+    'internet': ['1', 'LAN to Internet'], 'dns': ['2', 'LAN to DNS'],
+    'file': ['3', 'LAN to file servers'], 'intranet': ['4', 'LAN to intranet'],
+    'linux': ['4', 'LAN to intranet'], 'terminal': ['5', 'LAN to terminal servers'],
+    'admin': ['6', 'Admins to servers'], 'drop_dmz': ['7', 'Drop LAN to DMZ'],
+    'quic': ['8', 'Block QUIC']} -%}
+{%- set kinds = ['web', 'http', 'intranet', 'file', 'terminal', 'dns', 'probe', 'admin'] -%}
+{%- set kind_roles = {'intranet': ['intranet', 'linux'], 'file': ['file'],
+    'terminal': ['terminal'], 'admin': ['file', 'intranet', 'terminal', 'linux']} -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if params.client_count < 8 or params.admin_count < 1
+      or params.admin_count >= params.client_count
+      or params.client_first + params.client_count > 255 -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set clients = [] -%}
+  {%- set weights = {} -%}
+  {%- set macs = {} -%}
+  {%- set pres = {'day': [], 'eve': [], 'night': []} -%}
+  {%- for n in range(params.client_count) -%}
+    {%- set ip = params.client_prefix ~ (params.client_first + n) -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- do clients.append(ip) -%}
+    {#- Activity weight (bounded so no client falls silent) and hours
+        present, from samples/clients.csv; clients beyond its rows
+        draw them from the same law. -#}
+    {%- if n < samples.clients | length -%}
+      {%- set row = samples.clients[n] -%}
+      {%- set w = row.activity_weight | float -%}
+      {%- set eve = row.evening == 'true' -%}
+      {%- set night = row.overnight == 'true' -%}
+    {%- else -%}
+      {%- set w = [[module.rand.number.lognormal(0, 0.8), 0.3] | max, 3.0] | min -%}
+      {%- set night = module.rand.chance(0.25) -%}
+      {%- set eve = night or module.rand.chance(0.47) -%}
+    {%- endif -%}
+    {%- do weights.update({ip: w}) -%}
+    {%- do pres['day'].append(ip) -%}
+    {%- if eve -%}{%- do pres['eve'].append(ip) -%}{%- endif -%}
+    {%- if night -%}{%- do pres['night'].append(ip) -%}{%- endif -%}
+    {%- do macs.update({ip: module.rand.network.mac(vendor=module.rand.choice(['dell', 'hp', 'lenovo', 'intel'])) | upper}) -%}
+  {%- endfor -%}
+  {%- set regular = clients[params.admin_count:] -%}
+  {%- for per in ['eve', 'night'] -%}
+    {%- if not (pres[per] | select('in', regular) | list) -%}
+      {%- do pres[per].append(regular[0]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set servers = {} -%}
+  {%- for ip, role in params.servers.items() -%}
+    {%- set checked = module.ipaddress.IPv4Address(ip) -%}
+    {%- if role not in ['file', 'intranet', 'terminal', 'linux', 'dns'] -%}
+      {{ module.math.sqrt(-1) }}
+    {%- endif -%}
+    {%- do servers.update({ip: role}) -%}
+    {%- do macs.update({ip: module.rand.network.mac(vendor='vmware') | upper}) -%}
+  {%- endfor -%}
+  {%- set targets = servers | dictsort | rejectattr('1', 'equalto', 'dns')
+      | map(attribute='0') | list -%}
+  {%- if targets | length < 2 or 'dns' not in servers.values() -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set by_role = {} -%}
+  {%- for ip in targets -%}
+    {%- do by_role.setdefault(servers[ip], []).append(ip) -%}
+  {%- endfor -%}
+  {%- set by_kind = {} -%}
+  {%- for k, roles in kind_roles.items() -%}
+    {%- set lst = [] -%}
+    {%- for r in roles -%}{%- do lst.extend(by_role.get(r, [])) -%}{%- endfor -%}
+    {%- do by_kind.update({k: lst}) -%}
+  {%- endfor -%}
+  {#- Activity mix of ordinary clients and of admins; a kind with no
+      server of its role is left out. -#}
+  {%- set kw_reg = [] -%}
+  {%- set kw_adm = [] -%}
+  {%- for k in kinds -%}
+    {%- set ok = k not in by_kind or by_kind[k] | length > 0 -%}
+    {%- do kw_reg.append([45, 5, 14, 11, 4, 8, 9, 0][loop.index0] if ok else 0) -%}
+    {%- do kw_adm.append([45, 5, 14, 11, 4, 8, 0, 25][loop.index0] if ok else 0) -%}
+  {%- endfor -%}
+  {#- Client/server pairs an episode may use: the expected number of
+      ordinary activities of the pair over four days is at least 10,
+      so the pair also occurs in ordinary traffic. -#}
+  {%- set span = {'day': [6, 10], 'eve': [17, 4], 'night': [22, 10]} -%}
+  {%- set expc = {} -%}
+  {%- for per in ['day', 'eve', 'night'] -%}
+    {%- set arr = 0.045 * (load_at(span[per][0]) | float) * span[per][1] * 3600 * 4 -%}
+    {%- set tot = namespace(w=0) -%}
+    {%- for c in pres[per] -%}{%- set tot.w = tot.w + weights[c] -%}{%- endfor -%}
+    {%- for c in pres[per] -%}
+      {%- do expc.update({c: expc.get(c, 0) + arr * weights[c] / tot.w}) -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set sreg = kw_reg | sum -%}
+  {%- set epairs = [] -%}
+  {%- set apairs = [] -%}
+  {%- for s in targets -%}
+    {%- set f = namespace(v=kw_reg[6] / (targets | length)) -%}
+    {%- for k in ['intranet', 'file', 'terminal'] -%}
+      {%- if s in by_kind[k] -%}
+        {%- set f.v = f.v + kw_reg[kinds.index(k)] / (by_kind[k] | length) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- for c in regular -%}
+      {%- do apairs.append([c, s, weights[c] * f.v / sreg]) -%}
+      {%- if expc.get(c, 0) * f.v / sreg >= 10 -%}
+        {%- do epairs.append([c, s, weights[c] * f.v / sreg]) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set web = [] -%}
+  {%- set country = {} -%}
+  {%- for n in range(40) -%}
+    {%- set ip = module.rand.choice(['198.51.100.', '203.0.113.']) ~ module.rand.number.integer(10, 250) -%}
+    {%- if ip != params.wan_ip -%}
+      {%- set cc = module.rand.weighted_choice(['USA', 'IRL', 'NLD', 'DEU', 'GBR', 'FRA'],
+          [45, 15, 12, 12, 10, 6]) -%}
+      {%- do web.append([ip, cc]) -%}
+      {%- do country.setdefault(ip, cc) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set pool = [] -%}
+  {%- for n in range(600) -%}
+    {%- do pool.append(64 * module.rand.number.integer(2000000, 50000000)) -%}
+  {%- endfor -%}
+  {%- set pres_w = {} -%}
+  {%- for per, lst in pres.items() -%}
+    {%- set pw = [] -%}
+    {%- for c in lst -%}{%- do pw.append(weights[c]) -%}{%- endfor -%}
+    {%- do pres_w.update({per: pw}) -%}
+  {%- endfor -%}
+  {%- do macs.update({'gateway': module.rand.network.mac(vendor='cisco') | upper}) -%}
+  {%- do shared.update({'initialized': true, 'clients': clients,
+      'admins': clients[:params.admin_count], 'weights': weights,
+      'pres': pres, 'pres_w': pres_w,
+      'kw_reg': kw_reg, 'kw_adm': kw_adm, 'by_kind': by_kind, 'by_role': by_role,
+      'epairs': epairs or apairs,
+      'macs': macs, 'servers': servers, 'targets': targets,
+      'dns': servers | dictsort | selectattr('1', 'equalto', 'dns') | map(attribute='0') | list,
+      'web': web, 'country': country, 'pool': pool, 'q': [], 'ctr': [0], 'den': {},
+      'start_at': pick_time(now, now + ([interval, 24] | min * 3600) | int,
+          false) | int,
+      'last_client': none, 'last_server': none}) -%}
+{%- endif -%}
+{%- set q = shared.get('q') -%}
+{%- set ctr = shared.get('ctr') -%}
+{%- set den = shared.get('den') -%}
+{%- set servers = shared.get('servers') -%}
+{%- set admins = shared.get('admins') -%}
+{%- set hour = timestamp.astimezone(utc).hour -%}
+
+{%- macro gap(median, sigma) -%}
+{{- [(module.rand.number.lognormal(module.math.log(median), sigma)) | round | int, 1] | max -}}
+{%- endmacro -%}
+
+{%- macro push(at, kind, s) -%}
+  {%- do ctr.append(ctr.pop() + 1) -%}
+  {%- do hq.heappush(q, [at, ctr[0], kind, s]) -%}
+{%- endmacro -%}
+
+{#- Queue one allowed connection; the Start record is due at `at`, the
+    Stop record is queued when the Start is emitted. -#}
+{%- macro open_conn(client, dst, port, at, episode=false, burst=0) -%}
+  {%- set role = servers.get(dst, 'internet') -%}
+  {%- set proto = 'UDP' if port == 53 else 'TCP' -%}
+  {%- if role == 'internet' -%}
+    {%- set rule = rules.internet -%}
+  {%- elif role == 'dns' -%}
+    {%- set rule = rules.dns -%}
+  {%- elif client in admins and port not in open_ports[role] -%}
+    {%- set rule = rules.admin -%}
+  {%- else -%}
+    {%- set rule = rules[role] -%}
+  {%- endif -%}
+  {%- if port == 53 -%}
+    {%- set up = module.rand.number.integer(55, 90) -%}
+    {%- set down = module.rand.number.integer(80, 420) -%}
+    {#- Assumed: the UDP connection entry expires after an idle
+        timeout, so the Stop follows the reply by tens of seconds. -#}
+    {%- set dur = 30 + gap(10, 0.8) | int -%}
+  {%- elif port == 445 -%}
+    {%- set down = (module.rand.number.lognormal(module.math.log(400000), 2.0)) | int + 2000 -%}
+    {%- set up = (down * module.rand.number.floating(0.01, 0.04)) | int + module.rand.number.integer(1500, 9000) -%}
+    {%- set dur = (down / module.rand.number.lognormal(module.math.log(15000000), 0.6)) | int + gap(8, 1.0) | int -%}
+  {%- elif port == 3389 -%}
+    {%- set dur = gap(1500, 1.1) | int -%}
+    {%- set down = (dur * module.rand.number.lognormal(module.math.log(30000), 0.7)) | int + 20000 -%}
+    {%- set up = (down * module.rand.number.floating(0.05, 0.2)) | int + 5000 -%}
+  {%- elif port in [22, 5985] -%}
+    {%- set dur = gap(400, 1.3) | int -%}
+    {%- set down = (dur * module.rand.number.lognormal(module.math.log(600), 1.0)) | int + 3000 -%}
+    {%- set up = (down * module.rand.number.floating(0.1, 0.5)) | int + 1500 -%}
+  {%- else -%}
+    {%- set down = (module.rand.number.lognormal(module.math.log(40000), 1.6)) | int + 300 -%}
+    {%- set up = (module.rand.number.lognormal(module.math.log(3000), 1.0)) | int + 200 -%}
+    {%- set dur = ([down, up] | max / module.rand.number.lognormal(module.math.log(1500000), 0.5)) | int
+        + gap(15, 1.2) | int -%}
+  {%- endif -%}
+  {{- push(at, 'start', {'client': client, 'dst': dst, 'port': port, 'proto': proto,
+      'role': role, 'rule': rule, 'up': up, 'down': down, 'dur': dur,
+      'episode': episode, 'burst': burst}) -}}
+{%- endmacro -%}
+
+{%- macro deny(client, dst, port, proto, at, episode=false) -%}
+  {%- set role = servers.get(dst, 'internet') -%}
+  {{- push(at, 'deny', {'client': client, 'dst': dst, 'port': port, 'proto': proto,
+      'role': role, 'rule': rules.quic if role == 'internet' else rules.drop_dmz,
+      'episode': episode}) -}}
+{%- endmacro -%}
+
+{#- Denied attempts on several ports of one server, then optionally an
+    allowed connection to the same server. The same law serves
+    background and the episode. -#}
+{%- macro probe_burst(client, dst, ports, follow, episode=false) -%}
+  {%- set t = namespace(v=now) -%}
+  {%- for port in ports -%}
+    {%- if not loop.first -%}{%- set t.v = t.v + gap(25, 1.2) | int -%}{%- endif -%}
+    {%- for a in range(module.rand.weighted_choice([1, 2, 3], [60, 30, 10])) -%}
+      {%- if not loop.first -%}{%- set t.v = t.v + gap(4, 0.7) | int -%}{%- endif -%}
+      {{- deny(client, dst, port, 'TCP', t.v, episode) -}}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- if follow -%}
+    {{- open_conn(client, dst, module.rand.choice(open_ports[servers[dst]]),
+        t.v + gap(120, 1.0) | int, episode) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- True ('y') when the client was denied on three or more distinct TCP
+    ports of the server within the chain window: an allowed connection
+    to it now would complete the chain. -#}
+{%- macro hot(client, dst) -%}
+  {%- set lst = den.get(client ~ '|' ~ dst) -%}
+  {%- if lst -%}
+    {{- 'y' if lst | selectattr('0', 'ge', now - guard_s) | map(attribute='1')
+        | unique | list | length >= 3 else '' -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Episode: the first starts within min(interval, 24 h), its time
+    drawn from the load curve; each later one in a window of
+    min(interval / 4, 6 h) centred on its due time (previous start
+    plus the interval), weighted by the squared load curve. The pair
+    is drawn with the background client and server weights among the
+    clients present at this hour. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {%- set cand = shared.get('epairs') | rejectattr('0', 'equalto', shared.get('last_client'))
+      | rejectattr('1', 'equalto', shared.get('last_server')) | list -%}
+  {%- set here = cand | selectattr('0', 'in', shared.get('pres')[period_at(hour)]) | list -%}
+  {%- set cand = here or cand -%}
+  {%- set pair = module.rand.weighted_choice(cand, cand | map(attribute='2') | list) -%}
+  {%- set closed = probe_ports | reject('in', open_ports[servers[pair[1]]]) | list -%}
+  {%- set k = module.rand.weighted_choice([3, 4], [65, 35]) -%}
+  {{- probe_burst(pair[0], pair[1], module.rand.shuffle(closed)[:k], true, true) -}}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set half = ([interval / 4, 6] | min * 1800) | int -%}
+  {%- do shared.update({'last_client': pair[0], 'last_server': pair[1],
+      'start_at': pick_time(due - half, due + half, true) | int}) -%}
+{%- endif -%}
+
+{#- 2. No record due: a new activity of a present client, drawn by
+    client weight; its first record is due now. -#}
+{%- if not q or q[0][0] > now -%}
+  {%- set per = period_at(hour) -%}
+  {%- set c = module.rand.weighted_choice(shared.get('pres')[per], shared.get('pres_w')[per]) -%}
+  {%- set act = module.rand.weighted_choice(kinds,
+      shared.get('kw_adm') if c in admins else shared.get('kw_reg')) -%}
+  {%- set by_kind = shared.get('by_kind') -%}
+  {%- if act in ['web', 'http'] -%}
+    {%- set dest = module.rand.choice(shared.get('web')[:[(module.rand.number.exponential(0.1)) | int + 1, 40] | min]) -%}
+    {%- set t = namespace(v=now) -%}
+    {%- if module.rand.chance(0.5) -%}
+      {{- open_conn(c, module.rand.choice(shared.get('dns')), 53, now) -}}
+      {%- set t.v = now + module.rand.weighted_choice([0, 1], [70, 30]) -%}
+    {%- endif -%}
+    {%- if act == 'web' and module.rand.chance(0.15) -%}
+      {{- deny(c, dest[0], 443, 'UDP', t.v) -}}
+      {%- set t.v = t.v + module.rand.weighted_choice([0, 1], [60, 40]) -%}
+    {%- endif -%}
+    {{- open_conn(c, dest[0], 443 if act == 'web' else 80, t.v) -}}
+  {%- elif act == 'dns' -%}
+    {{- open_conn(c, module.rand.choice(shared.get('dns')), 53, now) -}}
+  {%- elif act == 'probe' -%}
+    {#- A client hitting ports it has no rule for: a mistyped host, a
+        tool trying several protocols, an inventory agent. -#}
+    {%- set dst = module.rand.choice(shared.get('targets')) -%}
+    {%- set closed = probe_ports | reject('in', open_ports[servers[dst]]) | list -%}
+    {%- set k = module.rand.weighted_choice([1, 2, 3, 4], [55, 25, 13, 7]) -%}
+    {{- probe_burst(c, dst, module.rand.shuffle(closed)[:k], module.rand.chance(0.5)) -}}
+  {%- else -%}
+    {%- set dst = module.rand.choice(by_kind[act]) -%}
+    {%- if act == 'admin' -%}
+      {%- set port = module.rand.choice(admin_ports[servers[dst]]) -%}
+    {%- else -%}
+      {%- set port = module.rand.choice(open_ports[servers[dst]]) -%}
+    {%- endif -%}
+    {{- open_conn(c, dst, port, now, burst=module.rand.weighted_choice([0, 1, 2, 3, 4],
+        [55, 22, 12, 7, 4]) if port == 445 else 0) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due record. -#}
+{%- set e = hq.heappop(q) -%}
+{%- set kind = e[2] -%}
+{%- set s = e[3] -%}
+
+{#- Guard on the final chain step only: an ordinary allowed connection
+    that would complete the chain goes to another server of the same
+    role instead (the client reaching the right host after trying the
+    wrong one); it is dropped only when every such server would
+    complete the chain too. -#}
+{%- if kind == 'start' and not s.episode and s.dst in servers and hot(s.client, s.dst) -%}
+  {%- set alt = [] -%}
+  {%- for a in shared.get('by_role').get(s.role, []) -%}
+    {%- if a != s.dst and not hot(s.client, a) -%}{%- do alt.append(a) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if not alt -%}{{ dispatch.drop() }}{%- endif -%}
+  {%- do s.update({'dst': module.rand.choice(alt)}) -%}
+{%- endif -%}
+
+{%- if kind == 'start' -%}
+  {%- set pool = shared.get('pool') -%}
+  {%- set cid = pool.pop(module.rand.number.integer(0, pool | length - 1)) -%}
+  {%- do s.update({'id': cid, 'start': now, 'spt': module.rand.number.integer(49152, 65535)}) -%}
+  {{- push(now + s.dur, 'stop', s) -}}
+  {%- if s.burst > 0 -%}
+    {{- open_conn(s.client, s.dst, s.port, now + gap(40, 1.0) | int, burst=s.burst - 1) -}}
+  {%- endif -%}
+{%- elif kind == 'stop' -%}
+  {%- do shared.get('pool').append(s.id) -%}
+{%- else -%}
+  {%- do s.update({'spt': module.rand.number.integer(49152, 65535)}) -%}
+  {%- if s.proto == 'TCP' and s.role != 'internet' -%}
+    {%- set key = s.client ~ '|' ~ s.dst -%}
+    {%- set lst = den.get(key, []) | selectattr('0', 'ge', now - guard_s) | list -%}
+    {%- do lst.append([now, s.port]) -%}
+    {%- do den.update({key: lst}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- Record fields, in the order of the SFOS 20 guide sample 00001 and
+    the Central Reporting Format fixtures. -#}
+{%- set allowed = kind != 'deny' -%}
+{%- set macs = shared.get('macs') -%}
+{%- set wan = s.role == 'internet' -%}
+{%- set dst_zone = 'WAN' if wan else 'DMZ' -%}
+{%- set out_if = 'Port2' if wan else 'Port3' -%}
+{%- set dst_country = shared.get('country')[s.dst] if wan else 'R1' -%}
+{%- set log_id = '010101600001' if allowed else '010102600002' -%}
+{%- set app = none -%}
+{%- if allowed -%}
+  {%- set app_p = 0.5 if s.port == 53 else (0.6 if kind == 'stop' else 0.15) -%}
+  {%- if s.port in [53, 80, 443] and wan or s.port == 53 -%}
+    {%- if module.rand.chance(app_p) -%}
+      {%- if s.port == 53 -%}
+        {%- set app = ['DNS', 1, 'Network Protocol', 'Infrastructure'] -%}
+      {%- elif s.port == 80 -%}
+        {%- set app = ['HTTP', 1, 'Browser Based', 'General Internet'] -%}
+      {%- else -%}
+        {%- set app = module.rand.weighted_choice([['Secure Socket Layer Protocol', 1, 'Network Protocol', 'Infrastructure'],
+            ['Youtube Website', 3, 'Browser Based', 'Streaming Media']], [90, 10]) -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set mac = macs[s.client] if allowed else macs[s.client] | lower -%}
+{%- set dmac = macs['gateway'] if wan else macs[s.dst] -%}
+{%- set iso = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set nat = allowed and wan -%}
+{%- set pkts = namespace(c=0, s=0, up=0, down=0) -%}
+{%- if kind == 'stop' -%}
+  {%- if s.proto == 'UDP' -%}
+    {%- set pkts.c = module.rand.weighted_choice([1, 2], [90, 10]) -%}
+    {%- set pkts.s = pkts.c -%}
+    {%- set pkts.up = s.up * pkts.c -%}
+    {%- set pkts.down = s.down * pkts.c -%}
+  {%- else -%}
+    {%- set spk0 = (s.down / module.rand.number.floating(1100, 1460)) | round(0, 'ceil') | int + 3 -%}
+    {%- set cpk0 = (s.up / module.rand.number.floating(1100, 1460)) | round(0, 'ceil') | int + 4 -%}
+    {%- set pkts.s = [spk0, (cpk0 / module.rand.number.floating(1.6, 2.2)) | int] | max -%}
+    {%- set pkts.c = [cpk0, (spk0 / module.rand.number.floating(1.6, 2.2)) | int] | max -%}
+    {%- set pkts.up = [s.up, pkts.c * 52] | max -%}
+    {%- set pkts.down = [s.down, pkts.s * 52] | max -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set duration = now - s.start if kind == 'stop' else 0 -%}
+{%- set policies = s.rule[0] == '1' -%}
+
+{%- set raw = namespace(v='device_name="SFW" timestamp="' ~ iso.strftime('%Y-%m-%dT%H:%M:%S%z')
+  ~ '" device_model="' ~ params.device_model ~ '" device_serial_id="' ~ params.device_serial_id
+  ~ '" log_id="' ~ log_id ~ '" log_type="Firewall" log_component="Firewall Rule" log_subtype="'
+  ~ ('Allowed' if allowed else 'Denied') ~ '" log_version=1 severity="Information"') -%}
+{%- if kind == 'stop' -%}{%- set raw.v = raw.v ~ ' duration=' ~ duration -%}{%- endif -%}
+{%- set raw.v = raw.v ~ ' fw_rule_id="' ~ s.rule[0] ~ '" fw_rule_name="' ~ s.rule[1]
+  ~ '" fw_rule_section="Local rule" nat_rule_id="' ~ ('2' if nat else '0') ~ '"'
+  ~ (' nat_rule_name="Default SNAT IPv4"' if nat else '') ~ ' fw_rule_type="USER"' -%}
+{%- if policies -%}
+  {%- set raw.v = raw.v ~ ' web_policy_id=' ~ params.web_policy_id ~ ' ips_policy_id='
+    ~ params.ips_policy_id ~ ' app_filter_policy_id=' ~ params.app_filter_policy_id -%}
+{%- endif -%}
+{%- if app -%}
+  {%- set raw.v = raw.v ~ ' app_name="' ~ app[0] ~ '" app_risk=' ~ app[1]
+    ~ ' app_technology="' ~ app[2] ~ '" app_category="' ~ app[3] ~ '"' -%}
+{%- endif -%}
+{%- set raw.v = raw.v ~ ' ether_type="' ~ ('Unknown (0x0000)' if allowed else 'IPv4 (0x0800)')
+  ~ '" in_interface="Port1"' ~ (' out_interface="' ~ out_if ~ '"' if allowed else '')
+  ~ ' src_mac="' ~ mac ~ '"' ~ (' dst_mac="' ~ dmac ~ '"' if allowed else '')
+  ~ ' src_ip="' ~ s.client ~ '" src_country="R1" dst_ip="' ~ s.dst ~ '" dst_country="' ~ dst_country
+  ~ '" protocol="' ~ s.proto ~ '" src_port=' ~ s.spt ~ ' dst_port=' ~ s.port -%}
+{%- if kind == 'stop' -%}
+  {%- set raw.v = raw.v ~ ' packets_sent=' ~ pkts.c ~ '  packets_received=' ~ pkts.s
+    ~ ' bytes_sent=' ~ pkts.up ~ ' bytes_received=' ~ pkts.down -%}
+{%- endif -%}
+{%- if allowed -%}
+  {%- set raw.v = raw.v ~ (' src_trans_ip="' ~ params.wan_ip ~ '"' if nat else '')
+    ~ ' src_zone_type="LAN" src_zone="LAN" dst_zone_type="' ~ dst_zone ~ '" dst_zone="' ~ dst_zone
+    ~ '" con_event="' ~ ('Start' if kind == 'start' else 'Stop') ~ '" con_id="' ~ s.id ~ '"' -%}
+{%- endif -%}
+{%- set raw.v = raw.v ~ ' hb_status="No Heartbeat" app_resolved_by="Signature" app_is_cloud="FALSE"'
+  ~ ' qualifier="New" in_display_interface="Port1"'
+  ~ (' out_display_interface="' ~ out_if ~ '"' if allowed else '') ~ ' log_occurrence="1"' -%}
+
+{#- ECS document, following the Elastic Sophos XG ingest mapping. -#}
+{%- set event = {'kind': 'event', 'category': ['network'],
+  'type': (['connection', 'start'] if kind == 'start' else ['connection', 'end']) if allowed else ['connection', 'denied'],
+  'action': 'allowed' if allowed else 'denied', 'code': log_id[-5:],
+  'outcome': 'success', 'severity': 6, 'timezone': '+00:00', 'original': raw.v} -%}
+{%- if kind == 'stop' -%}{%- do event.update({'duration': duration * 1000000000}) -%}{%- endif -%}
+{%- set observer = {'vendor': 'Sophos', 'product': 'XG', 'type': 'firewall',
+  'serial_number': params.device_serial_id, 'ingress': {'interface': {'name': 'Port1'}}} -%}
+{%- if allowed -%}
+  {%- do observer.ingress.update({'zone': 'LAN'}) -%}
+  {%- do observer.update({'egress': {'interface': {'name': out_if}, 'zone': dst_zone}}) -%}
+{%- endif -%}
+{%- set source = {'ip': s.client, 'port': s.spt, 'mac': mac | upper | replace(':', '-')} -%}
+{%- set destination = {'ip': s.dst, 'port': s.port} -%}
+{%- set network = {'transport': s.proto | lower} -%}
+{%- set related = [s.client, s.dst] -%}
+{%- if allowed -%}{%- do destination.update({'mac': dmac | upper | replace(':', '-')}) -%}{%- endif -%}
+{%- if nat -%}
+  {%- do source.update({'nat': {'ip': params.wan_ip}}) -%}
+  {%- do related.append(params.wan_ip) -%}
+{%- endif -%}
+{%- if kind == 'stop' -%}
+  {%- do source.update({'bytes': pkts.up, 'packets': pkts.c}) -%}
+  {%- do destination.update({'bytes': pkts.down, 'packets': pkts.s}) -%}
+  {%- do network.update({'bytes': pkts.up + pkts.down, 'packets': pkts.c + pkts.s}) -%}
+{%- endif -%}
+{%- set xg = {'device_name': 'SFW', 'device_model': params.device_model,
+  'log_id': log_id, 'log_type': 'Firewall', 'log_component': 'Firewall Rule',
+  'log_subtype': 'Allowed' if allowed else 'Denied', 'log_version': '1',
+  'fw_rule_type': 'USER', 'fw_rule_section': 'Local rule',
+  'ether_type': 'Unknown (0x0000)' if allowed else 'IPv4 (0x0800)',
+  'hb_status': 'No Heartbeat', 'app_resolved_by': 'Signature', 'app_is_cloud': 'FALSE',
+  'qualifier': 'New', 'log_occurrence': '1'} -%}
+{%- if allowed -%}
+  {%- do xg.update({'con_event': 'Start' if kind == 'start' else 'Stop', 'con_id': s.id | string,
+    'src_zone_type': 'LAN', 'dst_zone_type': dst_zone}) -%}
+{%- endif -%}
+{%- if app -%}
+  {%- do xg.update({'app_name': app[0], 'app_risk': app[1] | string,
+    'app_technology': app[2], 'app_category': app[3]}) -%}
+{%- endif -%}
+{%- if policies -%}
+  {%- do xg.update({'web_policy_id': params.web_policy_id | string,
+    'ips_policy_id': params.ips_policy_id | string,
+    'app_filter_policy_id': params.app_filter_policy_id | string}) -%}
+{%- endif -%}
+{%- set record = {'@timestamp': iso.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': event, 'log': {'level': 'Information'}, 'observer': observer,
+  'source': source, 'destination': destination, 'network': network,
+  'related': {'ip': related}, 'rule': {'id': s.rule[0], 'name': s.rule[1]},
+  'sophos': {'xg': xg}} -%}
+{{ record | tojson }}
