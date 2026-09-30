@@ -1,0 +1,240 @@
+{#- ESET PROTECT On-Prem 11.1 events exported to Syslog in CEF, wrapped
+    in ECS JSON with the CEF payload in event.original. The input sets
+    the event rate and the UTC hour curve; every timestamp is one
+    event: the earliest due follow-up row of an open incident, or else
+    the first row of a new incident on an endpoint drawn by its weight.
+    Incidents: inbound port scans blocked by the firewall, files
+    cleaned on creation by real-time protection, and HIPS incidents
+    where a suspicious executable is blocked one or more times and
+    sometimes cleaned later. Times are seconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc).replace(microsecond=0) -%}
+{%- set now = module.builtins.int(ts.timestamp()) -%}
+{%- set hq = module.heapq -%}
+{%- set hour = 3600 -%}
+{#- Chain window: a background cleanup of a file that the same endpoint
+    blocked three or more times within this window is reported for
+    another copy of that file. -#}
+{%- set window = 7200 -%}
+{#- UTC hour levels of the input curve (patterns/*.yml). -#}
+{%- set levels = [0.25, 0.25, 0.25, 0.25, 0.25, 0.35, 0.65, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.65, 0.35, 0.35, 0.25, 0.25, 0.25] -%}
+{%- set kinds = ['fw', 'thr', 'hips'] -%}
+{%- set kind_w = [150, 120, 60] -%}
+{%- set thr_dirs = ['Downloads', 'AppData\\Local\\Temp', 'AppData\\Local\\Microsoft\\Windows\\INetCache\\IE', 'Desktop', 'Documents'] -%}
+{%- set thr_dir_w = [50, 22, 12, 10, 6] -%}
+{%- set thr_procs = ['C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe', 'C:\\Program Files (x86)\\Microsoft\\Edge\\Application\\msedge.exe', 'C:\\Windows\\explorer.exe', 'C:\\Program Files\\Microsoft Office\\root\\Office16\\OUTLOOK.EXE', 'C:\\Program Files\\7-Zip\\7zFM.exe'] -%}
+{%- set thr_proc_w = [34, 26, 18, 14, 8] -%}
+{%- set hips_dirs = ['Downloads', 'AppData\\Local\\Temp', 'AppData\\Roaming', 'Desktop'] -%}
+{%- set hips_dir_w = [45, 30, 17, 8] -%}
+{%- set hips_apps = ['C:\\Windows\\explorer.exe', 'C:\\Windows\\System32\\cmd.exe', 'C:\\Windows\\System32\\wscript.exe', 'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe', 'C:\\Program Files\\Microsoft Office\\root\\Office16\\WINWORD.EXE', 'C:\\Windows\\System32\\svchost.exe'] -%}
+{%- set hips_app_w = [42, 14, 12, 12, 10, 10] -%}
+{%- set scanners = ['198.51.100.140', '203.0.113.201', '203.0.113.24', '198.51.100.19', '192.0.2.77', '10.20.1.200', '10.20.9.14', '10.20.4.31', '10.20.1.72', '10.20.1.63'] -%}
+{%- set scanner_w = [6, 4, 5, 5, 3, 14, 10, 6, 4, 3] -%}
+{%- set scan_ports = [445, 3389, 135, 139, 22, 5985, 1433, 80] -%}
+{%- set scan_port_w = [30, 22, 12, 10, 9, 7, 6, 4] -%}
+{%- set rn = module.rand.number -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 3, 'le': 8760}},
+    'protect_version': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'protect_host': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set eps = [] -%}
+  {%- set cum = [] -%}
+  {%- set tot = namespace(v=0.0) -%}
+  {%- for r in samples.endpoints -%}
+    {%- set tot.v = tot.v + (r.weight | float) -%}
+    {%- do cum.append(tot.v) -%}
+    {%- do eps.append({'id': r.id, 'name': r.name, 'ip': r.ip, 'user': r.user, 'short': r.user.split('\\')[-1], 'os': r.os, 'group': r.group, 'gdesc': r.group_description, 'lag': rn.integer(0, 2), 'hist': []}) -%}
+  {%- endfor -%}
+  {%- set objs = [] -%}
+  {%- for r in samples.objects -%}
+    {%- do objs.append({'file': r.file, 'sha1': r.sha1, 'threat': r.threat}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'queue': [], 'seq': 0, 'eps': eps, 'objs': objs, 'cum': cum, 'tot': tot.v, 'ep_last_a': none, 'ep_last_f': none, 'guard_n': 0, 'ep_n': 0, 'ep_retry_n': 0}) -%}
+  {%- if params.anomaly_mode -%}
+    {#- First episode within min(interval, 24 h), its hour drawn from
+        the background curve. -#}
+    {%- set span = [params.anomaly_interval_hours * hour, 86400] | min -%}
+    {%- set st = namespace(v=none) -%}
+    {%- for _ in range(500) if st.v is none -%}
+      {%- set t = now + module.builtins.int(rn.floating(0, span)) -%}
+      {%- if rn.floating(0, 1) < levels[(t % 86400) // 3600] -%}{%- set st.v = t -%}{%- endif -%}
+    {%- endfor -%}
+    {{- push(st.v if st.v is not none else now, {'k': 'ep'}) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set q = shared.get('queue') -%}
+{%- set eps = shared.get('eps') -%}
+{%- set objs = shared.get('objs') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{%- set out = namespace(it=none) -%}
+{%- for _ in range(50) if out.it is none and q and q[0][0] <= now -%}
+  {%- set it = hq.heappop(q)[2] -%}
+  {%- if it.k == 'ep' -%}
+    {#- Episode on one endpoint: three or four HIPS blocks of one file,
+        then its cleanup, with the gaps of ordinary HIPS incidents.
+        Endpoint (by weight) and file rotate. The next episode is due
+        one interval after this start and starts within w/2 of it,
+        w = min(interval/4, 6 h), its hour weighted by curve^2. -#}
+    {%- set a = namespace(v=shared.get('ep_last_a')) -%}
+    {%- for _ in range(50) if a.v == shared.get('ep_last_a') -%}
+      {%- set a.v = module.bisect.bisect_right(shared.get('cum'), rn.floating(0, shared.get('tot'))) -%}
+      {%- if a.v >= (eps | length) -%}{%- set a.v = (eps | length) - 1 -%}{%- endif -%}
+    {%- endfor -%}
+    {%- set f = namespace(v=shared.get('ep_last_f')) -%}
+    {%- for _ in range(50) if f.v == shared.get('ep_last_f') -%}{%- set f.v = rn.integer(0, (objs | length) - 1) -%}{%- endfor -%}
+    {%- set d = module.rand.weighted_choice(hips_dirs, hips_dir_w) -%}
+    {%- set out.it = {'c': 'HI', 'a': a.v, 'f': f.v, 'd': d, 'p': 'C:\\Users\\' ~ eps[a.v].short ~ '\\' ~ d ~ '\\' ~ objs[f.v].file, 'app': module.rand.weighted_choice(hips_apps, hips_app_w), 'left': module.rand.weighted_choice([2, 3], [61, 39]), 'clean': 'od' if module.rand.chance(0.6) else 'rt', 'first': none, 'ep': true} -%}
+    {%- do shared.update({'ep_last_a': a.v, 'ep_last_f': f.v, 'ep_n': shared.get('ep_n') + 1}) -%}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {%- set st = namespace(v=none) -%}
+    {%- for _ in range(500) if st.v is none -%}
+      {%- set t = now + interval - w // 2 + rn.integer(0, w) -%}
+      {%- set lv = levels[(t % 86400) // 3600] -%}
+      {%- if rn.floating(0, 1.05) < lv * lv + 0.05 -%}{%- set st.v = t -%}{%- endif -%}
+    {%- endfor -%}
+    {{- push(st.v if st.v is not none else now + interval, {'k': 'ep'}) -}}
+  {%- else -%}
+    {%- set out.it = it -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.it is none -%}
+  {#- New incident on an endpoint drawn by its weight. -#}
+  {%- set a = module.bisect.bisect_right(shared.get('cum'), rn.floating(0, shared.get('tot'))) -%}
+  {%- set a = [a, (eps | length) - 1] | min -%}
+  {%- set kind = module.rand.weighted_choice(kinds, kind_w) -%}
+  {%- set f = rn.integer(0, (objs | length) - 1) -%}
+  {%- if kind == 'fw' -%}
+    {#- One scanner probes a few ports of the endpoint within minutes. -#}
+    {%- set out.it = {'c': 'FW', 'a': a, 'src': module.rand.weighted_choice(scanners, scanner_w), 'left': module.rand.weighted_choice([0, 1, 2, 3], [58, 25, 11, 6]), 'ep': false} -%}
+  {%- elif kind == 'thr' -%}
+    {#- A malicious file is cleaned on creation, sometimes created and
+        cleaned again when the user retries the download. -#}
+    {%- set d = module.rand.weighted_choice(thr_dirs, thr_dir_w) -%}
+    {%- set out.it = {'c': 'TH', 'a': a, 'f': f, 'd': d, 'p': 'C:\\Users\\' ~ eps[a].short ~ '\\' ~ d ~ '\\' ~ objs[f].file, 'sc': 'rt', 'sprod': module.rand.weighted_choice(thr_procs, thr_proc_w), 'rep': module.rand.chance(0.15), 'ep': false} -%}
+  {%- else -%}
+    {#- One to four blocks of one file launched by one application,
+        40% of them cleaned later by either scanner. -#}
+    {%- set d = module.rand.weighted_choice(hips_dirs, hips_dir_w) -%}
+    {%- set out.it = {'c': 'HI', 'a': a, 'f': f, 'd': d, 'p': 'C:\\Users\\' ~ eps[a].short ~ '\\' ~ d ~ '\\' ~ objs[f].file, 'app': module.rand.weighted_choice(hips_apps, hips_app_w), 'left': module.rand.weighted_choice([0, 1, 2, 3], [45, 27, 17, 11]), 'clean': (('od' if module.rand.chance(0.6) else 'rt') if module.rand.chance(0.4) else none), 'first': none, 'ep': false} -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set it = out.it -%}
+{%- set ep = eps[it.a] -%}
+{#- HIPS blocks of the last chain window per endpoint. -#}
+{%- set keep = ep.hist | selectattr(0, 'ge', now - window) | list -%}
+{%- if keep | length > 100 -%}{%- set keep = keep[-100:] -%}{%- endif -%}
+{%- do ep.update({'hist': keep}) -%}
+{%- if it.c == 'HI' -%}
+  {%- do keep.append([now, it.p]) -%}
+{%- elif it.c == 'TH' and not it.ep and (keep | selectattr(1, 'equalto', it.p) | list | length) >= 3 -%}
+  {#- Guard: the cleanup is reported for a copy of the file in another
+      folder, drawn like an ordinary real-time cleanup. -#}
+  {%- set sub = namespace(it=none) -%}
+  {%- for _ in range(40) if sub.it is none -%}
+    {%- set nf = it.f if loop.index <= 20 else rn.integer(0, (objs | length) - 1) -%}
+    {%- set nd = module.rand.weighted_choice(thr_dirs, thr_dir_w) -%}
+    {%- set np = 'C:\\Users\\' ~ ep.short ~ '\\' ~ nd ~ '\\' ~ objs[nf].file -%}
+    {%- if np != it.p and (keep | selectattr(1, 'equalto', np) | list | length) < 3 -%}
+      {%- set sub.it = it.copy() -%}
+      {%- do sub.it.update({'f': nf, 'd': nd, 'p': np}) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set it = sub.it if sub.it is not none else it -%}
+  {%- do shared.set('guard_n', shared.get('guard_n') + 1) -%}
+{%- elif it.c == 'TH' and it.ep and (keep | selectattr(1, 'equalto', it.p) | list | length) < 3 -%}
+  {#- A long pause left fewer than three blocks of the episode file in
+      the window: the application tries once more, the cleanup follows. -#}
+  {%- set it = {'c': 'HI', 'a': it.a, 'f': it.f, 'd': it.d, 'p': it.p, 'app': it.sprod, 'left': 0, 'clean': it.sc, 'first': now, 'ep': true} -%}
+  {%- do keep.append([now, it.p]) -%}
+  {%- do shared.set('ep_retry_n', shared.get('ep_retry_n') + 1) -%}
+{%- endif -%}
+{#- Follow-up rows are scheduled from the time of this row. -#}
+{%- if it.c == 'HI' -%}
+  {%- set first = now if it.first is none else it.first -%}
+  {%- if it.left > 0 -%}
+    {%- set nx = it.copy() -%}
+    {%- do nx.update({'left': it.left - 1, 'first': first}) -%}
+    {{- push(now + module.builtins.int(rn.clamp(rn.lognormal(5.193, 0.8), 30, 900)), nx) -}}
+  {%- elif it.clean is not none -%}
+    {%- set gap = module.builtins.int(rn.clamp(rn.lognormal(6.397, 0.8), 60, 2400)) -%}
+    {{- push(now + ([gap, [first + hour - now, 60] | max] | min), {'c': 'TH', 'a': it.a, 'f': it.f, 'd': it.d, 'p': it.p, 'sc': it.clean, 'sprod': it.app, 'rep': false, 'ep': it.ep}) -}}
+  {%- endif -%}
+{%- elif it.c == 'FW' and it.left > 0 -%}
+  {%- set nx = it.copy() -%}
+  {%- do nx.update({'left': it.left - 1}) -%}
+  {{- push(now + module.builtins.int(rn.clamp(rn.lognormal(4.317, 1.0), 5, 900)), nx) -}}
+{%- elif it.c == 'TH' and it.rep -%}
+  {%- set nx = it.copy() -%}
+  {%- do nx.update({'rep': false}) -%}
+  {{- push(now + module.builtins.int(rn.clamp(rn.lognormal(6.802, 1.0), 60, 7200)), nx) -}}
+{%- endif -%}
+{%- set when = ts -%}
+{%- set rt = when.strftime('%b %d %Y %H:%M:%S') -%}
+{%- macro esc(v) -%}{{- v | replace('\\', '\\\\') | replace('=', '\\=') -}}{%- endmacro -%}
+{%- set common = 'dvc=' ~ ep.ip ~ ' dvchost=' ~ esc(ep.name) ~ ' deviceExternalId=' ~ ep.id ~ ' ESETProtectDeviceGroupName=' ~ esc(ep.group) ~ ' ESETProtectDeviceOsName=' ~ esc(ep.os) ~ ' ESETProtectDeviceGroupDescription=' ~ esc(ep.gdesc) -%}
+{%- if it.c == 'HI' -%}
+  {%- set cnt = module.rand.weighted_choice([1, 2, 3], [82, 13, 5]) -%}
+  {%- set class_id = '303' -%}
+  {%- set event_name = 'Attempt to run a suspicious object Blocked' -%}
+  {%- set ext = 'cat=ESET HIPS Event rt=' ~ rt ~ ' cs3=' ~ esc(it.app) ~ ' cs3Label=Application cs4=Attempt to run a suspicious object cs4Label=Operation cs5=' ~ esc(it.p) ~ ' cs5Label=Target act=Blocked cn1=1 cn1Label=Handled cs1=Suspicious attempt to launch an application cs1Label=Rule ID cnt=' ~ cnt -%}
+  {%- set kind = 'hips' -%}
+{%- elif it.c == 'TH' -%}
+  {#- Synthetic detection engine build: about five builds a day, the
+      endpoint up to two builds behind. -#}
+  {%- set base = module.datetime.datetime(2025, 1, 1, tzinfo=module.datetime.timezone.utc) -%}
+  {%- set slot = module.builtins.int((when - base).total_seconds() // 17280) - ep.lag -%}
+  {%- set built = base + module.datetime.timedelta(seconds=slot * 17280) -%}
+  {%- set engine = (31000 + slot) ~ ' (' ~ built.strftime('%Y%m%d') ~ ')' -%}
+  {%- set obj = objs[it.f] -%}
+  {%- set uri = 'file:///' ~ it.p | replace('\\', '/') -%}
+  {%- set class_id = '183' -%}
+  {%- set event_name = 'File scanner cleaned a virus' -%}
+  {%- if it.sc == 'rt' -%}
+    {%- set ext = 'cat=ESET Threat Event rt=' ~ rt ~ ' cs1=' ~ esc(obj.threat) ~ ' cs1Label=Threat Name cs2=' ~ engine ~ ' cs2Label=Engine Version cs3=Virus cs3Label=Threat Type cs4=Real-time file system protection cs4Label=Scanner ID cs5=virlog.dat cs5Label=Scan ID act=Cleaned by deleting fileType=File filePath=' ~ esc(uri) ~ ' cn1=1 cn1Label=Handled suser=' ~ esc(ep.user) ~ ' sprod=' ~ esc(it.sprod) ~ ' cs7=Event occurred on a newly created file. cs7Label=Circumstances deviceCustomDate1=' ~ rt ~ ' deviceCustomDate1Label=FirstSeen cs8=' ~ obj.sha1 ~ ' cs8Label=Hash' -%}
+  {%- else -%}
+    {%- set ext = 'cat=ESET Threat Event rt=' ~ rt ~ ' cs1=' ~ esc(obj.threat) ~ ' cs1Label=Threat Name cs2=' ~ engine ~ ' cs2Label=Engine Version cs3=Virus cs3Label=Threat Type cs4=On-demand scanner cs4Label=Scanner ID act=Cleaned by deleting fileType=File filePath=' ~ esc(uri) ~ ' cn1=1 cn1Label=Handled cn2=0 cn2Label=Restart Needed suser=' ~ esc(ep.user) ~ ' deviceCustomDate1=' ~ rt ~ ' deviceCustomDate1Label=FirstSeen cs8=' ~ obj.sha1 ~ ' cs8Label=Hash' -%}
+  {%- endif -%}
+  {%- set kind = 'threat' -%}
+{%- else -%}
+  {%- set cnt = module.rand.weighted_choice([1, 2, 3, 5], [70, 18, 8, 4]) -%}
+  {%- set spt = rn.integer(49152, 65535) if module.rand.chance(0.8) else rn.integer(1024, 49151) -%}
+  {%- set dpt = module.rand.weighted_choice(scan_ports, scan_port_w) -%}
+  {%- set class_id = '209' -%}
+  {%- set event_name = 'Detected port scanning attack' -%}
+  {%- set ext = 'cat=ESET Firewall Event rt=' ~ rt ~ ' msg=TCP Port Scanning attack src=' ~ it.src ~ ' spt=' ~ spt ~ ' dpt=' ~ dpt ~ ' dst=' ~ ep.ip ~ ' proto=TCP act=Blocked cnt=' ~ cnt ~ ' cn1=1 cn1Label=Handled deviceDirection=0 cs3=Win32/Botnet.generic cs3Label=Threat Name' -%}
+  {%- set kind = 'firewall' -%}
+{%- endif -%}
+{%- set raw = 'CEF:0|ESET|Protect|' ~ params.protect_version ~ '|' ~ class_id ~ '|' ~ event_name ~ '|5|' ~ common ~ ' ' ~ ext -%}
+{%- set cats = {'hips': (['intrusion_detection'], ['denied']), 'threat': (['malware', 'file'], ['info', 'deletion']), 'firewall': (['network', 'intrusion_detection'], ['denied'])} -%}
+{%- set record = {'@timestamp': when.strftime('%Y-%m-%dT%H:%M:%SZ'),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'alert', 'module': 'eset', 'dataset': 'eset.protect', 'code': class_id,
+    'action': 'Cleaned by deleting' if kind == 'threat' else 'Blocked',
+    'category': cats[kind][0], 'type': cats[kind][1], 'severity': 5, 'original': raw},
+  'observer': {'name': params.protect_host, 'vendor': 'ESET', 'product': 'Protect', 'version': params.protect_version},
+  'host': {'name': ep.name, 'id': ep.id, 'ip': [ep.ip], 'os': {'name': ep.os}},
+  'eset': {'protect': {'category': kind, 'class_id': class_id, 'group': ep.group}},
+  'related': {'ip': [ep.ip], 'hosts': [ep.name]}} -%}
+{%- if kind == 'hips' -%}
+  {%- do record.update({'file': {'path': it.p, 'name': it.p.split('\\')[-1]}, 'process': {'executable': it.app}}) -%}
+  {%- do record.eset.protect.update({'count': cnt}) -%}
+{%- elif kind == 'threat' -%}
+  {%- do record.update({'file': {'path': it.p, 'name': it.p.split('\\')[-1], 'hash': {'sha1': obj.sha1}},
+    'user': {'name': ep.short, 'domain': ep.user.split('\\')[0]}}) -%}
+  {%- do record.eset.protect.update({'threat_name': obj.threat, 'scanner': 'Real-time file system protection' if it.sc == 'rt' else 'On-demand scanner', 'engine_version': engine}) -%}
+  {%- do record.related.update({'user': [ep.short], 'hash': [obj.sha1]}) -%}
+  {%- if it.sc == 'rt' -%}{%- do record.update({'process': {'executable': it.sprod}}) -%}{%- endif -%}
+{%- else -%}
+  {%- do record.update({'source': {'ip': it.src, 'port': spt}, 'destination': {'ip': ep.ip, 'port': dpt}, 'network': {'transport': 'tcp', 'direction': 'inbound'}}) -%}
+  {%- do record.eset.protect.update({'count': cnt}) -%}
+  {%- do record.related.update({'ip': [ep.ip, it.src]}) -%}
+{%- endif -%}
+{{ module.json.dumps(record) }}
