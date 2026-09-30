@@ -1,0 +1,329 @@
+{#- Kaspersky CyberTrace 4.0 detection events in the ArcSight CEF pattern,
+    wrapped in ECS JSON. Every input timestamp yields one detection: the
+    earliest queued detection that is due, stamped with its own time,
+    or else the first detection of a new incident of the timestamp's
+    population (tag `svc`: service-account endpoints, otherwise user
+    endpoints), stamped with the input time. An incident is URL matches
+    with retries, a download (URL, file hash, further contacts), a
+    hash-first detection, a phishing redirect or beacon-like repeats;
+    its later detections are queued. Times are microseconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- set hq = module.heapq -%}
+{%- set sec = 1000000 -%}
+{%- set hour = 3600 * sec -%}
+{#- Chain window: URL match, file hash, the same URL again for one
+    endpoint and user, counted from the first URL match. -#}
+{%- set within = hour -%}
+{#- Recent URLs of an endpoint that a new episode avoids. -#}
+{%- set recent_window = 2 * hour -%}
+{#- Relative detection rate of user endpoints per UTC hour, as set by
+    the user input patterns; service accounts are flat. -#}
+{%- set diurnal = [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.6, 0.6, 0.6, 0.3, 0.3, 0.3, 0.3] -%}
+{#- An episode uses an endpoint and user with at least this effective
+    weight (per-user weight, user endpoints scaled by the mean diurnal
+    factor 0.66), about 1.4 incidents a day. -#}
+{%- set min_pair_w = 0.65 -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro pick(kind) -%}
+  {{- module.rand.weighted_choice(shared.get(kind ~ '_idx'), shared.get(kind ~ '_w')) -}}
+{%- endmacro -%}
+{%- macro hits(a, u, c, i, t0, ep) -%}
+  {#- One match and its retries (the same object requested again within
+      seconds); returns the time of the last one. -#}
+  {%- set t = namespace(v=t0, go=true) -%}
+  {{- push(t0, {'k': 'row', 'a': a, 'u': u, 'c': c, 'i': i, 'ep': ep}) -}}
+  {%- for _ in range(4) if t.go -%}
+    {%- if module.rand.chance(0.4 if c != 'H' else 0.15) -%}
+      {%- set t.v = t.v + (ln(25, 1.0) | int) -%}
+      {{- push(t.v, {'k': 'row', 'a': a, 'u': u, 'c': c, 'i': i, 'ep': ep}) -}}
+    {%- else -%}{%- set t.go = false -%}{%- endif -%}
+  {%- endfor -%}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro other_mal(avoid) -%}
+  {%- set r = namespace(v=avoid) -%}
+  {%- for _ in range(20) if r.v == avoid -%}{%- set r.v = pick('mal') | int -%}{%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro incident(a, t0) -%}
+  {%- set ep = shared.get('eps')[a] -%}
+  {%- set u = module.rand.choice(ep.users) -%}
+  {%- set kind = module.rand.weighted_choice(['url', 'phish', 'download', 'hash', 'beacon'], [38, 15, 18, 19, 10]) -%}
+  {%- if kind == 'url' -%}
+    {%- set c = 'M' if module.rand.chance(0.7) else 'P' -%}
+    {%- set _ = hits(a, u, c, pick('mal' if c == 'M' else 'phi') | int, t0, false) -%}
+  {%- elif kind == 'phish' -%}
+    {%- set t = hits(a, u, 'P', pick('phi') | int, t0, false) | int -%}
+    {%- if module.rand.chance(0.5) -%}
+      {%- set _ = hits(a, u, 'P', pick('phi') | int, t + (ln(8, 0.8) | int), false) -%}
+    {%- endif -%}
+  {%- elif kind == 'download' -%}
+    {%- set x = pick('mal') | int -%}
+    {%- set t = namespace(v=hits(a, u, 'M', x, t0, false) | int) -%}
+    {%- set h = pick('hash') | int -%}
+    {%- set t.v = t.v + (ln(90, 0.9) | int) -%}
+    {%- set th = t.v -%}
+    {%- set _ = hits(a, u, 'H', h, t.v, false) -%}
+    {%- if module.rand.chance(0.2) -%}
+      {%- set _ = hits(a, u, 'H', h, th + (ln(600, 1.0) | int), false) -%}
+    {%- endif -%}
+    {%- if module.rand.chance(0.6) -%}
+      {%- for j in range(module.rand.number.integer(1, 3)) -%}
+        {%- set t.v = t.v + (ln(300 if j == 0 else 400, 0.8) | int) -%}
+        {%- set t.v = hits(a, u, 'M', other_mal(x) | int, t.v, false) | int -%}
+      {%- endfor -%}
+    {%- endif -%}
+  {%- elif kind == 'hash' -%}
+    {%- set h = pick('hash') | int -%}
+    {%- set t = hits(a, u, 'H', h, t0, false) | int -%}
+    {%- if module.rand.chance(0.3) -%}
+      {%- set t = hits(a, u, 'H', h, t + (ln(120, 1.0) | int), false) | int -%}
+    {%- endif -%}
+    {%- if module.rand.chance(0.35) -%}
+      {%- set _ = hits(a, u, 'M', pick('mal') | int, t + (ln(240, 0.8) | int), false) -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set x = pick('mal') | int -%}
+    {%- set t = namespace(v=t0) -%}
+    {%- for j in range(module.rand.number.integer(2, 6)) -%}
+      {%- if j > 0 -%}{%- set t.v = t.v + (ln(900, 0.7) | int) -%}{%- endif -%}
+      {{- push(t.v, {'k': 'row', 'a': a, 'u': u, 'c': 'M', 'i': x, 'ep': false}) -}}
+    {%- endfor -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, hi, sq, floor) -%}
+  {#- Uniform time in [lo, hi) accepted with the relative incident rate
+      of its UTC hour (squared plus floor when sq), by rejection. -#}
+  {%- set r = namespace(t=lo + module.builtins.int(module.rand.number.floating(0, 1) * (hi - lo)), done=false) -%}
+  {%- set cmax = shared.get('curve') | max -%}
+  {%- for _ in range(200) if not r.done -%}
+    {%- set r.t = lo + module.builtins.int(module.rand.number.floating(0, 1) * (hi - lo)) -%}
+    {%- set c = shared.get('curve')[module.datetime.datetime.fromtimestamp(r.t / 1000000, module.datetime.timezone.utc).hour] / cmax -%}
+    {%- set acc = (c * c + floor) / (1 + floor) if sq else c -%}
+    {%- if module.rand.number.floating(0, 1) < acc -%}{%- set r.done = true -%}{%- endif -%}
+  {%- endfor -%}
+  {{- r.t -}}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 3, 'le': 8760}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- do shared.update({'queue': [], 'seq': 0}) -%}
+  {%- set eps = [] -%}
+  {%- for r in samples.endpoints -%}
+    {%- do eps.append({'ip': r.ip, 'users': r.users.split(' '), 'w': r.weight | float, 'eid': module.rand.number.integer(100000, 9000000), 'hist': [], 'remap': {}, 'seqm': {}}) -%}
+  {%- endfor -%}
+  {%- set fields = {
+    'mal': ['url', 'mask', 'domain', 'dst', 'category', 'threat', 'first_seen', 'last_seen', 'popularity', 'weight'],
+    'phi': ['url', 'mask', 'domain', 'dst', 'industry', 'first_seen', 'last_seen', 'popularity', 'weight'],
+    'hash': ['md5', 'sha1', 'sha256', 'file_size', 'threat', 'first_seen', 'last_seen', 'popularity', 'url', 'weight']} -%}
+  {%- for key, src in [('mal', samples.malicious_urls), ('phi', samples.phishing_urls), ('hash', samples.hashes)] -%}
+    {%- set rows = [] -%}
+    {%- for r in src -%}
+      {%- set d = {} -%}
+      {%- for f in fields[key] -%}{%- do d.update({f: module.builtins.getattr(r, f)}) -%}{%- endfor -%}
+      {%- do rows.append(d) -%}
+    {%- endfor -%}
+    {%- do shared.update({key: rows, key ~ '_idx': range(rows | length) | list, key ~ '_w': rows | map(attribute='weight') | list}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'eps': eps, 'ep_last_a': none, 'ep_last_x': none, 'ep_last_h': none}) -%}
+  {%- set total_w = eps | sum(attribute='w') -%}
+  {%- set pairs = [] -%}
+  {%- for a in range(eps | length) -%}
+    {%- do eps[a].update({'svc': eps[a].users[0].startswith('svc-')}) -%}
+    {%- set pw = eps[a].w / (eps[a].users | length) -%}
+    {%- if pw * (1 if eps[a].svc else 0.66) >= min_pair_w -%}
+      {%- for u in eps[a].users -%}{%- do pairs.append({'a': a, 'u': u, 'w': pw, 'svc': eps[a].svc}) -%}{%- endfor -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- Incident starts pick an endpoint of the timestamp's population in
+      proportion to its weight. -#}
+  {%- for key, sel in [('svc', true), ('usr', false)] -%}
+    {%- set idx = [] -%}
+    {%- set w = [] -%}
+    {%- for a in range(eps | length) if eps[a].svc == sel -%}{%- do idx.append(a) -%}{%- do w.append(eps[a].w) -%}{%- endfor -%}
+    {%- do shared.update({key ~ '_idx': idx, key ~ '_w': w}) -%}
+  {%- endfor -%}
+  {%- do shared.set('pairs', pairs) -%}
+  {#- Relative detection rate per UTC hour: service accounts flat, user
+      endpoints scaled by the diurnal factor (the input curve). -#}
+  {%- set svc_w = eps | selectattr('svc') | sum(attribute='w') -%}
+  {%- set curve = [] -%}
+  {%- for h in range(24) -%}{%- do curve.append(svc_w + (total_w - svc_w) * diurnal[h]) -%}{%- endfor -%}
+  {%- do shared.set('curve', curve) -%}
+  {%- if params.anomaly_mode -%}
+    {#- First episode within the first min(interval, 24 h), its hour
+        following the incident rate. -#}
+    {%- set first_w = module.builtins.int([params.anomaly_interval_hours, 24] | min * hour) -%}
+    {{- push(pick_start(now, now + first_w, false, 0) | int, {'k': 'ep'}) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set q = shared.get('queue') -%}
+{%- set eps = shared.get('eps') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{%- set out = namespace(due=none, item=none) -%}
+{%- for _ in range(500) if out.item is none and q and q[0][0] <= now -%}
+  {%- set top = hq.heappop(q) -%}
+  {%- set it = top[2] -%}
+  {%- if it.k == 'ep' -%}
+    {#- Episode: URL match, a file hash from the same endpoint and user,
+        then the same URL again. Actor and objects rotate. The next
+        start is drawn in a window of width w = min(interval / 4, 6 h)
+        centred one interval after this start, weighted by the squared
+        incident rate of the hour plus a floor. -#}
+    {%- set start = top[0] -%}
+    {%- set hr = module.datetime.datetime.fromtimestamp(start / 1000000, module.datetime.timezone.utc).hour -%}
+    {%- set pairs = shared.get('pairs') -%}
+    {%- set pw = [] -%}
+    {%- for p in pairs -%}{%- do pw.append(0 if p.a == shared.get('ep_last_a') else p.w * (1 if p.svc else diurnal[hr])) -%}{%- endfor -%}
+    {%- set pr = pairs[module.rand.weighted_choice(range(pairs | length) | list, pw)] -%}
+    {%- set a = namespace(v=pr.a) -%}
+    {%- set ep = eps[a.v] -%}
+    {%- set recent = ep.hist | map(attribute=2) | list -%}
+    {%- set x = namespace(v=shared.get('ep_last_x')) -%}
+    {%- for _ in range(50) if x.v == shared.get('ep_last_x') or shared.get('mal')[x.v].url in recent -%}{%- set x.v = pick('mal') | int -%}{%- endfor -%}
+    {%- set h = namespace(v=shared.get('ep_last_h')) -%}
+    {%- for _ in range(50) if h.v == shared.get('ep_last_h') -%}{%- set h.v = pick('hash') | int -%}{%- endfor -%}
+    {%- set u = pr.u -%}
+    {%- set t = hits(a.v, u, 'M', x.v, start, true) | int -%}
+    {#- Gaps from the ordinary distributions, redrawn in the rare case
+        that the repeated URL would fall outside the chain window. -#}
+    {%- set g = namespace(d=[within, 0]) -%}
+    {%- for _ in range(50) if t - start + g.d | sum >= within -%}
+      {%- set g.d = [ln(90, 0.9) | int, ln(300, 0.8) | int] -%}
+    {%- endfor -%}
+    {%- set t = t + g.d[0] -%}
+    {%- set _ = hits(a.v, u, 'H', h.v, t, true) -%}
+    {%- set t = t + g.d[1] -%}
+    {{- push(t, {'k': 'row', 'a': a.v, 'u': u, 'c': 'M', 'i': x.v, 'ep': true}) -}}
+    {%- if module.rand.chance(0.5) -%}
+      {%- set _ = hits(a.v, u, 'M', other_mal(x.v) | int, t + (ln(400, 0.8) | int), false) -%}
+    {%- endif -%}
+    {%- do shared.update({'ep_last_a': a.v, 'ep_last_x': x.v, 'ep_last_h': h.v}) -%}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {{- push(pick_start(start + interval - w // 2, start + interval + w // 2, true, 0.05) | int, {'k': 'ep'}) -}}
+  {%- else -%}
+    {%- set out.due = top[0] -%}
+    {%- set out.item = it -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.item is none -%}
+  {#- Nothing due: a new incident of the timestamp's population; its
+      first detection is due now and takes this timestamp. -#}
+  {{- incident(pick('svc' if 'svc' in tags else 'usr') | int, now) -}}
+  {%- set top = hq.heappop(q) -%}
+  {%- set out.due = top[0] -%}
+  {%- set out.item = top[2] -%}
+{%- endif -%}
+{%- set it = out.item -%}
+{%- set ep = eps[it.a] -%}
+{%- set keep = ep.hist | selectattr(0, 'ge', out.due - recent_window) | list -%}
+{%- if keep | length > 200 -%}{%- set keep = keep[-200:] -%}{%- endif -%}
+{%- do ep.update({'hist': keep}) -%}
+{%- if it.c == 'H' -%}
+  {%- set rec = shared.get('hash')[it.i] -%}
+  {%- set ident = rec.md5 -%}
+{%- else -%}
+  {%- set pool = 'mal' if it.c == 'M' else 'phi' -%}
+  {%- set idx = namespace(v=it.i) -%}
+  {#- Mirror of the chain matcher per endpoint and user: partial matches
+      [next step, first URL time, bound URL] advance on every matching
+      row and expire one hour after their first URL. All live partial
+      matches are kept (no cap, no reset when a chain completes), so
+      every ordered URL, hash, same URL within the hour is covered and
+      no later match completes a chain with rows of a completed one. Guard (both modes): a
+      background URL match that would complete the chain (URL, hash,
+      the same URL) is reported for another URL of the same list. -#}
+  {%- set bad = [] -%}
+  {%- for p in ep.seqm.get(it.u, []) if p[0] == 2 and out.due - p[1] <= within -%}{%- do bad.append(p[2]) -%}{%- endfor -%}
+  {%- if not it.ep -%}
+    {%- if shared.get(pool)[idx.v].url in bad -%}
+      {%- set m = ep.remap.get(pool ~ idx.v) -%}
+      {%- if m is none or shared.get(pool)[m].url in bad -%}
+        {%- set m = namespace(v=idx.v) -%}
+        {%- for _ in range(30) if shared.get(pool)[m.v].url in bad -%}{%- set m.v = pick(pool) | int -%}{%- endfor -%}
+        {%- set m = m.v -%}
+        {%- do ep.remap.update({pool ~ idx.v: m}) -%}
+        {%- if ep.remap | length > 50 -%}{%- do ep.update({'remap': {}}) -%}{%- endif -%}
+      {%- endif -%}
+      {%- set idx.v = m -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set rec = shared.get(pool)[idx.v] -%}
+  {%- set ident = rec.url -%}
+{%- endif -%}
+{%- do ep.hist.append([out.due, it.c, ident, it.u]) -%}
+{%- set parts = [] -%}
+{%- for p in ep.seqm.get(it.u, []) if out.due - p[1] <= within -%}
+  {%- if it.c == 'H' and p[0] == 1 -%}
+    {%- do parts.append([2, p[1], p[2]]) -%}
+  {%- else -%}
+    {%- do parts.append(p) -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if it.c != 'H' -%}{%- do parts.append([1, out.due, ident]) -%}{%- endif -%}
+{%- if not parts -%}
+  {%- do ep.seqm.pop(it.u, none) -%}
+{%- else -%}
+  {%- do ep.seqm.update({it.u: parts}) -%}
+{%- endif -%}
+{%- do ep.update({'eid': ep.eid + 1 + (module.rand.number.lognormal(module.math.log(150), 1.3) | int)}) -%}
+{%- set cats = {'M': 'KL_Malicious_URL', 'P': 'KL_Phishing_URL', 'H': 'KL_Malicious_Hash_MD5'} -%}
+{%- set cat = cats[it.c] -%}
+{%- if it.c == 'H' -%}
+  {%- set dst = '-' -%}
+  {%- set md5 = rec.md5 -%}
+  {%- set url = '-' -%}
+  {%- set indicator = rec.md5 -%}
+  {%- set actionable = 'flexString1=' ~ rec.first_seen ~ ' flexString2=' ~ rec.last_seen ~ ' cn2=' ~ rec.popularity ~ ' cs3=' ~ rec.threat ~ ' cs4=' ~ rec.url ~ ' fsize=' ~ rec.file_size -%}
+  {%- set context = 'MD5:' ~ rec.md5 ~ ' SHA1:' ~ rec.sha1 ~ ' SHA256:' ~ rec.sha256 ~ ' file_size:' ~ rec.file_size ~ ' first_seen:' ~ rec.first_seen ~ ' last_seen:' ~ rec.last_seen ~ ' popularity:' ~ rec.popularity ~ ' threat:' ~ rec.threat ~ ' ' -%}
+{%- else -%}
+  {%- set dst = rec.dst -%}
+  {%- set md5 = '-' -%}
+  {%- set url = rec.url -%}
+  {%- set indicator = rec.mask -%}
+  {%- if it.c == 'M' -%}
+    {%- set actionable = 'cs1=' ~ rec.mask ~ ' flexString1=' ~ rec.first_seen ~ ' flexString2=' ~ rec.last_seen ~ ' cn2=' ~ rec.popularity ~ ' cs3=' ~ rec.threat ~ ' cs4=' ~ rec.category ~ ' cs2=' ~ rec.domain -%}
+    {%- set context = 'category:' ~ rec.category ~ ' first_seen:' ~ rec.first_seen ~ ' last_seen:' ~ rec.last_seen ~ ' mask:' ~ rec.mask ~ ' popularity:' ~ rec.popularity ~ ' ' -%}
+  {%- else -%}
+    {%- set actionable = 'cs1=' ~ rec.mask ~ ' flexString1=' ~ rec.first_seen ~ ' flexString2=' ~ rec.last_seen ~ ' cn2=' ~ rec.popularity ~ ' deviceFacility=' ~ rec.industry ~ ' cs2=' ~ rec.domain -%}
+    {%- set context = 'first_seen:' ~ rec.first_seen ~ ' industry:' ~ rec.industry ~ ' last_seen:' ~ rec.last_seen ~ ' mask:' ~ rec.mask ~ ' popularity:' ~ rec.popularity ~ ' ' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set raw = 'CEF:0|Kaspersky|Kaspersky CyberTrace for ArcSight|2.0|2|CyberTrace Detection Event|8|'
+  ~ ' reason=' ~ cat ~ ' dst=' ~ dst ~ ' src=' ~ ep.ip
+  ~ ' fileHash=' ~ md5 ~ ' request=' ~ url
+  ~ ' sourceServiceName=ExampleVendor sproc=EndpointSecurity suser=' ~ it.u
+  ~ ' msg=CyberTrace detected ' ~ cat ~ ' externalId=' ~ ep.eid ~ ' ' ~ actionable
+  ~ ' cs5Label=MatchedIndicator cs5=' ~ indicator
+  ~ ' cn3Label=Confidence cn3=100 cs6Label=Context cs6=' ~ context -%}
+{%- set when = module.datetime.datetime.fromtimestamp(out.due / 1000000, module.datetime.timezone.utc) -%}
+{%- set record = {'@timestamp': when.isoformat(timespec='microseconds'),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'alert', 'dataset': 'kaspersky.cybertrace',
+    'category': ['threat'], 'type': ['indicator'], 'code': cat, 'severity': 8,
+    'action': 'indicator_match', 'original': raw},
+  'source': {'ip': ep.ip},
+  'observer': {'vendor': 'Kaspersky', 'product': 'Kaspersky CyberTrace for ArcSight'},
+  'user': {'name': it.u},
+  'related': {'ip': [ep.ip] if dst == '-' else [ep.ip, dst], 'user': [it.u]},
+  'kaspersky': {'cybertrace': {'matched_indicator': indicator,
+    'external_id': ep.eid, 'confidence': 100, 'record_context': context}}} -%}
+{%- if it.c == 'H' -%}
+  {%- do record.update({'file': {'hash': {'md5': rec.md5 | lower, 'sha1': rec.sha1 | lower, 'sha256': rec.sha256 | lower}, 'size': rec.file_size}}) -%}
+  {%- do record.related.update({'hash': [rec.md5 | lower, rec.sha1 | lower, rec.sha256 | lower]}) -%}
+{%- else -%}
+  {%- do record.update({'url': {'original': url, 'domain': rec.domain}, 'destination': {'ip': dst}}) -%}
+{%- endif -%}
+{{ record | tojson }}
