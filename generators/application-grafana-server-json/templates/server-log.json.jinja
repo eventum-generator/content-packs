@@ -1,0 +1,462 @@
+{#- Grafana OSS 9.5.1 server log, format = json, router_logging = true,
+    level info, wrapped in ECS JSON. The inputs set the rate: timestamps
+    tagged "web" carry browser users, timestamps tagged "api" carry
+    service accounts; every timestamp becomes exactly one line.
+
+    A browser request that logs two lines (a handler line and its
+    "Request Completed" line) writes the second line on the next
+    timestamp, stamped a few microseconds after the first. Otherwise a
+    "web" timestamp takes the earliest due step of a login (tight
+    queue), else the earliest due request of an open session (flexible
+    queue), else starts a login of an idle user drawn by activity
+    weight. The anomaly episode is one more login of an idle
+    administrator whose steps go through the same queues. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set epoch = module.datetime.datetime(1970, 1, 1, tzinfo=module.datetime.timezone.utc) -%}
+{%- set tick_us = (ts - epoch) // module.datetime.timedelta(microseconds=1) -%}
+{%- set now = tick_us / 1000000 -%}
+{%- set api = 'api' in tags -%}
+{%- set window = 3600 -%}
+{%- set token_cap = 40 -%}
+{#- Failed form logins before a login ends: users mostly succeed at the
+    first try; administrators type long vault-generated passwords by
+    hand and mistype them more often. Both laws fall with every extra
+    failure. -#}
+{%- set fail_k = [0, 1, 2, 3, 4, 5, 6] -%}
+{%- set user_fail_w = [960, 25, 8, 4, 2, 0.7, 0.3] -%}
+{%- set admin_fail_w = [820, 90, 42, 22, 12, 8, 6] -%}
+{#- Per signed-in request of an administrator: token creation and
+    service account page reads. -#}
+{%- set p_token = 0.013 -%}
+{%- set p_sa_page = 0.06 -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, truncated by redrawing. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(16) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- [ns.v, hi] | min -}}
+{%- endmacro -%}
+{%- macro typo_gap() -%}{{- d(3, 9, 0.8, 180) -}}{%- endmacro -%}
+{%- macro op_gap() -%}{{- d(0.2, 14, 1.2, 900) -}}{%- endmacro -%}
+{#- Administrators sign in for shorter pieces of work more often. -#}
+{%- macro session_len(admin) -%}{{- d(30, 900, 0.9, 14400) if admin else d(30, 2400, 0.9, 28800) -}}{%- endmacro -%}
+{%- macro absence(admin) -%}{{- d(60, 900, 1.0, 43200) if admin else d(60, 1800, 1.0, 43200) -}}{%- endmacro -%}
+{%- macro retry_later() -%}{{- d(30, 900, 1.0, 21600) -}}{%- endmacro -%}
+{%- macro revoke_delay() -%}{{- d(60, 2400, 1.2, 43200) -}}{%- endmacro -%}
+{#- Hour-of-day load of browser users. It repeats the rates of
+    patterns/web-floor.yml and patterns/web-day.yml (Beta(9, 11) over
+    the day) and only places episode starts; the inputs alone set the
+    rate. -#}
+{%- macro hload(t) -%}
+  {%- set x = [[(t % 86400) / 86400, 0.0001] | max, 0.9999] | min -%}
+  {%- set lb = module.math.lgamma(9) + module.math.lgamma(11) - module.math.lgamma(20) -%}
+  {{- (6048 + 21600 * module.math.exp(8 * module.math.log(x) + 10 * module.math.log(1 - x) - lb)) / 86400 -}}
+{%- endmacro -%}
+{%- if not shared.get('init', false) -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'grafana_host': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'}},
+    'root_url': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^https?://[A-Za-z0-9.:-]+$'}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {#- Browser users (samples/users.json) sign in with the login form;
+      Admin users also manage service account tokens. Service accounts
+      (samples/service_accounts.json) call the API with a bearer token
+      and never log in. -#}
+  {%- set actors = [] -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- set admins = [] -%}
+  {%- for i in range(samples.users | length) -%}
+    {%- set u = samples.users[i] -%}
+    {%- set acc.w = acc.w + u.activity -%}
+    {%- do cum.append(acc.w) -%}
+    {%- if u.role == 'Admin' -%}{%- do admins.append(i) -%}{%- endif -%}
+    {%- do actors.append({'login': u.login, 'email': u.email, 'id': u.id, 'ip': u.ip, 'admin': u.role == 'Admin',
+        'sa': false, 'w': u.activity, 'psa': u.primary_service_account, 'busy': false, 'on': false, 'rest': 0,
+        'page': '/', 'lh': []}) -%}
+  {%- endfor -%}
+  {%- set sa_idx = [] -%}
+  {%- set sa_w = [] -%}
+  {%- set sa_ids = [] -%}
+  {%- for j in range(samples.service_accounts | length) -%}
+    {%- set s = samples.service_accounts[j] -%}
+    {%- do sa_idx.append(actors | length) -%}
+    {%- do sa_w.append(s.activity) -%}
+    {%- do sa_ids.append(s.id) -%}
+    {%- do actors.append({'login': s.login, 'email': '', 'id': s.id, 'ip': s.ip, 'admin': false, 'sa': true,
+        'page': '/'}) -%}
+  {%- endfor -%}
+  {%- set dashboards = [] -%}
+  {%- for j in range(samples.dashboards | length) -%}
+    {%- do dashboards.append([samples.dashboards[j].uid, samples.dashboards[j].slug]) -%}
+  {%- endfor -%}
+  {%- do shared.update({'init': true, 'actors': actors, 'cum': cum, 'total': acc.w, 'n_users': cum | length,
+      'admins': admins, 'sa_idx': sa_idx, 'sa_w': sa_w, 'sa_ids': sa_ids, 'dashboards': dashboards,
+      'hq': [], 'lq': [], 'seq': 0, 'follow': none, 'tokens': {}, 'next_tid': module.rand.number.integer(20, 90),
+      'last_ns': tick_us * 1000 - 1000, 'ep_at': none, 'ep_last': none}) -%}
+{%- endif -%}
+{%- set actors = shared.get('actors') -%}
+{%- set admins = shared.get('admins') -%}
+{%- set sa_ids = shared.get('sa_ids') -%}
+{%- set dashboards = shared.get('dashboards') -%}
+{%- set tokens = shared.get('tokens') -%}
+{%- set hq = shared.get('hq') -%}
+{%- set lq = shared.get('lq') -%}
+{%- set interval = params.anomaly_interval_hours * 3600 -%}
+{%- set r = namespace(row=none) -%}
+
+{%- macro push(q, at, item) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- do module.heapq.heappush(q, [at, shared.get('seq'), item]) -%}
+{%- endmacro -%}
+
+{#- Row builders. A request row carries the handler duration. -#}
+{%- macro req(a, method, path, handler, status, size, dur_ms, referer, anon=false) -%}
+  {%- set r.row = {'kind': 'rc', 'a': a, 'method': method, 'path': path, 'handler': handler, 'status': status,
+      'size': size, 'dur_ns': module.builtins.int(dur_ms * 1000000), 'referer': referer, 'anon': anon} -%}
+{%- endmacro -%}
+{%- macro follow(a, method, path, status, size, dur_ms, referer) -%}
+  {#- The request line that follows a handler line of the same request. -#}
+  {%- do shared.set('follow', {'kind': 'rc', 'a': a, 'method': method, 'path': path, 'handler': path,
+      'status': status, 'size': size, 'dur_ns': module.builtins.int(dur_ms * 1000000), 'referer': referer,
+      'anon': path == '/login', 'follow': true}) -%}
+{%- endmacro -%}
+{%- macro page_ref(a) -%}{{- params.root_url ~ actors[a].page -}}{%- endmacro -%}
+{%- macro read(a) -%}
+  {%- set ac = actors[a] -%}
+  {%- set db = module.rand.choice(dashboards) -%}
+  {%- set k = module.rand.weighted_choice(['query', 'dash', 'search', 'annot', 'user', 'metrics', 'index'], [44, 12, 10, 14, 6, 9, 5]) -%}
+  {%- if k == 'query' -%}
+    {{- req(a, 'POST', '/api/ds/query', '/api/ds/query', 200, module.builtins.int(5200 * module.rand.number.lognormal(0, 1.1)) + 60, module.rand.number.lognormal(module.math.log(90), 1.0) + 3, page_ref(a)) -}}
+  {%- elif k == 'dash' -%}
+    {%- do ac.update({'page': '/d/' ~ db[0] ~ '/' ~ db[1] ~ '?orgId=1'}) -%}
+    {{- req(a, 'GET', '/api/dashboards/uid/' ~ db[0], '/api/dashboards/uid/:uid', 200, module.builtins.int(21000 * module.rand.number.lognormal(0, 0.6)), module.rand.number.lognormal(module.math.log(9), 0.7) + 1, page_ref(a)) -}}
+  {%- elif k == 'search' -%}
+    {{- req(a, 'GET', '/api/search', '/api/search/', 200, module.builtins.int(1800 * module.rand.number.lognormal(0, 0.7)) + 2, module.rand.number.lognormal(module.math.log(7), 0.7) + 1, page_ref(a)) -}}
+  {%- elif k == 'annot' -%}
+    {{- req(a, 'GET', '/api/annotations', '/api/annotations', 200, module.rand.weighted_choice([2, module.builtins.int(900 * module.rand.number.lognormal(0, 0.9)) + 60], [55, 45]), module.rand.number.lognormal(module.math.log(5), 0.7) + 0.5, page_ref(a)) -}}
+  {%- elif k == 'user' -%}
+    {{- req(a, 'GET', '/api/user', '/api/user/', 200, 330 + (ac.login | length) * 2 + (ac.email | length) + module.rand.number.integer(0, 40), module.rand.number.lognormal(module.math.log(2), 0.6) + 0.3, page_ref(a)) -}}
+  {%- elif k == 'metrics' -%}
+    {{- req(a, 'POST', '/api/frontend-metrics', '/api/frontend-metrics', 200, 2, module.rand.number.lognormal(module.math.log(0.6), 0.6) + 0.1, page_ref(a)) -}}
+  {%- else -%}
+    {%- do ac.update({'page': '/'}) -%}
+    {{- req(a, 'GET', '/', '/', 200, module.builtins.int(37500 + module.rand.number.integer(-300, 300)), module.rand.number.lognormal(module.math.log(12), 0.6) + 2, '') -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro sa_read(a) -%}
+  {%- set db = module.rand.choice(dashboards) -%}
+  {%- set tf = actors[a].login == 'sa-terraform' -%}
+  {%- set k = module.rand.weighted_choice(['query', 'dash', 'search', 'satok'] if tf else ['query', 'dash', 'search'], [50, 25, 20, 5] if tf else [60, 25, 15]) -%}
+  {%- if k == 'query' -%}
+    {{- req(a, 'POST', '/api/ds/query', '/api/ds/query', 200, module.builtins.int(5200 * module.rand.number.lognormal(0, 1.1)) + 60, module.rand.number.lognormal(module.math.log(90), 1.0) + 3, '') -}}
+  {%- elif k == 'dash' -%}
+    {{- req(a, 'GET', '/api/dashboards/uid/' ~ db[0], '/api/dashboards/uid/:uid', 200, module.builtins.int(21000 * module.rand.number.lognormal(0, 0.6)), module.rand.number.lognormal(module.math.log(9), 0.7) + 1, '') -}}
+  {%- elif k == 'search' -%}
+    {{- req(a, 'GET', '/api/search', '/api/search/', 200, module.builtins.int(1800 * module.rand.number.lognormal(0, 0.7)) + 2, module.rand.number.lognormal(module.math.log(7), 0.7) + 1, '') -}}
+  {%- else -%}
+    {{- req(a, 'GET', '/api/serviceaccounts/search', '/api/serviceaccounts/search', 200, module.builtins.int(900 * module.rand.number.lognormal(0, 0.3)), module.rand.number.lognormal(module.math.log(4), 0.6) + 0.5, '') -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro admin_read(a, sa) -%}
+  {%- if module.rand.chance(0.5) -%}
+    {%- do actors[a].update({'page': '/org/serviceaccounts'}) -%}
+    {{- req(a, 'GET', '/api/serviceaccounts/search', '/api/serviceaccounts/search', 200, module.builtins.int(900 * module.rand.number.lognormal(0, 0.3)), module.rand.number.lognormal(module.math.log(4), 0.6) + 0.5, page_ref(a)) -}}
+  {%- else -%}
+    {%- do actors[a].update({'page': '/org/serviceaccounts/' ~ sa}) -%}
+    {%- set n = tokens.values() | select('equalto', sa) | list | length -%}
+    {{- req(a, 'GET', '/api/serviceaccounts/' ~ sa ~ '/tokens', '/api/serviceaccounts/:serviceAccountId/tokens', 200, 2 + n * module.rand.number.integer(150, 175), module.rand.number.lognormal(module.math.log(3), 0.6) + 0.5, page_ref(a)) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro create_token(a, sa) -%}
+  {#- Every token, ordinary or episode, is deleted later by an
+      administrator signed in at that time. -#}
+  {%- set tid = shared.get('next_tid') -%}
+  {%- do shared.set('next_tid', tid + module.rand.weighted_choice([1, 2], [92, 8])) -%}
+  {%- do tokens.update({tid | string: sa}) -%}
+  {%- do actors[a].update({'page': '/org/serviceaccounts/' ~ sa}) -%}
+  {%- set name = module.rand.choice(['ci', 'grafana-sync', 'terraform', 'backup', 'reporting', 'alert-export', 'dashboards-ci']) ~ '-' ~ module.rand.number.integer(1, 99) -%}
+  {%- set body = '{"id":' ~ tid ~ ',"name":"' ~ name ~ '","key":"glsa_' ~ module.rand.string.letters(32) ~ '_' ~ module.rand.string.hex(8) ~ '"}' -%}
+  {{- req(a, 'POST', '/api/serviceaccounts/' ~ sa ~ '/tokens', '/api/serviceaccounts/:serviceAccountId/tokens', 200, body | length, module.rand.number.lognormal(module.math.log(14), 0.5) + 2, page_ref(a)) -}}
+  {{- push(lq, now + (revoke_delay() | float), {'k': 'revoke', 'tid': tid}) -}}
+{%- endmacro -%}
+{%- macro delete_token(a, tid) -%}
+  {%- set sa = tokens.pop(tid | string) -%}
+  {%- do actors[a].update({'page': '/org/serviceaccounts/' ~ sa}) -%}
+  {{- req(a, 'DELETE', '/api/serviceaccounts/' ~ sa ~ '/tokens/' ~ tid, '/api/serviceaccounts/:serviceAccountId/tokens/:tokenId', 200, ('{"message":"Service account token deleted"}') | length, module.rand.number.lognormal(module.math.log(6), 0.5) + 1, page_ref(a)) -}}
+{%- endmacro -%}
+{%- macro completes_chain(a) -%}
+  {#- True when this client address holds three failed logins followed
+      by a successful one inside the chain window, so a token creation
+      now would complete the chain. -#}
+  {%- set st = namespace(n=0, ok=false) -%}
+  {%- for x in actors[a].lh if x[0] >= now - window - 100 -%}
+    {%- if not x[1] -%}{%- set st.n = st.n + 1 -%}{%- elif st.n >= 3 -%}{%- set st.ok = true -%}{%- endif -%}
+  {%- endfor -%}
+  {{- 'y' if st.ok else '' -}}
+{%- endmacro -%}
+{%- macro login_attempt(a, ok) -%}
+  {#- POST /login. A failure logs the handler error line first and the
+      request line right after; a success logs "Successful Login"
+      first. Five invalid attempts in five minutes block the login. -#}
+  {%- set ac = actors[a] -%}
+  {%- set recent = ac.lh | selectattr('0', 'gt', now - 300) | rejectattr('1') | rejectattr('2') | list | length -%}
+  {%- set blocked = recent >= 5 -%}
+  {%- set okk = ok and not blocked -%}
+  {%- do ac.lh.append([now, okk, blocked]) -%}
+  {%- for x in ac.lh | list if x[0] < now - window - 100 -%}{%- do ac.lh.remove(x) -%}{%- endfor -%}
+  {%- if ac.lh | length > 24 -%}{%- do ac.lh.pop(0) -%}{%- endif -%}
+  {%- set dur = module.rand.number.lognormal(module.math.log(28), 0.5) + 4 -%}
+  {%- if okk -%}
+    {%- set r.row = {'kind': 'login_ok', 'a': a} -%}
+    {{- follow(a, 'POST', '/login', 200, ('{"message":"Logged in","redirectUrl":"/"}') | length, dur, params.root_url ~ '/login') -}}
+  {%- else -%}
+    {%- set r.row = {'kind': 'login_fail', 'a': a, 'blocked': blocked} -%}
+    {{- follow(a, 'POST', '/login', 401, ('{"message":"Invalid username or password","traceID":""}') | length, dur if not blocked else dur / 6, params.root_url ~ '/login') -}}
+  {%- endif -%}
+  {{- 'y' if okk else '' -}}
+{%- endmacro -%}
+{%- macro login_page(a) -%}
+  {{- req(a, 'GET', '/login', '/login', 200, module.builtins.int(37400 + module.rand.number.integer(-300, 300)), module.rand.number.lognormal(module.math.log(9), 0.6) + 1, '', true) -}}
+{%- endmacro -%}
+{%- macro session_step(a) -%}
+  {#- One ordinary signed-in request of a browser session. Guard: an
+      administrator's token creation that would complete the chain (three
+      failed logins, a successful one and the creation within the chain
+      window from one address) becomes a read of the same service
+      account's token list. -#}
+  {%- set ac = actors[a] -%}
+  {%- if ac.admin and module.rand.chance(p_token) -%}
+    {%- set sa = ac.psa if module.rand.chance(0.9) else module.rand.choice(sa_ids) -%}
+    {%- if completes_chain(a) or tokens | length >= token_cap -%}
+      {{- admin_read(a, sa) -}}
+    {%- else -%}
+      {{- create_token(a, sa) -}}
+    {%- endif -%}
+  {%- elif ac.admin and module.rand.chance(p_sa_page) -%}
+    {{- admin_read(a, module.rand.choice(sa_ids)) -}}
+  {%- else -%}
+    {{- read(a) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro attempt(p) -%}
+  {#- The next POST /login of a login: a failure while failures remain,
+      then the successful one. Users who give up, or are blocked, come
+      back later. -#}
+  {%- set ac = actors[p.a] -%}
+  {%- if p.fails > 0 -%}
+    {%- set _ = login_attempt(p.a, false) -%}
+    {%- do p.update({'fails': p.fails - 1}) -%}
+    {%- if (p.fails == 0 and p.give_up) or (r.row.blocked and module.rand.chance(0.7)) -%}
+      {%- do ac.update({'busy': false, 'rest': now + (retry_later() | float)}) -%}
+    {%- else -%}
+      {{- push(hq, now + (typo_gap() | float), {'k': 'try', 'p': p}) -}}
+    {%- endif -%}
+  {%- elif login_attempt(p.a, true) -%}
+    {%- do ac.update({'on': true, 'page': '/'}) -%}
+    {%- do p.update({'end': now + (session_len(ac.admin) | float)}) -%}
+    {{- push(hq if p.pre is not none else lq, now + (op_gap() | float), {'k': 'req', 'p': p}) -}}
+  {%- else -%}
+    {%- do ac.update({'busy': false, 'rest': now + (retry_later() | float)}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first timestamp, its hour drawn from the
+    browser-user hour curve. Each later start is due one interval after
+    the actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor. The episode waits for an idle
+    administrator (signed out, not the previous episode's, no failed
+    login in the last 10 minutes); missed starts are not replayed. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range(((hi - top) // 3600) | int + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload((a + b) / 2) | float / 0.96 -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.rand.number.floating(slot[0], slot[1]) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and shared.get('ep_at') is none -%}
+  {%- do shared.set('ep_at', pick_start(now, now + [interval, 86400] | min, false) | float) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and not api and now >= shared.get('ep_at') -%}
+  {%- set ep = namespace(c=[], w=[]) -%}
+  {%- for i in admins -%}
+    {%- set ac = actors[i] -%}
+    {%- if not ac.busy and ac.rest <= now and i != shared.get('ep_last') and not (ac.lh | selectattr('0', 'gt', now - 600) | rejectattr('1') | list) -%}
+      {%- set ep.c = ep.c + [i] -%}{%- set ep.w = ep.w + [ac.w] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ep.c -%}
+    {#- Three or four failed form logins from the administrator's
+        workstation, the successful login, zero to three ordinary
+        requests, then a token for the administrator's own service
+        account. The session then goes on and ends like any other. -#}
+    {%- set a = module.rand.weighted_choice(ep.c, ep.w) -%}
+    {%- do actors[a].update({'busy': true}) -%}
+    {%- set p = {'a': a, 'fails': module.rand.weighted_choice([3, 4], [65, 35]), 'give_up': false,
+        'pre': module.rand.weighted_choice([0, 1, 2, 3], [40, 30, 18, 12]), 'sa': actors[a].psa, 'end': 0} -%}
+    {{- push(hq, now, {'k': 'login', 'p': p}) -}}
+    {%- set due = now + interval -%}
+    {%- set half = [interval / 4, 21600] | min / 2 -%}
+    {%- do shared.update({'ep_last': a, 'ep_at': pick_start(due - half, due + half, true) | float}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Pick the work of this timestamp. -#}
+{%- set pending = shared.get('follow') -%}
+{%- if pending is not none -%}
+  {%- do shared.set('follow', none) -%}
+  {%- set r.row = pending -%}
+{%- elif api -%}
+  {{- sa_read(module.rand.weighted_choice(shared.get('sa_idx'), shared.get('sa_w'))) -}}
+{%- else -%}
+  {%- for _ in range(24) if r.row is none -%}
+    {%- set it = namespace(item=none) -%}
+    {%- if hq and hq[0][0] <= now -%}
+      {%- set it.item = module.heapq.heappop(hq)[2] -%}
+    {%- elif lq and lq[0][0] <= now -%}
+      {%- set it.item = module.heapq.heappop(lq)[2] -%}
+    {%- else -%}
+      {#- Nothing due: an idle user drawn by activity weight signs in. -#}
+      {%- set cum = shared.get('cum') -%}
+      {%- set pick = namespace(a=none) -%}
+      {%- for _ in range(32) if pick.a is none -%}
+        {%- set i = module.bisect.bisect_right(cum, module.rand.number.floating(0, shared.get('total'))) -%}
+        {%- if i < cum | length and not actors[i].busy and actors[i].rest <= now -%}{%- set pick.a = i -%}{%- endif -%}
+      {%- endfor -%}
+      {%- if pick.a is not none -%}
+        {%- set ac = actors[pick.a] -%}
+        {%- do ac.update({'busy': true}) -%}
+        {%- set k = module.rand.weighted_choice(fail_k, admin_fail_w if ac.admin else user_fail_w) -%}
+        {%- set it.item = {'k': 'login', 'p': {'a': pick.a, 'fails': k, 'give_up': k > 0 and module.rand.chance(0.2),
+            'pre': none, 'sa': none, 'end': 0}} -%}
+      {%- elif hq or lq -%}
+        {#- Every user is busy: the earliest queued step comes early. -#}
+        {%- set it.item = module.heapq.heappop(hq if hq and (not lq or hq[0][0] <= lq[0][0]) else lq)[2] -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- set item = it.item -%}
+    {%- if item is none -%}
+      {{- sa_read(module.rand.weighted_choice(shared.get('sa_idx'), shared.get('sa_w'))) -}}
+    {%- elif item.k == 'login' -%}
+      {%- if module.rand.chance(0.7) -%}
+        {{- login_page(item.p.a) -}}
+        {{- push(hq, now + (typo_gap() | float), {'k': 'try', 'p': item.p}) -}}
+      {%- else -%}
+        {{- attempt(item.p) -}}
+      {%- endif -%}
+    {%- elif item.k == 'try' -%}
+      {{- attempt(item.p) -}}
+    {%- elif item.k == 'req' -%}
+      {%- set p = item.p -%}
+      {%- set ac = actors[p.a] -%}
+      {%- if p.pre is none and now >= p.end -%}
+        {#- Session over: 30% sign out, the rest just leave. -#}
+        {%- do ac.update({'busy': false, 'on': false, 'rest': now + (absence(ac.admin) | float)}) -%}
+        {%- if module.rand.chance(0.3) -%}
+          {%- set r.row = {'kind': 'logout', 'a': p.a} -%}
+          {{- follow(p.a, 'GET', '/logout', 302, 29, module.rand.number.lognormal(module.math.log(3), 0.5) + 0.5, page_ref(p.a)) -}}
+        {%- endif -%}
+      {%- else -%}
+        {%- if p.pre is not none and p.pre == 0 -%}
+          {#- The episode's token creation. -#}
+          {%- if tokens | length >= token_cap -%}
+            {{- admin_read(p.a, p.sa) -}}
+          {%- else -%}
+            {{- create_token(p.a, p.sa) -}}
+          {%- endif -%}
+          {%- do p.update({'pre': none}) -%}
+        {%- else -%}
+          {{- session_step(p.a) -}}
+          {%- if p.pre is not none -%}{%- do p.update({'pre': p.pre - 1}) -%}{%- endif -%}
+        {%- endif -%}
+        {{- push(hq if p.pre is not none else lq, now + (op_gap() | float), {'k': 'req', 'p': p}) -}}
+      {%- endif -%}
+    {%- elif item.k == 'revoke' -%}
+      {%- if item.tid | string in tokens -%}
+        {%- set online = [] -%}
+        {%- for i in admins if actors[i].on -%}{%- do online.append(i) -%}{%- endfor -%}
+        {%- if online -%}
+          {{- delete_token(module.rand.choice(online), item.tid) -}}
+        {%- else -%}
+          {{- push(lq, now + (d(30, 600, 1.0, 7200) | float), item) -}}
+        {%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if r.row is none -%}
+    {{- sa_read(module.rand.weighted_choice(shared.get('sa_idx'), shared.get('sa_w'))) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Render. A request line that follows its handler line is stamped
+    microseconds after it; every other line carries its own timestamp. -#}
+{%- set row = r.row -%}
+{%- set last_ns = shared.get('last_ns') -%}
+{%- if row.get('follow') -%}
+  {%- set t_ns = last_ns + module.rand.number.integer(12000, 260000) -%}
+{%- else -%}
+  {%- set t_ns = [tick_us * 1000 + module.rand.number.integer(0, 999), last_ns + 1000] | max -%}
+{%- endif -%}
+{%- do shared.set('last_ns', t_ns) -%}
+{%- set ac = actors[row.a] -%}
+{%- set t = module.datetime.datetime.fromtimestamp(t_ns // 1000000000, module.datetime.timezone.utc) -%}
+{%- set frac = '%09d' | format(t_ns % 1000000000) -%}
+{%- set frac = frac.rstrip('0') -%}
+{%- set tstr = t.strftime('%Y-%m-%dT%H:%M:%S') ~ ('.' ~ frac if frac else '') ~ 'Z' -%}
+{%- set iso = t.strftime('%Y-%m-%dT%H:%M:%S') ~ '.' ~ '%06d' | format((t_ns % 1000000000) // 1000) ~ '+00:00' -%}
+{%- set anon = row.kind in ['login_fail', 'login_ok'] or row.get('anon') -%}
+{%- set ctx = {'userId': 0, 'orgId': 0, 'uname': ''} if anon else {'userId': ac.id, 'orgId': 1, 'uname': ac.login} -%}
+{%- if row.kind == 'rc' -%}
+  {#- Go time.Duration.String(). -#}
+  {%- set dn = row.dur_ns -%}
+  {%- if dn < 1000000 -%}
+    {%- set f = ('%03d' | format(dn % 1000)).rstrip('0') -%}
+    {%- set dstr = (dn // 1000) ~ ('.' ~ f if f else '') ~ 'µs' -%}
+  {%- elif dn < 1000000000 -%}
+    {%- set f = ('%06d' | format(dn % 1000000)).rstrip('0') -%}
+    {%- set dstr = (dn // 1000000) ~ ('.' ~ f if f else '') ~ 'ms' -%}
+  {%- else -%}
+    {%- set f = ('%09d' | format(dn % 1000000000)).rstrip('0') -%}
+    {%- set dstr = (dn // 1000000000) ~ ('.' ~ f if f else '') ~ 's' -%}
+  {%- endif -%}
+  {%- set native = dict(ctx, level='info', logger='context', msg='Request Completed', t=tstr, method=row.method, path=row.path, status=row.status, remote_addr=ac.ip, time_ms=dn // 1000000, duration=dstr, size=row.size, referer=row.referer, handler=row.handler) -%}
+  {%- set action = 'request-completed' -%}
+{%- elif row.kind == 'login_fail' -%}
+  {%- set native = dict(ctx, level='error', logger='context', msg='Invalid username or password', t=tstr, error='too many consecutive incorrect login attempts for user - login for user temporarily blocked' if row.blocked else 'invalid username or password', remote_addr=ac.ip, traceID='') -%}
+  {%- set action = 'invalid-username-or-password' -%}
+{%- elif row.kind == 'login_ok' -%}
+  {%- set native = {'User': ac.email, 'level': 'info', 'logger': 'http.server', 'msg': 'Successful Login', 't': tstr} -%}
+  {%- set action = 'successful-login' -%}
+{%- else -%}
+  {%- set native = {'User': ac.email, 'level': 'info', 'logger': 'http.server', 'msg': 'Successful Logout', 't': tstr} -%}
+  {%- set action = 'successful-logout' -%}
+{%- endif -%}
+{%- set original = module.json.dumps(native, sort_keys=true, separators=(',', ':'), ensure_ascii=false) -%}
+{%- set event = {'@timestamp': iso, 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'dataset': 'grafana.server', 'module': 'grafana', 'action': action, 'original': original}, 'host': {'name': params.grafana_host}, 'service': {'name': 'grafana', 'type': 'grafana', 'version': '9.5.1'}, 'message': native.msg, 'log': {'level': native.level, 'logger': native.logger}, 'grafana': {'log': native}} -%}
+{%- if row.kind == 'rc' -%}
+  {%- set is_login = row.path == '/login' and row.method == 'POST' -%}
+  {%- do event.event.update({'category': ['web', 'authentication'] if is_login else ['web'], 'type': (['start'] if row.status == 200 else ['denied']) if is_login else (['end'] if row.path == '/logout' else ['creation'] if row.method == 'POST' and 'tokens' in row.path else ['deletion'] if row.method == 'DELETE' else ['access']), 'outcome': 'failure' if row.status >= 400 else 'success', 'duration': row.dur_ns}) -%}
+  {%- do event.update({'source': {'ip': ac.ip}, 'http': {'request': {'method': row.method}, 'response': {'status_code': row.status, 'body': {'bytes': row.size}}}, 'url': {'path': row.path}, 'related': {'ip': [ac.ip], 'hosts': [params.grafana_host]}}) -%}
+  {%- if row.referer -%}{%- do event.http.request.update({'referrer': row.referer}) -%}{%- endif -%}
+  {%- if not anon -%}{%- do event.update({'user': {'name': ac.login, 'id': ac.id | string}}) -%}{%- do event.related.update({'user': [ac.login]}) -%}{%- endif -%}
+{%- elif row.kind == 'login_fail' -%}
+  {%- do event.event.update({'category': ['authentication'], 'type': ['info'], 'outcome': 'failure', 'reason': native.error}) -%}
+  {%- do event.update({'source': {'ip': ac.ip}, 'related': {'ip': [ac.ip], 'hosts': [params.grafana_host]}}) -%}
+{%- else -%}
+  {%- do event.event.update({'category': ['authentication'], 'type': ['start'] if row.kind == 'login_ok' else ['end'], 'outcome': 'success'}) -%}
+  {%- do event.update({'user': {'email': ac.email}, 'related': {'user': [ac.email], 'hosts': [params.grafana_host]}}) -%}
+{%- endif -%}
+{{- event | tojson -}}
