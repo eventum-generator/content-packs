@@ -1,0 +1,473 @@
+{#- Nextcloud 35 admin_audit records (data/audit.log) wrapped in ECS.
+    The input sets the rate and the UTC hour-of-day curve; every
+    timestamp becomes exactly one record. Each timestamp takes the
+    earliest due step of work in progress (login requests and anomaly
+    episode steps first, then the operations of open sessions) and,
+    when none is due, starts new work: a browser or DAV session of a
+    user picked by activity weight, now and then a sync client retrying
+    a stale password. Password guesses from outside arrive at a flat
+    rate of their own, and the anomaly episode, when anomaly_mode is
+    true, queues its own steps. -#}
+{#- Jinja has no raise statement: a missing-key lookup aborts the render
+    with the message as the key. -#}
+{%- macro invalid(message) -%}
+  {%- do module.operator.getitem({}, message) -%}
+{%- endmacro -%}
+{#- Hour-of-day load relative to the midday peak. It repeats the rates
+    of the patterns/*.yml input files and only places episode starts;
+    the input alone sets the record rate. -#}
+{%- macro hload(t) -%}
+  {%- set h = ((t | int) // 3600) % 24 -%}
+  {{- 0.15 + (0.30 if 7 <= h < 19 else 0) + (0.30 if 8 <= h < 17 else 0) + (0.25 if 10 <= h < 15 else 0) -}}
+{%- endmacro -%}
+{#- A start time in [lo, hi), drawn over hour slots weighted by the
+    load (first episode) or by load^2 + 0.05 (later episodes). -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.05) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- set num = module.rand.number -%}
+{%- set rand = module.rand -%}
+{%- set hq = module.heapq -%}
+{%- set ln = module.math.log -%}
+{%- set nowf = timestamp.timestamp() -%}
+{%- set now = nowf | int -%}
+{#- Native times have one-second resolution. -#}
+{%- set iso = timestamp.replace(microsecond=0).isoformat() -%}
+{#- Chain window, counted from the first failed login. -#}
+{%- set window = 3600 -%}
+{#- Human retries after a mistyped password; the same draws serve
+    ordinary logins and the anomaly episode. -#}
+{%- set tries = [1, 2, 3, 4, 5] -%}
+{%- set try_weights = [40, 28, 15, 10, 7] -%}
+{#- Share of new work that is a sync client with a stale password
+    (about one a day), and outside password guesses per second. -#}
+{%- set stale_share = 0.0007 -%}
+{%- set guess_rate = 5 / 86400 -%}
+{#- Operation delays within a session, seconds. -#}
+{%- macro delay() -%}
+  {{- 5 + ([num.lognormal(ln(60), 1.0), 1800] | min | int) -}}
+{%- endmacro -%}
+{%- if shared.get('tight') is none -%}
+  {%- if params.anomaly_mode is not boolean -%}
+    {{- invalid('anomaly_mode must be a boolean') -}}
+  {%- endif -%}
+  {%- if params.anomaly_interval_hours is not number or params.anomaly_interval_hours is boolean
+      or not 3 <= params.anomaly_interval_hours <= 8760 -%}
+    {{- invalid('anomaly_interval_hours must be a number in 3..8760') -}}
+  {%- endif -%}
+  {%- if params.first_share_id is not integer or params.first_share_id is boolean
+      or not 1 <= params.first_share_id <= 2000000000 -%}
+    {{- invalid('first_share_id must be an integer in 1..2000000000') -}}
+  {%- endif -%}
+  {#- The organisation (users, their files, office and home addresses,
+      activity weights) is fixed for a server; all activity on top of
+      it is random in every run. Activity weights are bounded, so every
+      user works from home within any few days. -#}
+  {%- set org = module.random.Random('nextcloud-org:' ~ params.server_name) -%}
+  {%- set users = [] -%}
+  {%- set by_name = {} -%}
+  {%- for row in samples.files -%}
+    {%- if row.user not in by_name -%}
+      {%- do by_name.update({row.user: {'u': row.user, 'office': row.ip, 'ua': row.user_agent, 'files': [],
+          'w': [[org.lognormvariate(0, 0.5), 0.5] | max, 2.0] | min}}) -%}
+      {%- do users.append(by_name[row.user]) -%}
+    {%- endif -%}
+    {%- do by_name[row.user].files.append({'path': '/' ~ row.user ~ '/files/' ~ row.relative_path, 'id': row.id}) -%}
+  {%- endfor -%}
+  {%- set pool = [] -%}
+  {%- for net in ['198.51.100.', '203.0.113.'] -%}
+    {%- for i in range(1, 255) -%}{%- do pool.append(net ~ i) -%}{%- endfor -%}
+  {%- endfor -%}
+  {%- set homes = org.sample(pool, users | length) -%}
+  {%- set cum = [] -%}
+  {%- set acc = namespace(w=0.0) -%}
+  {%- for u in users -%}
+    {%- do u.update({'home': homes[loop.index0]}) -%}
+    {%- set acc.w = acc.w + u.w -%}
+    {%- do cum.append(acc.w) -%}
+  {%- endfor -%}
+  {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
+  {%- do shared.update({'tight': [], 'flex': [], 'seq': 0, 'users': users, 'cum': cum, 'total': acc.w,
+      'homes': homes, 'chains': {}, 'links': {}, 'next_share': params.first_share_id - 1,
+      'last_t': nowf, 'cleanup': now + 600,
+      'ep_start': pick_start(now, now + [interval, 86400] | min, false) | int,
+      'last_ep': {'u': none, 'ip': none, 'file': none}}) -%}
+{%- endif -%}
+{%- set tight = shared.get('tight') -%}
+{%- set flex = shared.get('flex') -%}
+{%- set users = shared.get('users') -%}
+{%- set links = shared.get('links') -%}
+{#- Per user|IP: its failed and successful logins, file reads, link
+    creations and expiration removals [time, step, file] of the last
+    chain window, every record kept. -#}
+{%- set chains = shared.get('chains') -%}
+{#- Two queues of due work: login requests and episode steps go before
+    session operations. -#}
+{%- macro push(q, at, item) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do hq.heappush(q, [at, n, item]) -%}
+{%- endmacro -%}
+{#- A user picked by activity weight (binary search over cumulative
+    weights). -#}
+{%- macro pick_user() -%}
+  {%- set i = module.bisect.bisect_right(shared.get('cum'), module.random.random() * shared.get('total')) -%}
+  {{- [i, users | length - 1] | min -}}
+{%- endmacro -%}
+{#- Guard: 'y' when a permission change of this user, address and file
+    would complete the chain with any combination of their records of
+    the last window (three failed logins, a successful login, a read of
+    the file, a link to it and an expiration removal, in this order).
+    Scanning from the earliest failure finds any such combination. -#}
+{%- macro completes(u, ip, path) -%}
+  {%- set g = namespace(n=0) -%}
+  {%- for r in chains.get(u ~ '|' ~ ip, []) if r[0] >= now - window -%}
+    {%- if (g.n < 3 and r[1] == 'F') or (g.n == 3 and r[1] == 'S')
+        or (r[2] == path and ((g.n == 4 and r[1] == 'R') or (g.n == 5 and r[1] == 'C') or (g.n == 6 and r[1] == 'E'))) -%}
+      {%- set g.n = g.n + 1 -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- 'y' if g.n == 7 else '' -}}
+{%- endmacro -%}
+{#- Password guesses against the login page from outside addresses, a
+    flat Poisson arrival over the time since the previous timestamp. -#}
+{%- if module.random.random() < 1 - module.math.exp(-guess_rate * (nowf - shared.get('last_t'))) -%}
+  {%- set gip = namespace(v=none) -%}
+  {%- for _ in range(20) -%}
+    {%- set gip.v = rand.choice(['198.51.100.', '203.0.113.', '192.0.2.']) ~ num.integer(1, 254) -%}
+    {%- if gip.v not in shared.get('homes') -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set n = [[num.lognormal(ln(2), 0.8) | round | int, 1] | max, 10] | min -%}
+  {{- push(tight, now, {'k': 'login', 'u': rand.choice(users), 'ip': gip.v,
+      'f': n, 'gap': 8, 'give_up': true, 'ops': 0, 'ep': none}) -}}
+{%- endif -%}
+{%- do shared.set('last_t', nowf) -%}
+{%- if shared.get('cleanup') <= now -%}
+  {%- for key in chains | list -%}
+    {%- if chains[key][-1][0] < now - window -%}{%- do chains.pop(key) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('cleanup', now + 600) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and shared.get('ep_start') <= now -%}
+  {#- Episode: a user (weighted by activity, not the previous episode's)
+      from that user's home address, on one of that user's files (not
+      the previous episode's). The next start is drawn in a window of
+      min(interval / 4, 6 h) centred one interval after this actual
+      start, weighted towards busy hours. The episode adds its own
+      login and operations; the user's ordinary sessions go on. -#}
+  {%- set last = shared.get('last_ep') -%}
+  {%- set pick = namespace(u=users[pick_user() | int]) -%}
+  {%- for _ in range(50) -%}
+    {%- if pick.u.u != last.u and pick.u.home != last.ip -%}{%- break -%}{%- endif -%}
+    {%- set pick.u = users[pick_user() | int] -%}
+  {%- endfor -%}
+  {%- set files = [] -%}
+  {%- for f in pick.u.files if f.path != last.file -%}{%- do files.append(f) -%}{%- endfor -%}
+  {%- set file = rand.choice(files) -%}
+  {%- do last.update({'u': pick.u.u, 'ip': pick.u.home, 'file': file.path}) -%}
+  {{- push(tight, now, {'k': 'login', 'u': pick.u, 'ip': pick.u.home,
+      'f': 3, 'gap': 12, 'give_up': false, 'ops': 0, 'ep': file}) -}}
+  {%- set interval = (params.anomaly_interval_hours * 3600) | int -%}
+  {%- set width = [interval // 4, 21600] | min -%}
+  {%- do shared.set('ep_start', pick_start(now + interval - width // 2, now + interval - width // 2 + width, true) | int) -%}
+{%- endif -%}
+{#- Take the earliest due login step, else the earliest due session
+    operation, else start new work, until one record is produced. -#}
+{%- set out = namespace(done=false, u=none, ip=none, kind=none, file=none, share=none,
+    req=none, time=none, tt=none) -%}
+{%- for _ in range(16) -%}
+  {%- if out.done -%}{%- break -%}{%- endif -%}
+  {%- if tight and tight[0][0] <= now -%}
+    {%- set item = hq.heappop(tight)[2] -%}
+  {%- elif flex and flex[0][0] <= now -%}
+    {%- set item = hq.heappop(flex)[2] -%}
+  {%- elif module.random.random() < stale_share -%}
+    {#- A sync client keeps the old password after a change and retries
+        until its owner updates it. -#}
+    {%- set u = users[pick_user() | int] -%}
+    {%- set item = {'k': 'login', 'u': u, 'ip': u.office if rand.chance(0.6) else u.home,
+        'f': num.integer(3, 8), 'gap': 40, 'give_up': rand.chance(0.5), 'ops': num.integer(0, 3), 'ep': none} -%}
+  {%- else -%}
+    {#- A browser or DAV session from the office or home; half of them
+        start with a password login in the web interface (rarely
+        mistyped first), and a few of those web sessions are opened to
+        share a file with someone outside. -#}
+    {%- set u = users[pick_user() | int] -%}
+    {%- set ip = u.office if rand.chance(0.7) else u.home -%}
+    {%- set ops = rand.weighted_choice([1, 2, 3, 4, 6, 8, 10, 14], [10, 14, 16, 15, 15, 12, 10, 8]) -%}
+    {%- if rand.chance(0.5) -%}
+      {#- The share of web sessions opened to share a file drifts from
+          day to day between 4% and 12% (a standard Ornstein-Uhlenbeck
+          process in source time with a correlation time of three days,
+          mapped through the normal CDF onto that range). -#}
+      {%- set z = shared.get('share_z') -%}
+      {%- if z is none -%}
+        {%- set z = module.random.gauss(0, 1) -%}
+      {%- else -%}
+        {%- set rho = module.math.exp(-(nowf - shared.get('share_t')) / 259200) -%}
+        {%- set z = z * rho + module.math.sqrt(1 - rho * rho) * module.random.gauss(0, 1) -%}
+      {%- endif -%}
+      {%- do shared.update({'share_z': z, 'share_t': nowf}) -%}
+      {%- set f = rand.weighted_choice(tries, try_weights) if rand.chance(0.03) else 0 -%}
+      {%- set item = {'k': 'login', 'u': u, 'ip': ip, 'f': f, 'gap': 12,
+          'give_up': f > 0 and rand.chance(0.1), 'ops': ops, 'ep': none,
+          'share': rand.chance(0.04 + 0.04 * (1 + module.math.erf(z / 1.4142135623730951)))} -%}
+    {%- else -%}
+      {%- set item = {'k': 'op', 'u': u, 'ip': ip, 'n': ops, 'last': none} -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if item.k == 'login' -%}
+    {#- A login request logs the attempt and its result with one request
+        ID and time; the result takes the next timestamp. -#}
+    {%- set out.done = true -%}{%- set out.u = item.u -%}{%- set out.ip = item.ip -%}
+    {%- set out.kind = 'login_attempt' -%}
+    {%- if item.ep and item.get('t0') is none -%}{%- do item.update({'t0': now}) -%}{%- endif -%}
+    {%- do item.update({'k': 'result', 'req': module.rand.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 20) | join,
+        'time': iso, 'tt': now}) -%}
+    {%- set out.req = item.req -%}
+    {{- push(tight, 0, item) -}}
+  {%- elif item.k == 'result' -%}
+    {%- set out.done = true -%}{%- set out.u = item.u -%}{%- set out.ip = item.ip -%}
+    {%- set out.req = item.req -%}{%- set out.time = item.time -%}{%- set out.tt = item.tt -%}
+    {%- if item.f > 0 -%}
+      {%- set out.kind = 'login_failed' -%}
+      {%- do item.update({'k': 'login', 'f': item.f - 1}) -%}
+      {%- if item.f > 0 or not item.give_up -%}
+        {%- set wait = [num.lognormal(ln(item.gap), 0.7), item.gap * 10] | min -%}
+        {{- push(tight, item.tt + 1 + (wait | int), item) -}}
+      {%- endif -%}
+    {%- else -%}
+      {%- set out.kind = 'login_success' -%}
+      {%- if item.ep -%}
+        {#- The episode's four operation delays come from the ordinary
+            operation-delay distribution, drawn again until the episode
+            fits the chain window. -#}
+        {%- set d = namespace(v=[]) -%}
+        {%- for _ in range(1000) -%}
+          {%- set d.v = [] -%}
+          {%- for _ in range(4) -%}{%- do d.v.append(delay() | int) -%}{%- endfor -%}
+          {%- if item.tt - item.t0 + d.v | sum <= window - 120 -%}{%- break -%}{%- endif -%}
+        {%- endfor -%}
+        {{- push(tight, item.tt + d.v[0], {'k': 'epop', 'u': item.u, 'ip': item.ip, 'file': item.ep, 's': 0, 'link': none, 'd': d.v[1:]}) -}}
+      {%- elif item.get('share') -%}
+        {#- A sharing session: the user opens a file, creates a public
+            link to it and often adjusts the link, then may go on with
+            a few ordinary operations. -#}
+        {{- push(flex, item.tt + delay() | int, {'k': 'op', 'u': item.u, 'ip': item.ip, 'force': 'file_read', 'share': true,
+            'last': rand.choice(item.u.files), 'n': rand.weighted_choice([0, 1, 2, 3], [40, 30, 20, 10])}) -}}
+      {%- elif item.ops > 0 -%}
+        {{- push(flex, item.tt + delay() | int, {'k': 'op', 'u': item.u, 'ip': item.ip, 'n': item.ops, 'last': none}) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'op' -%}
+    {%- set u = item.u -%}
+    {%- set ulinks = links.setdefault(u.u, []) -%}
+    {%- set kind = item.force if item.get('force') else rand.weighted_choice(
+        ['file_read', 'file_write', 'share_create', 'expiration_remove', 'permissions_change'], [70, 29.33, 0.35, 0.2, 0.12]) -%}
+    {%- set file = item.last if item.last and (item.get('share') or rand.chance(0.55)) else rand.choice(u.files) -%}
+    {%- set eligible = [] -%}
+    {%- for l in ([item.link] if item.get('force') else ulinks | reverse)
+        if (kind == 'expiration_remove' and l.expires) or (kind == 'permissions_change' and l.perm == 1) -%}
+      {%- do eligible.append(l) -%}
+    {%- endfor -%}
+    {%- if kind in ['expiration_remove', 'permissions_change'] and not eligible -%}
+      {%- set kind = 'file_read' -%}
+    {%- endif -%}
+    {%- if item.get('share') and kind == 'file_read' -%}
+      {{- push(flex, now + delay() | int, {'k': 'op', 'u': u, 'ip': item.ip, 'force': 'share_create', 'share': true,
+          'last': file, 'n': item.n}) -}}
+    {%- elif item.get('share') -%}
+      {%- if item.n > 0 -%}
+        {{- push(flex, now + delay() | int, {'k': 'op', 'u': u, 'ip': item.ip, 'n': item.n, 'last': file}) -}}
+      {%- endif -%}
+    {%- elif item.n > 1 -%}
+      {{- push(flex, now + delay() | int, {'k': 'op', 'u': u, 'ip': item.ip, 'n': item.n - 1, 'last': file}) -}}
+    {%- endif -%}
+    {%- set link = none -%}
+    {%- if kind == 'share_create' -%}
+      {%- set sid = shared.get('next_share') + num.integer(1, 4) -%}
+      {%- do shared.set('next_share', sid) -%}
+      {%- set link = {'id': sid, 'path': file.path, 'fid': file.id, 'expires': true, 'perm': 1} -%}
+      {%- do ulinks.append(link) -%}
+      {%- if ulinks | length > 8 -%}{%- do ulinks.pop(0) -%}{%- endif -%}
+      {%- set out.share = sid -%}
+      {#- Sometimes the user adjusts the new link minutes later: removes
+          its expiration date, and sometimes then allows updates; most
+          often in a session opened to share. -#}
+      {%- if rand.chance(0.5 if item.get('share') else 0.25) -%}
+        {{- push(flex, now + delay() | int, {'k': 'op', 'u': u, 'ip': item.ip, 'n': 1, 'last': file,
+            'force': 'expiration_remove', 'link': link, 'then': rand.chance(0.4 if item.get('share') else 0.3)}) -}}
+      {%- endif -%}
+    {%- elif kind in ['expiration_remove', 'permissions_change'] -%}
+      {#- Mostly the user's most recent eligible link. -#}
+      {%- set link = eligible[0] if rand.chance(0.5) else rand.choice(eligible) -%}
+      {%- if kind == 'permissions_change' and completes(u.u, item.ip, link.path) -%}
+        {#- Guard: the change goes to another read-only link, drawn by
+            the same rule, and keeps its time: for a session's random
+            operation another link it could have picked, for a planned
+            change any other read-only link of the user. A random
+            operation left with none becomes a read, as when no link is
+            eligible; a planned change left with none is not made. -#}
+        {%- set alt = [] -%}
+        {%- for l in (ulinks | reverse if item.get('force') else eligible)
+            if l.perm == 1 and l.path != link.path and not completes(u.u, item.ip, l.path) -%}
+          {%- do alt.append(l) -%}
+        {%- endfor -%}
+        {%- set link = (alt[0] if rand.chance(0.5) else rand.choice(alt)) if alt else none -%}
+        {%- if not link and not item.get('force') -%}
+          {%- set kind = 'file_read' -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- if link -%}
+        {%- set file = {'path': link.path, 'id': link.fid} -%}
+        {%- set out.share = link.id -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if kind not in ['expiration_remove', 'permissions_change'] or link -%}
+      {%- if kind == 'expiration_remove' -%}
+        {%- do link.update({'expires': false}) -%}
+        {%- if item.get('force') and item.then -%}
+          {{- push(flex, now + delay() | int, {'k': 'op', 'u': u, 'ip': item.ip, 'n': 1, 'last': file,
+              'force': 'permissions_change', 'link': link}) -}}
+        {%- endif -%}
+      {%- elif kind == 'permissions_change' -%}
+        {%- do link.update({'perm': 3}) -%}
+      {%- endif -%}
+      {%- set out.done = true -%}{%- set out.u = u -%}{%- set out.ip = item.ip -%}
+      {%- set out.kind = kind -%}{%- set out.file = file -%}
+    {%- endif -%}
+  {%- elif item.k == 'epop' -%}
+    {#- Read of the file, a public link to it, removal of the link's
+        expiration date and its change from read-only to read and
+        update, at the delays drawn after the login. -#}
+    {%- set out.done = true -%}{%- set out.u = item.u -%}{%- set out.ip = item.ip -%}
+    {%- set out.file = item.file -%}
+    {%- set out.kind = ['file_read', 'share_create', 'expiration_remove', 'permissions_change'][item.s] -%}
+    {%- if item.s == 1 -%}
+      {%- set sid = shared.get('next_share') + num.integer(1, 4) -%}
+      {%- do shared.set('next_share', sid) -%}
+      {#- The episode's own link stays out of reach of ordinary changes. -#}
+      {%- do item.update({'link': {'id': sid, 'path': item.file.path, 'fid': item.file.id, 'expires': true, 'perm': 1}}) -%}
+    {%- elif item.s == 2 -%}
+      {%- do item.link.update({'expires': false}) -%}
+    {%- elif item.s == 3 -%}
+      {%- do item.link.update({'perm': 3}) -%}
+    {%- endif -%}
+    {%- set out.share = item.link.id if item.link else none -%}
+    {%- if item.s < 3 -%}
+      {{- push(tight, now + item.d[item.s], {'k': 'epop', 'u': item.u, 'ip': item.ip, 'file': item.file, 's': item.s + 1, 'link': item.link, 'd': item.d}) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if not out.done -%}
+  {{- dispatch.drop() -}}
+{%- endif -%}
+{%- set kind = out.kind -%}
+{%- set user = out.u.u -%}
+{%- set remote = out.ip -%}
+{%- set user_agent = out.u.ua -%}
+{%- set req_id = out.req or (module.rand.choices('abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789', 20) | join) -%}
+{%- set event_time = out.time or iso -%}
+{%- set path = out.file.path if out.file else '/' ~ user ~ '/files/' -%}
+{%- set file_id = out.file.id if out.file else none -%}
+{%- set share_id = out.share -%}
+{#- Chain-relevant history of the user|address pair, fed with every
+    record at its own time. -#}
+{%- set step = {'login_failed': 'F', 'login_success': 'S', 'file_read': 'R', 'share_create': 'C',
+    'expiration_remove': 'E'}.get(kind) -%}
+{%- if step -%}
+  {%- set key = user ~ '|' ~ remote -%}
+  {%- set kept = chains.get(key, []) | selectattr(0, 'ge', now - window) | list -%}
+  {%- do kept.append([out.tt if out.tt is not none else now, step, path]) -%}
+  {%- do chains.update({key: kept}) -%}
+{%- endif -%}
+{%- set method = 'GET' -%}
+{%- set url = '/remote.php/dav/files/' ~ user ~ '/' ~ module['urllib.parse'].quote(path.split('/files/', 1)[-1], safe='/') -%}
+{%- set script_name = '/remote.php' -%}
+{%- set message = 'File with id "' ~ file_id ~ '" accessed: "' ~ path ~ '"' -%}
+{%- set native_user = user -%}
+{%- set action = 'file-access' -%}
+{%- set category = ['file'] -%}
+{%- set event_type = ['access'] -%}
+{%- set outcome = 'success' -%}
+{%- if kind in ['login_attempt', 'login_success', 'login_failed'] -%}
+  {%- set method = 'POST' -%}
+  {%- set url = '/index.php/login' -%}
+  {%- set script_name = '/index.php' -%}
+  {%- set category = ['authentication'] -%}
+  {%- if kind == 'login_attempt' -%}
+    {%- set native_user = '--' -%}
+    {%- set message = 'Login attempt: "' ~ user ~ '"' -%}
+    {%- set action = 'user-login-attempt' -%}
+    {%- set event_type = ['start'] -%}
+    {%- set outcome = 'unknown' -%}
+  {%- elif kind == 'login_failed' -%}
+    {%- set native_user = '--' -%}
+    {%- set message = 'Login failed: "' ~ user ~ '"' -%}
+    {%- set action = 'user-login-failed' -%}
+    {%- set event_type = ['denied'] -%}
+    {%- set outcome = 'failure' -%}
+  {%- else -%}
+    {%- set message = 'Login successful: "' ~ user ~ '"' -%}
+    {%- set action = 'user-login' -%}
+    {%- set event_type = ['start'] -%}
+  {%- endif -%}
+{%- elif kind == 'file_write' -%}
+  {%- set method = 'PUT' -%}
+  {%- set message = 'File with id "' ~ file_id ~ '" written to: "' ~ path ~ '"' -%}
+  {%- set action = 'file-write' -%}
+  {%- set event_type = ['change'] -%}
+{%- elif kind == 'share_create' -%}
+  {%- set method = 'POST' -%}
+  {%- set url = '/ocs/v2.php/apps/files_sharing/api/v1/shares' -%}
+  {%- set script_name = '/ocs/v2.php' -%}
+  {%- set message = 'The file "' ~ path ~ '" with ID "' ~ file_id ~
+    '" has been shared via link with permissions "1" (Share ID: ' ~ share_id ~ ')' -%}
+  {%- set action = 'share-create' -%}
+  {%- set event_type = ['creation'] -%}
+{%- elif kind in ['expiration_remove', 'permissions_change'] -%}
+  {%- set method = 'PUT' -%}
+  {%- set url = '/ocs/v2.php/apps/files_sharing/api/v1/shares/' ~ share_id -%}
+  {%- set script_name = '/ocs/v2.php' -%}
+  {%- set event_type = ['change'] -%}
+  {%- if kind == 'expiration_remove' -%}
+    {%- set message = 'The expiration date of the publicly shared file with ID "' ~ file_id ~ '" has been removed' -%}
+    {%- set action = 'share-expiration-remove' -%}
+  {%- else -%}
+    {#- Share20 Manager passes this path relative to the owner's files
+        folder; creation, reads and writes log the full path. -#}
+    {%- set message = 'The permissions of the shared file "/' ~ path.split('/files/', 1)[-1] ~ '" with ID "' ~ file_id ~ '" have been changed to "3"' -%}
+    {%- set action = 'share-permissions-change' -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set original = {'reqId': req_id, 'level': 1, 'time': event_time,
+  'remoteAddr': remote, 'user': native_user, 'app': 'admin_audit',
+  'method': method, 'url': url, 'scriptName': script_name,
+  'message': message, 'userAgent': user_agent,
+  'version': params.server_version, 'data': {'app': 'admin_audit'}} -%}
+{%- set out = {'@timestamp': event_time, 'ecs': {'version': '8.17.0'},
+  'event': {'action': action, 'category': category, 'dataset': 'nextcloud.audit',
+    'kind': 'event', 'original': module.json.dumps(original, separators=(',', ':')), 'outcome': outcome,
+    'type': event_type},
+  'host': {'name': params.server_name},
+  'agent': {'name': params.server_name, 'type': 'filebeat'}, 'http': {'request': {'method': method}},
+  'log': {'file': {'path': params.audit_log_path}, 'level': 'info'},
+  'message': message, 'nextcloud': {'audit': original},
+  'related': {'ip': [remote], 'user': [user]}, 'source': {'ip': remote},
+  'tags': ['nextcloud', 'admin_audit'], 'url': {'path': url},
+  'user_agent': {'original': user_agent}} -%}
+{%- if native_user != '--' -%}{%- do out.update({'user': {'name': native_user}}) -%}{%- endif -%}
+{%- if category == ['file'] -%}{%- do out.update({'file': {'path': path}}) -%}{%- endif -%}
+{{- out | tojson -}}
