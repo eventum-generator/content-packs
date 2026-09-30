@@ -1,0 +1,203 @@
+{#- KLMS ScanLogic MA and AV exports. Every input timestamp is one
+    scanned message: the `ma` render picks the message and exports its
+    MA record, the `av` render then exports the AV record of the same
+    message at the same second. The input alone sets the message rate:
+    timestamps tagged `spoof` start sessions of spoofing senders, the
+    others sessions of ordinary senders. -#}
+{%- macro cef_extension(value) -%}
+{{- value | string | replace('\\', '\\\\') | replace('=', '\\=') | replace('\n', '\\n') | replace('\r', '\\r') -}}
+{%- endmacro -%}
+{%- macro cef_header(value) -%}
+{{- value | string | replace('\\', '\\\\') | replace('|', '\\|') -}}
+{%- endmacro -%}
+{%- set tz = module.datetime.timezone.utc -%}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set num = module.rand.number -%}
+{%- set rand = module.rand -%}
+{%- set heapq = module.heapq -%}
+{%- set ln = module.math.log -%}
+{%- set window = 180 -%}
+{%- set interval = (([1, params.anomaly_interval_hours | float] | max) * 3600) | int -%}
+{%- set PPP = ['Pass', 'Pass', 'Pass'] -%}
+{%- set FFF = ['Fail', 'Fail', 'Fail'] -%}
+{%- set FPP = ['Fail', 'Pass', 'Pass'] -%}
+{%- set PFP = ['Pass', 'Fail', 'Pass'] -%}
+{#- Per sender kind: messages per session, in-session gap log-normal
+    (median s, sigma), share of sessions that address one recipient,
+    SPF/DKIM/DMARC tuples with weights, share of messages keeping the
+    session tuple, infection chance of the first and of later messages,
+    and size log-normal. -#}
+{%- set kinds = {
+  'partner': {'k': [[1, 2, 3, 4], [70, 20, 7, 3]], 'gap': [2.5, 0.8], 'single': 0.7,
+    'tuples': [[PPP, FPP, PFP, FFF], [93, 3, 3.5, 0.5]], 'stick': 0.97, 'infected': [0.002, 0.002], 'size': [10.3, 1.1]},
+  'bulk': {'k': [[4, 5, 6, 7, 8, 9, 10], [10, 14, 17, 17, 16, 14, 12]], 'gap': [2.5, 0.8], 'single': 0.0,
+    'tuples': [[PPP, PFP, FPP], [90, 6, 4]], 'stick': 0.97, 'infected': [0.0, 0.0], 'size': [10.8, 0.5]},
+  'notify': {'k': [[1, 2, 3], [75, 18, 7]], 'gap': [2.5, 0.8], 'single': 0.8,
+    'tuples': [[PPP, FPP], [90, 10]], 'stick': 0.97, 'infected': [0.0, 0.0], 'size': [9.0, 0.6]},
+  'forwarder': {'k': [[1, 2, 3, 4], [60, 25, 10, 5]], 'gap': [3, 0.8], 'single': 0.5,
+    'tuples': [[FPP, FFF, PPP], [50, 35, 15]], 'stick': 0.97, 'infected': [0.004, 0.004], 'size': [9.8, 0.9]},
+  'spoof': {'k': [[1, 2, 3, 4, 5, 6], [55, 25, 11, 5, 3, 1]], 'gap': [35, 1.0], 'single': 0.6,
+    'tuples': [[FFF, FPP, PFP], [85, 10, 5]], 'stick': 0.85, 'infected': [0.04, 0.22], 'size': [9.6, 0.8]}} -%}
+
+{%- if vars.record == 'av' -%}
+  {%- set message = shared.get('pending') -%}
+  {%- set av = true -%}
+{%- else -%}
+  {%- if shared.get('pools') is none -%}
+    {%- set pools = {'ordinary': {'actors': [], 'weights': []}, 'spoof': {'actors': [], 'weights': []}} -%}
+    {%- for row in samples.senders -%}
+      {%- set pool = pools['spoof' if row.kind == 'spoof' else 'ordinary'] -%}
+      {%- do pool.actors.append({'relay': row.relay, 'sender': row.sender, 'kind': row.kind}) -%}
+      {%- do pool.weights.append(row.weight) -%}
+    {%- endfor -%}
+    {%- set targets = samples.recipients | selectattr('episode') | list -%}
+    {%- do shared.update({'pools': pools,
+      'mailboxes': samples.recipients | map(attribute='mailbox') | list,
+      'weights': samples.recipients | map(attribute='weight') | list,
+      'lure_weights': samples.recipients | map(attribute='lure_weight') | list,
+      'targets': targets | map(attribute='mailbox') | list,
+      'target_weights': targets | map(attribute='lure_weight') | list,
+      'episode_q': [], 'session_q': [], 'seq': 0, 'flows': {}, 'pending': none,
+      'start_at': none, 'scheduled': false, 'last_episode': [none, none]}) -%}
+  {%- endif -%}
+  {%- set counter = namespace(seq=shared.get('seq'), message=none) -%}
+  {%- set episode_q = shared.get('episode_q') -%}
+  {%- set session_q = shared.get('session_q') -%}
+  {#- Episode schedule. Spoofing senders are active round the clock at a
+      flat rate, so start times are uniform: the first start falls within
+      min(interval, 24 h) of the first timestamp; each later start is due
+      one interval after the actual previous start and falls uniformly in
+      a window of w = min(interval / 4, 6 h) centred on the due time. -#}
+  {%- if params.anomaly_mode and not shared.get('scheduled') -%}
+    {%- do shared.update({'scheduled': true, 'start_at': now + num.integer(0, ([interval, 86400] | min) - 1)}) -%}
+  {%- endif -%}
+  {#- Episode: a spoofing sender sends three all-fail messages to one
+      high-value mailbox within the window, the third infected. Sender
+      and mailbox follow the background weights of spoofing traffic and
+      differ from the previous episode's. The messages are added to the
+      traffic; no background session is paused, moved or replaced. -#}
+  {%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+    {%- set last = shared.get('last_episode') -%}
+    {%- set pool = shared.get('pools').spoof -%}
+    {%- set ep = namespace(actors=[], weights=[], boxes=[], box_weights=[]) -%}
+    {%- for actor in pool.actors -%}
+      {%- if actor.sender != last[0] -%}
+        {%- set ep.actors = ep.actors + [actor] -%}{%- set ep.weights = ep.weights + [pool.weights[loop.index0]] -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set target_weights = shared.get('target_weights') -%}
+    {%- for box in shared.get('targets') -%}
+      {%- if box != last[1] -%}
+        {%- set ep.boxes = ep.boxes + [box] -%}{%- set ep.box_weights = ep.box_weights + [target_weights[loop.index0]] -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set actor = rand.weighted_choice(ep.actors, ep.weights) -%}
+    {%- set recipient = rand.weighted_choice(ep.boxes, ep.box_weights) -%}
+    {%- set gaps = namespace(a=30, b=30) -%}
+    {%- for _ in range(1000) -%}
+      {%- set gaps.a = [1, num.lognormal(ln(35), 1.0) | round | int] | max -%}
+      {%- set gaps.b = [1, num.lognormal(ln(35), 1.0) | round | int] | max -%}
+      {%- if gaps.a + gaps.b <= window // 2 -%}{%- break -%}{%- endif -%}
+    {%- endfor -%}
+    {%- for offset in [0, gaps.a, gaps.a + gaps.b] -%}
+      {%- set counter.seq = counter.seq + 1 -%}
+      {%- do heapq.heappush(episode_q, (now + offset, counter.seq, {'relay': actor.relay, 'sender': actor.sender,
+        'recipient': recipient, 'kind': 'spoof', 'verdicts': FFF, 'episode': true, 'infected': loop.last})) -%}
+    {%- endfor -%}
+    {%- set half = (([interval // 4, 21600] | min) // 2) -%}
+    {%- set due = now + interval -%}
+    {%- do shared.update({'start_at': num.integer(due - half, due + half), 'last_episode': [actor.sender, recipient]}) -%}
+  {%- endif -%}
+  {#- Dispatcher: the earliest due episode message, else the earliest due
+      follow-up of an open session, else the first message of a new
+      session of the population this timestamp belongs to. -#}
+  {%- if episode_q and episode_q[0][0] <= now -%}
+    {%- set counter.message = heapq.heappop(episode_q)[2] -%}
+  {%- elif session_q and session_q[0][0] <= now -%}
+    {%- set counter.message = heapq.heappop(session_q)[2] -%}
+  {%- else -%}
+    {%- set pool = shared.get('pools')['spoof' if 'spoof' in tags else 'ordinary'] -%}
+    {%- set actor = rand.weighted_choice(pool.actors, pool.weights) -%}
+    {%- set kind = kinds[actor.kind] -%}
+    {%- set k = rand.weighted_choice(kind.k[0], kind.k[1]) -%}
+    {%- set weights = shared.get('lure_weights') if actor.kind == 'spoof' else shared.get('weights') -%}
+    {%- set single = rand.chance(kind.single) -%}
+    {%- set first = rand.weighted_choice(shared.get('mailboxes'), weights) -%}
+    {%- set spread = rand.shuffle(shared.get('mailboxes')) -%}
+    {%- set base = rand.weighted_choice(kind.tuples[0], kind.tuples[1]) -%}
+    {%- set clock = namespace(t=now) -%}
+    {%- for i in range(k) -%}
+      {%- if i > 0 -%}
+        {%- set clock.t = clock.t + ([1, num.lognormal(ln(kind.gap[0]), kind.gap[1]) | round | int] | max) -%}
+      {%- endif -%}
+      {%- if actor.kind == 'bulk' -%}
+        {%- set recipient = spread[i % (spread | length)] -%}
+      {%- elif single or i == 0 -%}
+        {%- set recipient = first -%}
+      {%- else -%}
+        {%- set recipient = rand.weighted_choice(shared.get('mailboxes'), weights) -%}
+      {%- endif -%}
+      {%- set verdicts = base if rand.chance(kind.stick) else rand.weighted_choice(kind.tuples[0], kind.tuples[1]) -%}
+      {%- set msg = {'relay': actor.relay, 'sender': actor.sender, 'recipient': recipient, 'kind': actor.kind,
+        'verdicts': verdicts, 'idx': i, 'episode': false} -%}
+      {%- if i == 0 -%}
+        {%- set counter.message = msg -%}
+      {%- else -%}
+        {%- set counter.seq = counter.seq + 1 -%}
+        {%- do heapq.heappush(session_q, (clock.t, counter.seq, msg)) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- do shared.set('seq', counter.seq) -%}
+  {%- set message = counter.message -%}
+  {%- set kind = kinds[message.kind] -%}
+  {%- set allfail = message.verdicts == FFF -%}
+  {%- set key = message.relay ~ '|' ~ message.sender ~ '|' ~ message.recipient -%}
+  {%- set flows = shared.get('flows') -%}
+  {%- set recent = flows.get(key, []) | selectattr(0, 'ge', now - window) | list -%}
+  {%- if not message.episode -%}
+    {%- set infected = rand.chance(kind.infected[0 if message.idx == 0 else 1]) -%}
+    {#- Ordinary traffic never completes the exact episode shape: an
+        infected all-fail message that follows two all-fail clean
+        messages of its flow within the window is scanned clean. -#}
+    {%- if infected and allfail and recent | selectattr(1) | rejectattr(2) | list | length >= 2 -%}
+      {%- set infected = false -%}
+    {%- endif -%}
+    {%- do message.update({'infected': infected}) -%}
+  {%- endif -%}
+  {%- do recent.append([now, allfail, message.infected]) -%}
+  {%- do flows.update({key: recent}) -%}
+  {%- set size = num.lognormal(11.6, 0.7) if message.infected else num.lognormal(kind.size[0], kind.size[1]) -%}
+  {%- do message.update({'id': rand.string.hex(16), 'size': num.clamp(size | int, 500, 30000000)}) -%}
+  {%- do shared.set('pending', message) -%}
+  {%- set av = false -%}
+{%- endif -%}
+{%- set utc = module.datetime.datetime.fromtimestamp(now, tz) -%}
+{%- set failed = 'Fail' in message.verdicts -%}
+{%- set class_id = 'LMS_EV_SCAN_LOGIC_AV_STATUS' if av else 'LMS_EV_SCAN_LOGIC_MA_STATUS' -%}
+{%- set name = 'antivirus scan status' if av else 'mail authentication status' -%}
+{%- set act = ('Reject' if message.infected else 'Skip') if av else ('Reject' if failed else 'Skip') -%}
+{%- set status = ('Infected' if message.infected else 'Clean') if av else ('ViolationFound' if failed else 'ViolationNotFound') -%}
+{%- set fields = ['cs1=' ~ cef_extension(message.id), 'cs1Label=MessageId', 'src=' ~ cef_extension(message.relay),
+  'act=' ~ act, 'fsize=' ~ message.size, 'suser=' ~ cef_extension(message.sender), 'duser=' ~ cef_extension(message.recipient),
+  'cs2=Default', 'cs2Label=Rules'] -%}
+{%- if not av -%}
+  {%- do fields.extend(['cs4=' ~ message.verdicts[0], 'cs4Label=SpfVerdict',
+    'cs5=' ~ message.verdicts[1], 'cs5Label=DkimVerdict',
+    'cs6=' ~ message.verdicts[2], 'cs6Label=DmarcVerdict']) -%}
+{%- endif -%}
+{%- do fields.append('outcome=' ~ status) -%}
+{%- set raw = utc.strftime('%B %d, %Y %H:%M:%S') ~ ' ' ~ params.mail_host
+  ~ ' CEF:0|AO Kaspersky Lab|Kaspersky Linux Mail Security|'
+  ~ cef_header(params.product_version) ~ '|' ~ class_id ~ '|' ~ name ~ '|'
+  ~ ('High' if av and message.infected else 'Low') ~ '|' ~ (fields | join(' ')) -%}
+{%- set klms = {'class_id': class_id} -%}
+{%- if not av -%}{%- do klms.update({'spf': message.verdicts[0], 'dkim': message.verdicts[1], 'dmarc': message.verdicts[2]}) -%}{%- endif -%}
+{%- set record = {'@timestamp': utc.isoformat(), 'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'dataset': 'kaspersky.klms', 'category': ['malware'] if av else ['email'],
+    'type': ['info'], 'code': class_id, 'action': act.lower(), 'original': raw},
+  'observer': {'hostname': params.mail_host, 'vendor': 'Kaspersky', 'product': 'Kaspersky Linux Mail Security', 'version': params.product_version},
+  'source': {'ip': message.relay},
+  'email': {'local_id': message.id, 'from': {'address': [message.sender]}, 'to': {'address': [message.recipient]}},
+  'kaspersky': {'klms': klms}} -%}
+{{- record | tojson -}}
