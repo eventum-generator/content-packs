@@ -1,0 +1,493 @@
+{#- Service Control Manager events from the System channel of a fleet of
+    Windows workstations and servers. Time-pattern inputs determine the volume. Each timestamp emits
+    the earliest due record or starts an ordinary service run. Service starts and stops, crashes,
+    start-type changes and software rollouts are independent random
+    processes; the anomaly episode only queues its own records and never
+    touches the background. -#}
+{%- set now = timestamp.timestamp() | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 1800 -%}
+{%- set guid = '{555908d1-a6d7-4695-8e1e-26931d2012f4}' -%}
+{%- set system_sid = 'S-1-5-18' -%}
+
+{#- Background load by UTC hour (office hours, evening, night). -#}
+{%- macro curve(hh) -%}{{ 1.0 if 7 <= hh < 21 else 0.18490566 }}{%- endmacro -%}
+
+{#- Episode start: a second drawn from [a, b), clock-hour slots weighted
+    by the load of their hour (squared plus a small floor when sq) and
+    by their length, uniform inside the chosen slot. -#}
+{%- macro draw(a, b, sq) -%}
+  {%- set slots = [] -%}{%- set sw = [] -%}
+  {%- for k in range((b - a) // 3600 + 2) -%}
+    {%- set lo = [a - a % 3600 + k * 3600, a] | max -%}
+    {%- set hi = [a - a % 3600 + (k + 1) * 3600, b] | min -%}
+    {%- if hi > lo -%}
+      {%- set f = curve(module.datetime.datetime.fromtimestamp(lo, utc).hour) | float -%}
+      {%- do slots.append([lo, hi]) -%}
+      {%- do sw.append(((f * f + 0.02) if sq else f) * (hi - lo)) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(slots, sw) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma) -%}
+{{- module.rand.number.lognormal(module.math.log(median), sigma) -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {#- One fixed fleet: hosts, services.exe PIDs, thread pools, account
+      SIDs and popularity weights come from a fixed seed, so every run
+      models the same organisation and only behaviour is random. -#}
+  {%- set rnd = module.random.Random(7045) -%}
+  {%- set names = [] -%}{%- for row in samples.hosts -%}{%- do names.append(row.name) -%}{%- endfor -%}
+  {%- set hosts = [] -%}
+  {%- for n in names -%}
+    {%- set tids = [] -%}
+    {%- for i in range(rnd.randint(3, 6)) -%}{%- do tids.append(rnd.randint(40, 4000) * 4) -%}{%- endfor -%}
+    {%- set tw = [] -%}
+    {%- for i in tids -%}{%- do tw.append(rnd.lognormvariate(0, 1.0)) -%}{%- endfor -%}
+    {%- do hosts.append({'name': n ~ '.' ~ params.dns_domain, 'server': n.startswith('SRV-'),
+        'pid': rnd.randint(150, 260) * 4, 'tids': tids, 'tw': tw,
+        'weight': rnd.lognormvariate(0, 0.5), 'rec': rnd.randint(20000, 900000)}) -%}
+  {%- endfor -%}
+  {#- Demand-start Windows services that start and stop on their own. -#}
+  {%- set builtin = [] -%}{%- for row in samples.services -%}{%- do builtin.append([row.key,row.name]) -%}{%- endfor -%}
+  {%- set services = [] -%}
+  {%- for s in builtin -%}
+    {%- do services.append({'key': s[0], 'name': s[1], 'third': false,
+        'weight': rnd.lognormvariate(0, 0.9)}) -%}
+  {%- endfor -%}
+  {#- Third-party services rolled out by deployment or by administrators. -#}
+  {%- set pool = [] -%}{%- for row in samples.rollout -%}{%- do pool.append([row.key,row.name,row.path,row.account]) -%}{%- endfor -%}
+  {%- set rollout = [] -%}
+  {%- for s in pool -%}
+    {%- do rollout.append({'key': s[0], 'name': s[1], 'path': s[2], 'account': s[3], 'third': true,
+        'weight': rnd.lognormvariate(0, 0.6)}) -%}
+  {%- endfor -%}
+  {%- set sid_base = 'S-1-5-21-' ~ rnd.randint(1000000000, 3999999999) ~ '-' ~ rnd.randint(1000000000, 3999999999)
+      ~ '-' ~ rnd.randint(1000000000, 3999999999) ~ '-' -%}
+  {%- set admins = [] -%}
+  {#- Each administrator looks after a fixed set of hosts and services. -#}
+  {%- set hnames = hosts | map(attribute='name') | list -%}
+  {%- set skeys = rollout | map(attribute='key') | list -%}
+  {%- for a in samples.admins -%}
+    {%- do admins.append({'sid': sid_base ~ rnd.randint(1100, 4800), 'name': a.name,
+        'weight': rnd.lognormvariate(0, 0.3), 'hosts': rnd.sample(hnames, rnd.randint(3, 5)),
+        'svcs': rnd.sample(skeys, rnd.randint(2, 3))}) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'hosts': hosts, 'services': services,
+      'rollout': rollout, 'admins': admins, 'q': [], 'running': {}, 'crashes': {},
+      'present': {}, 'bits': {}, 'startup': {}, 'restore': {}, 'm': {}, 'hist_uh': {}, 'hist_us': {}, 'seq': 0,
+      'last_u': none, 'last_s': none, 'last_hosts': [],
+      'start_at': draw(now, (now + ([interval, 24] | min) * 3600) | int, false) | int}) -%}
+{%- endif -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set services = shared.get('services') -%}
+{%- set rollout = shared.get('rollout') -%}
+{%- set admins = shared.get('admins') -%}
+{%- set q = shared.get('q') -%}
+{%- set running = shared.get('running') -%}
+{%- set present = shared.get('present') -%}
+{%- set m = shared.get('m') -%}
+{%- set startup = shared.get('startup') -%}
+{%- set restore = shared.get('restore') -%}
+{%- set load = (curve(timestamp.astimezone(utc).hour) | float) / 0.89 -%}
+
+{%- macro push(at, kind, host, svc, user=none, extra=none, episode=false) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- set extra = dict(extra or {}) -%}
+  {%- if episode -%}{%- do extra.update({'episode_id':shared.get('episode_id')}) -%}{%- endif -%}
+  {%- do q.append({'due': at, 'kind': kind, 'host': host, 'svc': svc, 'user': user,
+      'extra': extra or {}, 'episode': episode, 'id': shared.get('seq')}) -%}
+{%- endmacro -%}
+
+{#- A service starts on a host and later stops again; a third-party
+    service occasionally terminates unexpectedly instead. -#}
+{%- macro run_service(at, host, svc, episode=false) -%}
+  {%- do running.update({host ~ '|' ~ svc.key: true}) -%}
+  {{- push(at, 'start', host, svc, episode=episode) -}}
+  {%- set end = at + gap(150, 1.3) | float + 1 -%}
+  {%- if svc.third and module.rand.chance(0.05) -%}
+    {{- push(end, 'crash', host, svc) -}}
+  {%- else -%}
+    {{- push(end, 'stop', host, svc) -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{%- macro pick_host(pool_hosts, only=none) -%}
+  {%- set hw = [] -%}
+  {%- for h in pool_hosts -%}
+    {%- do hw.append(h.weight * (1.0 if h.server else load) * (1 if only is none or h.name in only else 0)) -%}
+  {%- endfor -%}
+  {{- module.rand.weighted_choice(pool_hosts, hw).name -}}
+{%- endmacro -%}
+
+{#- Return temporary automatic-start changes to demand start, using the
+    same delay for ordinary changes and episode changes. Fixed fleet keys. -#}
+{%- for key,item in restore.items()|list if item.due <= now -%}
+  {%- if startup.get(key) == 'auto start' -%}
+    {{- push(-1, 'config', item.host, item.svc, item.user, {'new':'demand start'}) -}}
+  {%- endif -%}
+  {%- do restore.pop(key) -%}
+{%- endfor -%}
+
+{#- 1. Service starts: one merged stream over the fleet. -#}
+{%- if q|length < 128 and module.rand.chance(0.3) -%}
+  {%- set h = pick_host(hosts) -%}
+  {%- set cand = [] -%}{%- set cw = [] -%}
+  {%- for s in services + rollout
+      if not running.get(h ~ '|' ~ s.key) and (not s.third or present.get(h ~ '|' ~ s.key)) -%}
+    {%- set reserved=namespace(yes=false) -%}
+    {%- for pending in q if pending.host==h and pending.svc.key==s.key and pending.kind in ['install','config'] -%}{%- set reserved.yes=true -%}{%- break -%}{%- endfor -%}
+    {%- if not reserved.yes -%}{%- do cand.append(s) -%}{%- do cw.append(s.weight) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if cand -%}
+    {{- run_service(now + module.random.random(), h, module.rand.weighted_choice(cand, cw)) -}}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. Start-type changes Windows makes itself (BITS toggles between
+    automatic and manual start) and occasional manual ones. -#}
+{%- if q|length < 128 and module.rand.chance(0.04) -%}
+  {%- set h = pick_host(hosts) -%}
+  {%- if module.rand.chance(0.8) -%}
+    {%- set bits = shared.get('bits') -%}
+    {%- set old = bits.get(h, module.rand.choice(['auto start', 'demand start'])) -%}
+    {%- set new = 'demand start' if old == 'auto start' else 'auto start' -%}
+    {%- do bits.update({h: new}) -%}
+    {{- push(now + module.random.random(), 'config', h, services[0], system_sid, {'old': old, 'new': new}) -}}
+  {%- else -%}
+    {%- set svc = module.rand.choice(services[1:]) -%}
+    {%- set pair = module.rand.weighted_choice([['demand start', 'auto start'], ['auto start', 'demand start']], [1, 1]) -%}
+    {%- if module.rand.chance(0.5) -%}
+      {{- push(now + module.random.random(), 'config', h, svc, system_sid, {'old': pair[0], 'new': pair[1]}) -}}
+    {%- else -%}
+      {%- set admin = module.rand.weighted_choice(admins, admins | map(attribute='weight') | list) -%}
+      {%- set h = pick_host(hosts, admin.hosts) -%}
+      {%- set uh = shared.get('hist_uh').setdefault(admin.sid, {}) -%}
+      {%- do uh.update({h: uh.get(h, 0) + 1}) -%}
+      {{- push(now + module.random.random(), 'config', h, svc, admin.sid, {'old': pair[0], 'new': pair[1]}) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- One host of a rollout: install, maybe switch to automatic start,
+    maybe start. Shared by background rollouts and the episode; renders
+    the time of its last record. -#}
+{%- macro install(at, host, svc, user, start_type, to_auto, start, episode=false) -%}
+  {{- push(at, 'install', host, svc, user, {'start': start_type}, episode) -}}
+  {%- do present.update({host ~ '|' ~ svc.key: true}) -%}
+  {%- set t = namespace(at=at) -%}
+  {%- if to_auto -%}
+    {%- set t.at = t.at + [gap(20, 0.9) | float, 90] | min -%}
+    {{- push(t.at, 'config', host, svc, user, {'old': 'demand start', 'new': 'auto start'}, episode) -}}
+  {%- endif -%}
+  {%- if start and not running.get(host ~ '|' ~ svc.key) -%}
+    {%- set t.at = t.at + [gap(6, 0.8) | float, 30] | min -%}
+    {{- run_service(t.at, host, svc, episode) -}}
+  {%- endif -%}
+  {{- t.at -}}
+{%- endmacro -%}
+
+{# One deployment per package across the fleet at a time, followed by
+    30 minutes without another installation of that package by that
+    deployment. The same admission rule applies to both modes. #}
+{%- macro deployment_free(user,svc) -%}
+  {%- set result=namespace(ok=true) -%}
+  {%- for pending in q if pending.kind in ['install','config'] and pending.svc.key == svc.key -%}
+    {%- set result.ok=false -%}{%- break -%}
+  {%- endfor -%}
+  {%- if result.ok -%}
+    {%- for sig,part in m.get(svc.name,{}).items() if part[0]==1 and now-part[1]<=window -%}
+      {%- set result.ok=false -%}{%- break -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {{- 'yes' if result.ok else '' -}}
+{%- endmacro -%}
+
+{#- 3. Rollouts: one service on one to six hosts, by the deployment
+    agent (SYSTEM) or by an administrator, hosts minutes to hours apart. -#}
+{%- if q|length < 100 and module.rand.chance(0.01) -%}
+  {%- set admin = none if module.rand.chance(0.4) else module.rand.weighted_choice(admins, admins | map(attribute='weight') | list) -%}
+  {%- set sl = rollout | selectattr('key', 'in', admin.svcs) | list if admin else rollout -%}
+  {%- set free=[] -%}
+  {%- for candidate in sl if deployment_free(admin.sid if admin else system_sid,candidate) -%}{%- do free.append(candidate) -%}{%- endfor -%}
+  {%- set sl=free -%}
+  {%- if sl -%}
+  {%- set svc = module.rand.weighted_choice(sl, sl | map(attribute='weight') | list) -%}
+  {%- set user = admin.sid if admin else system_sid -%}
+  {%- set k = module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [30, 25, 18, 12, 9, 6]) -%}
+  {%- set targets = namespace(l=[], at=now + module.random.random()) -%}
+  {%- for i in range(k) -%}
+    {%- set h = pick_host(hosts, admin.hosts if admin else none) -%}
+    {%- if h not in targets.l and not running.get(h ~ '|' ~ svc.key) -%}
+      {%- set targets.l = targets.l + [h] -%}
+      {%- set st = 'demand start' if module.rand.chance(0.7) else 'auto start' -%}
+      {%- set to_auto = st == 'demand start' and module.rand.chance(0.5) -%}
+      {%- set end = install(targets.at, h, svc, user, st, to_auto,
+          module.rand.chance(0.8 if (to_auto or st == 'auto start') else 0.4)) | float -%}
+      {%- if admin -%}
+        {%- set uh = shared.get('hist_uh').setdefault(user, {}) -%}
+        {%- do uh.update({h: uh.get(h, 0) + 1}) -%}
+        {%- set us = shared.get('hist_us').setdefault(user, {}) -%}
+        {%- do us.update({svc.key: us.get(svc.key, 0) + 1}) -%}
+      {%- endif -%}
+      {%- set targets.at = end + gap(1200, 1.1) | float -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 4. Episode, by source time. The first start is drawn within the
+    first min(interval, 24 h) by the load curve; each later one within
+    w = min(interval / 4, 6 h) centred on its due time (previous actual
+    start + interval), by load squared plus a floor. An administrator
+    installs one of their services on two of their hosts, switches it
+    to automatic start and starts it on each. -#}
+{%- if params.anomaly_mode and now >= shared.get('start_at') and q|length < 100 -%}
+  {#- Administrator: not the previous one; one who has already worked on
+      two eligible hosts and rolled out an eligible service in this run
+      when there is one. -#}
+  {%- set cand=[] -%}
+  {%- for candidate in admins if candidate.sid != shared.get('last_u') -%}
+    {%- set available=namespace(yes=false) -%}
+    {%- for service in rollout if service.key in candidate.svcs and service.key != shared.get('last_s') and deployment_free(candidate.sid,service) -%}{%- set available.yes=true -%}{%- endfor -%}
+    {%- if available.yes -%}{%- do cand.append(candidate) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if cand -%}
+  {%- set seen = [] -%}
+  {%- for c in cand -%}
+    {%- set ch = shared.get('hist_uh').get(c.sid, {}).keys() | reject('in', shared.get('last_hosts')) | list -%}
+    {%- set cs = shared.get('hist_us').get(c.sid, {}).keys() | reject('equalto', shared.get('last_s')) | list -%}
+    {%- if ch | length >= 2 and cs -%}{%- do seen.append(c) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set cand = seen or cand -%}
+  {%- set a = module.rand.weighted_choice(cand, cand | map(attribute='weight') | list) -%}
+  {%- set uh = shared.get('hist_uh').get(a.sid, {}) -%}
+  {%- set us = shared.get('hist_us').get(a.sid, {}) -%}
+  {#- Service: one this administrator has rolled out in this run when
+      there is one, otherwise one of their services. -#}
+  {%- set sl = [] -%}{%- set sw = [] -%}
+  {%- for k in a.svcs if k != shared.get('last_s') and us.get(k) and deployment_free(a.sid,rollout|selectattr('key','equalto',k)|first) -%}
+    {%- do sl.append(k) -%}{%- do sw.append(us[k]) -%}
+  {%- endfor -%}
+  {%- if not sl -%}
+    {%- for r in rollout if r.key in a.svcs and r.key != shared.get('last_s') and deployment_free(a.sid,r) -%}
+      {%- do sl.append(r.key) -%}{%- do sw.append(r.weight) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set svc = rollout | selectattr('key', 'equalto', module.rand.weighted_choice(sl, sw)) | first -%}
+  {#- Hosts: two of theirs not running the service and not used by the
+      previous episode; ones they have worked on in this run first. -#}
+  {%- set hl = [] -%}{%- set hw = [] -%}
+  {%- for h in a.hosts if h not in shared.get('last_hosts') and not running.get(h ~ '|' ~ svc.key) and uh.get(h) -%}
+    {%- do hl.append(h) -%}{%- do hw.append(uh[h]) -%}
+  {%- endfor -%}
+  {%- if hl | length < 2 -%}
+    {%- set hl = [] -%}{%- set hw = [] -%}
+    {%- for h in hosts if h.name in a.hosts and h.name not in shared.get('last_hosts')
+        and not running.get(h.name ~ '|' ~ svc.key) -%}
+      {%- do hl.append(h.name) -%}{%- do hw.append(h.weight) -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set ha = module.rand.weighted_choice(hl, hw) if hl | length >= 2 else none -%}
+  {%- set hl2 = [] -%}{%- set hw2 = [] -%}
+  {%- for i in range(hl | length) if ha and hl[i] != ha -%}
+    {%- do hl2.append(hl[i]) -%}{%- do hw2.append(hw[i]) -%}
+  {%- endfor -%}
+  {%- set hb = module.rand.weighted_choice(hl2, hw2) if hl2 else none -%}
+  {#- Same per-host gaps as a rollout; the host-to-host gap is redrawn
+      until it is at most 900 s. Without two free hosts, try next tick. -#}
+  {%- if hb -%}
+    {%- do shared.set('episode_id',shared.get('episode_id',0)+1) -%}
+    {%- set g = namespace(v=3600.0) -%}
+    {%- for i in range(40) if g.v > 900 -%}{%- set g.v = gap(1200, 1.1) | float -%}{%- endfor -%}
+    {%- set end = install(now + module.random.random(), ha, svc, a.sid, 'demand start', true, true, true) | float -%}
+    {%- set end = install(end + [g.v, 900] | min, hb, svc, a.sid, 'demand start', true, true, true) -%}
+    {%- set due = now + (interval * 3600) | int -%}
+    {%- set w = ([interval / 4, 6] | min) * 3600 -%}
+    {%- do shared.update({'last_u': a.sid, 'last_s': svc.key, 'last_hosts': [ha, hb],
+        'start_at': draw((due - w / 2) | int, (due + w / 2) | int, true) | int}) -%}
+  {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 5. Emit the earliest due record, otherwise nothing. -#}
+{%- set sel = namespace(i=-1, due=now + 1) -%}
+{%- for e in q -%}
+  {%- if e.due < now + 1 and e.due < sel.due -%}
+    {%- set sel.i = loop.index0 -%}{%- set sel.due = e.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{# Tight episode requests already due can precede flexible service work;
+    ordinary queued records keep their original deadlines and state. #}
+{%- set urgent = namespace(i=-1,due=now+1) -%}
+{%- for pending in q -%}
+  {%- if pending.episode and pending.due <= now and pending.due < urgent.due -%}
+    {%- set urgent.i=loop.index0 -%}{%- set urgent.due=pending.due -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if urgent.i >= 0 -%}{%- set sel.i=urgent.i -%}{%- endif -%}
+{%- if sel.i < 0 -%}
+  {%- set h = pick_host(hosts) -%}
+  {%- set cand = [] -%}{%- set cw = [] -%}
+  {%- for service in services if not running.get(h ~ '|' ~ service.key) -%}
+    {%- do cand.append(service) -%}{%- do cw.append(service.weight) -%}
+  {%- endfor -%}
+  {%- if cand -%}
+    {{- run_service(now, h, module.rand.weighted_choice(cand,cw)) -}}
+    {%- set sel.i=q|length-2 -%}
+  {%- else -%}
+    {#- Finite host/service pool exhausted: emit a real stop for an
+        active service and consume its existing scheduled stop. -#}
+    {%- for pending in q -%}
+      {%- if sel.i < 0 and pending.host==h and pending.kind in ['stop','crash'] -%}
+        {%- set sel.i=loop.index0 -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if sel.i < 0 -%}{%- set sel.i=0 -%}{%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set e = q.pop(sel.i) -%}
+{%- set host = e.host -%}
+{%- set svc = e.svc -%}
+{%- set hk = host ~ '|' ~ svc.key -%}
+{%- set frac = timestamp.microsecond * 10 -%}
+{%- set tms = now + (frac // 10000) / 1000 -%}
+
+{#- Startup state changes only when its record is emitted. -#}
+{%- if e.kind == 'install' -%}
+  {%- do startup.update({hk:e.extra.start}) -%}
+{%- elif e.kind == 'config' -%}
+  {%- set old = startup.get(hk,'demand start') -%}
+  {%- set new = e.extra.new if e.extra.new != old else ('demand start' if old == 'auto start' else 'auto start') -%}
+  {%- do e.extra.update({'old':old,'new':new}) -%}
+  {%- do startup.update({hk:new}) -%}
+{%- endif -%}
+{%- if e.kind in ['install','config'] -%}
+  {%- if startup[hk] == 'auto start' -%}
+    {%- do restore.update({hk:{'due':now+module.random.randint(300,900),'host':host,'svc':svc,'user':e.user}}) -%}
+  {%- else -%}{%- do restore.pop(hk,none) -%}{%- endif -%}
+{%- endif -%}
+
+{#- Row fields the detector reads. -#}
+{%- if e.kind == 'install' -%}
+  {%- set code = 7045 -%}
+{%- elif e.kind == 'config' -%}
+  {%- set code = 7040 -%}
+{%- elif e.kind == 'crash' -%}
+  {%- set code = 7034 -%}
+{%- else -%}
+  {%- set code = 7036 -%}
+{%- endif -%}
+{%- set state = 'running' if e.kind == 'start' else 'stopped' -%}
+
+{#- Keep every binding, compressing equal (stage, bindings) to the
+    newest start. Newer starts dominate older ones for a maximum window.
+    Keys range over the fixed host/account/service pools. No completion
+    resets history. An off final step is the only rare dropped row. -#}
+{%- set r = {'code': code, 'auto': code == 7040 and e.extra.new == 'auto start',
+    'up': code == 7036 and state == 'running', 'host': host, 'user': e.user, 'path': svc.path|default('')} -%}
+{%- macro step_ok(i,b,r) -%}
+  {%- if i == 1 -%}{{ r.auto and r.host == b.H }}
+  {%- elif i == 2 -%}{{ r.up and r.host == b.H }}
+  {%- elif i == 3 -%}{{ r.code == 7045 and r.host != b.H and r.user == b.U and r.path == b.P }}
+  {%- elif i == 4 -%}{{ r.auto and r.host == b.H2 }}
+  {%- else -%}{{ r.up and r.host == b.H2 }}{%- endif -%}
+{%- endmacro -%}
+{%- set live = {} -%}
+{%- for sig,p in m.get(svc.name,{}).items() if tms-p[1] <= window -%}
+  {%- do live.update({sig:p}) -%}
+{%- endfor -%}
+{%- set completes=namespace(yes=false) -%}
+{%- if r.up -%}
+  {%- for sig,p in live.items() if p[0]==5 and step_ok(5,p[2],r)=='True' -%}{%- set completes.yes=true -%}{%- endfor -%}
+{%- endif -%}
+{%- if completes.yes and e.episode and shared.get('completed_episode') != e.extra.episode_id -%}
+  {%- do shared.set('completed_episode',e.extra.episode_id) -%}
+{%- elif completes.yes -%}
+  {%- for sig,p in live.items() if p[0]==5 and step_ok(5,p[2],r)=='True' -%}
+    {%- do running.pop(hk,none) -%}
+    {%- set gone=[] -%}
+    {%- for x in q if x.host==host and x.svc.key==svc.key and x.kind in ['stop','crash'] -%}{%- do gone.append(x) -%}{%- endfor -%}
+    {%- for x in gone -%}{%- do q.remove(x) -%}{%- endfor -%}
+    {%- do m.update({svc.name:live}) -%}
+    {%- do shared.set('guard_drops',shared.get('guard_drops',0)+1) -%}
+    {{- dispatch.drop() -}}
+  {%- endfor -%}
+{%- endif -%}
+{%- set updated=dict(live) -%}
+{%- for sig,p in live.items() if p[0]<5 and step_ok(p[0],p[2],r)=='True' -%}
+  {%- set nb=dict(p[2]) -%}
+  {%- if p[0]==3 -%}{%- do nb.update({'H2':host}) -%}{%- endif -%}
+  {%- set nk=(p[0]+1,nb.H,nb.U,nb.P,nb.H2|default('')) -%}
+  {%- if nk not in updated or updated[nk][1]<p[1] -%}{%- do updated.update({nk:[p[0]+1,p[1],nb]}) -%}{%- endif -%}
+{%- endfor -%}
+{%- if code==7045 -%}
+  {%- set nb={'H':host,'U':e.user,'P':svc.path} -%}
+  {%- do updated.update({(1,host,e.user,svc.path,''):[1,tms,nb]}) -%}
+{%- endif -%}
+{%- do m.update({svc.name:updated}) -%}
+
+{%- if e.kind in ['stop', 'crash'] -%}{%- do running.pop(hk, none) -%}{%- endif -%}
+
+{#- System channel envelope: services.exe PID per host, one of its
+    threads, record numbers that also count other providers' events. -#}
+{%- set hi = hosts | selectattr('name', 'equalto', host) | first -%}
+{%- set tid = module.rand.weighted_choice(hi.tids, hi.tw) -%}
+{%- set last = shared.get('last_t:' ~ host, now) -%}
+{%- set rec = hi.rec + 1 + module.numpy.random.poisson(([now - last, 7200] | min) * 0.004) | int -%}
+{%- do hi.update({'rec': rec}) -%}
+{%- do shared.set('last_t:' ~ host, now) -%}
+{%- set dt = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set system_time = dt.strftime('%Y-%m-%dT%H:%M:%S') ~ '.' ~ '%07d' | format(frac) ~ '00Z' -%}
+{%- set ts = dt.strftime('%Y-%m-%dT%H:%M:%S') ~ '.' ~ '%03d' | format(frac // 10000) ~ 'Z' -%}
+
+{%- if code == 7045 -%}
+  {%- set data = {'ServiceName': svc.name, 'ImagePath': svc.path, 'ServiceType': 'user mode service',
+      'StartType': e.extra.start, 'AccountName': svc.account} -%}
+  {%- set msg = 'A service was installed in the system.\n\nService Name:  ' ~ svc.name
+      ~ '\nService File Name:  ' ~ svc.path ~ '\nService Type:  user mode service\nService Start Type:  '
+      ~ e.extra.start ~ '\nService Account:  ' ~ svc.account -%}
+{%- elif code == 7040 -%}
+  {%- set data = {'param1': svc.name, 'param2': e.extra.old, 'param3': e.extra.new, 'param4': svc.key} -%}
+  {%- set msg = 'The start type of the ' ~ svc.name ~ ' service was changed from ' ~ e.extra.old
+      ~ ' to ' ~ e.extra.new ~ '.' -%}
+{%- elif code == 7034 -%}
+  {%- set crashes = shared.get('crashes') -%}
+  {%- set n = crashes.get(hk, 0) + 1 -%}
+  {%- do crashes.update({hk: n}) -%}
+  {%- set data = {'param1': svc.name, 'param2': n | string,
+      'Binary': (svc.key.encode('utf-16-le').hex() | upper) ~ '0000'} -%}
+  {%- set msg = 'The ' ~ svc.name ~ ' service terminated unexpectedly. It has done this ' ~ n ~ ' time(s).' -%}
+{%- else -%}
+  {%- set data = {'param1': svc.name, 'param2': state,
+      'Binary': ((svc.key ~ ('/4' if state == 'running' else '/1')).encode('utf-16-le').hex() | upper) ~ '0000'} -%}
+  {%- set msg = 'The ' ~ svc.name ~ ' service entered the ' ~ state ~ ' state.' -%}
+{%- endif -%}
+{%- set level = 2 if code == 7034 else 4 -%}
+{%- set user = e.user if code in [7045, 7040] else none -%}
+{%- set xml -%}
+<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><Provider Name='Service Control Manager' Guid='{{ guid }}' EventSourceName='Service Control Manager'/><EventID Qualifiers='{{ 49152 if code == 7034 else 16384 }}'>{{ code }}</EventID><Version>0</Version><Level>{{ level }}</Level><Task>0</Task><Opcode>0</Opcode><Keywords>0x8080000000000000</Keywords><TimeCreated SystemTime='{{ system_time }}'/><EventRecordID>{{ rec }}</EventRecordID><Correlation/><Execution ProcessID='{{ hi.pid }}' ThreadID='{{ tid }}'/><Channel>System</Channel><Computer>{{ host }}</Computer>{% if user %}<Security UserID='{{ user }}'/>{% else %}<Security/>{% endif %}</System><EventData>{% for k, v in data.items() if k != 'Binary' %}<Data Name='{{ k }}'>{{ v | e }}</Data>{% endfor %}{% if data.Binary %}<Binary>{{ data.Binary }}</Binary>{% endif %}</EventData><RenderingInfo Culture='en-US'><Message>{{ msg | e }}</Message><Level>{{ 'Error' if code == 7034 else 'Information' }}</Level><Task></Task><Opcode></Opcode><Channel></Channel><Provider>Microsoft-Windows-Service Control Manager</Provider><Keywords><Keyword>Classic</Keyword></Keywords></RenderingInfo></Event>
+{%- endset -%}
+{%- set winlog = {'api': 'wineventlog', 'channel': 'System', 'computer_name': host, 'event_data': data,
+    'event_id': code | string, 'keywords': ['Classic'], 'opcode': 'Info',
+    'process': {'pid': hi.pid, 'thread': {'id': tid}}, 'provider_guid': guid,
+    'provider_name': 'Service Control Manager', 'record_id': rec | string} -%}
+{%- if user == system_sid -%}
+  {%- do winlog.update({'user': {'domain': 'NT AUTHORITY', 'identifier': user, 'name': 'SYSTEM',
+      'type': 'Well Known Group'}}) -%}
+{%- elif user -%}
+  {%- set adm = admins | selectattr('sid', 'equalto', user) | first -%}
+  {%- do winlog.update({'user': {'domain': params.ad_domain, 'identifier': user, 'name': adm.name,
+      'type': 'User'}}) -%}
+{%- endif -%}
+{%- set record = {'@timestamp': ts, 'ecs': {'version': '8.11.0'},
+    'event': {'code': code | string, 'dataset': 'system.system', 'kind': 'event', 'original': xml,
+      'provider': 'Service Control Manager'},
+    'host': {'name': host}, 'log': {'level': 'error' if code == 7034 else 'information'},
+    'message': msg, 'winlog': winlog} -%}
+{{ record | tojson }}
