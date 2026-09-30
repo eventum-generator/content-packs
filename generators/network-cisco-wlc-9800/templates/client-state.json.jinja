@@ -1,0 +1,236 @@
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000) -%}
+{#- Synthetic workload, durations in ms. Office stations attend on about 9 of 10 days, arrive around 08:45 UTC and leave about 9 hours later; always-on stations stay all day and sleep/wake more often. Sessions and absences are mixtures: a lognormal body per class plus a shared short tail (sleep/wake, band steering, re-authentication). Tails start at an offset, so density falls smoothly to zero with no floor cliff; upper limits truncate by redrawing. Episodes draw from the same tail components. -#}
+{%- set body = {'office': (module.math.log(35 * 60000), 1.0, module.math.log(10 * 60000), 1.2), 'always-on': (module.math.log(15 * 60000), 1.0, module.math.log(3 * 60000), 1.0)} -%}
+{#- Expected records per UTC hour, the sum of the pattern files; episode starts follow it. -#}
+{%- set curve = [433, 433, 433, 433, 433, 433, 433, 582, 1518, 2038, 1885, 1809, 1809, 1809, 1809, 1809, 1714, 1384, 842, 521, 433, 433, 433, 433] -%}
+{%- set peak = curve | max -%}
+{%- macro draw(lo, mu, sigma, hi) -%}
+  {%- set ns = namespace(value=lo + module.rand.number.lognormal(mu, sigma)) -%}
+  {%- for attempt in range(16) if ns.value > hi -%}{%- set ns.value = lo + module.rand.number.lognormal(mu, sigma) -%}{%- endfor -%}
+  {{- [ns.value, hi] | min -}}
+{%- endmacro -%}
+{%- macro short_session(hi) -%}{{- draw(8000, module.math.log(40000), 0.8, hi) -}}{%- endmacro -%}
+{%- macro quick_reconnect(hi) -%}{{- draw(1000, module.math.log(5000), 0.7, hi) -}}{%- endmacro -%}
+{%- macro session(cls) -%}{{- short_session(180000) if module.rand.chance(0.12) else draw(0, body[cls][0], body[cls][1], 43200000) -}}{%- endmacro -%}
+{%- macro absence(cls) -%}{{- quick_reconnect(60000) if module.rand.chance(0.12) else draw(0, body[cls][2], body[cls][3], 28800000) -}}{%- endmacro -%}
+{#- First attended working day at or after day0: "arrival departure" in ms. -#}
+{%- macro plan(day0) -%}
+  {%- for d in range(60) -%}
+    {%- if module.rand.chance(0.9) -%}
+      {%- set arrive = day0 + d * 86400000 + ([[module.rand.number.gauss(8.75, 0.6), 7.0] | max, 11.0] | min) * 3600000 -%}
+      {{- arrive | int }} {{ (arrive + ([[module.rand.number.gauss(9.0, 0.75), 6.5] | max, 11.5] | min) * 3600000) | int -}}
+      {%- break -%}
+    {%- endif -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{#- A time in [lo, hi) with density proportional to the hourly curve, or to its square plus a small floor. -#}
+{%- macro pick_time(lo, hi, squared) -%}
+  {%- set pieces = [] -%}
+  {%- set ns = namespace(a=lo, total=0) -%}
+  {%- for k in range(40) if ns.a < hi -%}
+    {%- set b = [ns.a - ns.a % 3600000 + 3600000, hi] | min -%}
+    {%- set r = curve[(ns.a // 3600000) % 24] -%}
+    {%- set w = (b - ns.a) * ((r * r + 0.02 * peak * peak) if squared else r) -%}
+    {%- do pieces.append((ns.a, b, w)) -%}
+    {%- set ns.total = ns.total + w -%}{%- set ns.a = b -%}
+  {%- endfor -%}
+  {%- set u = namespace(x=module.rand.number.floating(0, 1) * ns.total, out=none) -%}
+  {%- for piece in pieces -%}
+    {%- if u.out is none and (u.x <= piece[2] or loop.last) -%}
+      {%- set u.out = piece[0] + (piece[1] - piece[0]) * ([u.x / piece[2], 1] | min) -%}
+    {%- elif u.out is none -%}
+      {%- set u.x = u.x - piece[2] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- u.out | int -}}
+{%- endmacro -%}
+{#- The chain window: RUN on AP-A to the IP update on AP-C. -#}
+{%- set chain_window = 401000 -%}
+{%- if not shared.get('stations') -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'strict': true, 'ge': 6, 'le': 8760}},
+    'controller_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'}},
+    'ssid': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[^()\r\n]{1,32}$'}},
+    'suspicious_user': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^[A-Za-z0-9._@+-]{1,64}$'}},
+    'suspicious_mac': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true, 'pattern': '^([0-9A-Fa-f]{4}\.){2}[0-9A-Fa-f]{4}$'}},
+    'suspicious_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'strict': true}}
+  }} -%}
+  {%- set checked = module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set address = module.ipaddress.ip_address(checked.suspicious_ip) -%}
+  {%- set octets = module.builtins.bytearray.fromhex(checked.suspicious_mac.replace('.', '')) -%}
+  {%- set eui64 = module.ipaddress.IPv6Address(module.builtins.bytes([254, 128, 0, 0, 0, 0, 0, 0, octets[0] + (-2 if octets[0] % 4 >= 2 else 2), octets[1], octets[2], 255, 254, octets[3], octets[4], octets[5]])) -%}
+  {%- set stations = [] -%}
+  {%- for row in samples.clients -%}
+    {%- set i = loop.index0 -%}
+    {%- if i == 0 -%}
+      {%- set profile = 'v4ll' if address.version == 4 else 'v6' -%}
+      {%- set ipv4 = module.builtins.str(address) if address.version == 4 else none -%}
+      {%- set ipv6 = module.builtins.str(address) if address.version == 6 else none -%}
+      {%- set ll = module.builtins.str(eui64) -%}
+    {%- else -%}
+      {%- set profile = row.profile -%}{%- set ipv4 = row.ipv4 -%}{%- set ipv6 = row.ipv6 -%}{%- set ll = row.link_local -%}
+    {%- endif -%}
+    {#- Address learned at RUN, then addresses added by later IP updates. -#}
+    {%- set plan_ips = {'v4ll': ([ipv4], [ll]), 'dual': ([ipv4], [ll, ipv6]), 'v4': ([ipv4], []), 'v6': ([ll], [ipv6])}[profile] -%}
+    {%- do stations.append({'user': checked.suspicious_user if i == 0 else row.user, 'mac': checked.suspicious_mac.lower() if i == 0 else row.mac, 'floor': row.floor, 'home': i % 3, 'cls': row.presence, 'dep': 4000000000000000, 'ipv4': ipv4, 'ipv6': ipv6, 'll': ll, 'run_ips': plan_ips[0], 'learn': plan_ips[1], 'active': false, 'ap': none, 'ips': [], 'pending': [], 'kind': 'run', 'end_at': 0, 'hist': [], 'last_run': 0, 'left': 0, 'aps': [], 'final': false}) -%}
+  {%- endfor -%}
+  {%- set seen_macs = module.builtins.set() -%}{%- set seen_addresses = module.builtins.set() -%}
+  {%- set valid = namespace(macs=true, addresses=true) -%}
+  {%- for station in stations -%}
+    {%- if station.mac in seen_macs -%}{%- set valid.macs = false -%}{%- endif -%}
+    {%- do seen_macs.add(station.mac) -%}
+    {%- for value, family in [(station.ipv4, 4), (station.ipv6, 6), (station.ll, 0)] -%}
+      {%- if value is not none -%}
+        {%- set ip = module.ipaddress.ip_address(value) -%}
+        {%- set wrong_class = (ip.is_link_local != (family == 0)) or (family == 0 and ip.version != 6) or (family != 0 and ip.version != family) -%}
+        {%- if wrong_class or value in seen_addresses or ip.is_multicast or ip.is_unspecified or ip.is_loopback or ip.is_reserved or (ip.version == 4 and (module.builtins.int(ip) < 16777216 or module.builtins.int(ip) % 256 in [0, 255])) -%}{%- set valid.addresses = false -%}{%- endif -%}
+        {%- do seen_addresses.add(value) -%}
+      {%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- set guard = module.pydantic_core.SchemaValidator({'type': 'typed-dict', 'fields': {
+    'unique_station_macs': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}},
+    'distinct_unicast_addresses': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}},
+    'unicast_station_mac': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}},
+    'ascii_ssid': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}},
+    'known_presence': {'type': 'typed-dict-field', 'schema': {'type': 'literal', 'expected': [true]}}
+  }}) -%}
+  {%- do guard.validate_python({'unique_station_macs': valid.macs, 'distinct_unicast_addresses': valid.addresses, 'unicast_station_mac': module.builtins.int(checked.suspicious_mac[:2], 16) % 2 == 0 and checked.suspicious_mac != '0000.0000.0000', 'ascii_ssid': checked.ssid.isascii(), 'known_presence': stations | rejectattr('cls', 'in', ['office', 'always-on']) | list | length == 0}) -%}
+  {#- Each station keeps one pending step in a heap ordered by station time; every input timestamp emits the earliest step at the input time. Station time follows the clock: when it runs ahead of the input timestamps, new durations shrink a little, and when it falls behind they stretch. Start in steady state at the first timestamp: office stations follow today's attendance; present stations and always-on stations are associated with the steady-state probability. Residuals use the length-biased lognormal. -#}
+  {%- set heap = [] -%}
+  {%- set today = now - now % 86400000 -%}
+  {%- for station in stations -%}
+    {%- set b = body[station.cls] -%}
+    {%- set mean_session = module.math.exp(b[0] + b[1] ** 2 / 2) -%}
+    {%- set mean_gap = module.math.exp(b[2] + b[3] ** 2 / 2) -%}
+    {%- set present = namespace(on=true) -%}
+    {%- if station.cls == 'office' -%}
+      {%- set day = (plan(today) | trim).split(' ') | map('int') | list -%}
+      {%- if day[1] <= now + 600000 -%}{%- set day = (plan(today + 86400000) | trim).split(' ') | map('int') | list -%}{%- endif -%}
+      {%- do station.update({'dep': day[1]}) -%}
+      {%- if day[0] > now -%}{%- set present.on = false -%}{%- set due = day[0] -%}{%- endif -%}
+    {%- endif -%}
+    {%- if present.on and module.rand.chance(mean_session / (mean_session + mean_gap)) -%}
+      {%- set due = [now + module.builtins.int(module.rand.number.floating(0, 1) * (draw(0, b[0] + b[1] ** 2, b[1], 43200000) | float)), station.dep] | min -%}
+      {%- do station.update({'active': true, 'ap': 'AP-Floor' ~ station.floor ~ '-' ~ module.rand.weighted_choice(['A', 'B', 'C'], [[50, 25, 25], [25, 50, 25], [25, 25, 50]][station.home]), 'ips': station.run_ips + station.learn, 'kind': 'delete', 'end_at': due}) -%}
+    {%- elif present.on -%}
+      {%- set due = now + module.builtins.int(module.rand.number.floating(0, 1) * (draw(0, b[2] + b[3] ** 2, b[3], 28800000) | float)) -%}
+      {%- if due >= station.dep - 60000 -%}
+        {%- set day = (plan(today + 86400000) | trim).split(' ') | map('int') | list -%}
+        {%- do station.update({'dep': day[1]}) -%}{%- set due = day[0] -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- do heap.append((due, loop.index0, loop.index0)) -%}
+  {%- endfor -%}
+  {%- do module.heapq.heapify(heap) -%}
+  {#- The first episode starts within the first interval, at most 24 hours, at an hour drawn from the hourly curve. -#}
+  {%- set first_window = [checked.anomaly_interval_hours * 3600000, 86400000] | min -%}
+  {%- do shared.update({'stations': stations, 'heap': heap, 'seq': stations | length, 'episode_idx': none, 'episode_order': 0, 'episode_used': module.builtins.set(), 'episode_pool': stations | map(attribute='learn') | map('length') | select('equalto', 1) | list | length, 'next_episode_at': pick_time(now, now + module.builtins.int(first_window) - 600000, false) | int}) -%}
+{%- endif -%}
+{%- set stations = shared.get('stations') -%}
+{%- set heap = shared.get('heap') -%}
+{#- A due episode takes the station whose ordinary absence ends first among stations that learn one address by update, return within 5 minutes, stay at least 30 minutes more, made no association in the last chain window, preferring stations not yet used in the current rotation. -#}
+{%- if params.anomaly_mode and shared.get('episode_idx') is none and now >= shared.get('next_episode_at') -%}
+  {%- set used = shared.get('episode_used') -%}
+  {%- set best = namespace(idx=none, key=none) -%}
+  {%- for entry in heap -%}
+    {%- set candidate = stations[entry[2]] -%}
+    {%- if candidate.kind == 'run' and candidate.learn | length == 1 and entry[0] <= now + 300000 and candidate.dep - entry[0] >= 1800000 and now - candidate.last_run >= chain_window + 20000 -%}
+      {%- set key = (1 if entry[2] in used else 0, entry[0]) -%}
+      {%- if best.key is none or key < best.key -%}{%- set best.idx = entry[2] -%}{%- set best.key = key -%}{%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if best.idx is none -%}
+    {%- do shared.set('next_episode_at', now + 60000) -%}
+  {%- else -%}
+    {%- set order = shared.get('episode_order') -%}
+    {%- do stations[best.idx].update({'left': 3, 'aps': ['A', 'B', 'C'][order:] + ['A', 'B', 'C'][:order]}) -%}
+    {%- do used.add(best.idx) -%}
+    {%- if used | length >= shared.get('episode_pool') -%}{%- do used.clear() -%}{%- endif -%}
+    {%- do shared.update({'episode_idx': best.idx, 'episode_order': (order + 1) % 3}) -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set out = namespace(done=false, station=none, kind=none, ips=none) -%}
+{%- for attempt in range(8) if not out.done -%}
+  {%- set entry = module.heapq.heappop(heap) -%}
+  {%- set vt = entry[0] -%}
+  {%- set pace = [[module.math.exp((now - vt) / 1200000), 0.75] | max, 1.33] | min -%}
+  {%- set station = stations[entry[2]] -%}
+  {%- set kind = station.kind -%}
+  {%- set emit = namespace(on=true) -%}
+  {%- if kind == 'run' -%}
+    {%- if station.left > 0 -%}
+      {%- if station.left == 3 -%}
+        {#- Episode start: the next one is due one interval later, within a window of min(interval / 4, 6 h) around that time, at a time weighted by the squared hourly curve plus a small floor. -#}
+        {%- set interval = params.anomaly_interval_hours * 3600000 -%}
+        {%- set width = [interval / 4, 21600000] | min -%}
+        {%- do shared.set('next_episode_at', pick_time(module.builtins.int(now + interval - width / 2), module.builtins.int(now + interval + width / 2 - 600000), true) | int) -%}
+      {%- endif -%}
+      {%- set ap_suffix = station.aps[3 - station.left] -%}
+      {%- do station.update({'left': station.left - 1, 'final': station.left == 1}) -%}
+      {%- set dwell = (short_session(90000) | float) if station.left > 0 else (session(station.cls) | float) -%}
+    {%- else -%}
+      {%- set ap_suffix = module.rand.weighted_choice(['A', 'B', 'C'], [[50, 25, 25], [25, 50, 25], [25, 25, 50]][station.home]) -%}
+      {%- set dwell = (session(station.cls) | float) -%}
+    {%- endif -%}
+    {%- set ap = 'AP-Floor' ~ station.floor ~ '-' ~ ap_suffix -%}
+    {%- do station.update({'active': true, 'ap': ap, 'ips': station.run_ips, 'pending': station.learn, 'end_at': [vt + dwell * pace, station.dep] | min, 'last_run': now, 'hist': (station.hist | selectattr('run', 'ge', now - chain_window) | list) + [{'ap': ap, 'run': now}]}) -%}
+    {%- set ips = station.ips -%}
+  {%- elif kind == 'ipu' -%}
+    {#- An update that would make an ordinary client's third distinct AP within the chain window learn its address is not logged: the client keeps the addresses it has for the rest of that association. -#}
+    {%- set others = station.hist[:-1] | selectattr('run', 'ge', now - chain_window) | map(attribute='ap') | reject('equalto', station.ap) | unique | list -%}
+    {%- if not station.final and others | length >= 2 -%}
+      {%- do station.update({'pending': []}) -%}
+      {%- set emit.on = false -%}
+    {%- else -%}
+      {%- do station.update({'ips': station.ips + station.pending[:1], 'pending': station.pending[1:]}) -%}
+      {%- if station.final -%}
+        {%- do station.update({'final': false}) -%}
+        {%- do shared.set('episode_idx', none) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- set ips = station.ips -%}
+  {%- else -%}
+    {#- DELETE lists link-local first and IPv4 last, as in the 17.11 open-authentication DELETE example. -#}
+    {%- set ips = (station.ips | select('equalto', station.ll) | list) + (station.ips | reject('in', [station.ll, station.ipv4]) | list) + (station.ips | select('equalto', station.ipv4) | list) -%}
+    {%- if station.final -%}
+      {%- do station.update({'final': false}) -%}
+      {%- do shared.set('episode_idx', none) -%}
+    {%- endif -%}
+    {%- do station.update({'active': false, 'ips': [], 'pending': []}) -%}
+  {%- endif -%}
+  {#- Next step of this station in station time: address learning milliseconds to seconds after RUN unless the session ends first, DELETE at session end, RUN after an absence; an office station whose absence would outlast its working day returns on its next attended day. -#}
+  {%- set delay = ((draw(5, module.math.log(240), 1.0, 3000) if kind == 'run' else draw(500, module.math.log(2500), 0.8, 15000)) | float) if kind != 'delete' and station.pending else 0 -%}
+  {%- if kind != 'delete' and station.pending and vt + delay * pace < station.end_at -%}
+    {%- do station.update({'kind': 'ipu'}) -%}{%- set due = vt + delay * pace -%}
+  {%- elif kind != 'delete' -%}
+    {%- do station.update({'kind': 'delete'}) -%}{%- set due = [station.end_at, vt + 1] | max -%}
+  {%- elif station.left > 0 -%}
+    {%- do station.update({'kind': 'run'}) -%}{%- set due = vt + (quick_reconnect(30000) | float) * pace -%}
+  {%- else -%}
+    {%- do station.update({'kind': 'run'}) -%}{%- set due = vt + (absence(station.cls) | float) * pace -%}
+    {%- if due >= station.dep - 60000 -%}
+      {%- set day = (plan(vt - vt % 86400000 + 86400000) | trim).split(' ') | map('int') | list -%}
+      {%- do station.update({'dep': day[1]}) -%}{%- set due = day[0] -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- do module.heapq.heappush(heap, (due, shared.get('seq'), entry[2])) -%}
+  {%- do shared.set('seq', shared.get('seq') + 1) -%}
+  {%- if emit.on -%}
+    {%- set out.done = true -%}{%- set out.station = station -%}{%- set out.kind = kind -%}{%- set out.ips = ips -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if not out.done -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set station = out.station -%}{%- set kind = out.kind -%}{%- set ips = out.ips -%}
+{%- set code = {'run': 'CLIENT_MOVED_TO_RUN_STATE', 'ipu': 'CLIENT_IP_UPDATED', 'delete': 'CLIENT_MOVED_TO_DELETE_STATE'}[kind] -%}
+{%- set tail = {'run': 'associated to AP (', 'ipu': 'IP address updated, associated to AP (', 'delete': 'disconnected from AP ('}[kind] ~ station.ap ~ ') with SSID (' ~ params.ssid ~ ')' -%}
+{%- set primary = station.ipv4 if station.ipv4 in ips else (ips | reject('in', [station.ll]) | list or ips)[0] -%}
+{%- set native_time = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'][ts.month - 1] ~ ' ' ~ ('%2d' | format(ts.day)) ~ ts.strftime(' %H:%M:%S.') ~ ('%03d' | format(ts.microsecond // 1000)) ~ ' UTC' -%}
+{%- set original = native_time ~ ': %CLIENT_ORCH_LOG-7-' ~ code ~ ': Chassis 1 R0/0: wncd: Username (' ~ station.user ~ '), MAC: ' ~ station.mac ~ ', IP ' ~ (ips | join(' ')) ~ ' ' ~ tail -%}
+{%- set digits = station.mac.replace('.', '').upper() -%}
+{%- set ecs_mac = digits[0:2] ~ '-' ~ digits[2:4] ~ '-' ~ digits[4:6] ~ '-' ~ digits[6:8] ~ '-' ~ digits[8:10] ~ '-' ~ digits[10:12] -%}
+{%- set action = {'run': 'run', 'ipu': 'ip-update', 'delete': 'delete'}[kind] -%}
+{%- set state = {'run': 'run', 'ipu': 'ip_update', 'delete': 'delete'}[kind] -%}
+{{- {'@timestamp': ts.isoformat(timespec='milliseconds'), 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'category': ['network'], 'type': {'run': ['connection', 'start'], 'ipu': ['connection', 'info'], 'delete': ['connection', 'end']}[kind], 'action': action, 'code': code, 'provider': 'CLIENT_ORCH_LOG', 'severity': 7, 'timezone': '+00:00', 'original': original}, 'host': {'name': params.controller_name}, 'agent': {'type': 'eventum', 'name': 'synthetic-wlc-reader'}, 'log': {'level': 'debugging'}, 'process': {'name': 'wncd'}, 'user': {'name': station.user}, 'client': {'ip': primary, 'address': primary, 'mac': ecs_mac}, 'related': {'ip': ips, 'user': [station.user]}, 'cisco_wlc': {'ap_name': station.ap, 'ssid': params.ssid, 'chassis': '1 R0/0', 'client_state': state, 'client_mac': station.mac, 'client_ips': ips}} | tojson -}}
