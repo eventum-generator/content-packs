@@ -1,0 +1,108 @@
+{# One input timestamp, one Security event. Fixed account-keyed histories,
+   at most three temporary memberships, and at most 24 queued records. #}
+{%- set now = timestamp.timestamp() -%}
+{%- set interval = params.anomaly_interval_hours * 3600 -%}
+{%- set curve = [0.02] * 8 + [1.0] * 10 + [0.02] * 6 -%}
+{%- macro pick_start(lo, span, first=false) -%}
+  {%- set r = namespace(v=lo, ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.floating(0, span) -%}
+    {%- if module.rand.number.floating(0, 1.02) < (curve[((c + shared.get('tzoff')) // 3600) | int % 24] if first else curve[((c + shared.get('tzoff')) // 3600) | int % 24] ** 2 + 0.02) -%}
+      {%- set r.v = c -%}{%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set serial = shared.get('serial', 0) + 1 -%}
+  {%- do shared.set('serial', serial) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, serial, item]) -%}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- do module.pydantic_core.SchemaValidator({'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}}
+  }}).validate_python(params) -%}
+  {%- do shared.update({'queue': [], 'tzoff': timestamp.utcoffset().total_seconds(), 'last': now,
+    'history': {}, 'members': {}, 'last_actor': -1}) -%}
+  {%- do shared.set('episode_due', pick_start(now, [interval, 86400] | min, true) | float) -%}
+{%- endif -%}
+{%- set history = shared.get('history') -%}
+{%- set members = shared.get('members') -%}
+{%- set queue = shared.get('queue') -%}
+{%- set dt = [now - shared.get('last'), 0] | max -%}
+{%- do shared.set('last', now) -%}
+{%- set hour = timestamp.hour -%}
+{%- set available = [] -%}
+{%- for i in range(samples.admins | length) if i not in members -%}
+  {%- do available.append(i) -%}
+{%- endfor -%}
+{%- set rotating = available | reject('equalto', shared.get('last_actor')) | list -%}
+{%- set start_episode = params.anomaly_mode and now >= shared.get('episode_due') and rotating | length > 0 -%}
+{%- set start_routine = module.rand.chance(1 - module.math.exp(-12 / 36648 * curve[hour] * dt)) -%}
+{%- if (start_episode or start_routine) and available and queue | length < 16 -%}
+  {%- set candidates = rotating if start_episode else available -%}
+  {%- set ai = module.rand.choice(candidates if candidates else available) -%}
+  {%- set admin = samples.admins[ai] -%}
+  {%- set job = {'actor': ai, 'logon': '0x' ~ module.rand.string.hex(6),
+    'group': 512 if start_episode else module.rand.weighted_choice([512, 2601], [1, 9]),
+    'episode': start_episode} -%}
+  {%- do members.update({ai: job}) -%}
+  {%- set at = now -%}
+  {%- if start_episode -%}
+    {%- set phase_time = namespace(at=now) -%}
+    {%- for c in ['4771', '4768', '4769'] -%}
+      {{- push(phase_time.at, {'code': c, 'actor': ai, 'episode': true, 'job': job}) -}}
+      {%- set phase_time.at = phase_time.at + module.rand.number.floating(12, 35) -%}
+    {%- endfor -%}
+    {# Jinja loop assignments are scoped; the final step is 90-140 s later. #}
+    {%- set at = now + module.rand.number.floating(90, 140) -%}
+    {%- set w = [interval / 4, 21600] | min -%}
+    {%- do shared.update({'last_actor': ai, 'episode_due': pick_start(now + interval - w / 2, w) | float}) -%}
+  {%- endif -%}
+  {{- push(at, {'code': '4728', 'actor': ai, 'episode': start_episode, 'job': job}) -}}
+{%- endif -%}
+{# Directory changes are independent, reversible value replacements. #}
+{%- if queue | length < 16 and module.rand.chance(1 - module.math.exp(-6 / 36648 * curve[hour] * dt)) -%}
+  {%- set ai = module.rand.number.integer(0, samples.admins | length - 1) -%}
+  {%- set attr = shared.get('delegation', {}) -%}
+  {%- set old = attr.get(ai, 'cifs/backup01.' ~ params.dns_domain) -%}
+  {%- set values = ['cifs/backup01.' ~ params.dns_domain, 'cifs/filesrv01.' ~ params.dns_domain, 'ldap/' ~ params.dc_host] | reject('equalto', old) | list -%}
+  {%- set new = module.rand.choice(values) -%}
+  {%- set common = {'code': '5136', 'actor': ai, 'logon': '0x' ~ module.rand.string.hex(6), 'correlation': '{' ~ module.rand.crypto.uuid4() ~ '}'} -%}
+  {{- push(now, dict(common, operation='Value Deleted', value=old)) -}}
+  {{- push(now + 0.1, dict(common, operation='Value Added', value=new)) -}}
+  {%- do attr.update({ai: new}) -%}{%- do shared.set('delegation', attr) -%}
+{%- endif -%}
+{%- set item = {} -%}
+{%- set user_row = samples.automation.pick() if 'automation' in tags else samples.users.pick() -%}
+{%- if queue and queue[0][0] <= now -%}
+  {%- set item = module.heapq.heappop(queue)[2] -%}
+  {%- set user_row = samples.admins[item.actor] -%}
+{%- endif -%}
+{%- set code = item.get('code', module.rand.weighted_choice(['4768', '4769', '4776', '4771'], [47, 45, 6, 2])) -%}
+{%- set source_ip = user_row.ip -%}
+{%- set source_port = module.rand.number.integer(49152, 65535) -%}
+{%- set service_row = samples.services.pick() -%}
+{%- set enc = '0x17' if item.get('episode', false) else '0x12' -%}
+{%- set key = user_row.name ~ '|' ~ source_ip -%}
+{%- set hist = history.get(key, {'fail': -1e20, 'tgt': -1e20, 'rc4': -1e20}) -%}
+{%- if code == '4771' -%}{%- do hist.update({'fail': now}) -%}
+{%- elif code == '4768' and now - hist.fail <= 600 -%}{%- do hist.update({'tgt': hist.fail}) -%}
+{%- elif code == '4769' -%}
+  {%- set enc = '0x17' if item.get('episode', false) else module.rand.weighted_choice(['0x12', '0x17'], [98, 2]) -%}
+  {%- if enc == '0x17' and now - hist.tgt <= 600 -%}{%- do hist.update({'rc4': hist.tgt}) -%}{%- endif -%}
+{%- endif -%}
+{%- do history.update({key: hist}) -%}
+{%- if code == '4728' -%}
+  {%- set job = item.job -%}
+  {# Exact final-step guard changes only the destination global group. #}
+  {%- if not item.get('episode', false) and job.group == 512 and now - hist.rc4 <= 600 -%}
+    {%- do job.update({'group': 2601}) -%}
+  {%- endif -%}
+  {%- do item.update({'group': job.group, 'logon': job.logon}) -%}
+  {{- push(now + module.rand.number.floating(1200, 2400), {'code': '4729', 'actor': item.actor, 'group': job.group, 'logon': job.logon}) -}}
+{%- elif code == '4729' -%}
+  {%- do members.pop(item.actor) -%}
+{%- endif -%}
+{%- include 'templates/_render.json.jinja' -%}
