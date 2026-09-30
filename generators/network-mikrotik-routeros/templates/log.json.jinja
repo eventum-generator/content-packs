@@ -1,0 +1,283 @@
+{#- MikroTik RouterOS remote BSD-syslog records wrapped in ECS JSON. Every
+    input timestamp yields exactly one record at that time (whole
+    seconds, as the BSD header carries them). An `admin` timestamp starts
+    a Winbox session of an administrator drawn by weight; a small queue
+    holds the scheduled records - session steps, DHCP lease records of
+    the per-client lifecycles, episode steps - and the earliest due one
+    takes over the next timestamp of either input. Otherwise a `wan`
+    timestamp is an internet UDP packet logged by an input-chain rule.
+    Times are epoch seconds. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc).replace(microsecond=0) -%}
+{%- set now = module.builtins.int(ts.timestamp()) -%}
+{%- set hq = module.heapq -%}
+{#- Chain window: an external Winbox login followed by mangle add, move,
+    change and remove by the same user within this many seconds. -#}
+{%- set window = 1800 -%}
+{%- set hour = 3600 -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med, at least 1. -#}
+  {{- [module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig)), 1] | max -}}
+{%- endmacro -%}
+{%- macro ex(mean) -%}
+  {{- [module.builtins.int(module.rand.number.exponential(1.0 / mean)), 1] | max -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro hour_of(t) -%}
+  {#- Hour of the generator timezone, which anchors the input curves. -#}
+  {{- ((t + shared.get('tzoff')) // hour) % 24 -}}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its hour weighted by the admin
+      activity curve squared plus a small floor. -#}
+  {%- set curve = shared.get('curve') -%}
+  {%- set top = (curve | max) ** 2 + 0.02 -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, top) < curve[hour_of(c) | int] ** 2 + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro new_ops() -%}
+  {#- Edits of one session. About 65% of sessions edit; 60% of those
+      start with work on one mangle rule - added and moved into place,
+      then changed, sometimes removed again (a test rule), added and
+      taken back, or an earlier temporary rule moved, changed and
+      removed (clean-up) - followed by a geometric number of random
+      edits. The
+      more temporary rules exist, the more likely a random edit removes
+      one (clean-up); a remove with none left is logged as a change. -#}
+  {%- set ops = [] -%}
+  {%- set go = namespace(v=module.rand.chance(0.65)) -%}
+  {%- if go.v and module.rand.chance(0.6) -%}
+    {%- do ops.extend(module.rand.weighted_choice([['added', 'moved', 'changed'], ['added', 'moved', 'changed', 'removed'], ['added', 'removed'], ['added', 'changed', 'removed'], ['moved', 'changed', 'removed']], [25, 35, 20, 20, 20])) -%}
+    {%- set go.v = module.rand.chance(0.5) -%}
+  {%- endif -%}
+  {%- set rw = 9 * shared.get('temp_rules') -%}
+  {%- for _ in range(12) if go.v -%}
+    {%- do ops.append(module.rand.weighted_choice(['added', 'moved', 'changed', 'removed', 'item'], [15, 15, 33, rw + 0.001, 10])) -%}
+    {%- set go.v = module.rand.chance(0.62) -%}
+  {%- endfor -%}
+  {{- ops | join(',') -}}
+{%- endmacro -%}
+{%- macro session(ai, src, t0, ops) -%}
+  {#- Queue one Winbox session: login, the given edits with lognormal
+      gaps, logout; sometimes the user reconnects from the same address
+      a few minutes later (dropped link, second look). -#}
+  {%- set t = namespace(v=t0) -%}
+  {{- push(t.v, {'k': 'row', 'kind': 'login', 'a': ai, 'ip': src}) -}}
+  {%- for op in ops -%}
+    {%- set t.v = t.v + (ln(35, 1.1) | int) -%}
+    {{- push(t.v, {'k': 'row', 'kind': 'op', 'a': ai, 'op': op}) -}}
+  {%- endfor -%}
+  {%- set t.v = t.v + ((ln(120, 1.0) if ops else ln(180, 1.2)) | int) -%}
+  {{- push(t.v, {'k': 'row', 'kind': 'logout', 'a': ai, 'ip': src}) -}}
+  {%- if module.rand.chance(0.3) -%}
+    {{- push(t.v + (ln(420, 1.0) | int), {'k': 'again', 'a': ai, 'ip': src}) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'router_name': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 1}},
+    'router_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 7}},
+    'wan_ip': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'min_length': 7}},
+    'wan_gateway_mac': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^([0-9A-F]{2}:){5}[0-9A-F]{2}$'}},
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 4, 'le': 8760}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {#- Admin activity by hour of the generator timezone (relative rate,
+      peak 1): the hourly `admin` input rate of patterns/admin-*.yml.
+      Workstation DHCP joins are thinned by it; episode starts are
+      weighted by its square. -#}
+  {%- do shared.update({'queue': [], 'seq': 0, 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()), 'fw_left': 0, 'curve': [0.087, 0.087, 0.087, 0.087, 0.087, 0.395, 0.7, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.7, 0.395, 0.395, 0.207, 0.207, 0.207, 0.207, 0.087, 0.087]}) -%}
+  {%- set admins = [] -%}
+  {%- set aw = [] -%}
+  {%- for row in samples.admins -%}
+    {%- do admins.append({'user': row.user, 'w': row.weight, 'int': row.internal, 'ext': row.external | list, 'part': []}) -%}
+    {%- do aw.append(row.weight) -%}
+  {%- endfor -%}
+  {%- for row in samples.dhcp_clients -%}
+    {{- push(now + module.rand.number.integer(1, 4 * hour), {'k': 'join', 'c': loop.index0}) -}}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.update({'admins': admins, 'aw': aw, 'temp_rules': 0, 'ep_last': none, 'ep_due': pick_start(now, [interval, 24 * hour] | min) | int}) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- set admins = shared.get('admins') -%}
+{%- set curve = shared.get('curve') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Session start: an `admin` timestamp starts a Winbox session of an
+    administrator drawn by weight; about 40% come from the user's own
+    external addresses. Sessions of one user may overlap. -#}
+{%- if 'admin' in tags -%}
+  {%- set ai = module.rand.weighted_choice(range(admins | length) | list, shared.get('aw')) -%}
+  {%- set src = module.rand.choice(admins[ai].ext) if module.rand.chance(0.4) else admins[ai].int -%}
+  {{- session(ai, src, now, new_ops().split(',') | select | list) -}}
+{%- endif -%}
+{#- Episode: an extra session that starts at the first timestamp at or
+    after its drawn start; its records take over the following
+    timestamps like any queued record, so no background session is
+    replaced or moved. The administrator is drawn by background weight,
+    excluding the previous episode's, and logs in from one of his own
+    external addresses (the ones his background sessions use). He adds,
+    moves, changes and removes a mangle rule with background edit gaps,
+    all within the chain window, and logs out; the reconnect chance is
+    the background one. The first start falls within the first
+    min(interval, 24 h); each later start within a window of
+    min(interval / 4, 6 h) centred one interval after the actual start,
+    both weighted by the admin curve squared. Missed episodes are not
+    replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {%- set cand = range(admins | length) | reject('equalto', shared.get('ep_last')) | list -%}
+  {%- set wts = [] -%}
+  {%- for i in cand -%}{%- do wts.append(admins[i].w) -%}{%- endfor -%}
+  {%- set ai = module.rand.weighted_choice(cand, wts) -%}
+  {%- set src = module.rand.choice(admins[ai].ext) -%}
+  {%- set g = namespace(v=[], ok=false) -%}
+  {%- for _ in range(60) if not g.ok -%}
+    {%- set g.v = [] -%}
+    {%- for _ in range(4) -%}{%- do g.v.append(ln(35, 1.1) | int) -%}{%- endfor -%}
+    {%- set g.ok = (g.v | sum) <= window - 600 -%}
+  {%- endfor -%}
+  {%- set t = namespace(v=now) -%}
+  {{- push(t.v, {'k': 'row', 'kind': 'login', 'a': ai, 'ip': src, 'ep': true}) -}}
+  {%- for op in ['added', 'moved', 'changed', 'removed'] -%}
+    {%- set t.v = t.v + g.v[loop.index0] -%}
+    {{- push(t.v, {'k': 'row', 'kind': 'op', 'a': ai, 'op': op, 'ep': true}) -}}
+  {%- endfor -%}
+  {%- set t.v = t.v + (ln(120, 1.0) | int) -%}
+  {{- push(t.v, {'k': 'row', 'kind': 'logout', 'a': ai, 'ip': src, 'ep': true}) -}}
+  {%- if module.rand.chance(0.3) -%}
+    {{- push(t.v + (ln(420, 1.0) | int), {'k': 'again', 'a': ai, 'ip': src}) -}}
+  {%- endif -%}
+  {%- set w = [interval // 4, 6 * hour] | min -%}
+  {%- do shared.update({'ep_last': ai, 'ep_due': pick_start(now + interval - w // 2, w) | int}) -%}
+{%- endif -%}
+{#- The earliest due queued record takes this timestamp; lifecycle
+    control items popped on the way schedule further records. -#}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(48) if out.row is none and queue and queue[0][0] <= now -%}
+  {%- set top = hq.heappop(queue) -%}
+  {%- set due = top[0] -%}
+  {%- set item = top[2] -%}
+  {%- if item.k == 'row' -%}
+    {%- set out.row = item -%}
+  {%- elif item.k == 'join' -%}
+    {#- A client joins: workstations and laptops follow the activity
+        curve, other devices do not; the lease is released after a
+        lognormal stay. -#}
+    {%- set cl = samples.dhcp_clients[item.c] -%}
+    {%- set p = curve[hour_of(due) | int] if cl.kind in ['ws', 'nb'] else 0.6 -%}
+    {%- if module.rand.chance(p) -%}
+      {{- push(due, {'k': 'row', 'kind': 'dhcp', 'c': item.c, 'on': true}) -}}
+      {%- set stay = ln(3 * hour if cl.kind in ['ws', 'nb'] else 5 * hour, 1.0) | int -%}
+      {{- push(due + stay, {'k': 'row', 'kind': 'dhcp', 'c': item.c, 'on': false}) -}}
+      {{- push(due + stay + (ln(2 * hour, 1.1) | int), item) -}}
+    {%- else -%}
+      {{- push(due + ex(40 * 60) | int, item) -}}
+    {%- endif -%}
+  {%- elif item.k == 'again' -%}
+    {{- session(item.a, item.ip, due, new_ops().split(',') | select | list) -}}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.row is none -%}
+  {#- Unsolicited internet UDP to the WAN address, logged by an
+      input-chain rule with action=log (the packet's fate is set by
+      later rules and is not logged). A prober sends one to five
+      packets to one port; consecutive free timestamps continue the
+      current prober until its count is used up. -#}
+  {%- if shared.get('fw_left') > 0 -%}
+    {%- do shared.set('fw_left', shared.get('fw_left') - 1) -%}
+  {%- else -%}
+    {%- do shared.update({'fw_src': '198.51.100.' ~ module.rand.number.integer(1, 254), 'fw_port': module.rand.weighted_choice([53, 123, 161, 500, 1900, 4500, 5060], [30, 14, 18, 10, 12, 6, 10]), 'fw_left': module.rand.weighted_choice([0, 1, 2, 4], [70, 16, 9, 5])}) -%}
+  {%- endif -%}
+  {%- set out.row = {'kind': 'fw', 'src': shared.get('fw_src'), 'sport': module.rand.number.integer(1024, 65535), 'dport': shared.get('fw_port'), 'len': module.rand.number.integer(40, 480)} -%}
+{%- endif -%}
+{%- set row = out.row -%}
+{%- set kind = row.kind -%}
+{%- set ev = {'category': ['network'], 'type': ['info']} -%}
+{%- set actor = none -%}
+{%- set extra = {} -%}
+{%- if kind == 'fw' -%}
+  {%- set topic = 'firewall,info' -%}
+  {%- set action = 'firewall_log' -%}
+  {%- set message = 'input: in:ether1 out:(none), src-mac ' ~ (params.wan_gateway_mac | lower) ~ ', proto UDP, ' ~ row.src ~ ':' ~ row.sport ~ '->' ~ params.wan_ip ~ ':' ~ row.dport ~ ', len ' ~ row.len -%}
+  {%- do extra.update({'source': {'ip': row.src, 'port': row.sport, 'mac': params.wan_gateway_mac | replace(':', '-')}, 'destination': {'ip': params.wan_ip, 'port': row.dport}, 'network': {'transport': 'udp', 'bytes': row.len}, 'observer_ingress': 'ether1'}) -%}
+{%- elif kind == 'dhcp' -%}
+  {%- set cl = samples.dhcp_clients[row.c] -%}
+  {%- set topic = 'dhcp,info' -%}
+  {%- set action = 'dhcp_assigned' if row.on else 'dhcp_deassigned' -%}
+  {%- set message = 'defconf ' ~ ('assigned ' if row.on else 'deassigned ') ~ cl.ip ~ ' for ' ~ cl.mac ~ ' ' ~ cl.host -%}
+  {%- do extra.update({'client': {'ip': cl.ip, 'mac': cl.mac | replace(':', '-')}}) -%}
+{%- else -%}
+  {%- set adm = admins[row.a] -%}
+  {%- set actor = adm.user -%}
+  {#- Chain tracker, same semantics as a streaming ordered matcher keyed
+      by user: an external login opens a partial; add, move, change and
+      remove advance it in order; a partial older than the window is
+      dropped. A background remove that would complete a partial is
+      logged at the same time as another edit drawn by the random-edit
+      weights (the rule stays until a later ordinary remove). An
+      episode's remove completes its partials; they are kept until they
+      expire, so a later background remove of that user inside the
+      window is replaced the same way. -#}
+  {%- set part = adm.part | selectattr('t', 'ge', now - window) | list -%}
+  {%- if kind == 'op' -%}
+    {%- set op = row.op -%}
+    {%- if not row.get('ep') and op == 'removed' and shared.get('temp_rules') == 0 -%}{%- set op = 'changed' -%}{%- endif -%}
+    {%- set order = ['added', 'moved', 'changed', 'removed'] -%}
+    {%- if not row.get('ep') and op == 'removed' and part | selectattr('s', 'ge', 3) | list -%}
+      {%- set op = module.rand.weighted_choice(['added', 'moved', 'changed', 'item'], [15, 15, 33, 10]) -%}
+    {%- endif -%}
+    {%- for p in part if p.s < 4 and order[p.s] == op -%}{%- do p.update({'s': p.s + 1}) -%}{%- endfor -%}
+    {%- if op == 'added' -%}{%- do shared.set('temp_rules', shared.get('temp_rules') + 1) -%}{%- endif -%}
+    {%- if op == 'removed' -%}{%- do shared.set('temp_rules', [shared.get('temp_rules') - 1, 0] | max) -%}{%- endif -%}
+    {%- set topic = 'system,info' -%}
+    {%- set ev = {'category': ['configuration'], 'type': ['change']} -%}
+    {%- if op == 'item' -%}
+      {%- set action = 'item_added' -%}
+      {%- set message = 'item added by ' ~ actor -%}
+    {%- else -%}
+      {%- set action = 'mangle_rule_' ~ op -%}
+      {%- set message = 'mangle rule ' ~ op ~ ' by ' ~ actor -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set is_login = kind == 'login' -%}
+    {%- if is_login and row.ip != adm.int -%}{%- do part.append({'t': now, 's': 0}) -%}{%- endif -%}
+    {%- set topic = 'system,info,account' -%}
+    {%- set ev = {'category': ['authentication'], 'type': ['start' if is_login else 'end']} -%}
+    {%- set action = 'login' if is_login else 'logout' -%}
+    {%- set message = 'user ' ~ actor ~ ' logged ' ~ ('in' if is_login else 'out') ~ ' from ' ~ row.ip ~ ' via winbox' -%}
+    {%- do extra.update({'source': {'ip': row.ip}}) -%}
+  {%- endif -%}
+  {%- do adm.update({'part': part[-16:]}) -%}
+{%- endif -%}
+{%- set pri = 134 -%}
+{%- set original = '<' ~ pri ~ '>' ~ ts.strftime('%b ') ~ ('%2d' | format(ts.day)) ~ ts.strftime(' %H:%M:%S') ~ ' ' ~ params.router_name ~ ' ' ~ topic ~ ' ' ~ message -%}
+{%- set event = {
+  '@timestamp': ts.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'module': 'mikrotik', 'dataset': 'mikrotik.routeros.syslog', 'category': ev.category, 'type': ev.type, 'action': action, 'original': original},
+  'message': message,
+  'observer': {'hostname': params.router_name, 'ip': params.router_ip, 'vendor': 'MikroTik', 'product': 'RouterOS', 'type': 'router'},
+  'log': {'syslog': {'priority': pri, 'facility': {'code': 16, 'name': 'local0'}, 'severity': {'code': 6, 'name': 'info'}}},
+  'mikrotik': {'topics': topic.split(',')}
+} -%}
+{%- if actor is not none -%}{%- do event.update({'user': {'name': actor}, 'related': {'user': [actor]}}) -%}{%- endif -%}
+{%- if extra.get('observer_ingress') -%}{%- do event.observer.update({'ingress': {'interface': {'name': extra.pop('observer_ingress')}}}) -%}{%- endif -%}
+{%- do event.update(extra) -%}
+{%- if event.get('source') -%}
+  {%- set ips = [event.source.ip] + ([event.destination.ip] if event.get('destination') else []) -%}
+  {%- do event.update({'related': dict(event.get('related', {}), ip=ips)}) -%}
+{%- elif event.get('client') -%}
+  {%- do event.update({'related': {'ip': [event.client.ip]}}) -%}
+{%- endif -%}
+{{- module.json.dumps(event) -}}
