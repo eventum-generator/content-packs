@@ -1,0 +1,432 @@
+{#- VMware vCenter Server 8.0 vpxd events over remote syslog, as the
+    Elastic vSphere integration indexes them. The input sets the rate
+    and the hour-of-day curve; every timestamp becomes exactly one
+    record. Each timestamp takes the earliest due step of an open
+    session and, when none is due, starts a new session of an idle
+    account of the timestamp's population (automation or staff) picked
+    by its activity weight. An anomaly episode is one more staff
+    session of an idle administrator; its steps take ticks like any
+    other session. -#}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set tick = timestamp.astimezone(utc) -%}
+{%- set now = tick.timestamp() -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set window = 1800 -%}
+{%- set dom = params.sso_domain -%}
+{%- set dc = params.datacenter -%}
+{#- Wrong passwords before a staff login: 0-5, each extra failure
+    rarer than the previous one; 12% of failed starts give up. -#}
+{%- set fail_k = [0, 1, 2, 3, 4, 5] -%}
+{%- set fail_w = [930, 45, 15, 6, 3, 1] -%}
+{%- set giveup_p = 0.12 -%}
+{%- set roles = ['Admin', 'ReadOnly', 'VirtualMachinePowerUser', 'VirtualMachineUser', 'ResourcePoolAdministrator'] -%}
+{%- set role_w = [25, 30, 25, 15, 5] -%}
+
+{#- Hour-of-day load of the staff population relative to office hours;
+    it repeats patterns/staff-*.yml and only places episode starts. -#}
+{%- macro hload(t) -%}
+  {%- set h = ((t | int) // 3600) % 24 -%}
+  {{- 1.0 if 7 <= h < 17 else (0.2174 if 6 <= h < 19 else 0.0435) -}}
+{%- endmacro -%}
+
+{%- macro gap(median, sigma, lo, hi) -%}
+  {{- [[module.random.lognormvariate(module.math.log(median), sigma), lo] | max, hi] | min -}}
+{%- endmacro -%}
+
+{%- if shared.get('users') is none -%}
+  {%- if not (6 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- set users = [] -%}
+  {%- set pools = {'automation': [[], []], 'human': [[], []]} -%}
+  {%- set hist = {} -%}
+  {%- for row in samples.users -%}
+    {%- set pool = pools[row.population] -%}
+    {%- do pool[0].append(users | length) -%}
+    {%- do pool[1].append(((pool[1][-1] if pool[1] else 0) + row.weight) | float) -%}
+    {%- do users.append({'name': row.name, 'ip': row.ip, 'grp': row.population, 'role': row.role, 'w': row.weight | float, 'busy': false}) -%}
+    {%- if row.population == 'human' -%}{%- do hist.update({row.name: {'f': [], 'l': []}}) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set vms = [] -%}
+  {%- for row in samples.vms -%}
+    {%- do vms.append({'name': row.name, 'host': row.host, 'cls': row.tier, 'cpu': row.cpu, 'mem': row.memory_mb, 'on': true, 'busy': false}) -%}
+  {%- endfor -%}
+  {%- set principals = [] -%}
+  {%- for row in samples.principals -%}{%- do principals.append(dom ~ '\\' ~ row.name) -%}{%- endfor -%}
+  {%- set entities = [dc] -%}
+  {%- for row in samples.entities -%}{%- do entities.append(row.entity) -%}{%- endfor -%}
+  {%- do shared.update({'users': users, 'pools': pools, 'hist': hist, 'vms': vms,
+      'principals': principals, 'entities': entities, 'grants': {}, 'heap': [], 'plans': {},
+      'seq': 0, 'key': module.random.randint(300000, 900000),
+      'vpxd_pid': module.random.randint(3000, 60000), 'src_port': module.random.randint(32768, 60999),
+      'start_at': none, 'last_admin': none, 'last_principal': none, 'guarded': 0}) -%}
+{%- endif -%}
+{%- set users = shared.get('users') -%}
+{%- set vms = shared.get('vms') -%}
+{%- set hist = shared.get('hist') -%}
+{%- set grants = shared.get('grants') -%}
+{%- set heap = shared.get('heap') -%}
+{%- set plans = shared.get('plans') -%}
+
+{%- macro push(at, pid) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(heap, [at, n, pid]) -%}
+{%- endmacro -%}
+
+{#- Reserve an idle, powered-on VM of the given classes (fixed
+    inventory); the session powers it back on before releasing it. -#}
+{%- macro reserve(classes) -%}
+  {%- set free = [] -%}
+  {%- for v in vms -%}{%- if v.cls in classes and not v.busy -%}{%- do free.append(loop.index0) -%}{%- endif -%}{%- endfor -%}
+  {%- if free -%}
+    {%- set v = module.random.choice(free) -%}
+    {%- do vms[v].update({'busy': true}) -%}
+    {{- v -}}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- VM work of one operation: maintenance (power off, change CPU or
+    memory, power on) or a power cycle. `last_gap` is the delay after
+    the operation's final record. -#}
+{%- macro vm_op(steps, kind, classes, last_gap) -%}
+  {%- set v = reserve(classes) -%}
+  {%- if v != '' -%}
+    {%- set v = v | int -%}
+    {%- if kind == 'maint' -%}
+      {%- do steps.append(['off', gap(45, 0.6, 5, 300) | float, v]) -%}
+      {%- do steps.append(['reconf', gap(30, 0.6, 5, 300) | float, v]) -%}
+    {%- else -%}
+      {%- do steps.append(['off', gap(90, 0.7, 10, 900) | float, v]) -%}
+    {%- endif -%}
+    {%- do steps.append(['on', last_gap, v]) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- A staff session: wrong passwords (none for most), login, 0-3
+    operations by role, logout. An episode session has 3-5 failures,
+    drawn from the same law's tail, and a first operation that grants
+    the Admin role; everything else follows the same laws. -#}
+{%- macro staff_plan(a, ep) -%}
+  {%- set u = users[a] -%}
+  {%- do u.update({'busy': true}) -%}
+  {%- set steps = [] -%}
+  {%- set k = module.rand.weighted_choice(fail_k[3:], fail_w[3:]) if ep else module.rand.weighted_choice(fail_k, fail_w) -%}
+  {%- for i in range(k) -%}{%- do steps.append(['fail', gap(12, 0.6, 3, 90) | float, none]) -%}{%- endfor -%}
+  {%- if ep or k == 0 or not module.rand.chance(giveup_p) -%}
+    {%- if ep -%}
+      {%- set n = module.rand.weighted_choice([1, 2, 3], [25, 18, 12]) -%}
+    {%- elif u.role == 'admin' -%}
+      {%- set n = module.rand.weighted_choice([0, 1, 2, 3], [45, 25, 18, 12]) -%}
+    {%- elif u.role == 'operator' -%}
+      {%- set n = module.rand.weighted_choice([0, 1, 2], [50, 30, 20]) -%}
+    {%- else -%}
+      {%- set n = module.rand.weighted_choice([0, 1], [70, 30]) -%}
+    {%- endif -%}
+    {%- do steps.append(['login', (gap(60, 0.9, 5, 600) if n else gap(600, 1.0, 30, 7200)) | float, none]) -%}
+    {%- for j in range(n) -%}
+      {%- set g = (gap(120, 0.9, 10, 900) if j < n - 1 else gap(300, 1.0, 10, 3600)) | float -%}
+      {%- if ep and j == 0 -%}
+        {%- do steps.append(['grant_admin', g, none]) -%}
+      {%- elif u.role == 'admin' -%}
+        {%- set op = module.rand.weighted_choice(['perm', 'maint', 'cycle'], [30, 30, 40]) -%}
+        {%- if op == 'perm' -%}
+          {%- do steps.append(['perm', g, none]) -%}
+        {%- else -%}
+          {{- vm_op(steps, op, ['prod', 'batch', 'test'], g) -}}
+        {%- endif -%}
+      {%- elif u.role == 'operator' -%}
+        {{- vm_op(steps, module.rand.weighted_choice(['maint', 'cycle'], [40, 60]), ['prod', 'batch', 'test'], g) -}}
+      {%- else -%}
+        {{- vm_op(steps, 'cycle', ['batch', 'test'], g) -}}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- do steps.append(['logout', 0, none]) -%}
+  {%- endif -%}
+  {%- set pid = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', pid) -%}
+  {%- do plans.update({pid: {'a': a, 'steps': steps, 'i': 0, 'ep': ep, 'calls': 0, 'login': none}}) -%}
+  {{- pid -}}
+{%- endmacro -%}
+
+{#- A service-account session: login, logout after the role's usual
+    duration; the orchestrator sometimes power-cycles a batch VM. -#}
+{%- macro auto_plan(a) -%}
+  {%- set u = users[a] -%}
+  {%- set steps = [] -%}
+  {%- if u.role == 'poller' -%}
+    {%- do steps.append(['login', gap(3, 0.8, 0.5, 60) | float, none]) -%}
+  {%- elif u.role == 'collector' -%}
+    {%- do steps.append(['login', gap(120, 0.8, 5, 1800) | float, none]) -%}
+  {%- elif u.role == 'backup' -%}
+    {%- do steps.append(['login', gap(600, 0.9, 30, 7200) | float, none]) -%}
+  {%- else -%}
+    {%- do steps.append(['login', gap(5, 0.8, 1, 120) | float, none]) -%}
+    {%- if module.rand.chance(0.03) -%}{{- vm_op(steps, 'cycle', ['batch'], gap(10, 0.8, 1, 120) | float) -}}{%- endif -%}
+  {%- endif -%}
+  {%- do steps.append(['logout', 0, none]) -%}
+  {%- set pid = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', pid) -%}
+  {%- do plans.update({pid: {'a': a, 'steps': steps, 'i': 0, 'ep': false, 'calls': 0, 'login': none}}) -%}
+  {{- pid -}}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first timestamp; each later start is due
+    one interval after the actual previous start and falls in a window
+    w = min(interval / 4, 6 h) centred on the due time. Start times
+    are weighted by the squared staff hour curve plus a small floor.
+    No catch-up. -#}
+{%- macro pick_start(lo, hi) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range(((hi - top) // 3600) | int + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [(h * h + 0.02) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.uniform(slot[0], slot[1]) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and shared.get('start_at') is none -%}
+  {%- do shared.set('start_at', pick_start(now | int, (now + ([interval, 24] | min) * 3600) | int) | float) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and now >= shared.get('start_at') -%}
+  {#- An idle administrator, weighted like background, never the
+      previous episode's; if all are busy, try again next tick. -#}
+  {%- set cand = [] -%}
+  {%- for u in users -%}
+    {%- if u.role == 'admin' and not u.busy and u.name != shared.get('last_admin') -%}{%- do cand.append([loop.index0, u.w]) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if cand -%}
+    {%- set ids = [] -%}{%- set ws = [] -%}
+    {%- for c in cand -%}{%- do ids.append(c[0]) -%}{%- do ws.append(c[1]) -%}{%- endfor -%}
+    {%- set a = module.rand.weighted_choice(ids, ws) -%}
+    {%- set pid = staff_plan(a, true) | int -%}
+    {{- push(now, pid) -}}
+    {%- set due = now + interval * 3600 -%}
+    {%- set half = ([interval / 4, 6] | min) * 1800 -%}
+    {%- do shared.update({'last_admin': users[a].name, 'start_at': pick_start(due - half, due + half) | float}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 2. The earliest due step, else a new session of this timestamp's
+    population. -#}
+{%- set ns = namespace(pid=none) -%}
+{%- if heap and heap[0][0] <= now -%}
+  {%- set ns.pid = module.heapq.heappop(heap)[2] -%}
+{%- else -%}
+  {%- set pop = 'human' if 'staff' in tags else 'automation' -%}
+  {%- set pool = shared.get('pools')[pop] -%}
+  {%- for _ in range(16) -%}
+    {%- set i = module.bisect.bisect_right(pool[1], module.random.random() * pool[1][-1]) -%}
+    {%- set a = pool[0][[i, pool[0] | length - 1] | min] -%}
+    {%- if not users[a].busy -%}
+      {%- set ns.pid = (staff_plan(a, false) if pop == 'human' else auto_plan(a)) | int -%}
+      {%- break -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- if ns.pid is none -%}
+    {%- set pool = shared.get('pools')['automation'] -%}
+    {%- set i = module.bisect.bisect_right(pool[1], module.random.random() * pool[1][-1]) -%}
+    {%- set ns.pid = auto_plan(pool[0][[i, pool[0] | length - 1] | min]) | int -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set p = plans[ns.pid] -%}
+{%- set step = p.steps[p.i] -%}
+{%- set kind = step[0] -%}
+{%- set u = users[p.a] -%}
+
+{#- 3. Clocks: native createdTime is the event time; the syslog header
+    follows after a short delivery delay; @timestamp is the header in
+    milliseconds; ingest is seconds later, truncated to seconds. -#}
+{%- set created = tick -%}
+{%- set header = created + module.datetime.timedelta(seconds=gap(0.0005, 2.0, 0.0001, 2.5) | float) -%}
+{%- set at_ms = (header.replace(microsecond=0).timestamp() | int) * 1000 + header.microsecond // 1000 -%}
+{%- set at = module.datetime.datetime.fromtimestamp(at_ms / 1000, utc) -%}
+{%- set at_s = at.strftime('%Y-%m-%dT%H:%M:%S.') ~ '%03d' | format(at_ms % 1000) ~ 'Z' -%}
+{%- set frac = ('%06d' | format(created.microsecond)).rstrip('0') -%}
+{%- set native_time = created.strftime('%Y-%m-%dT%H:%M:%S.') ~ (frac if frac else '0') ~ 'Z' -%}
+{%- set ingested = (header + module.datetime.timedelta(seconds=gap(1.5, 0.8, 0.2, 30) | float)).strftime('%Y-%m-%dT%H:%M:%SZ') -%}
+{%- set key0 = shared.get('key') + 1 + ([module.random.lognormvariate(0.4, 1.0) | int, 60] | min) -%}
+{%- if kind in ['off', 'on', 'reconf'] -%}
+  {#- VM operations run as tasks; the task event (outside this subset)
+      opens the chain and the VM event follows it. -#}
+  {%- set chain_id = key0 -%}
+  {%- set key = key0 + 1 + module.random.randint(0, 2) -%}
+{%- else -%}
+  {%- set key = key0 -%}
+  {%- set chain_id = key0 -%}
+{%- endif -%}
+{%- do shared.set('key', key) -%}
+
+{#- Would a grant by this user now complete three failed logins, then
+    a login, then the grant, within the chain window? -#}
+{%- macro completes(name) -%}
+  {%- set h = hist[name] -%}
+  {%- set s = namespace(i=none, hit=false) -%}
+  {%- for f in h.f -%}
+    {%- if s.i is none and at_ms - f[0] <= window * 1000 -%}{%- set s.i = loop.index0 -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if s.i is not none and h.f | length - s.i >= 3 -%}
+    {%- set f3 = h.f[s.i + 2][1] -%}
+    {%- for l in h.l if l[1] > f3 -%}{%- set s.hit = true -%}{%- endfor -%}
+  {%- endif -%}
+  {{- 'y' if s.hit else '' -}}
+{%- endmacro -%}
+{%- macro remember(name, which) -%}
+  {%- set h = hist[name] -%}
+  {%- for side in ['f', 'l'] -%}
+    {%- for _ in range(h[side] | length) -%}
+      {%- if h[side] and h[side][0][0] < at_ms - (window + 60) * 1000 -%}{%- do h[side].pop(0) -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {%- do h[which].append([at_ms, key]) -%}
+{%- endmacro -%}
+
+{#- 4. The record of this step. -#}
+{%- set full = dom ~ '\\' ~ u.name -%}
+{%- set r = namespace(user=full, entity='', text='', auth=none, level='info') -%}
+{%- if kind == 'fail' -%}
+  {%- set r.cls = 'vim.event.EventEx' -%}
+  {%- set r.user = u.name -%}
+  {%- set r.text = 'Failed login ' ~ u.name ~ ' from ' ~ u.ip ~ ' at ' ~ created.strftime('%m/%d/%Y %H:%M:%S') ~ ' GMT in SSO' -%}
+  {%- set r.auth = 'fail' -%}
+  {{- remember(u.name, 'f') -}}
+{%- elif kind == 'login' -%}
+  {%- set r.cls = 'vim.event.UserLoginSessionEvent' -%}
+  {%- set r.text = 'User ' ~ full ~ '@' ~ u.ip ~ ' logged in as Go-http-client/1.1' -%}
+  {%- set r.auth = 'login' -%}
+  {%- do p.update({'login': created, 'calls': module.random.randint(1, 3)}) -%}
+  {%- if u.grp == 'human' -%}{{- remember(u.name, 'l') -}}{%- endif -%}
+{%- elif kind == 'logout' -%}
+  {%- set r.cls = 'vim.event.UserLogoutSessionEvent' -%}
+  {%- set dur = now - p.login.timestamp() -%}
+  {%- set rate = {'poller': [0.5, 2], 'collector': [2, 6], 'backup': [0.3, 1], 'orchestrator': [0.2, 0.8]}.get(u.role, [0.1, 1.2]) -%}
+  {%- set calls = p.calls + module.random.randint(1, 12) + (dur * module.random.uniform(rate[0], rate[1])) | int -%}
+  {%- set login_label = p.login.strftime('%A, %d %B, %Y %I:%M:%S %p') -%}
+  {%- set r.text = 'User ' ~ full ~ '@' ~ u.ip ~ ' logged out (login time: ' ~ login_label ~ ', number of API invocations: ' ~ '{:,}'.format(calls) ~ ', user agent: Go-http-client/1.1)' -%}
+  {%- set r.auth = 'logout' -%}
+  {%- set start_s = p.login.strftime('%Y-%m-%dT%H:%M:%S') -%}
+  {%- set start_ms = (p.login.replace(microsecond=0).timestamp() * 1000) | int -%}
+{%- elif kind in ['off', 'on', 'reconf'] -%}
+  {%- set vm = vms[step[2]] -%}
+  {%- set r.entity = dc -%}
+  {%- do p.update({'calls': p.calls + module.random.randint(4, 30)}) -%}
+  {%- if kind == 'reconf' -%}
+    {%- set r.cls = 'vim.event.VmReconfiguredEvent' -%}
+    {%- if module.rand.chance(0.6) -%}
+      {%- set ladder = [1, 2, 4, 8, 16] -%}{%- set field = 'numCPU' -%}{%- set old = vm.cpu -%}
+    {%- else -%}
+      {%- set ladder = [2048, 4096, 8192, 16384, 32768, 65536] -%}{%- set field = 'memoryMB' -%}{%- set old = vm.mem -%}
+    {%- endif -%}
+    {%- set pos = ladder.index(old) -%}
+    {%- set up = pos == 0 or (pos < ladder | length - 1 and module.rand.chance(0.65)) -%}
+    {%- set new = ladder[pos + 1] if up else ladder[pos - 1] -%}
+    {%- do vm.update({'cpu': new} if field == 'numCPU' else {'mem': new}) -%}
+    {%- set r.text = 'Reconfigured ' ~ vm.name ~ ' on ' ~ vm.host ~ ' in ' ~ dc ~ '. Modified: config.hardware.' ~ field ~ ': ' ~ old ~ ' -> ' ~ new ~ ';' -%}
+  {%- else -%}
+    {%- set r.cls = 'vim.event.VmPoweredOffEvent' if kind == 'off' else 'vim.event.VmPoweredOnEvent' -%}
+    {%- do vm.update({'on': kind == 'on', 'busy': kind != 'on'}) -%}
+    {%- set r.text = vm.name ~ ' on ' ~ vm.host ~ ' in ' ~ dc ~ ' is powered ' ~ kind -%}
+  {%- endif -%}
+{%- else -%}
+  {#- Permission work. Temporary grants expire after a lognormal lease
+      (median 36 h); an administrator removes an expired one in a later
+      session. One permission per principal and entity. -#}
+  {%- set r.entity = dc -%}
+  {%- do p.update({'calls': p.calls + module.random.randint(4, 30)}) -%}
+  {%- set due = [] -%}
+  {%- for g, v in grants.items() if v <= now -%}{%- do due.append([v, g]) -%}{%- endfor -%}
+  {%- set s = namespace(pair=none) -%}
+  {%- if kind == 'perm' and due and module.rand.chance(0.7) -%}
+    {%- set s.pair = (due | min)[1] -%}
+  {%- else -%}
+    {%- for _ in range(40) -%}
+      {%- set pr = module.random.choice(shared.get('principals')) -%}
+      {%- set en = module.random.choice(shared.get('entities')) -%}
+      {%- if s.pair is none and (pr ~ '|' ~ en) not in grants and not (kind == 'grant_admin' and pr == shared.get('last_principal')) -%}
+        {%- set s.pair = pr ~ '|' ~ en -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- if s.pair is none -%}
+      {%- set s.pair = (due | min)[1] if due else (grants | list | first) -%}
+      {%- set kind = 'remove' -%}
+    {%- else -%}
+      {%- set kind = 'grant_admin' if kind == 'grant_admin' else 'grant' -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set principal = s.pair.split('|')[0] -%}
+  {%- set entity = s.pair.split('|')[1] -%}
+  {%- if kind == 'grant' or kind == 'grant_admin' -%}
+    {%- if kind == 'grant_admin' -%}
+      {%- set role = 'Admin' -%}
+      {%- do shared.set('last_principal', principal) -%}
+    {%- else -%}
+      {%- set role = module.rand.weighted_choice(roles, role_w) -%}
+      {%- if role == 'Admin' and completes(u.name) -%}
+        {#- Guard: a background Admin grant that would complete the
+            chain gets another role, drawn by the background weights. -#}
+        {%- set role = module.rand.weighted_choice(roles[1:], role_w[1:]) -%}
+        {%- do shared.set('guarded', shared.get('guarded') + 1) -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- do grants.update({s.pair: now + gap(129600, 0.8, 7200, 1209600) | float}) -%}
+    {%- set r.cls = 'vim.event.PermissionAddedEvent' -%}
+    {%- set r.text = 'Permission created for ' ~ principal ~ ' on ' ~ entity ~ ', role is ' ~ role ~ ', propagation is ' ~ ('Enabled' if module.rand.chance(0.85) else 'Disabled') -%}
+  {%- else -%}
+    {%- do grants.pop(s.pair) -%}
+    {%- set r.cls = 'vim.event.PermissionRemovedEvent' -%}
+    {%- set r.text = 'Permission rule removed for ' ~ principal ~ ' on ' ~ entity -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 5. Advance the session. -#}
+{%- do p.update({'i': p.i + 1}) -%}
+{%- if p.i < p.steps | length -%}
+  {{- push(now + step[1], ns.pid) -}}
+{%- else -%}
+  {%- do plans.pop(ns.pid) -%}
+  {%- if u.grp == 'human' -%}{%- do u.update({'busy': false}) -%}{%- endif -%}
+{%- endif -%}
+
+{#- 6. Render: the syslog line and the fields the integration adds. -#}
+{%- set tail = '[' ~ r.user ~ '] [' ~ r.entity ~ '] [' ~ chain_id ~ '] [' ~ r.text ~ ']' -%}
+{%- set header_s = header.isoformat(timespec='microseconds') -%}
+{%- set pid_v = shared.get('vpxd_pid') -%}
+{%- set raw = '<14>1 ' ~ header_s ~ ' ' ~ params.vcenter_host ~ ' vpxd ' ~ pid_v ~ ' - -  Event [' ~ key ~ '] [1-1] [' ~ native_time ~ '] [' ~ r.cls ~ '] [' ~ r.level ~ '] ' ~ tail -%}
+{%- set body = {
+  '@timestamp': at_s,
+  'agent': {'ephemeral_id': params.agent_ephemeral_id, 'id': params.agent_id, 'name': params.collector_name, 'type': 'filebeat', 'version': params.agent_version},
+  'data_stream': {'dataset': 'vsphere.log', 'namespace': 'default', 'type': 'logs'},
+  'ecs': {'version': '8.11.0'},
+  'elastic_agent': {'id': params.agent_id, 'snapshot': false, 'version': params.agent_version},
+  'event': {'agent_id_status': 'verified', 'dataset': 'vsphere.log', 'id': key | string, 'ingested': ingested, 'kind': 'event', 'original': raw, 'timezone': '+00:00'},
+  'host': {'architecture': 'x86_64', 'containerized': false, 'hostname': params.collector_name, 'id': params.collector_host_id, 'ip': [params.collector_ip], 'mac': [params.collector_mac], 'name': params.vcenter_host,
+           'os': {'codename': 'jammy', 'family': 'debian', 'kernel': '5.15.0-122-generic', 'name': 'Ubuntu', 'platform': 'ubuntu', 'type': 'linux', 'version': '22.04.5 LTS (Jammy Jellyfish)'}},
+  'input': {'type': 'udp'},
+  'log': {'level': r.level, 'logger': r.cls, 'source': {'address': params.vcenter_ip ~ ':' ~ shared.get('src_port')},
+          'syslog': {'facility': {'code': 1, 'name': 'User'}, 'priority': 14, 'severity': {'code': 6, 'name': 'Informational'}}},
+  'message': tail,
+  'process': {'name': 'vpxd', 'pid': pid_v},
+  'tags': ['preserve_original_event', 'vmware-sphere']
+} -%}
+{%- if r.auth is not none -%}
+  {%- do body.update({'client': {'ip': u.ip}, 'source': {'ip': u.ip}, 'related': {'ip': [u.ip]}}) -%}
+  {%- do body.event.update({'category': ['authentication'], 'type': ['info']}) -%}
+  {%- if r.auth == 'fail' -%}
+    {%- do body.event.update({'outcome': 'failure'}) -%}
+    {%- do body.update({'user': {'name': u.name}}) -%}
+  {%- else -%}
+    {%- do body.event.update({'action': r.auth, 'outcome': 'success'}) -%}
+    {%- do body.update({'user': {'domain': dom, 'name': u.name},
+        'user_agent': {'device': {'name': 'Other'}, 'name': 'Go-http-client', 'original': 'Go-http-client/1.1', 'version': '1.1'}}) -%}
+    {%- if r.auth == 'logout' -%}
+      {%- do body.event.update({'start': start_s ~ '.000Z', 'end': at_s, 'duration': (at_ms - start_ms) * 1000000}) -%}
+      {%- do body.update({'vsphere': {'log': {'api': {'invocations': calls}}}}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{{ body | tojson }}
