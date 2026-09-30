@@ -1,0 +1,367 @@
+{#- One Stormshield SNS firewall between office workstations and a
+    server segment. It writes l_alarm records (alarm 85, interactive SSH
+    session detected) and l_connection records (one per closed
+    connection). The input sets the rate and the hour-of-day curve;
+    every timestamp becomes exactly one record: the earliest due record
+    of an open session or task, otherwise the first record of a new
+    background action (an admin SSH task or a web/NTP connection) drawn
+    by the hourly mix. The anomaly episode queues its own sessions for
+    one admin workstation and takes ticks of the same stream; it never
+    removes or moves a background record. -#}
+{%- set now_f = timestamp.timestamp() -%}
+{%- set now = now_f | int -%}
+{%- set utc = module.datetime.timezone.utc -%}
+{%- set interval = params.anomaly_interval_hours | float -%}
+{%- set bulk_bytes = 104857600 -%}
+{%- set window = 3600 -%}
+{%- set max_gap = 900 -%}
+{#- Admin tasks per second at unit load, the share of scp transfers
+    among admin sessions, and the web/NTP connections per second
+    (load-proportional part and floor). Together with 1.8 records per
+    admin session they give the record rate of the input bands. -#}
+{%- set task_rate = 0.00275 -%}
+{%- set xfer = 0.2 -%}
+{%- set web_rate = 0.0587 -%}
+{%- set web_floor = 0.004 -%}
+{%- set servers = [
+    ['10.20.0.11', 'srv_app01'], ['10.20.0.12', 'srv_app02'],
+    ['10.20.0.13', 'srv_app03'], ['10.20.0.21', 'srv_db01'],
+    ['10.20.0.22', 'srv_db02'], ['10.20.0.23', 'srv_db03'],
+    ['10.20.0.31', 'srv_files01'], ['10.20.0.32', 'srv_files02'],
+    ['10.20.0.41', 'srv_backup01'], ['10.20.0.51', 'srv_mon01'],
+    ['10.20.0.52', 'srv_log01'], ['10.20.0.61', 'srv_git01'],
+    ['10.20.0.62', 'srv_ci01'], ['10.20.0.63', 'srv_ci02'],
+    ['10.20.0.71', 'srv_mail01'], ['10.20.0.81', 'srv_proxy01'],
+    ['10.20.0.91', 'srv_k8s01'], ['10.20.0.92', 'srv_k8s02'],
+    ['10.20.0.93', 'srv_k8s03'], ['10.20.0.101', 'srv_vpn01'],
+    ['10.20.0.111', 'srv_erp01'], ['10.20.0.112', 'srv_erp02'],
+    ['10.20.0.121', 'srv_web01'], ['10.20.0.122', 'srv_web02']] -%}
+{%- set web = [['10.20.0.121', 'srv_web01'], ['10.20.0.122', 'srv_web02'],
+    ['10.20.0.111', 'srv_erp01'], ['10.20.0.112', 'srv_erp02'],
+    ['10.20.0.61', 'srv_git01'], ['10.20.0.71', 'srv_mail01']] -%}
+
+{%- macro lgn(median, sigma) -%}
+{{- module.rand.number.lognormal(module.math.log(median), sigma) -}}
+{%- endmacro -%}
+{%- macro clamp(v, lo, hi) -%}{{- [[v | float, lo] | max, hi] | min -}}{%- endmacro -%}
+
+{#- Hour-of-day activity of people (UTC): office hours, evening, night.
+    The input bands carry the same shape. -#}
+{%- macro hload(t) -%}
+  {%- set h = (t // 3600) % 24 -%}
+  {{- 1.6842 if 8 <= h < 18 else (0.7368 if 18 <= h < 22 else 0.2632) -}}
+{%- endmacro -%}
+
+{%- if not shared.get('initialized', false) -%}
+  {%- if not (2 <= interval <= 8760) -%}{{ module.math.sqrt(-1) }}{%- endif -%}
+  {%- if not (4 <= params.admin_count <= 60) or not (10 <= params.user_count <= 200) -%}
+    {{ module.math.sqrt(-1) }}
+  {%- endif -%}
+  {%- set admins = [] -%}
+  {%- set admin_w = [] -%}
+  {%- for n in range(params.admin_count) -%}
+    {%- set own = [] -%}
+    {%- set own_w = [] -%}
+    {%- for s in module.rand.shuffle(servers)[:module.rand.number.integer(6, 11)] -%}
+      {%- do own.append(s) -%}
+      {%- do own_w.append(clamp(module.rand.number.lognormal(0, 0.8), 0.4, 2.5) | float) -%}
+    {%- endfor -%}
+    {%- do admins.append({'ip': '10.10.5.' ~ (11 + n),
+        'name': 'adm_ws' ~ '%02d' | format(n + 1), 'srv': own, 'w': own_w}) -%}
+    {%- do admin_w.append(clamp(module.rand.number.lognormal(0, 0.5), 0.5, 2.0) | float) -%}
+  {%- endfor -%}
+  {#- Episode tier: admin workstations with at least 0.8 of an average
+      share of admin work, and on each of them the servers it reaches
+      at least 10 times in four days (about 1700 alarms 85 in four
+      days), so every pair an episode uses also occurs in ordinary
+      traffic of any few days. -#}
+  {%- set tot = admin_w | sum -%}
+  {%- set ep = namespace(i=[], w=[]) -%}
+  {%- for a in admins -%}
+    {%- set ai = loop.index0 -%}
+    {%- set share = admin_w[ai] / tot -%}
+    {%- set sw = a.w | sum -%}
+    {%- set es = [] -%}{%- set ew = [] -%}
+    {%- for j in range(a.srv | length) if 1700 * share * a.w[j] / sw >= 10 -%}
+      {%- do es.append(a.srv[j]) -%}{%- do ew.append(a.w[j]) -%}
+    {%- endfor -%}
+    {%- if es | length >= 3 and share * admins | length >= 0.8 -%}
+      {%- set ep.i = ep.i + [ai] -%}{%- set ep.w = ep.w + [admin_w[ai]] -%}
+    {%- else -%}
+      {#- Outside the tier (only used when the tier is too small): the
+          three servers it reaches most. -#}
+      {%- set es = [] -%}{%- set ew = [] -%}
+      {%- set order = a.w | sort(reverse=true) -%}
+      {%- for j in range(a.srv | length) if a.w[j] >= order[2] -%}
+        {%- do es.append(a.srv[j]) -%}{%- do ew.append(a.w[j]) -%}
+      {%- endfor -%}
+    {%- endif -%}
+    {%- do a.update({'es': es, 'ew': ew}) -%}
+  {%- endfor -%}
+  {%- if ep.i | length < 2 -%}
+    {%- set order = admin_w | sort(reverse=true) -%}
+    {%- set ep.i = [] -%}{%- set ep.w = [] -%}
+    {%- for ai in range(admins | length) if admin_w[ai] >= order[1] -%}
+      {%- set ep.i = ep.i + [ai] -%}{%- set ep.w = ep.w + [admin_w[ai]] -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {%- set users = [] -%}
+  {%- set user_w = [] -%}
+  {%- for n in range(params.user_count) -%}
+    {%- do users.append('10.10.1.' ~ (20 + n)) -%}
+    {%- do user_w.append(module.rand.number.lognormal(0, 1.3)) -%}
+  {%- endfor -%}
+  {%- do shared.update({'initialized': true, 'admins': admins,
+      'admin_w': admin_w, 'ep_i': ep.i, 'ep_w': ep.w, 'users': users,
+      'user_w': user_w, 'q': [], 'seq': 0, 'hist': {}, 'scheduled': false,
+      'start_at': none, 'last_admin': none}) -%}
+{%- endif -%}
+{%- set admins = shared.get('admins') -%}
+{%- set q = shared.get('q') -%}
+{%- set hist = shared.get('hist') -%}
+
+{#- Queue a record: [due, sequence, item]. -#}
+{%- macro push(at, item) -%}
+  {%- set n = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', n) -%}
+  {%- do module.heapq.heappush(q, [at, n, item]) -%}
+{%- endmacro -%}
+
+{#- Gap between the session starts of one admin task. -#}
+{%- macro gap() -%}{{- [lgn(90, 1.2) | float, max_gap] | min + 1 -}}{%- endmacro -%}
+
+{#- Plan one SSH session starting at `at`. An interactive session
+    raises alarm 85 when it starts and closes `dur` seconds later; a
+    transfer (scp) writes only its connection record. A transfer that
+    opens a new task (`now_close`) closes at this timestamp. -#}
+{%- macro ssh(admin, srv, at, bulk, episode, now_close) -%}
+  {%- if bulk -%}
+    {%- set r = namespace(v=lgn(60000000, 1.3) | float | int) -%}
+    {%- if episode -%}
+      {%- for i in range(40) if r.v < bulk_bytes -%}
+        {%- set r.v = lgn(60000000, 1.3) | float | int -%}
+      {%- endfor -%}
+      {%- set r.v = [r.v, bulk_bytes + module.rand.number.integer(1, 999999)] | max -%}
+    {%- endif -%}
+    {%- set rcvd = r.v -%}
+    {%- set dur = rcvd / (lgn(35000000, 0.5) | float) + lgn(2, 0.6) | float -%}
+    {%- set sent = (rcvd * module.rand.number.floating(0.004, 0.03)) | int + 3000 -%}
+  {%- else -%}
+    {%- set rcvd = lgn(180000, 1.6) | float | int + 2500 -%}
+    {%- set sent = lgn(25000, 1.4) | float | int + 1800 -%}
+    {%- set dur = lgn(420, 1.3) | float + 1 -%}
+  {%- endif -%}
+  {%- set sess = {'src': admin.ip, 'srcname': admin.name, 'dst': srv[0],
+      'dstname': srv[1], 'svc': 'ssh', 'start': at,
+      'sport': module.rand.number.integer(1024, 65535), 'dur': dur,
+      'sent': sent, 'rcvd': rcvd, 'episode': episode} -%}
+  {%- if not bulk -%}
+    {%- do push(at, {'k': 'start', 's': sess}) -%}
+  {%- elif now_close -%}
+    {%- do sess.update({'start': now_f - dur}) -%}
+    {%- do push(now_f, {'k': 'conn', 's': sess}) -%}
+  {%- else -%}
+    {%- do push(at + dur, {'k': 'conn', 's': sess}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+
+{#- 1. Episode scheduling, by source time. The first start falls within
+    min(interval, 24 h) of the first record, its hour drawn from the
+    hour-of-day curve. Each later start is due one interval after the
+    actual previous start and falls in a window of
+    w = min(interval / 4, 6 h) centred on the due time, weighted by the
+    squared curve plus a small floor. -#}
+{%- macro pick_start(lo, hi, squared) -%}
+  {%- set s = namespace(slots=[], w=[]) -%}
+  {%- set top = lo - lo % 3600 -%}
+  {%- for k in range((hi - top) // 3600 + 1) -%}
+    {%- set a = [top + k * 3600, lo] | max -%}
+    {%- set b = [top + (k + 1) * 3600, hi] | min -%}
+    {%- if b > a -%}
+      {%- set h = hload(a) | float -%}
+      {%- set s.slots = s.slots + [[a, b]] -%}
+      {%- set s.w = s.w + [((h * h + 0.02) if squared else h) * (b - a)] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set slot = module.rand.weighted_choice(s.slots, s.w) -%}
+  {{- module.random.randint(slot[0], slot[1] - 1) -}}
+{%- endmacro -%}
+{%- if params.anomaly_mode and not shared.get('scheduled') -%}
+  {%- do shared.update({'scheduled': true, 'start_at':
+      pick_start(now, now + (([interval, 24] | min) * 3600) | int, false) | int}) -%}
+{%- endif -%}
+{%- if params.anomaly_mode and shared.get('start_at') is not none and now >= shared.get('start_at') -%}
+  {#- One admin workstation of the episode tier (activity-weighted, not
+      the previous episode's) opens interactive sessions to three
+      different servers it often reaches, with ordinary task gaps, and
+      then pulls a transfer of 100 MiB or more over SSH. Its ordinary
+      work goes on alongside. -#}
+  {%- set ep_i = shared.get('ep_i') -%}
+  {%- set pool = namespace(i=[], w=[]) -%}
+  {%- for j in range(ep_i | length) if admins[ep_i[j]].ip != shared.get('last_admin') -%}
+    {%- set pool.i = pool.i + [ep_i[j]] -%}{%- set pool.w = pool.w + [shared.get('ep_w')[j]] -%}
+  {%- endfor -%}
+  {%- set a = admins[module.rand.weighted_choice(pool.i, pool.w)] -%}
+  {%- set picked = [] -%}
+  {%- for i in range(80) if picked | length < 3 -%}
+    {%- set s = module.rand.weighted_choice(a.es, a.ew) -%}
+    {%- if s not in picked -%}{%- do picked.append(s) -%}{%- endif -%}
+  {%- endfor -%}
+  {%- set t = namespace(at=now_f) -%}
+  {%- for s in picked -%}
+    {%- if not loop.first -%}{%- set t.at = t.at + gap() | float -%}{%- endif -%}
+    {%- do ssh(a, s, t.at, false, true, false) -%}
+  {%- endfor -%}
+  {%- set t.at = t.at + gap() | float -%}
+  {%- do ssh(a, module.rand.weighted_choice(a.es, a.ew), t.at, true, true, false) -%}
+  {%- set due = now + (interval * 3600) | int -%}
+  {%- set half = (([interval / 4, 6] | min) * 1800) | int -%}
+  {%- do shared.update({'last_admin': a.ip,
+      'start_at': pick_start(due - half, due + half, true) | int}) -%}
+{%- endif -%}
+
+{#- 2. Nothing due: start a background action. Admin tasks and web/NTP
+    connections keep their hourly proportions. -#}
+{%- if not (q and q[0][0] <= now_f) -%}
+  {%- set load = hload(now) | float -%}
+  {%- if module.rand.chance(task_rate * load / ((task_rate + web_rate) * load + web_floor)) -%}
+    {#- An admin task touches one or several servers of the
+        workstation's own set, some sessions being scp transfers. -#}
+    {%- set a = module.rand.weighted_choice(admins, shared.get('admin_w')) -%}
+    {%- set n = module.rand.weighted_choice([1, 2, 3, 4, 5, 6], [38, 22, 16, 11, 8, 5]) -%}
+    {%- set t = namespace(at=now_f, prev=none) -%}
+    {%- for i in range(n) -%}
+      {%- if i > 0 -%}{%- set t.at = t.at + gap() | float -%}{%- endif -%}
+      {%- if t.prev is not none and module.rand.chance(0.2) -%}
+        {%- set s = t.prev -%}
+      {%- else -%}
+        {%- set s = module.rand.weighted_choice(a.srv, a.w) -%}
+      {%- endif -%}
+      {%- set t.prev = s -%}
+      {%- do ssh(a, s, t.at, module.rand.chance(xfer), false, i == 0) -%}
+    {%- endfor -%}
+  {%- else -%}
+    {#- Ordinary traffic from all workstations to internal web servers
+        and the firewall NTP service, logged when it closes. -#}
+    {%- if module.rand.chance(0.2) -%}
+      {%- set a = module.rand.weighted_choice(admins, shared.get('admin_w')) -%}
+      {%- set src = a.ip -%}{%- set srcname = a.name -%}
+    {%- else -%}
+      {%- set src = module.rand.weighted_choice(shared.get('users'), shared.get('user_w')) -%}
+      {%- set srcname = none -%}
+    {%- endif -%}
+    {%- set svc = module.rand.weighted_choice(['https', 'http', 'ntp'], [78, 16, 6]) -%}
+    {%- if svc == 'ntp' -%}
+      {%- set d = ['10.10.1.254', 'Firewall_in'] -%}
+      {%- set dur = module.rand.number.floating(0.0, 0.2) -%}
+      {%- set sent = 48 -%}{%- set rcvd = 48 -%}
+    {%- else -%}
+      {%- set d = module.rand.choice(web) -%}
+      {%- set dur = lgn(6, 1.6) | float -%}
+      {%- set sent = lgn(1800, 1.1) | float | int + 300 -%}
+      {%- set rcvd = lgn(24000, 1.7) | float | int + 400 -%}
+    {%- endif -%}
+    {%- do push(now_f, {'k': 'conn', 's': {'src': src, 'srcname': srcname,
+        'dst': d[0], 'dstname': d[1], 'svc': svc, 'start': now_f - dur,
+        'sport': (123 if svc == 'ntp' else module.rand.number.integer(1024, 65535)),
+        'dur': dur, 'sent': sent, 'rcvd': rcvd, 'episode': false}}) -%}
+  {%- endif -%}
+{%- endif -%}
+
+{#- 3. Emit the earliest due record. An interactive session starts
+    now: alarm 85, and its connection record is due when it closes.
+    A connection record lasts from its start to now. -#}
+{%- set e = module.heapq.heappop(q)[2] -%}
+{%- set s = e.s -%}
+{%- set rcvd = s.rcvd -%}
+{%- if e.k == 'start' -%}
+  {%- do s.update({'start': now_f}) -%}
+  {%- do push(now_f + s.dur, {'k': 'conn', 's': s}) -%}
+  {#- Latest alarm per destination of this source within the chain
+      window (bounded by the number of servers). -#}
+  {%- set h = {} -%}
+  {%- for d, at in hist.get(s.src, {}).items() if at >= now - window -%}
+    {%- do h.update({d: at}) -%}
+  {%- endfor -%}
+  {%- do h.update({s.dst: now}) -%}
+  {%- do hist.update({s.src: h}) -%}
+  {%- set kind = 'alarm' -%}
+{%- else -%}
+  {%- set kind = 'conn' -%}
+  {%- set dur_s = now_f - s.start -%}
+  {#- Guard on the final chain step only: an ordinary SSH transfer of
+      100 MiB or more closing within the hour after the same source's
+      alarms for three different servers carries a smaller volume. -#}
+  {%- if s.svc == 'ssh' and not s.episode and rcvd >= bulk_bytes -%}
+    {%- set hc = namespace(n=0) -%}
+    {%- for d, at in hist.get(s.src, {}).items() if at >= now - window -%}
+      {%- set hc.n = hc.n + 1 -%}
+    {%- endfor -%}
+    {%- if hc.n >= 3 -%}
+      {%- set r = namespace(v=rcvd) -%}
+      {%- for i in range(40) if r.v >= bulk_bytes -%}
+        {%- set r.v = lgn(60000000, 1.3) | float | int -%}
+      {%- endfor -%}
+      {%- set rcvd = [r.v, bulk_bytes - module.rand.number.integer(1000000, 60000000)] | min -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+
+{%- set iso = module.datetime.datetime.fromtimestamp(now, utc) -%}
+{%- set start = module.datetime.datetime.fromtimestamp(s.start | int, utc) -%}
+{%- set ltime = iso.strftime('%Y-%m-%d %H:%M:%S') -%}
+{%- set head = 'id=firewall time="' ~ ltime ~ '" fw="' ~ params.firewall_name ~ '" tz=+0000 startime="' -%}
+{%- set srcname_kv = (' srcname=' ~ s.srcname) if s.srcname else '' -%}
+{%- if kind == 'alarm' -%}
+  {%- set raw = head ~ ltime ~ '" pri=4 srcif="Ethernet1" srcifname="in" ipproto=tcp proto=ssh src='
+    ~ s.src ~ ' srcport=' ~ s.sport ~ ' srcportname=ephemeral_fw' ~ srcname_kv ~ ' dst=' ~ s.dst
+    ~ ' dstport=22 dstportname=ssh dstname=' ~ s.dstname
+    ~ ' action=pass msg="Interactive connection detected" class=protocol classification=0 alarmid=85 logtype="alarm"' -%}
+  {%- set record = {'@timestamp': iso.isoformat(), 'ecs': {'version': '8.17.0'},
+    'event': {'kind': 'alert', 'dataset': 'stormshield.sns',
+      'category': ['network', 'intrusion_detection'], 'type': ['info'],
+      'action': 'interactive_connection_detected', 'code': '85', 'severity': 4,
+      'original': raw},
+    'observer': {'name': params.firewall_name, 'vendor': 'Stormshield',
+      'product': 'SNS', 'type': 'firewall',
+      'ingress': {'interface': {'id': 'Ethernet1', 'name': 'in'}}},
+    'source': {'ip': s.src, 'port': s.sport},
+    'destination': {'ip': s.dst, 'port': 22, 'domain': s.dstname},
+    'network': {'transport': 'tcp', 'protocol': 'ssh', 'type': 'ipv4'},
+    'message': 'Interactive connection detected',
+    'related': {'ip': [s.src, s.dst], 'hosts': ([s.srcname] if s.srcname else []) + [s.dstname]},
+    'stormshield': {'sns': {'logtype': 'alarm', 'priority': 4, 'action': 'pass',
+      'alarm_id': 85, 'class': 'protocol', 'classification': 0}}} -%}
+{%- else -%}
+  {%- set proto = s.svc -%}
+  {%- set port = {'ssh': 22, 'https': 443, 'http': 80, 'ntp': 123}[proto] -%}
+  {%- set ipproto = 'udp' if proto == 'ntp' else 'tcp' -%}
+  {%- set rule = {'ssh': 5, 'https': 7, 'http': 7, 'ntp': 3}[proto] -%}
+  {%- set sportname = 'ntp' if proto == 'ntp' else 'ephemeral_fw' -%}
+  {#- Hundredths, rounded down like the whole-second times. -#}
+  {%- set dur = '%.2f' | format(((dur_s * 100) | int) / 100) -%}
+  {%- set raw = head ~ start.strftime('%Y-%m-%d %H:%M:%S') ~ '" pri=5 confid=01 slotlevel=2 ruleid=' ~ rule
+    ~ ' srcif="Ethernet1" srcifname="in" ipproto=' ~ ipproto ~ ' proto=' ~ proto ~ ' src=' ~ s.src
+    ~ ' srcport=' ~ s.sport ~ ' srcportname=' ~ sportname ~ srcname_kv ~ ' dst=' ~ s.dst
+    ~ ' dstport=' ~ port ~ ' dstportname=' ~ proto ~ ' dstname=' ~ s.dstname
+    ~ ' modsrc=' ~ s.src ~ ' modsrcport=' ~ s.sport ~ ' origdst=' ~ s.dst ~ ' origdstport=' ~ port
+    ~ ' ipv=4 sent=' ~ s.sent ~ ' rcvd=' ~ rcvd ~ ' duration=' ~ dur ~ ' action=pass logtype="connection"' -%}
+  {%- set record = {'@timestamp': iso.isoformat(), 'ecs': {'version': '8.17.0'},
+    'event': {'kind': 'event', 'dataset': 'stormshield.sns',
+      'category': ['network'], 'type': ['connection', 'end', 'allowed'],
+      'action': 'connection_closed', 'start': start.isoformat(),
+      'end': iso.isoformat(), 'duration': (dur_s * 1000000000) | round | int,
+      'original': raw},
+    'observer': {'name': params.firewall_name, 'vendor': 'Stormshield',
+      'product': 'SNS', 'type': 'firewall',
+      'ingress': {'interface': {'id': 'Ethernet1', 'name': 'in'}}},
+    'rule': {'id': rule | string},
+    'source': {'ip': s.src, 'port': s.sport, 'bytes': s.sent},
+    'destination': {'ip': s.dst, 'port': port, 'domain': s.dstname, 'bytes': rcvd},
+    'network': {'transport': ipproto, 'protocol': proto, 'type': 'ipv4',
+      'bytes': s.sent + rcvd},
+    'related': {'ip': [s.src, s.dst], 'hosts': ([s.srcname] if s.srcname else []) + [s.dstname]},
+    'stormshield': {'sns': {'logtype': 'connection', 'priority': 5, 'action': 'pass',
+      'confid': '01', 'slotlevel': 2}}} -%}
+{%- endif -%}
+{{ record | tojson }}
