@@ -1,0 +1,413 @@
+{#- Yandex Cloud Audit Trails management events inside ECS JSON.
+    The inputs set the rate and every timestamp is one record, stamped
+    with the timestamp itself. `human` timestamps follow the office-hours
+    curve and each starts an operator session; `automation` timestamps
+    come round the clock and carry queued steps (episode steps, operator
+    follow-ups, runner steps) or new CI runner autoscaler actions.
+    Created VMs, service accounts, folder roles and static keys carry
+    lognormal lifetimes and are removed through native delete events.
+    Times are in microseconds internally. -#}
+{%- set hq_ = module.heapq -%}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- set auto = 'automation' in tags -%}
+{%- set hour = 3600000000 -%}
+{#- Chain window, counted from the service-account creation. -#}
+{%- set window = 1800000000 -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(q, due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(shared.get(q), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its UTC hour weighted by the human
+      rate curve squared plus a small floor. -#}
+  {%- set curve = shared.get('curve') -%}
+  {%- set top = (curve | max) ** 2 + 0.02 -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, top) < curve[(c // 3600000000) % 24] ** 2 + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro pick_op(exclude) -%}
+  {#- Operator index weighted by session rate, other than exclude. -#}
+  {%- set idx = range(samples.operators | length) | reject('equalto', exclude) | list -%}
+  {%- set ws = [] -%}
+  {%- for i in idx -%}{%- do ws.append(1 / samples.operators[i].gap_h) -%}{%- endfor -%}
+  {{- module.rand.weighted_choice(idx, ws) -}}
+{%- endmacro -%}
+{%- macro addr(o) -%}
+  {{- samples.operators[o].ips[0] if module.rand.chance(0.85) else samples.operators[o].ips[1] -}}
+{%- endmacro -%}
+{%- macro later(o) -%}
+  {#- Operator of a follow-up job: usually the same one. -#}
+  {{- o if module.rand.chance(0.6) else pick_op(o) -}}
+{%- endmacro -%}
+{%- macro row(o, ip, kind, details, sa) -%}
+  {#- The record of this timestamp. -#}
+  {%- do shared.set('row', {'o': o, 'ip': ip, 'kind': kind, 'd': details, 'sa': sa}) -%}
+{%- endmacro -%}
+{%- macro imm(item) -%}
+  {#- A step that takes this same timestamp. -#}
+  {%- do shared.set('imm', item) -%}
+{%- endmacro -%}
+{%- macro vm_details(vid, name, nat) -%}
+  {%- set zone = module.rand.choice(['ru-central1-a', 'ru-central1-b', 'ru-central1-d']) -%}
+  {%- set subnet = {'ru-central1-a': 'e9b0ba6b3ff9de4bb42d', 'ru-central1-b': 'e2l1ca7c4aa0ef5cc53e', 'ru-central1-d': 'fl82db8d5bb1fa6dd64f'}[zone] -%}
+  {%- set v4 = {'address': '10.60.' ~ {'ru-central1-a': 20, 'ru-central1-b': 21, 'ru-central1-d': 22}[zone] ~ '.' ~ module.rand.number.integer(10, 250)} -%}
+  {%- if module.rand.chance(nat) -%}
+    {%- do v4.update({'one_to_one_nat': {'address': '203.0.113.' ~ module.rand.number.integer(10, 250), 'ip_version': 'IPV4'}}) -%}
+  {%- endif -%}
+  {%- set mac = 'd0:0d:' ~ [module.rand.string.hex(2), module.rand.string.hex(2), module.rand.string.hex(2), module.rand.string.hex(2)] | join(':') | lower -%}
+  {%- do shared.set('vmd', {'instance_id': vid, 'instance_name': name, 'zone_id': zone, 'platform_id': 'standard-v3', 'metadata_keys': ['ssh-keys', 'user-data'], 'network_settings': {'type': 'STANDARD'}, 'placement_policy': {}, 'os': {'type': 'LINUX'}, 'product_ids': ['fd8j7i4d1e3f9a5b2c6d'], 'resources': {'memory': '4294967296', 'cores': '2', 'core_fraction': '100'}, 'boot_disk': {'mode': 'READ_WRITE', 'device_name': name ~ '-boot', 'auto_delete': true, 'disk_id': 'epd' ~ module.rand.string.hex(17) | lower}, 'network_interfaces': [{'index': '0', 'mac_address': mac, 'subnet_id': subnet, 'primary_v4_address': v4}], 'fqdn': vid ~ '.auto.internal'}) -%}
+{%- endmacro -%}
+{%- if shared.get('hq') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 2, 'le': 8760}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python({'anomaly_mode': params.anomaly_mode, 'anomaly_interval_hours': params.anomaly_interval_hours}) -%}
+  {#- Relative rate of the `human` input by UTC hour (peak 1): the sum
+      of the stacked bands in patterns/human-*.yml. Episode starts are
+      weighted by its square. -#}
+  {%- do shared.update({'eq': [], 'hq': [], 'aq': [], 'seq': 0, 'acc': {}, 'vms': {}, 'rv': {}, 'managed': 0, 'pipe': module.rand.number.integer(20000, 60000), 'job': module.rand.number.integer(400000, 900000), 'ep_last': -1, 'guard': 0, 'curve': [0.065, 0.065, 0.065, 0.065, 0.065, 0.315, 0.691, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.691, 0.315, 0.315, 0.152, 0.152, 0.152, 0.065, 0.065, 0.065]}) -%}
+  {%- set pool = [] -%}
+  {%- for i in range(samples.instances | length) -%}{%- do pool.append([samples.instances[i].id, samples.instances[i].name]) -%}{%- endfor -%}
+  {%- do shared.set('pool', pool) -%}
+  {%- for i in range(samples.service_accounts | length) -%}
+    {%- set a = samples.service_accounts[i] -%}
+    {%- do shared.get('acc').update({a.id: {'name': a.name, 'by': -1, 'te': 0, 'roles': [], 'kz': [], 'm': false, 'ed': []}}) -%}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+  {%- do shared.set('ep_due', pick_start(now, [interval, 24 * hour] | min) | int) -%}
+{%- endif -%}
+{%- set eq = shared.get('eq') -%}
+{%- set hq = shared.get('hq') -%}
+{%- set aq = shared.get('aq') -%}
+{%- set acc = shared.get('acc') -%}
+{%- set vms = shared.get('vms') -%}
+{%- set rv = shared.get('rv') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{#- Episode: at the first timestamp at or after the drawn start, and
+    after a random delay, an operator other than the previous episode's
+    provisions a fresh account. The first start falls within the first
+    min(interval, 24 h); each later start within a window of
+    min(interval / 4, 6 h) centred one interval after the actual start,
+    weighted by the human rate curve squared. Missed episodes are not
+    replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {%- set o = pick_op(shared.get('ep_last')) | int -%}
+  {{- push('eq', now + (ln(150, 0.9) | int), {'k': 'ep', 'o': o, 'ip': addr(o)}) -}}
+  {%- do shared.set('ep_due', now + 1000 * 24 * hour) -%}
+{%- endif -%}
+{#- Dispatcher. A `human` timestamp always starts a new operator
+    session, so sessions follow the human input exactly. An
+    `automation` timestamp serves the earliest due queued step - episode
+    steps, then operator follow-ups, then runner steps - and otherwise
+    starts a new runner action. Steps that belong to the same moment
+    (a routine and its first native call) take the same timestamp. -#}
+{%- do shared.update({'row': none, 'imm': none}) -%}
+{%- set out = namespace(fresh=true) -%}
+{%- for _ in range(64) if shared.get('row') is none -%}
+  {%- if shared.get('imm') is not none -%}
+    {%- set item = shared.get('imm') -%}
+    {%- do shared.set('imm', none) -%}
+  {%- elif out.fresh and not auto -%}
+    {%- set out.fresh = false -%}
+    {%- set item = {'k': 'sess'} -%}
+  {%- elif auto and eq and eq[0][0] <= now -%}
+    {%- set item = hq_.heappop(eq)[2] -%}
+  {%- elif auto and hq and hq[0][0] <= now -%}
+    {%- set item = hq_.heappop(hq)[2] -%}
+  {%- elif auto and aq and aq[0][0] <= now -%}
+    {%- set item = hq_.heappop(aq)[2] -%}
+  {%- elif out.fresh -%}
+    {%- set out.fresh = false -%}
+    {%- set item = {'k': 'auto'} -%}
+  {%- else -%}
+    {#- Nothing left that yields a record; not reached in practice. -#}
+    {%- set item = {'k': 'upd', 'o': pick_op(-1) | int} -%}
+    {%- do item.update({'ip': addr(item.o)}) -%}
+  {%- endif -%}
+  {%- set o = item.get('o') -%}
+  {%- set ip = item.get('ip') -%}
+  {%- if item.k == 'sess' -%}
+    {#- Operator session: a random number of operations with lognormal
+        gaps; the first one takes this timestamp. -#}
+    {%- set o = pick_op(-1) | int -%}
+    {%- set n = namespace(v=1, go=true) -%}
+    {%- for _ in range(15) if n.go -%}
+      {%- if module.rand.chance(0.68) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
+    {%- endfor -%}
+    {{- imm({'k': 'op', 'o': o, 'ip': addr(o), 'left': n.v}) -}}
+  {%- elif item.k == 'op' -%}
+    {%- set kind = module.rand.weighted_choice(['upd', 'vmc', 'prov', 'maint', 'revoke', 'key', 'rot'], [54, 9, 9, 8, 6, 4, 3]) -%}
+    {{- imm({'k': kind, 'o': o, 'ip': ip}) -}}
+    {%- if item.left > 1 -%}
+      {{- push('hq', now + (ln(50, 1.0) | int), {'k': 'op', 'o': o, 'ip': ip, 'left': item.left - 1}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'ep' -%}
+    {#- An episode obeys the account cap of background provisioning:
+        with the cap reached it is skipped, like a missed episode. -#}
+    {%- set w = [interval // 4, 6 * hour] | min -%}
+    {%- do shared.update({'ep_last': o, 'ep_due': pick_start(now + interval - w // 2, w) | int}) -%}
+    {%- if shared.get('managed') < 70 -%}
+      {{- imm({'k': 'prov', 'o': o, 'ip': ip, 'ep': true}) -}}
+    {%- else -%}
+      {%- do shared.set('ep_skipped', shared.get('ep_skipped', 0) + 1) -%}
+    {%- endif -%}
+  {%- elif item.k == 'upd' -%}
+    {%- set pool = shared.get('pool') -%}
+    {%- set j = module.rand.number.integer(0, pool | length + vms | length - 1) -%}
+    {%- if j < pool | length -%}
+      {%- set vm = pool[j] -%}
+    {%- else -%}
+      {%- set vid = (vms | list)[j - pool | length] -%}
+      {%- set vm = [vid, vms[vid].name] -%}
+    {%- endif -%}
+    {%- set labels = {'deployment': 'rollout-' ~ module.rand.number.integer(100, 999)} -%}
+    {%- if module.rand.chance(0.3) -%}{%- do labels.update({'owner': module.rand.choice(['platform', 'payments', 'search', 'infra'])}) -%}{%- endif -%}
+    {{- row(o, ip, 'UpdateInstance', {'instance_id': vm[0], 'instance_name': vm[1], 'labels': labels, 'update_mask': 'labels'}, none) -}}
+  {%- elif item.k == 'vmc' -%}
+    {%- if vms | length >= 8 -%}
+      {{- imm({'k': 'upd', 'o': o, 'ip': ip}) -}}
+    {%- else -%}
+      {%- do shared.set('pipe', shared.get('pipe') + module.rand.number.integer(1, 60)) -%}
+      {%- set vid = 'fhm' ~ module.rand.string.hex(17) | lower -%}
+      {%- set name = 'ci-job-' ~ shared.get('pipe') -%}
+      {{- vm_details(vid, name, 0.3) -}}
+      {%- do vms.update({vid: {'name': name}}) -%}
+      {{- row(o, ip, 'CreateInstance', shared.get('vmd'), none) -}}
+      {%- set o2 = later(o) | int -%}
+      {{- push('hq', now + (ln(9000, 0.7) | int), {'k': 'vmd', 'o': o2, 'ip': addr(o2), 'v': vid}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'vmd' -%}
+    {%- if item.v in vms -%}
+      {%- set vm = vms.pop(item.v) -%}
+      {{- row(o, ip, 'DeleteInstance', {'instance_id': item.v, 'instance_name': vm.name}, none) -}}
+    {%- endif -%}
+  {%- elif item.k == 'prov' -%}
+    {%- if shared.get('managed') >= 70 -%}
+      {{- imm({'k': 'upd', 'o': o, 'ip': ip}) -}}
+    {%- else -%}
+      {%- set hexid = module.rand.string.hex(17) | lower -%}
+      {%- set sid = 'aje' ~ hexid -%}
+      {%- set sname = params.service_account_prefix ~ '-' ~ hexid -%}
+      {%- do acc.update({sid: {'name': sname, 'by': o, 'te': now, 'roles': [], 'kz': [], 'm': true, 'ed': []}}) -%}
+      {%- do shared.set('managed', shared.get('managed') + 1) -%}
+      {{- row(o, ip, 'CreateServiceAccount', {'service_account_id': sid, 'service_account_name': sname, 'description': 'Maintenance automation', 'labels': {'team': 'infra'}, 'status': 'ACTIVE'}, [sid, sname]) -}}
+      {#- Follow-up role and key on the new account. Both gaps share the
+          background distribution; an episode redraws them until the
+          sequence fits half the chain window, leaving the other half
+          for the wait on the next automation timestamp. -#}
+      {%- set g = namespace(a=ln(90, 1.0) | int, b=ln(120, 1.0) | int) -%}
+      {%- if item.get('ep') -%}
+        {%- for _ in range(50) if g.a + g.b > window // 2 -%}
+          {%- set g.a = ln(90, 1.0) | int -%}{%- set g.b = ln(120, 1.0) | int -%}
+        {%- endfor -%}
+        {{- push('eq', now + g.a, {'k': 'grant', 'o': o, 'ip': ip, 's': sid, 'role': 'editor'}) -}}
+        {{- push('eq', now + g.a + g.b, {'k': 'key', 'o': o, 'ip': ip, 's': sid, 'ep': true}) -}}
+      {%- else -%}
+        {%- set do_grant = module.rand.chance(0.65) -%}
+        {%- set do_key = module.rand.chance(0.55) -%}
+        {%- set role = module.rand.weighted_choice(['viewer', 'editor', 'storage.editor', 'compute.editor'], [3, 4, 2, 1]) -%}
+        {%- if do_grant and do_key and module.rand.chance(0.2) -%}
+          {{- push('hq', now + g.a, {'k': 'key', 'o': o, 'ip': ip, 's': sid}) -}}
+          {{- push('hq', now + g.a + g.b, {'k': 'grant', 'o': o, 'ip': ip, 's': sid, 'role': role}) -}}
+        {%- else -%}
+          {%- if do_grant -%}{{- push('hq', now + g.a, {'k': 'grant', 'o': o, 'ip': ip, 's': sid, 'role': role}) -}}{%- endif -%}
+          {%- if do_key -%}{{- push('hq', now + (g.a if do_grant else 0) + g.b, {'k': 'key', 'o': o, 'ip': ip, 's': sid}) -}}{%- endif -%}
+        {%- endif -%}
+      {%- endif -%}
+      {%- set o2 = later(o) | int -%}
+      {{- push('hq', now + (ln(30 * 3600, 0.6) | int), {'k': 'sad', 'o': o2, 'ip': addr(o2), 's': sid}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'maint' -%}
+    {#- Work on one existing account: a role, sometimes a key after it. -#}
+    {%- set sid = module.rand.choice(acc.keys() | list) -%}
+    {{- imm({'k': 'grant', 'o': o, 'ip': ip, 's': sid}) -}}
+    {%- if module.rand.chance(0.5) -%}
+      {{- push('hq', now + (ln(120, 1.0) | int), {'k': 'key', 'o': o, 'ip': ip, 's': sid}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'grant' -%}
+    {%- if item.s in acc -%}
+      {%- set a = acc[item.s] -%}
+      {%- set free = ['viewer', 'editor', 'storage.editor', 'compute.editor'] | reject('in', a.roles) | list -%}
+      {%- if item.get('role') and item.role not in a.roles -%}
+        {%- set role = item.role -%}
+      {%- elif free and not item.get('role') -%}
+        {%- set ws = [] -%}
+        {%- for r in free -%}{%- do ws.append({'viewer': 3, 'editor': 4, 'storage.editor': 2, 'compute.editor': 1}[r]) -%}{%- endfor -%}
+        {%- set role = module.rand.weighted_choice(free, ws) -%}
+      {%- else -%}
+        {%- set role = none -%}
+      {%- endif -%}
+      {%- if role is not none -%}
+        {%- do a.roles.append(role) -%}
+        {%- if role == 'editor' and o not in a.ed -%}{%- do a.ed.append(o) -%}{%- endif -%}
+        {{- row(o, ip, 'UpdateFolderAccessBindings', {'folder_id': params.folder_id, 'folder_name': 'production', 'access_binding_deltas': [{'action': 'ADD', 'access_binding': {'role_id': role, 'subject_id': item.s, 'subject_type': 'SERVICE_ACCOUNT', 'subject_name': a.name}}]}, [item.s, a.name]) -}}
+      {%- elif a.roles and not item.get('role') -%}
+        {{- imm({'k': 'revoke', 'o': o, 'ip': ip, 's': item.s}) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'revoke' -%}
+    {%- set held = [] -%}
+    {%- if not item.get('s') -%}
+      {%- for sid, a in acc.items() if a.roles -%}{%- do held.append(sid) -%}{%- endfor -%}
+    {%- endif -%}
+    {%- set sid = item.get('s') or (module.rand.choice(held) if held else none) -%}
+    {%- if sid is none or sid not in acc or not acc[sid].roles -%}
+      {{- imm({'k': 'upd', 'o': o, 'ip': ip}) -}}
+    {%- else -%}
+      {%- set a = acc[sid] -%}
+      {%- set role = module.rand.choice(a.roles) -%}
+      {%- do a.roles.remove(role) -%}
+      {{- row(o, ip, 'UpdateFolderAccessBindings', {'folder_id': params.folder_id, 'folder_name': 'production', 'access_binding_deltas': [{'action': 'REMOVE', 'access_binding': {'role_id': role, 'subject_id': sid, 'subject_type': 'SERVICE_ACCOUNT', 'subject_name': a.name}}]}, [sid, a.name]) -}}
+    {%- endif -%}
+  {%- elif item.k == 'key' -%}
+    {#- Guard on the final chain step: a background key that would
+        complete the chain (this operator created the account and added
+        it as editor, and the account is at most one chain window old)
+        is replaced by an operation of the same operator at the same
+        time, drawn with the background operation weights (a key then
+        goes to another account). -#}
+    {%- set gk = namespace(sid=item.get('s')) -%}
+    {%- if not item.get('ep') -%}
+      {%- set open = [] -%}
+      {%- for sid, a in acc.items() if a.kz | length < 2 and not (a.by == o and o in a.ed and now - a.te <= window) -%}{%- do open.append(sid) -%}{%- endfor -%}
+      {%- if gk.sid is not none and gk.sid in acc -%}
+        {%- set a = acc[gk.sid] -%}
+        {%- if a.by == o and o in a.ed and now - a.te <= window -%}
+          {%- do shared.set('guard', shared.get('guard') + 1) -%}
+          {%- set gk.sid = none -%}
+          {{- imm({'k': module.rand.weighted_choice(['upd', 'vmc', 'prov', 'maint', 'revoke', 'key', 'rot'], [54, 9, 9, 8, 6, 4, 3]), 'o': o, 'ip': ip}) -}}
+        {%- elif a.kz | length >= 2 -%}
+          {%- set gk.sid = none -%}
+        {%- endif -%}
+      {%- elif gk.sid is none -%}
+        {%- set gk.sid = module.rand.choice(open) if open else none -%}
+        {%- if gk.sid is none -%}{{- imm({'k': 'upd', 'o': o, 'ip': ip}) -}}{%- endif -%}
+      {%- endif -%}
+    {%- endif -%}
+    {%- if gk.sid is not none and gk.sid in acc -%}
+      {%- set sid = gk.sid -%}
+      {%- set a = acc[sid] -%}
+      {%- set akid = 'aje' ~ module.rand.string.hex(17) | lower -%}
+      {%- set kid = 'YC' ~ module.rand.string.letters(23) -%}
+      {%- do a.kz.append(akid) -%}
+      {{- row(o, ip, 'CreateAccessKey', {'access_key_id': akid, 'service_account_id': sid, 'service_account_name': a.name, 'key_id': kid, 'description': 'Maintenance automation', 'created_at': ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ')}, [sid, a.name]) -}}
+      {%- set o2 = later(o) | int -%}
+      {{- push('hq', now + (ln(20 * 3600, 0.8) | int), {'k': 'kd', 'o': o2, 'ip': addr(o2), 's': sid, 'akid': akid}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'kd' -%}
+    {%- if item.s in acc and item.akid in acc[item.s].kz -%}
+      {%- set a = acc[item.s] -%}
+      {%- do a.kz.remove(item.akid) -%}
+      {{- row(o, ip, 'DeleteAccessKey', {'access_key_id': item.akid, 'service_account_id': item.s, 'service_account_name': a.name}, [item.s, a.name]) -}}
+    {%- endif -%}
+  {%- elif item.k == 'rot' -%}
+    {#- Key rotation: revoke one key, issue a new one shortly after. -#}
+    {%- set keyed = [] -%}
+    {%- for sid, a in acc.items() if a.kz -%}{%- do keyed.append(sid) -%}{%- endfor -%}
+    {%- if keyed -%}
+      {%- set sid = module.rand.choice(keyed) -%}
+      {{- imm({'k': 'kd', 'o': o, 'ip': ip, 's': sid, 'akid': module.rand.choice(acc[sid].kz)}) -}}
+      {{- push('hq', now + (ln(60, 0.9) | int), {'k': 'key', 'o': o, 'ip': ip, 's': sid}) -}}
+    {%- else -%}
+      {{- imm({'k': 'key', 'o': o, 'ip': ip}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'sad' -%}
+    {#- Account cleanup, one native call per step: keys, roles, account. -#}
+    {%- if item.s in acc -%}
+      {%- set a = acc[item.s] -%}
+      {%- if a.kz -%}
+        {{- imm({'k': 'kd', 'o': o, 'ip': ip, 's': item.s, 'akid': a.kz[0]}) -}}
+      {%- elif a.roles -%}
+        {{- imm({'k': 'revoke', 'o': o, 'ip': ip, 's': item.s}) -}}
+      {%- else -%}
+        {%- do acc.pop(item.s) -%}
+        {%- do shared.set('managed', shared.get('managed') - 1) -%}
+        {{- row(o, ip, 'DeleteServiceAccount', {'service_account_id': item.s, 'service_account_name': a.name}, [item.s, a.name]) -}}
+      {%- endif -%}
+      {%- if a.kz or a.roles -%}
+        {{- push('hq', now + (ln(25, 0.8) | int), item) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'auto' -%}
+    {#- CI runner autoscaler: a new runner VM for queued jobs, or, with
+        the pool full, one more job on a live runner. -#}
+    {%- if rv | length < 24 -%}
+      {%- set rip = module.rand.choice(samples.automation[0].ips) -%}
+      {%- set vid = 'fhm' ~ module.rand.string.hex(17) | lower -%}
+      {%- set name = 'ci-runner-' ~ module.rand.string.hex(8) | lower -%}
+      {{- vm_details(vid, name, 0) -}}
+      {%- do rv.update({vid: {'name': name, 'ip': rip}}) -%}
+      {{- row(-1, rip, 'CreateInstance', shared.get('vmd'), none) -}}
+      {%- set n = namespace(v=1, go=true) -%}
+      {%- for _ in range(12) if n.go -%}
+        {%- if module.rand.chance(0.4) -%}{%- set n.v = n.v + 1 -%}{%- else -%}{%- set n.go = false -%}{%- endif -%}
+      {%- endfor -%}
+      {{- push('aq', now + (ln(90, 0.6) | int), {'k': 'rj', 'v': vid, 'left': n.v}) -}}
+    {%- else -%}
+      {{- imm({'k': 'aupd'}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'aupd' -%}
+    {%- set vid = module.rand.choice(rv | list) -%}
+    {{- imm({'k': 'rj', 'v': vid, 'left': 0}) -}}
+  {%- elif item.k == 'rj' -%}
+    {#- A job assigned to a runner: the autoscaler labels the VM busy.
+        A finished job often, and the last job always, returns the runner
+        to idle; an idle runner without jobs is deleted. -#}
+    {%- if item.v in rv -%}
+      {%- set r = rv[item.v] -%}
+      {%- do shared.set('job', shared.get('job') + module.rand.number.integer(1, 40)) -%}
+      {{- row(-1, r.ip, 'UpdateInstance', {'instance_id': item.v, 'instance_name': r.name, 'labels': {'ci-job-id': shared.get('job') | string, 'runner-state': 'busy'}, 'update_mask': 'labels'}, none) -}}
+      {%- set run = ln(420, 0.7) | int -%}
+      {%- if item.left > 1 -%}
+        {%- if module.rand.chance(0.3) -%}
+          {{- push('aq', now + run, {'k': 'ri', 'v': item.v}) -}}
+        {%- endif -%}
+        {{- push('aq', now + run + (ln(180, 0.8) | int), {'k': 'rj', 'v': item.v, 'left': item.left - 1}) -}}
+      {%- elif item.left == 1 -%}
+        {{- push('aq', now + run, {'k': 'ri', 'v': item.v}) -}}
+        {{- push('aq', now + run + (ln(1200, 0.6) | int), {'k': 'rd', 'v': item.v}) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- elif item.k == 'ri' -%}
+    {%- if item.v in rv -%}
+      {%- set r = rv[item.v] -%}
+      {{- row(-1, r.ip, 'UpdateInstance', {'instance_id': item.v, 'instance_name': r.name, 'labels': {'runner-state': 'idle'}, 'update_mask': 'labels'}, none) -}}
+    {%- endif -%}
+  {%- elif item.k == 'rd' -%}
+    {%- if item.v in rv -%}
+      {%- set r = rv.pop(item.v) -%}
+      {{- row(-1, r.ip, 'DeleteInstance', {'instance_id': item.v, 'instance_name': r.name}, none) -}}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- set r = shared.get('row') -%}
+{%- set kind = r.kind -%}
+{%- set service = 'iam' if kind in ['CreateServiceAccount', 'DeleteServiceAccount', 'CreateAccessKey', 'DeleteAccessKey'] else ('resourcemanager' if kind == 'UpdateFolderAccessBindings' else 'compute') -%}
+{%- set stamp = ts.strftime('%Y-%m-%dT%H:%M:%S.%fZ') -%}
+{%- set event_id = module.rand.crypto.uuid4() | string -%}
+{%- if r.o == -1 -%}
+  {%- set op = samples.automation[0] -%}
+  {%- set authn = {'authenticated': true, 'subject_type': 'SERVICE_ACCOUNT', 'subject_id': op.id, 'subject_name': op.name} -%}
+{%- else -%}
+  {%- set op = samples.operators[r.o] -%}
+  {%- set authn = {'authenticated': true, 'subject_type': 'FEDERATED_USER_ACCOUNT', 'subject_id': op.id, 'subject_name': op.name, 'federation_id': 'bpffd0b1506f5e3af1f1', 'federation_name': 'contoso', 'federation_type': 'PRIVATE_FEDERATION'} -%}
+{%- endif -%}
+{%- set native = {'event_id': event_id, 'event_source': service, 'event_type': 'yandex.cloud.audit.' ~ service ~ '.' ~ kind, 'event_time': stamp, 'authentication': authn, 'authorization': {'authorized': true}, 'resource_metadata': {'path': [{'resource_type': 'organization-manager.organization', 'resource_id': params.organization_id, 'resource_name': 'contoso-org'}, {'resource_type': 'resource-manager.cloud', 'resource_id': params.cloud_id, 'resource_name': 'contoso-cloud'}, {'resource_type': 'resource-manager.folder', 'resource_id': params.folder_id, 'resource_name': 'production'}]}, 'request_metadata': {'remote_address': r.ip, 'user_agent': op.ua, 'request_id': module.rand.crypto.uuid4() | string}, 'event_status': 'DONE', 'details': r.d} -%}
+{%- set users = [op.name] + ([r.sa[1]] if r.sa else []) -%}
+{%- set ecs = {'@timestamp': stamp, 'ecs': {'version': '8.17.0'}, 'event': {'kind': 'event', 'module': 'yandex_cloud', 'dataset': 'yandex_cloud.audit', 'id': event_id, 'action': kind, 'category': ['iam'] if service in ['iam', 'resourcemanager'] else ['configuration'], 'type': ['creation'] if kind.startswith('Create') else (['deletion'] if kind.startswith('Delete') else ['change']), 'outcome': 'success', 'original': module.json.dumps(native, ensure_ascii=False)}, 'source': {'ip': r.ip}, 'user': {'id': op.id, 'name': op.name}, 'related': {'ip': [r.ip], 'user': users}, 'cloud': {'provider': 'yandex', 'account': {'id': params.cloud_id}}, 'yandex_cloud': {'audit': native}} -%}
+{%- if r.sa -%}{%- do ecs.user.update({'target': {'id': r.sa[0], 'name': r.sa[1]}}) -%}{%- endif -%}
+{{ module.json.dumps(ecs, ensure_ascii=False) }}
