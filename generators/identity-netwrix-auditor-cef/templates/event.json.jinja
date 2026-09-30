@@ -1,0 +1,639 @@
+{#- Netwrix Auditor CEF Export Add-on records for the Active Directory
+    and Logon Activity data sources, as Filebeat decode_cef style ECS
+    JSON with the raw CEF line in event.original. Every input timestamp
+    is one record: a record already due (the next attempt after a
+    mistyped password, the next change of a multi-step task) goes
+    first; otherwise the timestamp's tag starts new activity - "arrive"
+    a workstation logon that opens a work session, "logon" a server
+    logon by someone at work, "task" one helpdesk or admin directory
+    change, "account" one account lifecycle task. Times are in
+    microseconds; the record time is the timestamp. -#}
+{%- set ts = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now = module.builtins.int(ts.timestamp() * 1000000) -%}
+{%- set hq = module.heapq -%}
+{%- set rnd = module.random -%}
+{%- set sec = 1000000 -%}
+{%- set minute = 60 * sec -%}
+{%- set hour = 3600 * sec -%}
+{#- Chain window: background offboarding never picks an account created
+    within this window plus one hour. -#}
+{%- set window = 4 * hour -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * hour) -%}
+{%- set domain = params.domain -%}
+{%- set netbios = params.netbios -%}
+{%- set base = '\\' ~ (domain.split('.') | reverse | join('\\')) -%}
+{#- Relative hourly rate (UTC) of account lifecycle work, as in
+    patterns/account-office.yml: even over 08-17 UTC. Who of the desk
+    is at work thins the late hours, for episodes and background
+    alike. -#}
+{%- set ep_curve = [0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0, 0] -%}
+{%- set day = 24 * hour -%}
+{%- macro ln(med, sig) -%}
+  {#- Lognormal seconds with median med; returns microseconds. -#}
+  {{- module.builtins.int(module.rand.number.lognormal(module.math.log(med), sig) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(due, item) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do hq.heappush(shared.get('queue'), [due, s, item]) -%}
+{%- endmacro -%}
+{%- macro row(due, product, action, cat, dc, who, what) -%}
+  {#- Queue a record; the account it concerns (the one logging on, or
+      the target of a user change) remembers its last queued record, so
+      it is not offboarded while a ticket or logon is still under way. -#}
+  {{- push(due, {'k': 'row', 'p': product, 'a': action, 'c': cat, 'dc': dc, 'who': who, 'what': what}) -}}
+  {%- set a = shared.get('users').get(who if product == 'Logon Activity' else (what.split('\\')[-1] if cat == 'user' else '')) -%}
+  {%- if a and a.get('busy', 0) < due -%}{%- do a.update({'busy': due}) -%}{%- endif -%}
+{%- endmacro -%}
+{%- macro ladd(name, sam) -%}
+  {#- Add to an index-mapped list (O(1) add, remove and uniform pick). -#}
+  {%- set l = shared.get(name) -%}
+  {%- set p = shared.get(name ~ '_pos') -%}
+  {%- if sam not in p -%}
+    {%- do p.update({sam: l | length}) -%}
+    {%- do l.append(sam) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro ldel(name, sam) -%}
+  {%- set l = shared.get(name) -%}
+  {%- set p = shared.get(name ~ '_pos') -%}
+  {%- if sam in p -%}
+    {%- set i = p.pop(sam) -%}
+    {%- set last = l.pop() -%}
+    {%- if last != sam -%}
+      {%- do module.operator.setitem(l, i, last) -%}
+      {%- do p.update({last: i}) -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro pick_dc(pref) -%}
+  {{- pref if rnd.random() < 0.75 else module.rand.choice(shared.get('dcs')) -}}
+{%- endmacro -%}
+{%- macro new_name(rng) -%}
+  {#- A logon name not held by a current or recently removed account. -#}
+  {%- set users = shared.get('users') -%}
+  {%- set r = namespace(v=none) -%}
+  {%- for _ in range(50) if r.v is none -%}
+    {%- set cand = rng.choice('jmdrkstacblpegwhnfvo') ~ rng.choice(shared.get('surnames')) -%}
+    {%- for sfx in ['', '2', '3', '4'] if r.v is none -%}
+      {%- if (cand ~ sfx) not in users and (cand ~ sfx) not in shared.get('recent_names') -%}{%- set r.v = cand ~ sfx -%}{%- endif -%}
+    {%- endfor -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro add_user(sam, kind, rng) -%}
+  {#- Register an account: staff, fresh (onboarded, no logon yet), op,
+      test (created by mistake or for a test) or episode. -#}
+  {%- set c = rng.choices(shared.get('containers'), [40, 35, 10, 15])[0] -%}
+  {%- do shared.get('users').update({sam: {
+    'sam': sam, 'path': base ~ '\\' ~ c ~ '\\' ~ sam,
+    'ws': 'ws-' ~ rng.randint(1000, 9899) ~ '.' ~ domain,
+    'dc': rng.choice(shared.get('dcs')),
+    'pace': [[rng.lognormvariate(0, 0.35), 0.6] | max, 1.7] | min,
+    'op': kind == 'op', 'fresh': kind == 'fresh', 'sid': 0, 'on': false,
+    'gone': false, 'added': none, 'left': none, 'last_logon': none}}) -%}
+{%- endmacro -%}
+{%- macro logon(due, u, host, typo) -%}
+  {#- A logon to host, sometimes after mistyped attempts (each one
+      repeated with falling probability, at most four). Returns the
+      success time. -#}
+  {%- set t = namespace(v=due) -%}
+  {%- if rnd.random() < typo -%}
+    {%- set n = namespace(go=true) -%}
+    {%- for _ in range(4) if n.go -%}
+      {{- row(t.v, 'Logon Activity', 'Failed Logon', 'Logon', pick_dc(u.dc), u.sam, host) -}}
+      {%- set t.v = t.v + (ln(7, 0.8) | int) -%}
+      {%- set n.go = rnd.random() < 0.35 -%}
+    {%- endfor -%}
+  {%- endif -%}
+  {{- row(t.v, 'Logon Activity', 'Successful Logon', 'Logon', pick_dc(u.dc), u.sam, host) -}}
+  {%- do u.update({'last_logon': t.v}) -%}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro stale_burst(due, u) -%}
+  {#- A mapped drive or saved credential still holding an old password:
+      a few failed logons to one server within minutes. -#}
+  {%- set host = module.rand.weighted_choice(shared.get('servers'), shared.get('server_w')) -%}
+  {%- set t = namespace(v=due) -%}
+  {%- for _ in range(module.rand.weighted_choice([2, 3, 4], [55, 30, 15])) -%}
+    {{- row(t.v, 'Logon Activity', 'Failed Logon', 'Logon', pick_dc(u.dc), u.sam, host) -}}
+    {%- set t.v = t.v + (ln(80, 0.9) | int) -%}
+  {%- endfor -%}
+{%- endmacro -%}
+{%- macro start_session(t, u) -%}
+  {#- Workstation logon; the session end goes to the end heap. -#}
+  {%- set sid = u.sid + 1 -%}
+  {%- do u.update({'sid': sid, 'on': true}) -%}
+  {{- ldel('offl', u.sam) -}}
+  {{- ladd('onl', u.sam) -}}
+  {%- if u.fresh -%}
+    {%- do u.update({'fresh': false}) -%}
+    {%- do shared.set('nfresh', shared.get('nfresh') - 1) -%}
+    {{- ladd('staff', u.sam) -}}
+  {%- endif -%}
+  {%- set t2 = logon(t, u, u.ws, 0.07) | int -%}
+  {#- Operators keep regular hours; staff days vary more. -#}
+  {%- set te = t2 + (ln(9 * 3600, 0.08 if u.op else 0.25) | int) -%}
+  {%- do u.update({'end': te}) -%}
+  {%- do hq.heappush(shared.get('ends'), [te, u.sam, sid]) -%}
+{%- endmacro -%}
+{%- macro end_session(u, t) -%}
+  {%- do u.update({'on': false, 'left': t}) -%}
+  {{- ldel('onl', u.sam) -}}
+  {{- ladd('offl', u.sam) -}}
+{%- endmacro -%}
+{%- macro server_logon(t, u) -%}
+  {#- Server logon (operators also log on to domain controllers). -#}
+  {%- set host = module.rand.choice(shared.get('dcs')) if u.op and rnd.random() < 0.2 else module.rand.weighted_choice(shared.get('servers'), shared.get('server_w')) -%}
+  {%- set t2 = logon(t, u, host, 0.03) | int -%}
+  {%- if rnd.random() < 0.002 -%}{{- stale_burst(t2 + (ln(600, 1.0) | int), u) -}}{%- endif -%}
+{%- endmacro -%}
+{%- macro pick_off() -%}
+  {#- Someone not at work who left at least 8 hours ago. -#}
+  {%- set users = shared.get('users') -%}
+  {%- set l = shared.get('offl') -%}
+  {%- set r = namespace(v='') -%}
+  {%- for _ in range(24) -%}
+    {%- if r.v or not l -%}{%- break -%}{%- endif -%}
+    {%- set u = users[l[rnd.randrange(l | length)]] -%}
+    {%- if u.left is none or now - u.left >= 8 * hour -%}{%- set r.v = u.sam -%}{%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro pick_on() -%}
+  {#- Someone at work, weighted by their own logon pace. -#}
+  {%- set users = shared.get('users') -%}
+  {%- set l = shared.get('onl') -%}
+  {%- set r = namespace(v='') -%}
+  {%- for _ in range(40) -%}
+    {%- if r.v or not l -%}{%- break -%}{%- endif -%}
+    {%- set u = users[l[rnd.randrange(l | length)]] -%}
+    {%- if rnd.random() * u.pace < 0.6 -%}{%- set r.v = u.sam -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if not r.v and l -%}{%- set r.v = l[0] -%}{%- endif -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro pick_op(cands) -%}
+  {%- set users = shared.get('users') -%}
+  {%- set ws = [] -%}
+  {%- for s in cands -%}{%- do ws.append(1.0 / users[s].pace) -%}{%- endfor -%}
+  {{- module.rand.weighted_choice(cands, ws) -}}
+{%- endmacro -%}
+{%- macro first_delay() -%}
+  {#- A new hire logging on at the desk while the helpdesk waits. -#}
+  {%- set w = namespace(v=ln(25 * 60, 0.8) | int) -%}
+  {%- for _ in range(40) if w.v > 2 * hour -%}{%- set w.v = ln(25 * 60, 0.8) | int -%}{%- endfor -%}
+  {{- w.v -}}
+{%- endmacro -%}
+{%- macro onboard(t0, op, sam) -%}
+  {#- New account: created, then attributes set in quick succession,
+      sometimes group memberships. Returns the time of the last row. -#}
+  {%- set u = shared.get('users')[sam] -%}
+  {%- do u.update({'added': t0}) -%}
+  {%- set dc = pick_dc(op.dc) -%}
+  {{- row(t0, 'Active Directory', 'Added', 'user', dc, op.sam, u.path) -}}
+  {%- set t = namespace(v=t0) -%}
+  {%- for _ in range(module.rand.weighted_choice([1, 2, 3], [45, 35, 20])) -%}
+    {%- set t.v = t.v + (ln(18, 0.9) | int) -%}
+    {{- row(t.v, 'Active Directory', 'Modified', 'user', dc, op.sam, u.path) -}}
+  {%- endfor -%}
+  {%- if rnd.random() < 0.6 -%}
+    {%- for _ in range(module.rand.weighted_choice([1, 2], [70, 30])) -%}
+      {%- set t.v = t.v + (ln(25, 0.9) | int) -%}
+      {{- row(t.v, 'Active Directory', 'Modified', 'group', dc, op.sam, module.rand.weighted_choice(shared.get('groups'), shared.get('group_w'))) -}}
+    {%- endfor -%}
+  {%- endif -%}
+  {{- t.v -}}
+{%- endmacro -%}
+{%- macro remove(t, op, u) -%}
+  {#- Account deletion; the account leaves every pool at once and the
+      directory after its queued rows. -#}
+  {{- row(t, 'Active Directory', 'Removed', 'user', pick_dc(op.dc), op.sam, u.path) -}}
+  {%- do u.update({'gone': true, 'on': false}) -%}
+  {{- ldel('staff', u.sam) -}}
+  {{- ldel('offl', u.sam) -}}
+  {{- ldel('onl', u.sam) -}}
+  {{- push(t + minute, {'k': 'gc', 'u': u.sam}) -}}
+{%- endmacro -%}
+{%- macro task(t, u) -%}
+  {#- One helpdesk or admin directory change by operator u. -#}
+  {%- set users = shared.get('users') -%}
+  {%- set staff = shared.get('staff') -%}
+  {%- set dc = pick_dc(u.dc) -%}
+  {%- set r = rnd.random() -%}
+  {%- if r < 0.30 -%}
+    {#- Password reset ticket: the user's failed attempts, the reset,
+        then a successful logon; sometimes an old saved password keeps
+        failing afterwards. -#}
+    {%- set v = users[staff[rnd.randrange(staff | length)]] -%}
+    {%- set tt = namespace(v=t) -%}
+    {%- if rnd.random() < 0.6 -%}
+      {%- for _ in range(module.rand.weighted_choice([1, 2, 3, 4], [45, 28, 17, 10])) -%}
+        {{- row(tt.v, 'Logon Activity', 'Failed Logon', 'Logon', pick_dc(v.dc), v.sam, v.ws) -}}
+        {%- set tt.v = tt.v + (ln(40, 1.0) | int) -%}
+      {%- endfor -%}
+      {%- set tt.v = tt.v + (ln(6 * 60, 0.8) | int) -%}
+    {%- endif -%}
+    {{- row(tt.v, 'Active Directory', 'Modified', 'user', dc, u.sam, v.path) -}}
+    {%- if rnd.random() < 0.7 -%}
+      {%- set tt.v = logon(tt.v + (ln(120, 0.9) | int), v, v.ws, 0.1) | int -%}
+    {%- endif -%}
+    {%- if rnd.random() < 0.15 -%}{{- stale_burst(tt.v + (ln(900, 1.0) | int), v) -}}{%- endif -%}
+  {%- elif r < 0.58 -%}
+    {#- Attribute change (title, phone, manager, expiry). -#}
+    {%- set v = users[staff[rnd.randrange(staff | length)]] -%}
+    {%- set tt = namespace(v=t) -%}
+    {%- for _ in range(module.rand.weighted_choice([1, 2], [75, 25])) -%}
+      {{- row(tt.v, 'Active Directory', 'Modified', 'user', dc, u.sam, v.path) -}}
+      {%- set tt.v = tt.v + (ln(20, 0.9) | int) -%}
+    {%- endfor -%}
+  {%- elif r < 0.84 -%}
+    {#- Group membership changes. -#}
+    {%- set tt = namespace(v=t) -%}
+    {%- for _ in range(module.rand.weighted_choice([1, 2, 3], [60, 28, 12])) -%}
+      {{- row(tt.v, 'Active Directory', 'Modified', 'group', dc, u.sam, module.rand.weighted_choice(shared.get('groups'), shared.get('group_w'))) -}}
+      {%- set tt.v = tt.v + (ln(25, 0.9) | int) -%}
+    {%- endfor -%}
+  {%- elif r < 0.98 -%}
+    {#- Computer account lifecycle. -#}
+    {%- set a = module.rand.weighted_choice(['Added', 'Modified', 'Removed'], [35, 50, 15]) -%}
+    {%- set cc = module.rand.weighted_choice(['Computers', 'Corp\\Workstations', 'Corp\\Servers'], [30, 60, 10]) -%}
+    {{- row(t, 'Active Directory', a, 'computer', dc, u.sam, base ~ '\\' ~ cc ~ '\\WS-' ~ module.rand.number.integer(1000, 9899)) -}}
+  {%- else -%}
+    {#- Group created or deleted. -#}
+    {{- row(t, 'Active Directory', module.rand.weighted_choice(['Added', 'Removed'], [60, 40]), 'group', dc, u.sam, base ~ '\\Groups\\' ~ module.rand.choice(['Project', 'Team', 'Share', 'App']) ~ ' ' ~ module.rand.choice(shared.get('surnames')) | capitalize) -}}
+  {%- endif -%}
+{%- endmacro -%}
+{%- macro draw(a, b, sq) -%}
+  {#- A time in [a, b] weighted by the hourly weights (the desk curve
+      for the first start, the recurrence weights for later ones);
+      none when the span holds no desk working time. -#}
+  {%- set wts = shared.get('ep_w') if sq else ep_curve -%}
+  {%- set segs = [] -%}
+  {%- set s = namespace(t=a, tot=0.0) -%}
+  {%- for _ in range(30) -%}
+    {%- if s.t >= b -%}{%- break -%}{%- endif -%}
+    {%- set e = [(s.t // hour + 1) * hour, b] | min -%}
+    {%- set w = wts[(s.t // hour) % 24] -%}
+    {%- if w > 0 -%}
+      {%- do segs.append([s.t, e, w * (e - s.t)]) -%}
+      {%- set s.tot = s.tot + w * (e - s.t) -%}
+    {%- endif -%}
+    {%- set s.t = e -%}
+  {%- endfor -%}
+  {%- set r = namespace(x=rnd.random() * s.tot, v=none) -%}
+  {%- for g in segs -%}
+    {%- if r.v is not none -%}{%- break -%}{%- endif -%}
+    {%- if r.x <= g[2] -%}
+      {%- set r.v = g[0] + module.builtins.int((g[1] - g[0]) * r.x / g[2]) -%}
+    {%- else -%}
+      {%- set r.x = r.x - g[2] -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('ep_draw', r.v if r.v is not none or not segs else segs[-1][0]) -%}
+{%- endmacro -%}
+{%- macro arm(a, b, sq, due) -%}
+  {#- Episode window [a, b] and a start drawn in it. A later start
+      (due given) is drawn in the window only when its due time falls
+      in desk working hours; otherwise, and when the window holds no
+      working time, the start is drawn across the next working day
+      after the due time (or after b) by the desk curve itself, as the
+      whole day needs no reweighting; that day becomes the window. -#}
+  {%- if due is none or ep_curve[(due // hour) % 24] > 0 -%}
+    {{- draw(a, b, sq) -}}
+  {%- else -%}
+    {%- do shared.set('ep_draw', none) -%}
+  {%- endif -%}
+  {%- set st = shared.get('ep_draw') -%}
+  {%- if st is none -%}
+    {%- set d0 = -((8 * hour - (b if due is none else due)) // day) * day + 8 * hour -%}
+    {{- draw(d0, d0 + 9 * hour, false) -}}
+    {%- do shared.update({'ep_start': shared.get('ep_draw'), 'ep_lo': d0, 'ep_hi': d0 + 9 * hour, 'ep_sq': sq}) -%}
+  {%- else -%}
+    {%- do shared.update({'ep_start': st, 'ep_lo': a, 'ep_hi': b, 'ep_sq': sq}) -%}
+  {%- endif -%}
+{%- endmacro -%}
+{%- if shared.get('queue') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 6, 'le': 8760}},
+    'domain': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[a-z0-9-]+(\\.[a-z0-9-]+)+$'}},
+    'netbios': {'type': 'typed-dict-field', 'schema': {'type': 'str', 'pattern': '^[A-Z0-9-]{1,15}$'}},
+    'staff_count': {'type': 'typed-dict-field', 'schema': {'type': 'int', 'ge': 100, 'le': 20000}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- set surnames = [] -%}
+  {%- for r in samples.surnames -%}{%- do surnames.append(r.surname) -%}{%- endfor -%}
+  {%- set sv = [] -%}
+  {%- set sw = [] -%}
+  {%- for r in samples.servers -%}{%- do sv.append(r.host ~ '.' ~ domain) -%}{%- do sw.append(module.builtins.int(r.weight)) -%}{%- endfor -%}
+  {%- set gp = [] -%}
+  {%- set gw = [] -%}
+  {%- for r in samples.groups -%}{%- do gp.append(base ~ '\\' ~ r.path) -%}{%- do gw.append(module.builtins.int(r.weight)) -%}{%- endfor -%}
+  {%- do shared.update({
+    'queue': [], 'ends': [], 'seq': 0, 'users': {}, 'recent_names': [], 'surnames': surnames,
+    'staff': [], 'staff_pos': {}, 'offl': [], 'offl_pos': {}, 'onl': [], 'onl_pos': {}, 'nfresh': 0,
+    'dcs': ['dc-01.' ~ domain, 'dc-02.' ~ domain, 'dc-03.' ~ domain],
+    'containers': ['Users', 'Corp\\Staff', 'Corp\\Contractors', 'Corp\\Branch\\Users'],
+    'servers': sv, 'server_w': sw, 'groups': gp, 'group_w': gw
+  }) -%}
+  {#- The roster (names, containers, workstations, home DCs, paces) is
+      the same in every run: it comes from a fixed seed. -#}
+  {%- set roster = module.random.Random(20260901) -%}
+  {%- for i in range(params.staff_count) -%}
+    {%- set sam = new_name(roster) -%}
+    {{- add_user(sam, 'staff', roster) -}}
+    {{- ladd('staff', sam) -}}
+  {%- endfor -%}
+  {#- Three admins and nine helpdesk operators; the first three helpdesk
+      operators form the accounts desk that does most account work. -#}
+  {%- set ops = [] -%}
+  {%- for i in range(12) -%}
+    {%- set sam = ('adm.' if i < 3 else 'hd.') ~ new_name(roster) -%}
+    {{- add_user(sam, 'op', roster) -}}
+    {%- do ops.append(sam) -%}
+  {%- endfor -%}
+  {%- do shared.update({'ops': ops, 'hd': ops[3:], 'desk': ops[3:6]}) -%}
+  {#- Who is at work when generation starts, by UTC hour. -#}
+  {%- set on_frac = [0.05, 0.04, 0.04, 0.04, 0.04, 0.04, 0.08, 0.3, 0.6, 0.8, 0.82, 0.82, 0.82, 0.82, 0.82, 0.8, 0.72, 0.5, 0.25, 0.12, 0.08, 0.06, 0.06, 0.05] -%}
+  {%- set pf = on_frac[ts.hour] -%}
+  {%- for sam, u in shared.get('users').items() -%}
+    {%- if rnd.random() < pf -%}
+      {%- set te = now + module.builtins.int(rnd.random() * (ln(9 * 3600, 0.25) | int)) -%}
+      {%- do u.update({'sid': 1, 'on': true, 'end': te}) -%}
+      {{- ladd('onl', sam) -}}
+      {%- do hq.heappush(shared.get('ends'), [te, sam, 1]) -%}
+    {%- else -%}
+      {{- ladd('offl', sam) -}}
+    {%- endif -%}
+  {%- endfor -%}
+  {#- Recurrence weights: a later start is drawn within due +- wd / 2
+      by the squared desk curve, reweighted per hour so that the hours
+      near the ends of the working day, which fewer windows reach, get
+      starts at the curve's own rate over many episodes (fixed point of
+      weight(h) * reach(h) = curve(h)^2, reach(h) = weight summed over
+      the window around h). -#}
+  {%- set half = ([params.anomaly_interval_hours / 4, 6] | min) / 2 -%}
+  {%- set c2 = [] -%}
+  {%- for c in ep_curve -%}{%- do c2.append(c * c) -%}{%- endfor -%}
+  {%- set fw = namespace(w=c2) -%}
+  {%- for _ in range(40) -%}
+    {%- set nw = [] -%}
+    {%- for h in range(24) -%}
+      {%- set z = namespace(v=0.0) -%}
+      {%- if c2[h] > 0 -%}
+        {%- for j in range(24) if c2[j] > 0 -%}
+          {%- set ov = ([h + 0.5 + half, j + 1] | min) - ([h + 0.5 - half, j] | max) -%}
+          {%- if ov > 0 -%}{%- set z.v = z.v + fw.w[j] * ov -%}{%- endif -%}
+        {%- endfor -%}
+      {%- endif -%}
+      {%- do nw.append(c2[h] / z.v if z.v > 0 else 0) -%}
+    {%- endfor -%}
+    {%- set top = nw | max -%}
+    {%- set dw = [] -%}
+    {%- for h in range(24) -%}{%- do dw.append((fw.w[h] * nw[h] / top) ** 0.5) -%}{%- endfor -%}
+    {%- set fw.w = dw -%}
+  {%- endfor -%}
+  {#- The first episode window is the first min(interval, 24 h), or up
+      to the end of the first working day (17:00 UTC) when it ends
+      earlier; its start can be redrawn up to the end of the first 24
+      hours. -#}
+  {%- do shared.update({'ep_last_op': none, 'ep_w': fw.w}) -%}
+  {%- set e0 = -((17 * hour - now) // day) * day + 17 * hour -%}
+  {{- arm(now, [now + ([interval, 24 * hour] | min), e0] | max, false, none) -}}
+  {%- do shared.set('ep_hi', [shared.get('ep_hi'), now + 24 * hour] | max) -%}
+{%- endif -%}
+{%- set queue = shared.get('queue') -%}
+{%- set users = shared.get('users') -%}
+{#- Sessions that ended by now. -#}
+{%- set ends = shared.get('ends') -%}
+{%- for _ in range(256) -%}
+  {%- if not ends or ends[0][0] > now -%}{%- break -%}{%- endif -%}
+  {%- set e = hq.heappop(ends) -%}
+  {%- set u = users.get(e[1]) -%}
+  {%- if u and u.on and not u.gone and u.sid == e[2] -%}{{- end_session(u, e[0]) -}}{%- endif -%}
+{%- endfor -%}
+{#- Episode start. Accounts desk operators arrive by 10:00 UTC, and
+    from then on the end of each one's working day is known: once the
+    window has begun, a start that no desk operator at work would reach
+    is redrawn within the rest of the window, up to the latest departure
+    of a desk operator at work. -#}
+{%- set desk = shared.get('desk') -%}
+{%- set prev = shared.get('ep_last_op') -%}
+{%- set es = shared.get('ep_start') -%}
+{%- if params.anomaly_mode and shared.get('ep_lo') <= now < es and ts.hour >= 10 and now // (24 * hour) == es // (24 * hour) -%}
+  {%- set lk = namespace(v=none) -%}
+  {%- for s in desk if users[s].on -%}
+    {%- set lk.v = [lk.v or 0, users[s].get('end', 0)] | max -%}
+  {%- endfor -%}
+  {%- set last = lk.v -%}
+  {%- if last is not none and last < es and last > now -%}
+    {{- arm(now, [last, shared.get('ep_hi')] | min, shared.get('ep_sq'), none) -}}
+  {%- endif -%}
+{%- endif -%}
+{#- Episode: at its start, an accounts desk operator at work (not the
+    previous episode's while another may still come in) creates an
+    account; the account logs on after the delay new hires use at the
+    desk, and the same operator deletes it shortly after. The rows join
+    the queue and take the next timestamps. With nobody eligible at
+    work, the start is redrawn within the rest of the window. The next
+    window is centred one interval after this start, or is the next
+    working day when that due time falls outside desk working hours;
+    missed starts are not replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_start') -%}
+  {%- set cands = [] -%}
+  {%- for s in desk if users[s].on and s != prev -%}{%- do cands.append(s) -%}{%- endfor -%}
+  {%- if not cands and ts.hour >= 10 and prev and users[prev].on -%}{%- do cands.append(prev) -%}{%- endif -%}
+  {%- if cands -%}
+    {%- set op = users[module.rand.choice(cands)] -%}
+    {%- set sam = new_name(rnd) -%}
+    {{- add_user(sam, 'episode', rnd) -}}
+    {%- set t = onboard(now, op, sam) | int -%}
+    {{- push(t + (first_delay() | int), {'k': 'first', 'u': sam, 'ep_rm': t + (ln(10 * 60, 0.9) | int), 'op': op.sam}) -}}
+    {%- do shared.set('ep_last_op', op.sam) -%}
+    {%- set wd = [interval // 4, 6 * hour] | min -%}
+    {{- arm(now + interval - wd // 2, now + interval + wd // 2, true, now + interval) -}}
+  {%- else -%}
+    {{- arm(now, shared.get('ep_hi'), shared.get('ep_sq'), none) -}}
+  {%- endif -%}
+{%- endif -%}
+{%- set out = namespace(row=none) -%}
+{%- for _ in range(64) -%}
+  {%- if out.row is not none or not queue or queue[0][0] > now -%}{%- break -%}{%- endif -%}
+  {%- set item = hq.heappop(queue)[2] -%}
+  {%- set u = users.get(item.get('u')) -%}
+  {%- if item.k == 'row' -%}
+    {%- set out.row = item -%}
+  {%- elif item.k == 'first' and u and not u.gone -%}
+    {#- First logon of a new account at the desk. An episode account is
+        deleted at the pair's own deletion time if that falls after the
+        logon, otherwise after a new draw of the same short delay. -#}
+    {{- start_session(now, u) -}}
+    {%- if item.get('ep_rm') is not none -%}
+      {%- set rm = item.ep_rm if item.ep_rm > u.last_logon else u.last_logon + (ln(10 * 60, 0.9) | int) -%}
+      {{- push(rm, {'k': 'remove', 'u': u.sam, 'op': item.op}) -}}
+    {%- endif -%}
+  {%- elif item.k == 'remove' and u and not u.gone -%}
+    {#- A deletion waits for the account's queued logons to finish. -#}
+    {%- if u.get('busy', 0) >= now -%}
+      {{- push(u.busy + (ln(30, 0.9) | int), item) -}}
+    {%- else -%}
+      {{- remove(now, users[item.op], u) -}}
+    {%- endif -%}
+  {%- elif item.k == 'gc' and u and u.gone -%}
+    {%- do users.pop(item.u) -%}
+    {%- set rn = shared.get('recent_names') -%}
+    {%- do rn.append(item.u) -%}
+    {%- if rn | length > 300 -%}{%- do rn.pop(0) -%}{%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.row is none -%}
+  {%- set ops = shared.get('ops') -%}
+  {%- if 'arrive' in tags or ('logon' in tags and not shared.get('onl')) -%}
+    {%- set sam = '' -%}
+    {%- if 'arrive' in tags and 6 <= ts.hour < 10 and rnd.random() < 0.3 -%}
+      {#- Operators keep a regular day: each comes in every morning
+          between 07:00 and 08:30 UTC unless absent that day (8%). -#}
+      {%- set dn = now // day -%}
+      {%- set oc = [] -%}
+      {%- for s in ops -%}
+        {%- set o = users[s] -%}
+        {%- if o.get('aday') != dn -%}{%- do o.update({'aday': dn, 'absent': rnd.random() < 0.08, 'arr': dn * day + 7 * hour + rnd.randrange(90 * minute)}) -%}{%- endif -%}
+        {%- if not o.on and not o.absent and o.arr <= now and (o.left is none or now - o.left >= 12 * hour) -%}{%- do oc.append(s) -%}{%- endif -%}
+      {%- endfor -%}
+      {%- if oc -%}{%- set sam = module.rand.choice(oc) -%}{%- endif -%}
+    {%- endif -%}
+    {%- if not sam -%}{%- set sam = pick_off() -%}{%- endif -%}
+    {%- if not sam and not shared.get('onl') -%}{%- set sam = shared.get('offl')[0] -%}{%- endif -%}
+    {%- if sam -%}
+      {{- start_session(now, users[sam]) -}}
+    {%- else -%}
+      {{- server_logon(now, users[pick_on()]) -}}
+    {%- endif -%}
+  {%- elif 'task' in tags or 'account' in tags -%}
+    {%- set duty = [] -%}
+    {%- for s in ops if users[s].on -%}{%- do duty.append(s) -%}{%- endfor -%}
+    {%- if 'task' in tags -%}
+      {#- One directory change by an operator at work, or by the on-call
+          operator when nobody is. -#}
+      {{- task(now, users[pick_op(duty if duty else ops)]) -}}
+    {%- else -%}
+      {#- Account lifecycle, mostly by the accounts desk. -#}
+      {%- set desk = [] -%}
+      {%- for s in shared.get('desk') if users[s].on -%}{%- do desk.append(s) -%}{%- endfor -%}
+      {%- set hd = [] -%}
+      {%- for s in shared.get('hd') if users[s].on -%}{%- do hd.append(s) -%}{%- endfor -%}
+      {%- if desk and rnd.random() < 0.9 -%}
+        {%- set op = users[module.rand.choice(desk)] -%}
+      {%- else -%}
+        {%- set op = users[pick_op(hd if hd else (duty if duty else ops))] -%}
+      {%- endif -%}
+      {%- set nstaff = (shared.get('staff') | length) + shared.get('nfresh') -%}
+      {%- set kind = module.rand.weighted_choice(['on', 'off', 'test'], [39, 39, 22]) -%}
+      {%- if kind == 'on' and nstaff >= params.staff_count * 1.2 -%}{%- set kind = 'off' -%}{%- endif -%}
+      {%- if kind == 'off' and nstaff <= params.staff_count * 0.85 -%}{%- set kind = 'on' -%}{%- endif -%}
+      {%- set v = namespace(u=none) -%}
+      {%- if kind == 'off' -%}
+        {#- An account created within the chain window plus one hour, or
+            with a ticket or logon still under way, is not offboarded. -#}
+        {%- set staff = shared.get('staff') -%}
+        {%- for _ in range(30) -%}
+          {%- if v.u is not none -%}{%- break -%}{%- endif -%}
+          {%- set c = users[staff[rnd.randrange(staff | length)]] -%}
+          {%- if (c.added is none or now - c.added > window + hour) and c.get('busy', 0) < now -%}{%- set v.u = c -%}{%- endif -%}
+        {%- endfor -%}
+        {%- if v.u is none -%}{%- set kind = 'test' -%}{%- endif -%}
+      {%- endif -%}
+      {%- if kind == 'on' -%}
+        {#- Onboarding. The new hire logs on either at the desk while the
+            helpdesk waits, or on a later working day. -#}
+        {%- set sam = new_name(rnd) -%}
+        {{- add_user(sam, 'fresh', rnd) -}}
+        {%- do shared.set('nfresh', shared.get('nfresh') + 1) -%}
+        {%- set t = onboard(now, op, sam) | int -%}
+        {%- if rnd.random() < 0.3 -%}
+          {{- push(t + (first_delay() | int), {'k': 'first', 'u': sam}) -}}
+        {%- else -%}
+          {%- do users[sam].update({'left': t}) -%}
+          {{- ladd('offl', sam) -}}
+        {%- endif -%}
+      {%- elif kind == 'off' -%}
+        {#- Offboarding: either a direct deletion, or disable (sometimes a
+            group change) and delete soon or hours later. -#}
+        {%- if rnd.random() < 0.5 -%}
+          {{- remove(now, op, v.u) -}}
+        {%- else -%}
+          {%- set dc = pick_dc(op.dc) -%}
+          {{- row(now, 'Active Directory', 'Modified', 'user', dc, op.sam, v.u.path) -}}
+          {%- do v.u.update({'on': false, 'sid': v.u.sid + 1}) -%}
+          {{- ldel('staff', v.u.sam) -}}
+          {{- ldel('offl', v.u.sam) -}}
+          {{- ldel('onl', v.u.sam) -}}
+          {%- set t = namespace(v=now) -%}
+          {%- if rnd.random() < 0.4 -%}
+            {%- set t.v = t.v + (ln(30, 0.9) | int) -%}
+            {{- row(t.v, 'Active Directory', 'Modified', 'group', dc, op.sam, module.rand.weighted_choice(shared.get('groups'), shared.get('group_w'))) -}}
+          {%- endif -%}
+          {{- push(t.v + (ln(20 * 60, 1.0) | int if rnd.random() < 0.7 else ln(6 * 3600, 0.6) | int), {'k': 'remove', 'u': v.u.sam, 'op': op.sam}) -}}
+        {%- endif -%}
+      {%- else -%}
+        {#- Account created by mistake or for a test: sometimes edited,
+            deleted within minutes, never used. -#}
+        {%- set sam = new_name(rnd) -%}
+        {{- add_user(sam, 'test', rnd) -}}
+        {%- set t = onboard(now, op, sam) | int -%}
+        {{- push(t + (ln(10 * 60, 0.9) | int), {'k': 'remove', 'u': sam, 'op': op.sam}) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- else -%}
+    {{- server_logon(now, users[pick_on()]) -}}
+  {%- endif -%}
+  {%- for _ in range(8) -%}
+    {%- if out.row is not none or not queue or queue[0][0] > now -%}{%- break -%}{%- endif -%}
+    {%- set item = hq.heappop(queue)[2] -%}
+    {%- if item.k == 'row' -%}{%- set out.row = item -%}{%- endif -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- if out.row is none -%}{{- dispatch.drop() -}}{%- endif -%}
+{%- set row = out.row -%}
+{%- set moment = ts.replace(microsecond=0) -%}
+{%- set iso = moment.strftime('%Y-%m-%dT%H:%M:%SZ') -%}
+{%- set who = netbios ~ '\\' ~ row.who -%}
+{%- set name = row.a ~ ' ' ~ row.c -%}
+{%- macro esc(v) -%}{{- v.replace('\\', '\\\\').replace('=', '\\=') -}}{%- endmacro -%}
+{%- set ext = [['shost', row.dc], ['cat', row.c], ['suser', who], ['filePath', row.what], ['start', moment.strftime('%b %d %Y %H:%M:%S')]] -%}
+{%- set pieces = [] -%}
+{%- for k, v in ext -%}{%- do pieces.append(k ~ '=' ~ esc(v)) -%}{%- endfor -%}
+{%- set raw = 'CEF:0|Netwrix|' ~ row.p ~ '|1.0|' ~ row.a ~ '|' ~ name ~ '|0|' ~ pieces | join(' ') -%}
+{%- set logon_row = row.p == 'Logon Activity' -%}
+{%- if logon_row -%}
+  {%- set ecs_ev = {'action': row.a | lower | replace(' ', '-'), 'category': ['authentication'], 'type': ['start'], 'outcome': 'success' if row.a == 'Successful Logon' else 'failure'} -%}
+  {%- set user = {'name': row.who, 'domain': netbios} -%}
+  {%- set related = {'user': [row.who], 'hosts': [row.dc, row.what]} -%}
+{%- else -%}
+  {%- set ecs_ev = {'action': (row.a ~ '-' ~ row.c) | lower, 'category': ['iam'], 'type': [row.c if row.c in ['user', 'group'] else 'info', {'Added': 'creation', 'Removed': 'deletion', 'Modified': 'change'}[row.a]]} -%}
+  {%- set user = {'name': row.who, 'domain': netbios} -%}
+  {%- set tgt = row.what.split('\\')[-1] -%}
+  {%- if row.c == 'user' -%}{%- do user.update({'target': {'name': tgt}}) -%}{%- elif row.c == 'group' -%}{%- do user.update({'target': {'group': {'name': tgt}}}) -%}{%- endif -%}
+  {%- set related = {'user': [row.who, tgt] if row.c == 'user' else [row.who], 'hosts': [row.dc]} -%}
+{%- endif -%}
+{%- do ecs_ev.update({'code': row.a, 'dataset': 'cef.log', 'kind': 'event', 'module': 'cef', 'original': raw, 'severity': 0, 'start': iso}) -%}
+{%- set event = {
+  '@timestamp': iso,
+  'cef': {
+    'version': '0',
+    'device': {'vendor': 'Netwrix', 'product': row.p, 'version': '1.0', 'event_class_id': row.a},
+    'name': name,
+    'severity': '0',
+    'extensions': {'sourceHostName': row.dc, 'deviceEventCategory': row.c, 'sourceUserName': who, 'filePath': row.what, 'startTime': iso}
+  },
+  'ecs': {'version': '8.17.0'},
+  'event': ecs_ev,
+  'file': {'path': row.what},
+  'message': name,
+  'observer': {'product': row.p, 'vendor': 'Netwrix', 'version': '1.0'},
+  'related': related,
+  'source': {'domain': row.dc, 'user': {'name': who}},
+  'user': user
+} -%}
+{{- event | tojson -}}
