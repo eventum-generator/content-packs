@@ -1,0 +1,144 @@
+{# Fixed client inventory; at most 40 active services and 840 memberships. #}
+{%- set now = timestamp.timestamp() -%}
+{%- set epoch = now | int -%}
+{%- set serial = shared.get('serial', 0) + 1 -%}{%- do shared.set('serial', serial) -%}
+{%- set generalized = timestamp.strftime('%Y%m%d%H%M%SZ') -%}
+{%- set csn = timestamp.strftime('%Y%m%d%H%M%S.%fZ') ~ '#000000#000#000000' -%}
+{%- set interval = [params.anomaly_interval_hours | float, 1] | max * 3600 -%}
+{%- set curve = [0.526315789,0.526315789,0.526315789,0.526315789,0.526315789,0.526315789,0.526315789,0.526315789,1,1,1,1,1,1,1,1,1,1,0.526315789,0.526315789,0.526315789,0.526315789,0.526315789,0.526315789] -%}
+{%- macro schedule(first=false) -%}
+  {%- set width = [interval / 4, 21600] | min -%}
+  {%- set lo = now if first else now + interval - width / 2 -%}
+  {%- set hi = now + [interval,86400] | min if first else now + interval + width / 2 -%}
+  {%- set pick = namespace(at=lo) -%}
+  {%- for attempt in range(100) -%}
+    {%- set pick.at = module.rand.number.floating(lo, hi - 180) -%}
+    {%- set weight = curve[(pick.at // 3600) | int % 24] -%}
+    {%- if module.rand.chance(weight if first else weight * weight + 0.01) -%}{%- break -%}{%- endif -%}
+  {%- endfor -%}
+  {%- do shared.set('episode_due', pick.at) -%}
+{%- endmacro -%}
+{%- if shared.get('episode_due') is none -%}{%- do schedule(true) -%}{%- endif -%}
+{%- set clients = samples.clients -%}
+{%- set actor_weights = [20 if 8 <= timestamp.hour < 18 else 2,45,35] -%}
+{%- set actor_indices = [0,1,2] -%}
+{%- if params.anomaly_mode and not shared.get('episode',{}) and now >= shared.get('episode_due') -%}
+  {%- set actor_indices = actor_indices | reject('equalto',shared.get('previous_actor')) | list -%}
+{%- endif -%}
+{%- set selected_weights = [] -%}
+{%- for index in actor_indices -%}{%- do selected_weights.append(actor_weights[index]) -%}{%- endfor -%}
+{%- set ci = module.rand.weighted_choice(actor_indices,selected_weights) -%}
+{%- set actor = 'cn=admin,' ~ params.base_dn if ci == 0 else (params.operator_dn if ci == 1 else 'uid=svc-provision,ou=People,' ~ params.base_dn) -%}
+{%- set peer_ip = clients[ci].ip -%}
+{%- set connections = shared.get('connections', {}) -%}
+{%- if ci not in connections or now >= connections[ci].until -%}
+  {%- set nconn = shared.get('conn', 1000) + 1 -%}{%- do shared.set('conn', nconn) -%}
+  {%- do connections.update({ci:{'id':nconn,'port':module.rand.number.integer(32768,60999),'until':now + module.rand.number.floating(300,1800)}}) -%}
+{%- endif -%}
+{%- do shared.set('connections', connections) -%}
+{%- set conn = connections[ci].id -%}{%- set peer_port = connections[ci].port -%}
+{%- set services = shared.get('services', {}) -%}
+{%- set memberships = shared.get('memberships', {}) -%}
+{%- set episode = shared.get('episode', {}) -%}
+{%- set change = 'modify' -%}{%- set operation = 'replace' -%}
+{%- set attribute = 'description' -%}{%- set value = 'Account profile review ' ~ serial -%}
+{%- set target_uid = 'employee' ~ '%03d'|format(module.rand.number.integer(1,800)) -%}
+{%- set kind = module.rand.weighted_choice(['metadata','password','member','create'],[88,5,5,2]) -%}
+{%- set chosen = namespace(uid=none, cleanup=false, final=false) -%}
+{# Restore membership before deleting a service, on the same lifetime in both modes. #}
+{%- for uid, service in services.items() -%}
+  {%- if now >= service.expires -%}{%- set chosen.uid = uid -%}{%- set chosen.cleanup = true -%}{%- break -%}{%- endif -%}
+{%- endfor -%}
+{%- if chosen.cleanup -%}
+  {%- set target_uid = chosen.uid -%}
+  {%- if target_uid in memberships -%}{%- set kind = 'remove' -%}
+  {%- else -%}{%- set kind = 'delete' -%}{%- endif -%}
+{%- elif episode and now >= episode.due -%}
+  {%- set target_uid = episode.uid -%}{%- set actor = episode.actor -%}
+  {%- set peer_ip = episode.ip -%}{%- set conn = episode.conn -%}{%- set peer_port = episode.port -%}
+  {%- if episode.stage == 1 -%}
+    {%- set kind = 'member' -%}
+    {%- do episode.update({'stage':2,'due':now + module.rand.number.floating(20,80)}) -%}
+  {%- else -%}
+    {%- set kind = 'password' -%}{%- set chosen.final = true -%}
+    {%- do shared.set('episode', {}) -%}
+  {%- endif -%}
+{%- elif params.anomaly_mode and not episode and now >= shared.get('episode_due') and services | length < 40 -%}
+  {%- set kind = 'create' -%}
+  {%- set chosen.final = true -%}
+  {%- do shared.set('previous_actor',ci) -%}
+  {%- do schedule() -%}
+{%- elif kind in ['password','member','metadata'] and services and module.rand.chance(0.3) -%}
+  {%- set available = services.keys() | reject('equalto', episode.uid if episode else '') | list -%}
+  {%- if available -%}{%- set target_uid = module.rand.choice(available) -%}{%- endif -%}
+{%- endif -%}
+{%- if kind == 'create' and services | length >= 40 -%}{%- set kind = 'metadata' -%}{%- endif -%}
+{%- if kind == 'create' -%}
+  {%- set service_seq = shared.get('service_seq',0) + 1 -%}{%- do shared.set('service_seq',service_seq) -%}
+  {%- set target_uid = (params.backdoor_uid if module.rand.chance(0.2) else 'svc-worker') ~ '-' ~ '%06d'|format(service_seq) -%}
+  {%- set change = 'add' -%}{%- set attribute = 'uid' -%}{%- set value = target_uid -%}
+  {%- do services.update({target_uid:{'created':now,'actor':actor,'ip':peer_ip,'expires':now + module.rand.number.floating(7200,14400),'qualifying_member':false}}) -%}
+  {%- if chosen.final -%}
+    {%- do shared.set('episode', {'uid':target_uid,'actor':actor,'ip':peer_ip,'conn':conn,'port':peer_port,'stage':1,'due':now + module.rand.number.floating(20,80)}) -%}
+  {%- endif -%}
+{%- elif kind == 'delete' -%}
+  {%- set change = 'delete' -%}{%- set attribute = none -%}{%- set value = none -%}
+  {%- do services.pop(target_uid) -%}
+{%- elif kind in ['member','remove'] -%}
+  {%- if target_uid in memberships -%}
+    {%- set operation = 'delete' -%}{%- set group = memberships.pop(target_uid) -%}
+  {%- elif memberships | length >= 840 -%}
+    {%- set target_uid = module.rand.choice(memberships.keys() | list) -%}
+    {%- set operation = 'delete' -%}{%- set group = memberships.pop(target_uid) -%}
+  {%- else -%}
+    {%- set operation = 'add' -%}
+    {%- set group = params.privileged_group if episode and target_uid == episode.uid else module.rand.weighted_choice([params.privileged_group,'app-operators','vpn-users'],[10,30,60]) -%}
+    {%- do memberships.update({target_uid:group}) -%}
+    {%- if group == params.privileged_group and target_uid in services and services[target_uid].actor == actor and services[target_uid].ip == peer_ip -%}
+      {%- do services[target_uid].update({'qualifying_member':true}) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set attribute = 'member' -%}
+  {%- set member_dn = 'uid=' ~ target_uid ~ ',ou=People,' ~ params.base_dn -%}
+  {%- set value = member_dn -%}
+{%- elif kind == 'password' -%}
+  {%- if not chosen.final and target_uid in services -%}
+    {%- set service = services[target_uid] -%}
+    {%- if now - service.created <= 900 and service.actor == actor and service.ip == peer_ip and service.qualifying_member -%}
+      {%- set target_uid = 'employee' ~ '%03d'|format(module.rand.number.integer(1,800)) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- set attribute = 'userPassword' -%}
+{%- else -%}
+  {%- set attribute = module.rand.weighted_choice(['description','telephoneNumber','title','mail'],[50,20,20,10]) -%}
+  {%- set value = {'description':'Account profile review ' ~ serial,'telephoneNumber':'+1 555 ' ~ '%07d'|format(serial % 10000000),'title':module.rand.choice(['Analyst','Engineer','Service Operator','Support Specialist']),'mail':target_uid ~ '@corp.example'}[attribute] -%}
+{%- endif -%}
+{%- set dn = 'cn=' ~ group ~ ',ou=Groups,' ~ params.base_dn if attribute == 'member' else 'uid=' ~ target_uid ~ ',ou=People,' ~ params.base_dn -%}
+{%- do shared.set('services',services) -%}{%- do shared.set('memberships',memberships) -%}
+{%- set salt = '%08d'|format(serial) -%}
+{%- if change == 'add' or attribute == 'userPassword' -%}
+  {%- set digest = module.hashlib.sha1(('synthetic-only-' ~ serial ~ '-' ~ target_uid ~ salt).encode('ascii')).digest() -%}
+  {%- set hash_value = '{SSHA}' ~ module.base64.b64encode(digest + salt.encode('ascii')).decode('ascii') -%}
+  {%- if attribute == 'userPassword' -%}{%- set value = hash_value -%}{%- endif -%}
+{%- endif -%}
+{%- set prefix = '# ' ~ change ~ ' ' ~ epoch ~ ' ' ~ params.base_dn ~ ' ' ~ actor ~ ' IP=' ~ peer_ip ~ ':' ~ peer_port ~ ' conn=' ~ conn ~ '\ndn: ' ~ dn ~ '\nchangetype: ' ~ change ~ '\n' -%}
+{%- if change == 'add' -%}
+  {%- set cn = 'Service Account ' ~ target_uid -%}
+  {%- set body = 'objectClass: top\nobjectClass: person\nobjectClass: organizationalPerson\nobjectClass: inetOrgPerson\nuid: ' ~ target_uid ~ '\ncn: ' ~ cn ~ '\nsn: ' ~ 'Service' ~ '\nuserPassword: ' ~ hash_value ~ '\nstructuralObjectClass: inetOrgPerson\nentryUUID: ' ~ module.rand.crypto.uuid4() ~ '\ncreatorsName: ' ~ actor ~ '\ncreateTimestamp: ' ~ generalized ~ '\nentryCSN: ' ~ csn ~ '\nmodifiersName: ' ~ actor ~ '\nmodifyTimestamp: ' ~ generalized ~ '\n' -%}
+{%- elif change == 'delete' -%}
+  {%- set body = '' -%}
+{%- else -%}
+  {%- set body = operation ~ ': ' ~ attribute ~ '\n' ~ attribute ~ ': ' ~ value ~ '\n-\nreplace: entryCSN\nentryCSN: ' ~ csn ~ '\n-\nreplace: modifiersName\nmodifiersName: ' ~ actor ~ '\n-\nreplace: modifyTimestamp\nmodifyTimestamp: ' ~ generalized ~ '\n-\n' -%}
+{%- endif -%}
+{%- set original = prefix ~ body ~ '# end ' ~ change ~ ' ' ~ epoch ~ '\n\n' -%}
+{%- set event = {
+  '@timestamp': timestamp.isoformat(),
+  'ecs': {'version': '8.17.0'},
+  'event': {'kind': 'event', 'category': ['iam'], 'type': ['creation'] if change == 'add' else (['deletion'] if change == 'delete' else ['change']), 'action': 'ldap-' ~ change, 'outcome': 'success', 'original': original},
+  'host': {'name': params.host_name},
+  'source': {'ip': peer_ip, 'port': peer_port},
+  'user': {'name': actor},
+  'related': {'user': [actor, member_dn if attribute == 'member' else dn], 'ip': [peer_ip]},
+  'ldap': {'auditlog': {'base_dn': params.base_dn, 'actor_dn': actor, 'peer_ip': peer_ip, 'peer_port': peer_port, 'connection_id': conn, 'target_dn': dn, 'change_type': change, 'operation': operation if change == 'modify' else none, 'attribute': attribute, 'value': value, 'entry_csn': csn if change != 'delete' else none}}
+} -%}
+{{- event | tojson -}}
