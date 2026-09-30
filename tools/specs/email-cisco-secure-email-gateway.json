@@ -1,0 +1,67 @@
+{
+ "notes": [
+  "constants: @timestamp is always .000 because RFC 3164 syslog has one-second resolution; native and identical in both modes, accepted by the coordinator (2026-09-27). A constants-only SUSPECT is expected.",
+  "chain key: the owner part of an address (group 1 of the regex over the email object), so a user's From/ready rows and To rows to the user's own freemail mailbox (<user><digits>@freemail) share one key. A To row is followed by the ready row of the same MID; three such pairs with distinct MIDs, each ready >= 8 MB, within the chain window.",
+  "limit: steps are ordered, so an episode whose next To line is written before the previous ready line (two messages under about a minute apart, slow transfer) is not matched; custom 8 h capture of 2026-09-27 loop 4: 6 of 7 checker episodes matched."
+ ],
+ "timestamp": {"path": "@timestamp"},
+ "actors": [
+  {"name": "sender", "path": "email.from.address",
+   "when": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^\\d+$"}},
+  {"name": "sender_big", "path": "email.from.address",
+   "when": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^(?:[89]\\d{6}|[1-9]\\d{7,})$"}},
+  {"name": "rcpt", "path": "email.to.address"},
+  {"name": "rcpt_freemail", "path": "email.to.address",
+   "when": {"path": "email.to.address", "regex": "@(?:mail\\.example\\.com|webmail\\.example\\.net|inbox\\.example\\.org)$"}},
+  {"name": "owner", "path": "email", "regex": "\"address\": \\[\"([a-z]+\\.[a-z]+)\\d*@"},
+  {"name": "client", "path": "cisco_secure_email_gateway.log.address",
+   "when": {"path": "cisco_secure_email_gateway.log.message", "regex": "^New SMTP ICID"}},
+  {"name": "dest", "path": "cisco_secure_email_gateway.log.address",
+   "when": {"path": "cisco_secure_email_gateway.log.message", "regex": "^New SMTP DCID"}}
+ ],
+ "action": {"paths": ["cisco_secure_email_gateway.log.message"],
+  "regex": "^(?:MID \\d+ )?(?:ICID \\d+ )?(?:RID \\d+ )?(New SMTP ICID|New SMTP DCID|Start MID|Delivery start|Message done|Message finished|Message aborted|RPC Delivery start|RPC Message done|EUQ: Tagging|EUQ: Quarantined|Bounced|DCID|From|To|Message-ID|Subject|ready|matched all recipients for per-recipient policy DEFAULT in the inbound|matched all recipients for per-recipient policy DEFAULT in the outbound|SPF|DKIM|DMARC|close|interim verdict|interim AV|using engine: CASE spam negative|using engine: CASE spam suspect|using engine: CASE spam positive|using engine: GRAYMAIL|antivirus negative|antivirus positive|attachment|Outbreak|queued|RID|ACCEPT|RELAY|REJECT)"},
+ "chain_seq": {
+  "key": {"path": "email", "regex": "\"address\": \\[\"([a-z]+\\.[a-z]+)\\d*@"},
+  "within": 2460,
+  "steps": [
+   {"match": {"path": "email.to.address", "regex": "^[a-z]+\\.[a-z]+\\d+@(?:mail\\.example\\.com|webmail\\.example\\.net|inbox\\.example\\.org)$"},
+    "bind": {"A": "email.message_id"}},
+   {"match": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^(?:[89]\\d{6}|[1-9]\\d{7,})$"},
+    "eq": {"A": "email.message_id"}},
+   {"match": {"path": "email.to.address", "regex": "^[a-z]+\\.[a-z]+\\d+@(?:mail\\.example\\.com|webmail\\.example\\.net|inbox\\.example\\.org)$"},
+    "ne": {"A": "email.message_id"}, "bind": {"B": "email.message_id"}},
+   {"match": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^(?:[89]\\d{6}|[1-9]\\d{7,})$"},
+    "eq": {"B": "email.message_id"}},
+   {"match": {"path": "email.to.address", "regex": "^[a-z]+\\.[a-z]+\\d+@(?:mail\\.example\\.com|webmail\\.example\\.net|inbox\\.example\\.org)$"},
+    "ne": {"A,B": "email.message_id"}, "bind": {"C": "email.message_id"}},
+   {"match": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^(?:[89]\\d{6}|[1-9]\\d{7,})$"},
+    "eq": {"C": "email.message_id"}}
+  ]
+ },
+ "features": [
+  {"name": "three_large_same_sender", "key": {"path": "email.from.address"}, "within": 2700,
+   "steps": [
+    {"match": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^(?:[89]\\d{6}|[1-9]\\d{7,})$"}, "bind": {"A": "email.message_id"}},
+    {"match": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^(?:[89]\\d{6}|[1-9]\\d{7,})$"}, "ne": {"A": "email.message_id"}, "bind": {"B": "email.message_id"}},
+    {"match": {"path": "cisco_secure_email_gateway.log.read_bytes", "regex": "^(?:[89]\\d{6}|[1-9]\\d{7,})$"}, "ne": {"A,B": "email.message_id"}}
+   ]},
+  {"name": "three_to_own_freemail", "key": {"path": "email", "regex": "\"address\": \\[\"([a-z]+\\.[a-z]+)\\d*@"}, "within": 2460,
+   "steps": [
+    {"match": {"path": "email.to.address", "regex": "^[a-z]+\\.[a-z]+\\d+@"}, "bind": {"A": "email.message_id"}},
+    {"match": {"path": "email.to.address", "regex": "^[a-z]+\\.[a-z]+\\d+@"}, "ne": {"A": "email.message_id"}, "bind": {"B": "email.message_id"}},
+    {"match": {"path": "email.to.address", "regex": "^[a-z]+\\.[a-z]+\\d+@"}, "ne": {"A,B": "email.message_id"}}
+   ]}
+ ],
+ "pairs": [
+  {"name": "icid", "key": {"path": "cisco_secure_email_gateway.log.injection_connection_id"},
+   "open": {"path": "cisco_secure_email_gateway.log.message", "regex": "^New SMTP ICID"},
+   "close": {"path": "cisco_secure_email_gateway.log.message", "regex": "^ICID \\d+ close$"}},
+  {"name": "dcid", "key": {"path": "cisco_secure_email_gateway.log.delivery_connection_id"},
+   "open": {"path": "cisco_secure_email_gateway.log.message", "regex": "^New SMTP DCID"},
+   "close": {"path": "cisco_secure_email_gateway.log.message", "regex": "^DCID \\d+ close$"}},
+  {"name": "mid", "key": {"path": "email.message_id"},
+   "open": {"path": "cisco_secure_email_gateway.log.message", "regex": "^Start MID"},
+   "close": {"path": "cisco_secure_email_gateway.log.message", "regex": "^Message finished MID"}}
+ ]
+}
