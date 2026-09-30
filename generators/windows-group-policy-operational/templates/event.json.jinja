@@ -1,0 +1,413 @@
+{#- Microsoft-Windows-GroupPolicy/Operational: computer policy refreshes
+    (4006/8006/7006 periodic, 4004/8004/7004 manual) and client-side
+    extension processing (4016 start, 5016 success, 7016 error) of a
+    fleet of domain members, as Winlogbeat-style ECS JSON with the raw
+    event XML. Every input timestamp yields exactly one record at that
+    time. Timestamps tagged `srv` come from the servers' share of the
+    volume, `ws` from the workstations' share.
+
+    Each timestamp takes, in this order: the next record of the oldest
+    refresh in progress whose next record is due (the records of one
+    refresh follow each other at their modelled gaps), a due manual
+    gpupdate, otherwise the
+    start of the periodic refresh of the host of its population whose
+    refresh is due first (even when it is not due yet). Every host then
+    schedules its next periodic refresh 90 minutes plus 0-30 minutes
+    after this one. Workstations that are not left on power up in the
+    morning and shut down in the evening; a switched-off workstation
+    refreshes again after its next start. Times are microseconds. -#}
+{%- set hq = module.heapq -%}
+{%- set now = module.builtins.int(timestamp.timestamp() * 1000000) -%}
+{%- set S = 1000000 -%}
+{%- set M = 60 * S -%}
+{%- set H = 3600 * S -%}
+{%- set DAY = 24 * H -%}
+{#- Chain window (6 h, plus the 1 ms of timestamp rounding): a
+    background Security extension error is turned into a success when
+    two other hosts already logged one within this window. -#}
+{%- set window = 6 * H + 1000 -%}
+{%- set sec_gpos = ['Default Domain Policy', 'Workstation Security Baseline', 'Server Security Baseline'] -%}
+{%- set cse_ids = {
+  'Registry': '{35378EAC-683F-11D2-A89A-00C04FBBCFA2}',
+  'Security': '{827D319E-6EAC-11D2-A4EA-00C04F79F83A}',
+  'Audit Policy Configuration': '{F3CCC681-B74C-4060-9F26-CD84525DCA2A}',
+  'Group Policy Registry': '{B087BE9D-ED37-454F-AF9C-04291E351182}',
+  'Group Policy Folders': '{6232C319-91AC-4931-9385-E70C2B099F0E}',
+  'Group Policy Scheduled Tasks': '{AADCED64-746C-4633-A97C-D61349046527}',
+  'EFS recovery': '{B1BE8D72-6EAC-11D2-A4EA-00C04F79F83A}'
+} -%}
+{#- Share of periodic refreshes in which an extension runs although no
+    GPO changed (synthetic); Security also runs after its own error. A
+    manual refresh runs every extension. -#}
+{%- set cse_p = {'Registry': 0.55, 'Security': 0.2, 'Audit Policy Configuration': 0.15, 'Group Policy Registry': 0.35, 'Group Policy Folders': 0.3, 'Group Policy Scheduled Tasks': 0.3, 'EFS recovery': 0.1} -%}
+{#- Extension run time in ms: offset, median, sigma, cap. -#}
+{%- set cse_ms = {'Registry': [15, 180, 0.9, 20000], 'Security': [150, 1800, 0.9, 60000], 'Audit Policy Configuration': [5, 60, 0.8, 5000], 'Group Policy Registry': [10, 120, 0.9, 15000], 'Group Policy Folders': [5, 45, 0.8, 5000], 'Group Policy Scheduled Tasks': [10, 150, 0.9, 20000], 'EFS recovery': [3, 30, 0.8, 3000]} -%}
+{%- set order = ['Registry'] + ((cse_ids | dictsort(by='value')) | map(attribute=0) | reject('equalto', 'Registry') | list) -%}
+{#- Fleet activity by hour of the generator timezone (relative, peak 1):
+    workstations are mostly on from about 08:00 to 18:00 and refresh
+    from about 09:00; servers and left-on workstations around the
+    clock. Episode starts are weighted by its square. -#}
+{%- set curve = [0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.3, 0.45, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 0.35, 0.3, 0.3, 0.3, 0.3, 0.3] -%}
+{%- macro d(lo, med, sig, hi) -%}
+  {#- Offset lognormal in seconds, truncated by redrawing; returns us. -#}
+  {%- set ns = namespace(v=lo + module.rand.number.lognormal(module.math.log(med), sig)) -%}
+  {%- for _ in range(6) if ns.v > hi -%}
+    {%- set ns.v = lo + module.rand.number.lognormal(module.math.log(med), sig) -%}
+  {%- endfor -%}
+  {{- module.builtins.int(([ns.v, hi] | min) * 1000000) -}}
+{%- endmacro -%}
+{%- macro push(heap, due, x) -%}
+  {%- set s = shared.get('seq') + 1 -%}
+  {%- do shared.set('seq', s) -%}
+  {%- do module.heapq.heappush(heap, [due, s, x]) -%}
+{%- endmacro -%}
+{%- macro pick_start(lo, span) -%}
+  {#- Time in [lo, lo + span) with its hour weighted by the activity
+      curve squared plus a small floor. -#}
+  {%- set top = 1.02 -%}
+  {%- set r = namespace(v=lo + module.rand.number.integer(0, span - 1), ok=false) -%}
+  {%- for _ in range(500) if not r.ok -%}
+    {%- set c = lo + module.rand.number.integer(0, span - 1) -%}
+    {%- if module.rand.number.floating(0, top) < curve[((c + shared.get('tzoff')) // H) % 24] ** 2 + 0.02 -%}
+      {%- set r.v = c -%}
+      {%- set r.ok = true -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {{- r.v -}}
+{%- endmacro -%}
+{%- macro next_boot(h, t) -%}
+  {#- The workstation's next power-on after t: its usual start time of
+      day, +- 10 minutes. -#}
+  {%- set local = t + shared.get('tzoff') -%}
+  {%- set b = local - local % DAY + h.b0 + module.rand.number.integer(-10 * M, 10 * M) -%}
+  {{- (b + DAY if b <= local else b) - shared.get('tzoff') -}}
+{%- endmacro -%}
+{%- macro candidates(gpo, excl) -%}
+  {#- Hosts a GPO change can break now: they apply the GPO, have no
+      Security fault of their own and stay on for at least 4 hours, so
+      their next refreshes come soon. Comma-separated indexes. -#}
+  {%- set cand = [] -%}
+  {%- set hosts = shared.get('hosts') -%}
+  {%- for i in range(hosts | length) if i not in excl and hosts[i].pending == 0 and hosts[i].ep_left == 0 and not hosts[i].sec_bad and hosts[i].up and hosts[i].off_at - now >= 4 * H and gpo in hosts[i].gnames -%}
+    {%- do cand.append(i | string) -%}
+  {%- endfor -%}
+  {{- cand | join(',') -}}
+{%- endmacro -%}
+{%- if shared.get('hosts') is none -%}
+  {%- set schema = {'type': 'typed-dict', 'fields': {
+    'anomaly_mode': {'type': 'typed-dict-field', 'schema': {'type': 'bool', 'strict': true}},
+    'anomaly_interval_hours': {'type': 'typed-dict-field', 'schema': {'type': 'float', 'ge': 12, 'le': 8760}}
+  }} -%}
+  {%- do module.pydantic_core.SchemaValidator(schema).validate_python(params) -%}
+  {%- do shared.update({'seq': 0, 'tzoff': module.builtins.int(timestamp.utcoffset().total_seconds()) * S}) -%}
+  {%- set tzoff = shared.get('tzoff') -%}
+  {%- set hosts = [] -%}
+  {%- set per_ws = [] -%}
+  {%- set per_srv = [] -%}
+  {%- set boot = [] -%}
+  {#- 120 of the workstations are left on around the clock. -#}
+  {%- set left_on = [] -%}
+  {%- for row in samples.hosts -%}{%- if row.role == 'ws' -%}{%- do left_on.append(row.name) -%}{%- endif -%}{%- endfor -%}
+  {%- set left_on = module.rand.shuffle(left_on)[:120] -%}
+  {%- for row in samples.hosts -%}
+    {%- set i = loop.index0 -%}
+    {%- set gpos = [] -%}
+    {%- set gnames = [] -%}
+    {%- for gi in range(samples.gpos | length) if samples.gpos[gi].scope in ['all', row.role] -%}
+      {%- set g = samples.gpos[gi] -%}
+      {%- if g.name == 'Default Domain Policy' or 'Baseline' in g.name or module.rand.chance(0.6) -%}
+        {%- do gpos.append(gi) -%}
+        {%- do gnames.append(g.name) -%}
+      {%- endif -%}
+    {%- endfor -%}
+    {%- set threads = [] -%}
+    {%- for _ in range(module.rand.number.integer(5, 12)) -%}{%- do threads.append(4 * module.rand.number.integer(100, 4000)) -%}{%- endfor -%}
+    {#- A workstation is either left on or on from its start time
+        (07:25-08:35) to its shutdown time (17:20-18:40). -#}
+    {%- set always = row.role == 'srv' or row.name in left_on -%}
+    {%- set host = {'name': row.name, 'sam': row.sam, 'srv': row.role == 'srv', 'gpos': gpos, 'gnames': gnames, 'pid': 4 * module.rand.number.integer(200, 3000), 'threads': threads, 'record': module.rand.number.integer(3000, 900000), 'busy': false, 'pending': 0, 'ep_left': 0, 'sec_bad': false, 'always': always, 'b0': module.rand.number.integer(445 * M, 515 * M), 'b1': module.rand.number.integer(1040 * M, 1120 * M), 'up': true, 'off_at': now + 100000 * DAY} -%}
+    {%- do hosts.append(host) -%}
+    {%- if host.srv -%}
+      {{- push(per_srv, now + module.rand.number.integer(0, 120 * M), i) -}}
+    {%- elif always -%}
+      {{- push(per_ws, now + module.rand.number.integer(0, 120 * M), i) -}}
+    {%- else -%}
+      {%- set local = now + tzoff -%}
+      {%- set day0 = local - local % DAY -%}
+      {%- if day0 + host.b0 <= local < day0 + host.b1 -%}
+        {%- do host.update({'off_at': day0 + host.b1 - tzoff}) -%}
+        {{- push(per_ws, now + module.rand.number.integer(0, 120 * M), i) -}}
+      {%- else -%}
+        {%- do host.update({'up': false}) -%}
+        {{- push(boot, next_boot(host, now) | int, i) -}}
+      {%- endif -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- set interval = module.builtins.int(params.anomaly_interval_hours * H) -%}
+  {%- do shared.update({'hosts': hosts, 'per_ws': per_ws, 'per_srv': per_srv, 'boot': boot, 'tight': [], 'man': [], 'fails': [], 'ep_hosts': [], 'ep_last': [],
+    'nx_flaky': now + module.builtins.int(module.rand.number.exponential(1 / (8 * H))),
+    'nx_pair': now + module.builtins.int(module.rand.number.exponential(1 / (16 * H))),
+    'nx_admin': now}) -%}
+  {%- do shared.set('ep_due', pick_start(now, [interval, DAY] | min) | int) -%}
+{%- endif -%}
+{%- set hosts = shared.get('hosts') -%}
+{%- set tight = shared.get('tight') -%}
+{%- set man = shared.get('man') -%}
+{%- set interval = module.builtins.int(params.anomaly_interval_hours * H) -%}
+{#- Background Security extension faults, fleet-wide: a spell on one
+    host (every 8 h on average) fails its next one (65%) or two (35%)
+    Security runs before the fault clears; a shared cause (every 16 h on
+    average) breaks the next Security run of two hosts that apply the
+    same Security-bearing GPO. -#}
+{%- if now >= shared.get('nx_flaky') -%}
+  {%- set h = module.rand.choice(hosts) -%}
+  {%- if h.pending == 0 and h.ep_left == 0 -%}{%- do h.update({'pending': 1 if module.rand.chance(0.65) else 2}) -%}{%- endif -%}
+  {%- do shared.set('nx_flaky', now + module.builtins.int(module.rand.number.exponential(1 / (8 * H)))) -%}
+{%- endif -%}
+{%- if now >= shared.get('nx_pair') -%}
+  {%- set cand = candidates(module.rand.choice(sec_gpos), []) -%}
+  {%- if cand.count(',') >= 1 -%}
+    {%- for i in module.rand.shuffle(cand.split(','))[:2] -%}{%- do hosts[i | int].update({'pending': 1}) -%}{%- endfor -%}
+  {%- endif -%}
+  {%- do shared.set('nx_pair', now + module.builtins.int(module.rand.number.exponential(1 / (16 * H)))) -%}
+{%- endif -%}
+{#- Administrators run gpupdate on a host that is on, about 60 times a
+    day fleet-wide, mostly in working hours; one in five is repeated
+    within minutes. -#}
+{%- if now >= shared.get('nx_admin') -%}
+  {%- set pick = namespace(i=none) -%}
+  {%- for _ in range(20) if pick.i is none -%}
+    {%- set i = module.rand.number.integer(0, (hosts | length) - 1) -%}
+    {%- if hosts[i].up and now < hosts[i].off_at -%}{%- set pick.i = i -%}{%- endif -%}
+  {%- endfor -%}
+  {%- if pick.i is not none -%}
+    {{- push(man, now, pick.i) -}}
+    {%- if module.rand.chance(0.2) -%}{{- push(man, now + (d(20, 90, 0.8, 1800) | int), pick.i) -}}{%- endif -%}
+  {%- endif -%}
+  {%- set nx = namespace(t=now, ok=false) -%}
+  {%- for _ in range(400) if not nx.ok -%}
+    {%- set nx.t = nx.t + module.builtins.int(module.rand.number.exponential(1 / (H / 5.3))) -%}
+    {%- set a = curve[((nx.t + shared.get('tzoff')) // H) % 24] -%}
+    {%- set nx.ok = module.rand.chance(1.0 if a >= 1 else 0.1) -%}
+  {%- endfor -%}
+  {%- do shared.set('nx_admin', nx.t) -%}
+{%- endif -%}
+{#- Episode: a change to one Security-bearing GPO breaks its security
+    settings on three hosts that apply it and are on, picked like the
+    two hosts of a background shared-cause fault, none of them in the
+    previous episode. Each host fails at the next Security run its own
+    refresh schedule brings and succeeds at the run after it, as in a
+    one-error background spell. The first episode error that has two
+    other hosts' errors within the window completes the chain; the
+    episode's remaining hosts then keep their settings, so each episode
+    completes exactly one chain. The first start falls within
+    min(interval, 24 h), each later one within min(interval / 4, 6 h)
+    centred one interval after the actual start, both weighted by the
+    activity curve squared. Missed episodes are not replayed. -#}
+{%- if params.anomaly_mode and now >= shared.get('ep_due') -%}
+  {%- set cand = candidates(module.rand.choice(sec_gpos), shared.get('ep_last')) -%}
+  {%- if cand.count(',') >= 2 -%}
+    {%- set chosen = module.rand.shuffle(cand.split(','))[:3] | map('int') | list -%}
+    {%- for i in chosen -%}{%- do hosts[i].update({'ep_left': 1}) -%}{%- endfor -%}
+    {%- set w = [interval // 4, 6 * H] | min -%}
+    {%- do shared.update({'ep_hosts': chosen, 'ep_last': chosen, 'ep_due': pick_start(now + interval - w // 2, w) | int}) -%}
+  {%- endif -%}
+{%- endif -%}
+{#- Workstations whose start time has come are on again (a new service
+    process) and refresh 90-120 minutes later. -#}
+{%- set boot = shared.get('boot') -%}
+{%- if 'ws' in tags -%}
+  {%- for _ in range(8) if boot and boot[0][0] <= now -%}
+    {%- set it = hq.heappop(boot) -%}
+    {%- set h = hosts[it[2]] -%}
+    {%- set threads = [] -%}
+    {%- for _ in range(module.rand.number.integer(5, 12)) -%}{%- do threads.append(4 * module.rand.number.integer(100, 4000)) -%}{%- endfor -%}
+    {%- do h.update({'up': true, 'pid': 4 * module.rand.number.integer(200, 3000), 'threads': threads, 'off_at': it[0] + h.b1 - h.b0 + module.rand.number.integer(-20 * M, 20 * M)}) -%}
+    {{- push(shared.get('per_ws'), it[0] + 90 * M + module.rand.number.integer(0, 30 * M), it[2]) -}}
+  {%- endfor -%}
+{%- endif -%}
+{#- Dispatcher. -#}
+{%- set out = namespace(ref=none, start=none, manual=false) -%}
+{%- for _ in range(24) if out.ref is none and out.start is none -%}
+  {%- set due = namespace(ref=none) -%}
+  {%- for r in tight if due.ref is none and r.due <= now -%}{%- set due.ref = r -%}{%- endfor -%}
+  {%- if due.ref is not none -%}
+    {%- set out.ref = due.ref -%}
+  {%- elif man and man[0][0] <= now -%}
+    {%- set it = hq.heappop(man) -%}
+    {%- set h = hosts[it[2]] -%}
+    {%- if h.busy -%}
+      {{- push(man, now + 30 * S, it[2]) -}}
+    {%- elif h.up and now < h.off_at -%}
+      {%- set out.start = it[2] -%}
+      {%- set out.manual = true -%}
+    {%- endif -%}
+  {%- else -%}
+    {%- set heap = shared.get('per_srv') if 'srv' in tags else shared.get('per_ws') -%}
+    {%- set heap = heap if heap else shared.get('per_srv') -%}
+    {%- set it = hq.heappop(heap) -%}
+    {%- set h = hosts[it[2]] -%}
+    {%- if now >= h.off_at -%}
+      {#- The workstation shut down since its last refresh. -#}
+      {%- do h.update({'up': false}) -%}
+      {{- push(boot, next_boot(h, now) | int, it[2]) -}}
+    {%- elif h.busy -%}
+      {{- push(heap, now + M, it[2]) -}}
+    {%- else -%}
+      {{- push(heap, now + 90 * M + module.rand.number.integer(0, 30 * M), it[2]) -}}
+      {%- set out.start = it[2] -%}
+    {%- endif -%}
+  {%- endif -%}
+{%- endfor -%}
+{%- if out.ref is none and out.start is none -%}
+  {#- Many workstations that shut down since their last refresh came up
+      at once: this timestamp goes to the server due first. -#}
+  {%- set per_srv = shared.get('per_srv') -%}
+  {%- for it in per_srv | sort if out.start is none and not hosts[it[2]].busy -%}
+    {%- do per_srv.remove(it) -%}
+    {%- do hq.heapify(per_srv) -%}
+    {{- push(per_srv, now + 90 * M + module.rand.number.integer(0, 30 * M), it[2]) -}}
+    {%- set out.start = it[2] -%}
+  {%- endfor -%}
+{%- endif -%}
+{%- macro guid() -%}{{- '{' ~ (module.rand.crypto.uuid4() | string | upper) ~ '}' -}}{%- endmacro -%}
+{%- if out.start is not none -%}
+  {#- A refresh starts: pick the extensions that run in it. -#}
+  {%- set host = hosts[out.start] -%}
+  {%- set steps = [['s', none]] -%}
+  {%- for cse in order -%}
+    {%- set has = namespace(v=false) -%}
+    {%- for gi in host.gpos if cse in samples.gpos[gi].cses -%}{%- set has.v = true -%}{%- endfor -%}
+    {%- set sec_due = cse == 'Security' and (host.sec_bad or host.pending > 0 or host.ep_left > 0) -%}
+    {%- if has.v and (out.manual or sec_due or module.rand.chance(cse_p[cse])) -%}
+      {%- do steps.append(['cs', cse]) -%}
+      {%- do steps.append(['ce', cse]) -%}
+    {%- endif -%}
+  {%- endfor -%}
+  {%- do steps.append(['e', none]) -%}
+  {%- do host.update({'busy': true}) -%}
+  {%- set out.ref = {'h': out.start, 'act': guid(), 'thr': module.rand.choice(host.threads), 'manual': out.manual, 'steps': steps, 'i': 0, 't0': now, 'ct0': now, 'fail': 0, 'due': now} -%}
+  {%- do tight.append(out.ref) -%}
+{%- endif -%}
+{%- set ref = out.ref -%}
+{%- set host = hosts[ref.h] -%}
+{%- set step = ref.steps[ref.i] -%}
+{%- set data = [] -%}
+{%- if step[0] == 's' -%}
+  {%- set code = 4004 if ref.manual else 4006 -%}
+  {%- set data = [['PolicyActivityId', ref.act], ['PrincipalSamName', host.sam], ['IsMachine', '1'], ['IsDomainJoined', 'true'], ['IsBackgroundProcessing', 'false' if ref.manual else 'true'], ['IsAsyncProcessing', 'false'], ['IsServiceRestart', 'false'], ['ReasonForSyncProcessing', '0']] -%}
+{%- elif step[0] == 'cs' -%}
+  {%- set cse = step[1] -%}
+  {%- set gxml = namespace(v='', desc='') -%}
+  {%- for gi in host.gpos if cse in samples.gpos[gi].cses -%}
+    {%- set g = samples.gpos[gi] -%}
+    {%- set gxml.v = gxml.v ~ '<GPO ID="' ~ g.id ~ '"><Name>' ~ g.name ~ '</Name></GPO>' -%}
+    {%- set gxml.desc = gxml.desc ~ g.name ~ '\n' -%}
+  {%- endfor -%}
+  {%- set code = 4016 -%}
+  {%- do ref.update({'ct0': now}) -%}
+  {%- set data = [['CSEExtensionId', cse_ids[cse]], ['CSEExtensionName', cse], ['IsExtensionAsyncProcessing', 'false'], ['IsGPOListChanged', 'false'], ['GPOListStatusString', '%%4101'], ['DescriptionString', gxml.desc], ['ApplicableGPOList', gxml.v]] -%}
+{%- elif step[0] == 'ce' -%}
+  {%- set cse = step[1] -%}
+  {%- set err = namespace(v=0) -%}
+  {%- if cse == 'Security' -%}
+    {#- Distinct other hosts with a Security error within the window. -#}
+    {%- set fails = shared.get('fails') -%}
+    {%- for _ in range(fails | length) if fails and fails[0][0] < now - window -%}{%- do fails.pop(0) -%}{%- endfor -%}
+    {%- set others = [] -%}
+    {%- for f in fails if f[1] != ref.h and f[1] not in others and others | length < 2 -%}{%- do others.append(f[1]) -%}{%- endfor -%}
+    {%- if host.ep_left > 0 -%}
+      {%- set err.v = 1252 -%}
+      {%- do host.update({'ep_left': 0}) -%}
+      {%- if others | length >= 2 -%}
+        {#- This error completes the chain: the episode is over. -#}
+        {%- for i in shared.get('ep_hosts') -%}{%- do hosts[i].update({'ep_left': 0}) -%}{%- endfor -%}
+        {%- do shared.set('ep_hosts', []) -%}
+      {%- endif -%}
+    {%- elif host.pending > 0 -%}
+      {#- Guard: an error with two other hosts' errors within the window
+          would complete the chain; the run succeeds instead and the
+          spell ends. -#}
+      {%- if others | length < 2 -%}{%- set err.v = 1252 -%}{%- endif -%}
+      {%- do host.update({'pending': host.pending - 1 if err.v else 0}) -%}
+    {%- endif -%}
+    {%- if err.v -%}{%- do fails.append([now, ref.h]) -%}{%- endif -%}
+    {%- do host.update({'sec_bad': err.v != 0}) -%}
+  {%- elif cse == 'Audit Policy Configuration' -%}
+    {#- E_PENDING: the audit extension continues asynchronously. -#}
+    {%- set err.v = 2147483658 -%}
+  {%- endif -%}
+  {%- if cse == 'Security' and err.v -%}{%- do ref.update({'fail': err.v}) -%}{%- endif -%}
+  {%- set code = 7016 if cse == 'Security' and err.v else 5016 -%}
+  {%- set data = [['CSEElaspedTimeInMilliSeconds', ((now - ref.ct0) // 1000) | string], ['ErrorCode', err.v | string], ['CSEExtensionName', cse], ['CSEExtensionId', cse_ids[cse]]] -%}
+{%- else -%}
+  {%- set code = ((7004 if ref.manual else 7006) if ref.fail else (8004 if ref.manual else 8006)) -%}
+  {%- set data = [['PolicyElaspedTimeInSeconds', ((now - ref.t0) // S) | string], ['ErrorCode', ref.fail | string], ['PrincipalSamName', host.sam], ['IsMachine', '1'], ['IsConnectivityFailure', 'false']] -%}
+{%- endif -%}
+{#- Schedule the refresh's next record, or finish it. -#}
+{%- do ref.update({'i': ref.i + 1}) -%}
+{%- if ref.i < ref.steps | length -%}
+  {%- set nk = ref.steps[ref.i][0] -%}
+  {%- if step[0] == 's' -%}{%- set gap = d(0.3, 2.5, 1.1, 90) | int -%}
+  {%- elif step[0] == 'cs' -%}{%- set m = cse_ms[step[1]] -%}{%- set gap = d(m[0] / 1000, m[1] / 1000, m[2], m[3] / 1000) | int -%}
+  {%- elif nk == 'e' -%}{%- set gap = d(0.01, 0.3, 0.9, 10) | int -%}
+  {%- else -%}{%- set gap = d(0.001, 0.02, 0.9, 2) | int -%}
+  {%- endif -%}
+  {%- do ref.update({'due': now + gap}) -%}
+{%- else -%}
+  {%- do tight.remove(ref) -%}
+  {%- do host.update({'busy': false}) -%}
+  {#- After a failed refresh an administrator often reruns gpupdate
+      within minutes. -#}
+  {%- if ref.fail and module.rand.chance(0.35) -%}{{- push(man, now + (d(30, 240, 0.8, 1800) | int), ref.h) -}}{%- endif -%}
+{%- endif -%}
+{#- Other Operational records of the same refresh (5340, 5326, 5312,
+    ...; not modeled) take record numbers in between. -#}
+{%- set rstep = module.rand.number.integer(3, 12) if code in [4004, 4006] else module.rand.number.integer(1, 4) -%}
+{%- set record_id = host.record + rstep -%}
+{%- do host.update({'record': record_id}) -%}
+{%- set moment = timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set system_time = moment.strftime('%Y-%m-%dT%H:%M:%S.%f') ~ module.rand.number.integer(0, 9) ~ 'Z' -%}
+{%- set ev = {} -%}
+{%- for kv in data -%}{%- do ev.update({kv[0]: kv[1]}) -%}{%- endfor -%}
+{%- set failed = code in [7016, 7006, 7004] -%}
+{%- if code == 4006 or code == 4004 -%}
+  {%- set action = ('periodic' if code == 4006 else 'manual') ~ '-policy-processing-started' -%}
+  {%- set message = ('Starting periodic policy processing for computer ' if code == 4006 else 'Starting manual processing of policy for computer ') ~ ev.PrincipalSamName ~ '. \nActivity id: ' ~ ev.PolicyActivityId -%}
+  {%- set opcode = [1, 'Start'] -%}{%- set version = 1 -%}
+{%- elif code == 8006 or code == 8004 -%}
+  {%- set action = ('periodic' if code == 8006 else 'manual') ~ '-policy-processing-completed' -%}
+  {%- set message = ('Completed periodic policy processing for computer ' if code == 8006 else 'Completed manual processing of policy for computer ') ~ ev.PrincipalSamName ~ ' in ' ~ ev.PolicyElaspedTimeInSeconds ~ ' seconds.' -%}
+  {%- set opcode = [2, 'Stop'] -%}{%- set version = 1 -%}
+{%- elif code == 7006 or code == 7004 -%}
+  {%- set action = ('periodic' if code == 7006 else 'manual') ~ '-policy-processing-failed' -%}
+  {%- set message = ('Periodic policy processing failed for computer ' if code == 7006 else 'Manual processing of policy failed for computer ') ~ ev.PrincipalSamName ~ ' in ' ~ ev.PolicyElaspedTimeInSeconds ~ ' seconds.' -%}
+  {%- set opcode = [2, 'Stop'] -%}{%- set version = 1 -%}
+{%- elif code == 4016 -%}
+  {%- set action = 'cse-processing-started' -%}
+  {%- set message = 'Starting ' ~ ev.CSEExtensionName ~ ' Extension Processing. \n\nList of applicable Group Policy objects: (No changes were detected.)\n\n' ~ ev.DescriptionString -%}
+  {%- set opcode = [1, 'Start'] -%}{%- set version = 0 -%}
+{%- else -%}
+  {%- set action = 'cse-processing-failed' if failed else 'cse-processing-completed' -%}
+  {%- set message = 'Completed ' ~ ev.CSEExtensionName ~ ' Extension Processing in ' ~ ev.CSEElaspedTimeInMilliSeconds ~ ' milliseconds.' -%}
+  {%- set opcode = [2, 'Stop'] -%}{%- set version = 0 -%}
+{%- endif -%}
+{%- set level = [2, 'error'] if failed else [4, 'information'] -%}
+{%- set ns = namespace(xml='') -%}
+{%- for kv in data -%}{%- set ns.xml = ns.xml ~ '<Data Name="' ~ kv[0] ~ '">' ~ (kv[1] | e) ~ '</Data>' -%}{%- endfor -%}
+{%- set xml = '<Event xmlns="http://schemas.microsoft.com/win/2004/08/events/event"><System><Provider Name="Microsoft-Windows-GroupPolicy" Guid="{AEA1B4FA-97D1-45F2-A64C-4D69FFFD92C9}"/><EventID>' ~ code ~ '</EventID><Version>' ~ version ~ '</Version><Level>' ~ level[0] ~ '</Level><Task>0</Task><Opcode>' ~ opcode[0] ~ '</Opcode><Keywords>0x4000000000000000</Keywords><TimeCreated SystemTime="' ~ system_time ~ '"/><EventRecordID>' ~ record_id ~ '</EventRecordID><Correlation ActivityID="' ~ ref.act ~ '"/><Execution ProcessID="' ~ host.pid ~ '" ThreadID="' ~ ref.thr ~ '"/><Channel>Microsoft-Windows-GroupPolicy/Operational</Channel><Computer>' ~ host.name ~ '</Computer><Security UserID="S-1-5-18"/></System><EventData>' ~ ns.xml ~ '</EventData></Event>' -%}
+{#- ECS configuration allows access/change/creation/deletion/info:
+    a successful completion applied policy (change), the rest is info. -#}
+{%- set etype = ['change'] if opcode[0] == 2 and not failed else ['info'] -%}
+{%- set evt = {'kind': 'event', 'category': ['configuration'], 'type': etype, 'action': action, 'code': code | string, 'provider': 'Microsoft-Windows-GroupPolicy', 'original': xml} -%}
+{%- if opcode[0] == 2 -%}{%- do evt.update({'outcome': 'failure' if failed else 'success'}) -%}{%- endif -%}
+{%- set event = {
+  '@timestamp': moment.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+  'ecs': {'version': '8.17.0'},
+  'event': evt,
+  'host': {'name': host.name},
+  'log': {'level': level[1]},
+  'message': message.rstrip(),
+  'winlog': {'activity_id': ref.act, 'channel': 'Microsoft-Windows-GroupPolicy/Operational', 'computer_name': host.name, 'event_data': ev, 'event_id': code | string, 'opcode': opcode[1], 'process': {'pid': host.pid, 'thread': {'id': ref.thr}}, 'provider_guid': '{AEA1B4FA-97D1-45F2-A64C-4D69FFFD92C9}', 'provider_name': 'Microsoft-Windows-GroupPolicy', 'record_id': record_id | string, 'user': {'identifier': 'S-1-5-18'}, 'version': version}
+} -%}
+{{- event | tojson -}}
