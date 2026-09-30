@@ -1,0 +1,120 @@
+{# Legacy Event Forwarder JSON, normalized like Elastic carbonblack_edr.
+   Fixed host slots plus one extra episode process. Histories live in the
+   process objects and disappear when their process ends. #}
+{%- set ts=timestamp.astimezone(module.datetime.timezone.utc) -%}
+{%- set now=ts.timestamp() -%}
+{%- set interval=params.anomaly_interval_hours * 3600 -%}
+{%- macro guid(sensor,pid,created) -%}
+  {%- set ft=(created|int + 11644473600)*10000000 + ((created-created|int)*1000000)|round|int * 10 -%}
+  {{- '%08x-%04x-%04x-%04x-%012x'|format(sensor,pid//65536,pid%65536,ft//281474976710656,ft%281474976710656) -}}
+{%- endmacro -%}
+{%- macro schedule(first=false) -%}
+  {%- set width=[interval/4,21600]|min -%}
+  {%- set lo=now if first else now+interval-width/2 -%}
+  {%- set hi=now+[interval,86400]|min if first else now+interval+width/2 -%}
+  {%- set candidates=[] -%}{%- set weights=[] -%}
+  {%- for _ in range(96) -%}
+    {%- set at=module.rand.number.floating(lo,hi) -%}
+    {%- set h=module.datetime.datetime.fromtimestamp(at,module.datetime.timezone.utc).hour -%}
+    {%- set w=1.0 if 8<=h<18 else 0.01369863 -%}
+    {%- do candidates.append(at) -%}{%- do weights.append(w if first else w*w+0.001) -%}
+  {%- endfor -%}
+  {{- module.rand.weighted_choice(candidates,weights) -}}
+{%- endmacro -%}
+{%- if shared.get('processes') is none -%}
+  {%- do module.pydantic_core.SchemaValidator({'type':'typed-dict','fields':{
+    'anomaly_mode':{'type':'typed-dict-field','schema':{'type':'bool','strict':true}},
+    'anomaly_interval_hours':{'type':'typed-dict-field','schema':{'type':'float','ge':2,'le':8760}}
+  }}).validate_python(params) -%}
+  {%- do shared.update({'processes':{},'episode_due':schedule(true)|float,'last_actor':-1,'pid':2000,'parent_time':now-7200}) -%}
+{%- endif -%}
+{%- set processes=shared.get('processes') -%}
+{%- macro create(slot,ai,episode) -%}
+  {%- set actor=samples.hosts[ai] -%}
+  {%- set app=samples.applications.pick() -%}
+  {%- set pid=shared.get('pid')+4 -%}{%- if pid>60000 -%}{%- set pid=2000 -%}{%- endif -%}{%- do shared.set('pid',pid) -%}
+  {%- set steps=['reg','file','net'] if episode else module.rand.weighted_choice([['net','file'],['file','net'],['reg','net'],['file','reg','net'],['reg','file','net']],[40,35,15,9,1]) -%}
+  {%- set c={'ai':ai,'host':actor.host,'sensor':actor.sensor,'user':actor.user,'local_ip':actor.local_ip,
+    'pid':pid,'guid':guid(actor.sensor,pid,now),'start':now,'parent_guid':guid(actor.sensor,1500,shared.get('parent_time')),
+    'parent_pid':1500,'parent_time':shared.get('parent_time'),'parent_path':app.parent_path,
+    'path':app.path,'md5':module.hashlib.md5(app.path.encode()).hexdigest()|upper,'sha256':module.hashlib.sha256(app.path.encode()).hexdigest()|upper,
+    'remote_ip':app.remote_ip,'domain':app.domain,'local_port':module.rand.number.integer(49152,65535),
+    'steps':steps,'due':now+module.rand.number.floating(3,15),'expires':now+module.rand.number.floating(600,1200),
+    'reg':false,'file':false,'reg_prefix':false,'file_prefix':false,'episode':episode,'completed':false} -%}
+  {%- do processes.update({slot:c}) -%}
+{%- endmacro -%}
+{%- set choice=namespace(slot=none,kind=none) -%}
+{%- if params.anomaly_mode and now>=shared.get('episode_due') and -1 not in processes -%}
+  {%- set eligible=[] -%}
+  {%- for i in range(samples.hosts|length) if not samples.hosts[i].auto and i!=shared.get('last_actor') -%}{%- do eligible.append(i) -%}{%- endfor -%}
+  {%- set ai=module.rand.choice(eligible) -%}
+  {{- create(-1,ai,true) -}}
+  {%- do shared.update({'episode_due':schedule()|float,'last_actor':ai}) -%}
+  {%- set choice.slot=-1 -%}{%- set choice.kind='procstart' -%}
+{%- else -%}
+  {# Finish expired processes before beginning new work. #}
+  {%- for slot,c in processes.items() if now>=c.expires -%}
+    {%- set choice.slot=slot -%}{%- set choice.kind='delreg' if c.reg else 'delfile' if c.file else 'procend' -%}{%- break -%}
+  {%- endfor -%}
+  {%- if choice.slot is none -%}
+    {%- set pick=namespace(at=now+1) -%}
+    {%- for slot,c in processes.items() if c.steps and c.due<=now and c.due<pick.at -%}
+      {%- set pick.at=c.due -%}{%- set choice.slot=slot -%}
+    {%- endfor -%}
+    {%- if choice.slot is not none -%}
+      {%- set c=processes[choice.slot] -%}
+      {%- set choice.kind=c.steps.pop(0) -%}
+      {%- do c.update({'due':now+module.rand.number.floating(3,15)}) -%}
+    {%- endif -%}
+  {%- endif -%}
+  {%- if choice.slot is none -%}
+    {%- set eligible=[] -%}
+    {%- for i in range(samples.hosts|length) if samples.hosts[i].auto == ('automation' in tags) -%}{%- do eligible.append(i) -%}{%- endfor -%}
+    {%- set ai=module.rand.choice(eligible) -%}{%- set choice.slot=ai -%}
+    {%- if ai not in processes -%}{{- create(ai,ai,false) -}}{%- set choice.kind='procstart' -%}
+    {%- else -%}{%- set choice.kind='net' -%}{%- endif -%}
+  {%- endif -%}
+{%- endif -%}
+{%- set c=processes[choice.slot] -%}
+{%- set kind=choice.kind -%}
+{%- set base=params.link_base.rstrip('/') ~ '/' -%}
+{%- set native={'cb_server':params.cb_server,'computer_name':c.host,'sensor_id':c.sensor,'timestamp':now,
+  'process_guid':c.guid,'pid':c.pid,'process_path':c.path,'md5':c.md5,'sha256':c.sha256,
+  'link_process':base ~ '#analyze/' ~ c.guid ~ '/0','link_sensor':base ~ '#/host/' ~ c.sensor} -%}
+{%- if kind in ['procstart','procend'] -%}
+  {%- do native.update({'event_type':'proc','type':'ingress.event.' ~ kind,'path':c.path,'command_line':'"' ~ c.path ~ '"',
+    'parent_path':c.parent_path,'parent_pid':c.parent_pid,'parent_create_time':c.parent_time,'parent_guid':c.parent_guid,'parent_process_guid':c.parent_guid,
+    'parent_md5':module.hashlib.md5(c.parent_path.encode()).hexdigest()|upper,'filtering_known_dlls':false,'expect_followon_w_md5':false,
+    'link_parent':base ~ '#analyze/' ~ c.parent_guid ~ '/1','username':c.user}) -%}
+{%- elif kind in ['reg','delreg'] -%}
+  {%- set path='\\registry\\user\\s-1-5-21-1000-1000-1000-' ~ (1000+c.sensor) ~ '\\software\\contoso\\sessions\\' ~ c.pid -%}
+  {%- do native.update({'event_type':'regmod','type':'ingress.event.regmod','path':path,'action':'writeval' if kind=='reg' else 'delval','actiontype':2 if kind=='reg' else 8,'tamper':false,'tamper_sent':false}) -%}
+  {%- do c.update({'reg':kind=='reg'}) -%}
+  {%- if kind=='reg' -%}{%- do c.update({'reg_prefix':true}) -%}{%- endif -%}
+{%- elif kind in ['file','delfile'] -%}
+  {%- set path='c:\\users\\' ~ c.user.split('@')[0] ~ '\\appdata\\local\\temp\\session-' ~ c.pid ~ '.dat' -%}
+  {%- do native.update({'event_type':'filemod','type':'ingress.event.filemod','path':path,'action':'lastwrite' if kind=='file' else 'delete','actiontype':8 if kind=='file' else 4,'filetype':0,'filetype_name':'Unknown','tamper':false,'tamper_sent':false}) -%}
+  {%- do c.update({'file':kind=='file'}) -%}
+  {%- if kind=='file' and c.reg_prefix -%}{%- do c.update({'file_prefix':true}) -%}{%- endif -%}
+{%- else -%}
+  {%- set remote=c.remote_ip -%}{%- set domain=c.domain -%}
+  {%- if c.file_prefix and now-c.start<=600 -%}
+    {%- if c.episode and not c.completed -%}{%- do c.update({'completed':true}) -%}
+    {%- else -%}{%- set remote='10.20.1.20' -%}{%- set domain='inventory.example.test' -%}{%- endif -%}
+  {%- endif -%}
+  {%- do native.update({'event_type':'netconn','type':'ingress.event.netconn','direction':'outbound','domain':domain,'ipv4':remote,'port':443,'protocol':6,
+    'remote_ip':remote,'remote_port':443,'local_ip':c.local_ip,'local_port':c.local_port}) -%}
+{%- endif -%}
+{%- if kind=='procend' -%}{%- do processes.pop(choice.slot) -%}{%- endif -%}
+{# The ingress pipeline moves cb_server/type to observer/event and keeps
+   other source fields. It does not populate ECS host/process/user here. #}
+{%- set parsed=dict(native) -%}{%- do parsed.pop('cb_server') -%}{%- do parsed.pop('type') -%}
+{%- if 'parent_create_time' in parsed -%}{%- do parsed.update({'parent_create_time':parsed.parent_create_time|int}) -%}{%- endif -%}
+{%- set out={'@timestamp':ts.isoformat(),'ecs':{'version':'8.11.0'},'event':{'action':native.type,'kind':'event','dataset':'carbonblack_edr.log','original':native|tojson},
+  'observer':{'name':params.cb_server,'vendor':'VMWare','product':'Carbon Black EDR','type':'edr'},'carbonblack':{'edr':parsed},'tags':['carbonblack_edr-log','forwarded','preserve_original_event']} -%}
+{%- if native.event_type in ['filemod','regmod','netconn'] -%}
+  {%- do out.event.update({'category':[{'filemod':'file','regmod':'registry','netconn':'network'}[native.event_type]],'type':['connection','start'] if native.event_type=='netconn' else ['change']}) -%}
+{%- endif -%}
+{%- if native.event_type=='regmod' -%}{%- do out.update({'registry':{'path':native.path[10:]}}) -%}{%- endif -%}
+{%- if native.event_type=='netconn' -%}{%- do out.update({'network':{'iana_number':'6'}}) -%}{%- endif -%}
+{{- out|tojson -}}
